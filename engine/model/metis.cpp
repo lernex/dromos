@@ -58,12 +58,15 @@ std::vector<float> host_values(const WeightView& w) {
 }  // namespace
 
 // A projection: its bf16 weight (prefill, through cuBLASLt) and, when quantized, an int8 copy with
-// per-row scales that decode steps read instead, at half the bytes.
+// per-row scales that decode steps read instead, at half the bytes. With LX_BF16X, decode reads a
+// lossless compressed copy instead (LX_W_BF16X: the same bf16 values in ~12.2 bits, so the same
+// logits to the bit at ~1.3x fewer bytes).
 struct Linear {
   const void* w = nullptr;     // bf16 [N, K]
   const void* bias = nullptr;  // bf16 [N] or null
   int8_t* q = nullptr;         // int8 [N, K], or null to decode from w
   float* scale = nullptr;      // f32 [N]
+  void* x16 = nullptr;         // LX_W_BF16X encoding of w, or null
   int N = 0, K = 0;
   bool host = false;           // w is in pinned host memory (offload): prefill stages it into VRAM
   lx_weight pw{LX_W_BF16, nullptr, nullptr, 1.0f};  // what prefill multiplies by (LX_PREFILL): w, or a copy
@@ -90,6 +93,7 @@ struct MetisModel::Impl {
     int8_t *gate_up_q = nullptr, *down_q = nullptr;  // int8 experts, for decode
     float *gate_up_scale = nullptr, *down_scale = nullptr;
     lx_weight gate_up_pw{}, down_pw{};  // the experts as prefill multiplies them (LX_PREFILL)
+    void *gate_up_x16 = nullptr, *down_x16 = nullptr;  // LX_W_BF16X experts, for decode (LX_BF16X)
     const float *router_w, *router_b, *selection_bias;
     Connection mixer_conn, moe_conn;
   };
@@ -179,6 +183,9 @@ struct MetisModel::Impl {
   void* gemm_ws = nullptr;
   void* moe_grouped_ws = nullptr;
   std::string w8_keep;  // LX_W8_KEEP: comma-separated name fragments that stay bf16 for decode
+  bool bf16x = false;        // LX_BF16X: decode reads lossless compressed bf16 copies (no int8)
+  bool keep_bf16x = false;   // LX_KEEP_BF16X: what decode would read as plain bf16 it reads as LX_W_BF16X
+  bool decode_bf16 = false;  // LX_DECODE_BF16: plain bf16 decode products run on bf16x.cu's kernels
   void *streams_bf, *retrieved_bf, *feat_in_bf, *h_bf, *normed_bf, *lora_bf, *att_bf, *latent_bf, *shared_bf,
       *routed_bf, *entry_bf, *meta_bf, *out_bf;
 
@@ -255,8 +262,19 @@ lx_weight prefill_weight(Impl& m, const void* w, int8_t* q, float* scale, int64_
   return out;
 }
 
+// The lossless compressed copy of a bf16 tensor ([rows, K]), for decode.
+void* encode_bf16x(Impl& m, const void* w, int64_t rows, int64_t K) {
+  const int64_t bytes = lx_bf16x_bytes(w, rows, static_cast<int>(K), nullptr);
+  if (bytes <= 0) throw std::runtime_error("lx_bf16x_bytes failed");
+  void* out = m.alloc<uint8_t>(static_cast<size_t>(bytes));
+  LX_CHECK(lx_bf16x_encode(w, rows, static_cast<int>(K), out, bytes, nullptr));
+  return out;
+}
+
 // A projection from the checkpoint; with `quantize`, also its int8 decode copy, unless its name
-// contains a fragment of LX_W8_KEEP (for measuring what quantizing each part costs).
+// contains a fragment of LX_W8_KEEP (for measuring what quantizing each part costs). With LX_BF16X,
+// every projection whose rows the format makes smaller gets a lossless copy instead, whatever
+// `quantize` says (lossless, so the Mamba out_proj too).
 Linear make_linear(Impl& m, const WeightLookup& lw, const std::string& weight, const std::string& bias, int64_t N,
                    int64_t K, bool quantize) {
   Linear l;
@@ -274,11 +292,14 @@ Linear make_linear(Impl& m, const WeightLookup& lw, const std::string& weight, c
     l.host = true;
     m.stage_bytes = std::max(m.stage_bytes, bytes);
   }
-  const bool keep = !quantize || kept_bf16(m, weight);
-  if (!keep) {
+  if (m.bf16x) {
+    if (lx_bf16x_row_bytes(static_cast<int>(K)) < 2 * K) l.x16 = encode_bf16x(m, l.w, N, K);
+  } else if (quantize && !kept_bf16(m, weight)) {
     l.q = m.alloc<int8_t>(static_cast<size_t>(N) * K);
     l.scale = m.alloc<float>(N);
     LX_CHECK(lx_quantize_w8(l.w, l.q, l.scale, N, static_cast<int>(K), nullptr));
+  } else if (m.keep_bf16x && lx_bf16x_row_bytes(static_cast<int>(K)) < 2 * K) {
+    l.x16 = encode_bf16x(m, l.w, N, K);
   }
   l.pw = lx_weight{LX_W_BF16, l.w, nullptr, 1.0f};
   if (quantize && !listed(m.prefill_keep, weight)) l.pw = prefill_weight(m, l.w, l.q, l.scale, N, K);
@@ -420,6 +441,13 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
       }
     if (!found) throw std::runtime_error("LX_PREFILL: unknown mode " + v);
   }
+  // LX_W_BF16X (bf16x.cu) is lossless, so either switch keeps the logits of the path it replaces to
+  // the bit. LX_BF16X: every decode projection is read compressed instead of int8 or bf16 (BF16
+  // logits). LX_KEEP_BF16X: int8 stays, and what stays bf16 (LX_W8_KEEP) is read compressed.
+  // LX_DECODE_BF16 (for measuring the format against the same kernels): plain bf16 through them.
+  m.bf16x = std::getenv("LX_BF16X") != nullptr;
+  m.keep_bf16x = std::getenv("LX_KEEP_BF16X") != nullptr;
+  m.decode_bf16 = std::getenv("LX_DECODE_BF16") != nullptr;
   m.embedding = need(lw, "embedding.weight", LX_BF16, {V, D});
   m.head = make_linear(m, lw, "embedding.weight", "", V, D, true);
   m.stream_emb = need(lw, "stream_embeddings", LX_BF16, {S, D});
@@ -479,7 +507,10 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
     }
     layer.shared_gate_up = make_linear(m, lw, e + "shared_expert.gate_up.weight", "", 2 * m.Ishared, Lat, true);
     layer.shared_down = make_linear(m, lw, e + "shared_expert.down.weight", "", Lat, m.Ishared, true);
-    if (!m.offload && !kept_bf16(m, e + "local_experts.gate_up.weight")) {
+    if (!m.offload && (m.bf16x || (m.keep_bf16x && kept_bf16(m, e + "local_experts.gate_up.weight")))) {
+      layer.gate_up_x16 = encode_bf16x(m, layer.gate_up, static_cast<int64_t>(E) * 2 * m.Iexp, Lat);
+      layer.down_x16 = encode_bf16x(m, layer.down, static_cast<int64_t>(E) * Lat, m.Iexp);
+    } else if (!m.offload && !kept_bf16(m, e + "local_experts.gate_up.weight")) {
       const int64_t gu_rows = static_cast<int64_t>(E) * 2 * m.Iexp, dn_rows = static_cast<int64_t>(E) * Lat;
       layer.gate_up_q = m.alloc<int8_t>(gu_rows * Lat);
       layer.gate_up_scale = m.alloc<float>(gu_rows);
@@ -581,7 +612,8 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
   m.last_rows = m.alloc<float>(static_cast<size_t>(max_slots) * D);
   m.cast_capacity = TS * static_cast<size_t>(std::max({3 * D + R, m.I, m.proj, D}));
   m.cast_bf = m.alloc<uint16_t>(m.cast_capacity);
-  m.moe_workspace = m.alloc<char>(static_cast<size_t>(lx_moe_workspace_bytes(Impl::kGemvRows, m.Iexp, m.K)));
+  m.moe_workspace = m.alloc<char>(static_cast<size_t>(std::max(lx_moe_workspace_bytes(Impl::kGemvRows, m.Iexp, m.K),
+                                                                 lx_moe_bf16x_workspace_bytes(Impl::kGemvRows, m.Iexp, m.K))));
   {
     const int kmax = std::max({3 * D + R, m.I, m.proj, D, Lat, m.Ishared, m.AH * m.Dh});
     const int rows = static_cast<int>(T);
@@ -591,7 +623,7 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
     m.moe_grouped_ws =
         m.alloc<char>(static_cast<size_t>(lx_moe_grouped_workspace_bytes(rows, Lat, m.Iexp, E, m.K, m.prefill_math)));
   }
-    m.meta_count = T + (max_slots + 1) + 5 * static_cast<size_t>(max_slots);
+  m.meta_count = T + (max_slots + 1) + 5 * static_cast<size_t>(max_slots);
   m.d_meta = m.alloc<int32_t>(m.meta_count);
   m.d_tokens = m.d_meta;
   m.d_cu = m.d_tokens + T;
@@ -769,9 +801,16 @@ void linear(Impl& m, const Linear& l, const void* x, lx_dtype x_dtype, int ld_x,
     const size_t xs = x_dtype == LX_F32 ? 4 : 2, ys = y_dtype == LX_F32 ? 4 : 2;
     for (int r0 = 0; r0 < M; r0 += Impl::kGemvRows) {
       const int rows = std::min(Impl::kGemvRows, M - r0);
-      LX_CHECK(lx_gemv(static_cast<const char*>(x) + xs * r0 * ld_x, x_dtype, ld_x,
-                       l.q ? static_cast<const void*>(l.q) : l.w, l.q ? LX_W_INT8 : LX_W_BF16, l.scale, l.bias,
-                       LX_BF16, static_cast<char*>(y) + ys * r0 * ld_y, y_dtype, ld_y, rows, l.N, l.K, alpha, beta, s));
+      const void* xr = static_cast<const char*>(x) + xs * r0 * ld_x;
+      void* yr = static_cast<char*>(y) + ys * r0 * ld_y;
+      if (l.x16)
+        LX_CHECK(lx_gemv_bf16x(xr, x_dtype, ld_x, l.x16, l.bias, LX_BF16, yr, y_dtype, ld_y, rows, l.N, l.K, alpha, beta, s));
+      else if (m.decode_bf16 && !l.q)
+        LX_CHECK(lx_gemv_decode_bf16(xr, x_dtype, ld_x, l.w, l.bias, LX_BF16, yr, y_dtype, ld_y, rows, l.N, l.K, alpha,
+                                     beta, s));
+      else
+        LX_CHECK(lx_gemv(xr, x_dtype, ld_x, l.q ? static_cast<const void*>(l.q) : l.w, l.q ? LX_W_INT8 : LX_W_BF16,
+                         l.scale, l.bias, LX_BF16, yr, y_dtype, ld_y, rows, l.N, l.K, alpha, beta, s));
     }
     return;
   }
@@ -1126,7 +1165,13 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
           m.offload->decode(i, m.route_ids, m.route_w, m.latent_bf, m.routed, T, s);
         else
           m.offload->prefill(i, m.route_ids, m.route_w, m.latent_bf, m.routed, T, s);
-      } else if (T <= Impl::kGemvRows && layer.gate_up_q)
+      } else if (T <= Impl::kGemvRows && layer.gate_up_x16)
+        LX_CHECK(lx_moe_experts_bf16x(m.latent_bf, m.route_ids, m.route_w, layer.gate_up_x16, layer.down_x16, m.routed,
+                                      m.moe_workspace, T, Lat, m.Iexp, m.K, s));
+      else if (T <= Impl::kGemvRows && m.decode_bf16 && !layer.gate_up_q)
+        LX_CHECK(lx_moe_experts_decode_bf16(m.latent_bf, m.route_ids, m.route_w, layer.gate_up, layer.down, m.routed,
+                                            m.moe_workspace, T, Lat, m.Iexp, m.K, s));
+      else if (T <= Impl::kGemvRows && layer.gate_up_q)
         LX_CHECK(lx_moe_experts_w8(m.latent_bf, m.route_ids, m.route_w, layer.gate_up_q, layer.gate_up_scale,
                                    layer.down_q, layer.down_scale, m.routed, m.moe_workspace, T, Lat, m.Iexp, m.K, s));
       else if (m.grouped_experts)
