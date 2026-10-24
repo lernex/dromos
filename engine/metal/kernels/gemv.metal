@@ -137,11 +137,25 @@ inline void dot_core(const thread dptr* rows, const thread dptr* scales,
         s1[r] = 1.0f;
       }
     }
+    if (MM == 1) {
+      float xv[V];
+      load_x<V, XB, XV>(xrows[0], k0, xv);
+      for (int r = 0; r < NR; ++r) acc[r] = dot_chunk<F>(w[r], s0[r], s1[r], xv, acc[r]);
+      continue;
+    }
+    // Several x rows: decode each weight chunk once (block scales applied), then one dot per row.
+    float wv[NR][V];
+    for (int r = 0; r < NR; ++r) decode_chunk<F>(w[r], s0[r] * (F == W_NVFP4 ? 1.0f / 16384.0f : 1.0f),
+                                                 s1[r] * (F == W_NVFP4 ? 1.0f / 16384.0f : 1.0f), wv[r]);
     for (int m = 0; m < MM; ++m) {
-      if (MM > 1 && m >= M) break;
+      if (m >= M) break;
       float xv[V];
       load_x<V, XB, XV>(xrows[m], k0, xv);
-      for (int r = 0; r < NR; ++r) acc[r * MM + m] = dot_chunk<F>(w[r], s0[r], s1[r], xv, acc[r * MM + m]);
+      for (int r = 0; r < NR; ++r) {
+        float t = acc[r * MM + m];
+        for (int i = 0; i < V; ++i) t = fma(wv[r][i], xv[i], t);
+        acc[r * MM + m] = t;
+      }
     }
   }
 }
@@ -236,7 +250,7 @@ kernel void gemv(constant GemvArgs& a [[buffer(0)]], threadgroup float* red [[th
   LX_GEMV(F, 1, 1, MM, R, 0) \
   LX_GEMV(F, 0, 0, MM, R, 1) \
   LX_GEMV(F, 1, 0, MM, R, 1)
-#define LX_GEMV_F(F) LX_GEMV_X(F, 1, 4) LX_GEMV_X(F, 4, 4) LX_GEMV_X(F, 8, 4)
+#define LX_GEMV_F(F) LX_GEMV_X(F, 1, 1) LX_GEMV_X(F, 4, 2) LX_GEMV_X(F, 8, 2)
 LX_GEMV_F(0)
 LX_GEMV_F(1)
 LX_GEMV_F(2)

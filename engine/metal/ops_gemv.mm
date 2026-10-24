@@ -11,7 +11,6 @@ using namespace lx::metal;
 
 namespace {
 
-constexpr int kRows = 4;    // rows per simdgroup (R in the kernel)
 constexpr int kGroups = 4;  // simdgroups per threadgroup
 constexpr int kMaxM = 8;
 
@@ -20,11 +19,14 @@ int variant(int f, bool xb, bool xv, int mm, bool scalar) {
   const int mb = mm == 1 ? 0 : mm == 4 ? 1 : 2;
   return ((((f * 2 + xb) * 2 + (scalar ? 0 : xv)) * 3 + mb) * 2) + scalar;
 }
+// Rows per simdgroup (R in the kernel): one for a single x row, which streams the weight fastest, two
+// when several x rows share each weight chunk (measured on the M5, Praxis decode shapes).
+int rows_for(int mm) { return mm == 1 ? 1 : 2; }
 std::string gemv_name(int i) {
   const int scalar = i % 2, mb = (i / 2) % 3, xv = (i / 6) % 2, xb = (i / 12) % 2, f = i / 24;
   const int mm = mb == 0 ? 1 : mb == 1 ? 4 : 8;
   char name[64];
-  std::snprintf(name, sizeof(name), "gemv_%d_%d%d_%d_%d_%d", f, xb, xv, mm, kRows, scalar);
+  std::snprintf(name, sizeof(name), "gemv_%d_%d%d_%d_%d_%d", f, xb, xv, mm, rows_for(mm), scalar);
   return name;
 }
 KernelSet<120> g_gemv(gemv_name);  // the four formats, then f32 weights (format 4)
@@ -65,8 +67,9 @@ int launch(int f, const void* data, const void* scale, float global, const void*
   a.bias_bf16 = bias_dtype == LX_BF16;
   a.y_bf16 = y_dtype == LX_BF16;
   a.split = S;
-  const int rows_per_group = kRows * kGroups / S;
-  const NSUInteger red = S > 1 ? NSUInteger(kGroups * kRows * mm * 4) : 0;
+  const int R = rows_for(mm);
+  const int rows_per_group = R * kGroups / S;
+  const NSUInteger red = S > 1 ? NSUInteger(kGroups * R * mm * 4) : 0;
   return g_gemv.launch(variant(f, xb, xv, mm, scalar), stream, a, size1(ceil_div(N, rows_per_group)),
                        size1(32 * kGroups), red);
 }
