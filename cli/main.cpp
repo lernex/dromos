@@ -1,19 +1,53 @@
 // lernex: the command line of the Lernex engine.
 #include <cstdio>
 #include <cstring>
+#include <exception>
 
 int cmd_inspect(int argc, char** argv);
 int cmd_eval(int argc, char** argv);
+int cmd_bench(int argc, char** argv);
+int cmd_run(int argc, char** argv);
+int cmd_serve(int argc, char** argv);
+int cmd_pull(int argc, char** argv);
+int cmd_list(int argc, char** argv);
 
-int main(int argc, char** argv) {
-  if (argc >= 2) {
-    if (!std::strcmp(argv[1], "inspect")) return cmd_inspect(argc - 1, argv + 1);
-    if (!std::strcmp(argv[1], "eval")) return cmd_eval(argc - 1, argv + 1);
-  }
+namespace {
+
+void usage() {
   std::fprintf(stderr,
                "usage: lernex <command>\n"
+               "  run MODEL [--think on|off] [--context N]  chat in the terminal\n"
+               "  serve MODEL [--host H] [--port P] [--weights bf16|fp8|nvfp4] [--context N] [--sequences N]\n"
+               "                                            the OpenAI API on this machine\n"
+               "  pull MODEL                                download a model into the cache\n"
+               "  list                                      the models and which are installed\n"
+               "  bench MODEL [--streams 1,8,32,64] [--prompt-tokens N] [--gen-tokens N]\n"
+               "                                            throughput of the engine on this GPU\n"
                "  inspect MODEL_DIR                         load a model and describe it\n"
                "  eval MODEL_DIR PROMPTS_JSON OUT_DIR [N]   logits for reference prompts; with N, the\n"
                "                                            first N tokens at once and the rest one by one\n");
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  if (argc < 2) {
+    usage();
+    return 2;
+  }
+  const char* cmd = argv[1];
+  try {
+    if (!std::strcmp(cmd, "inspect")) return cmd_inspect(argc - 1, argv + 1);
+    if (!std::strcmp(cmd, "eval")) return cmd_eval(argc - 1, argv + 1);
+    if (!std::strcmp(cmd, "bench")) return cmd_bench(argc - 1, argv + 1);
+    if (!std::strcmp(cmd, "run")) return cmd_run(argc - 1, argv + 1);
+    if (!std::strcmp(cmd, "serve")) return cmd_serve(argc - 1, argv + 1);
+    if (!std::strcmp(cmd, "pull")) return cmd_pull(argc - 1, argv + 1);
+    if (!std::strcmp(cmd, "list")) return cmd_list(argc - 1, argv + 1);
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "lernex: %s\n", e.what());
+    return 1;
+  }
+  usage();
   return 2;
 }
