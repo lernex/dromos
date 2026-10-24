@@ -127,8 +127,8 @@ inline void stage_w_raw(const thread Raw16& r, thread uint4* w) {
 // whole weight tile, and skips that while its rows are past the tile's. At prefill most experts get a
 // few tokens each, so most tiles hold fewer than 16 rows, and multiplying all 64 rows over the four
 // simdgroups is what bounded these stages under NVFP4 on the M5. Measured on Praxis's experts (GPU time
-// per call, both stages): 300 tokens NVFP4 3.4 -> 2.0 ms, BF16 5.3 -> 4.8, INT8 unchanged; 2048 tokens
-// NVFP4 5.4 -> 4.3 ms, INT8 5.1 -> 4.8, BF16 within 3%.
+// per call, both stages, warm, best of two): 300 tokens NVFP4 3.2 -> 1.7 ms, BF16 5.2 -> 4.8, INT8 2.8 ->
+// 2.6; 2048 tokens NVFP4 5.1 -> 3.7 ms, INT8 4.7 -> 4.1, BF16 within 3%.
 constant constexpr int kSlab = kTileM / 4;
 
 template <int AF, int WF, int MODE>
@@ -312,8 +312,8 @@ LX_GEMM_NAX(2, 1, 2) LX_GEMM_NAX(3, 2, 2) LX_GEMM_NAX(3, 3, 2) LX_GEMM_NAX(4, 3,
 // ---- Straight from device memory ---------------------------------------------------------------
 // A plain product of bf16 activations with BF16 or INT8 weights (the common ones under BF16 math) needs
 // no decoding, so the accelerators read both operands from device memory themselves: one matmul2d over
-// device tensors, K looped inside the op. On the M5 that runs 1.3x to 1.7x faster than staging the tiles
-// through threadgroup memory (Praxis prefill shapes). The finished 64 x 64 tile goes through threadgroup
+// device tensors, K looped inside the op. On the M5 that runs 1.2x to 1.75x faster than staging the tiles
+// through threadgroup memory (Praxis prefill shapes, warm GPU). The finished 64 x 64 tile goes through threadgroup
 // memory to the epilogue, which writes it row by row so each simdgroup's stores are contiguous.
 // Grid (N / 64, M / 64), 128 threads, 16 KB of threadgroup memory. The host takes this path only when
 // the rows are 16-byte aligned and K is a multiple of 16.
