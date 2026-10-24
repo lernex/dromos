@@ -281,19 +281,24 @@ LX_API int lx_quantize_weight(const void* w, lx_weight* out, int64_t rows, int c
 // =============================================================================================
 // A decode step (M <= 8 tokens, one per sequence) runs as one persistent kernel. The step is built
 // once per shape as a program of ops (products, the depth-memory read, the Mamba step, routing,
-// experts, attention, the memory write, the depth head), each op is split into tasks, and every SM
-// runs its share of the tasks in program order. A loader warp per SM streams each task's weights
-// (and the Mamba state) into a ring of shared-memory pages ahead of time, independent of the data
-// dependencies, so DRAM stays busy across op boundaries; tasks wait on the ops they read from
-// through counters in global memory. Dependencies are inferred from the buffers each op reads and
+// experts, attention, the memory write, the depth head), each op is split into tasks spread evenly
+// over the SMs, and every SM runs its tasks in program order. Products read their weight rows
+// straight from global memory on the tensor cores (bf16, and int8 converted to f16 exactly), with the
+// x staging and norms before the reader and the epilogue (bias, activations, the hyper-connection
+// write) after it, in the same task. Each SM has L2 fetch the weights of its coming tasks a fixed
+// number of bytes ahead, so DRAM keeps streaming while tasks wait, through counters in global
+// memory, on the ops they read from. Dependencies are inferred from the buffers each op reads and
 // writes, so ops are added in step order and nothing else.
+//
+// A token's results do not depend on how many tokens the step takes: every row is summed in an order
+// fixed by its shape alone (speculative verification compares against single steps bit for bit).
 //
 //   lx_program_create, the lx_program_* ops in step order, lx_program_build, then lx_program_run
 //   once per step. Every pointer is fixed at build time; what changes per step (token ids, slots,
 //   start positions) is read on the device from the buffers named at create.
 //
-// Runs on sm_80 and newer (cp.async and mbarrier only). Products read their weight in its stored
-// format (BF16, INT8, LX_W_F32; FP8 and NVFP4 once wformat.cuh decodes them).
+// Runs on sm_80 and newer (mma.sync; bulk L2 prefetches from sm_90). Products read BF16, INT8 and
+// LX_W_F32 weights; a caller falls back to the per-kernel path for other formats.
 
 typedef struct lx_program lx_program;
 
@@ -312,9 +317,10 @@ LX_API int lx_program_run(const lx_program* p, void* stream);
 // LX_FY_WRITE with next_read leaves per token (the n_parts of the LX_FX_RMS that reads them).
 LX_API int lx_program_tasks(const lx_program* p, int op);
 // With LX_PROGRAM_TRACE set at build, timestamps (ns, globaltimer) of the last run, two tables of
-// [tasks][4] int64 in list order (block by block): per task (op << 32 | task << 16 | block, wait start, start,
-// end), then per run of an op's tasks, at the run's first task (run start, dependencies met,
-// inputs staged, 0). Returns the number of records written (up to 2 * tasks).
+// [tasks][4] int64 in list order (block by block): per task (op << 32 | task << 16 | block, start,
+// inputs staged (the start but for products), end), then per run of an op's tasks, at the run's
+// first task (run start, dependencies met, 0, 0). Returns the number of records written (up to 2 *
+// tasks).
 LX_API int lx_program_trace(const lx_program* p, int64_t* out, int capacity);
 
 // ---- Products: out = epilogue(W x) for a weight [N, K] ----------------------------------------

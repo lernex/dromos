@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -17,10 +18,6 @@ using namespace lx::decode;
 
 namespace {
 
-// The x buffer: products whose x does not fit are split along K into partial products. It holds
-// a 2048-wide bf16 x for every token of the step (so the trunk's products stay whole at any M), and
-// at least 9472 bytes (a 4096-wide x of one token, and the experts' staging).
-int x_cap(int M) { return std::max(9472, M * 2048 * 2); }
 constexpr int kMaxSeg = 4;
 
 struct Region {
@@ -31,6 +28,8 @@ struct Region {
 int ceil_div(int64_t a, int64_t b) { return static_cast<int>((a + b - 1) / b); }
 int round_up(int a, int b) { return (a + b - 1) / b * b; }
 
+bool row_scaled_type(int wtype) { return wtype == LX_W_INT8 || wtype == LX_W_FP8; }
+
 int bytes_per_value(int wtype) {
   switch (wtype) {
     case LX_W_BF16: return 2;
@@ -40,13 +39,6 @@ int bytes_per_value(int wtype) {
   }
 }
 
-// The warps per row tile_dots picks for a tile, and whether its partial sums fit the scratch slots.
-bool red_fits(int rows, int mc, int slots) {
-  int wpr = 1;
-  while (wpr < kComputeWarps && 2 * wpr * rows <= kComputeWarps) wpr *= 2;
-  return rows * wpr * mc <= slots;
-}
-
 }  // namespace
 
 struct lx_program {
@@ -54,7 +46,6 @@ struct lx_program {
   const int32_t *tokens, *slots, *has_state, *start_pos;
   std::vector<OpDesc> ops;
   std::vector<std::vector<Region>> regions;
-  std::vector<std::vector<Region>> prefetch;  // non-weight memory a static op's loader reads early
   std::vector<double> cost;                   // per task, in bytes moved (estimated for non-products)
   std::vector<std::vector<uint64_t>> ancestors;
   std::vector<void*> scratch;
@@ -65,15 +56,19 @@ struct lx_program {
   OpDesc* d_ops = nullptr;
   uint32_t* d_lists = nullptr;
   int32_t* d_off = nullptr;
-  uint32_t *d_slists = nullptr, *d_dlists = nullptr;
-  int32_t *d_soff = nullptr, *d_doff = nullptr;
   bool bulk = false;
   uint32_t* d_done = nullptr;
   int64_t* d_trace = nullptr;
-  int total_tasks = 0, pages_static = 0, pages_dynamic = 0, x_bytes = 0;
+  uint32_t* d_ahead = nullptr;
+  PfSpan* d_spans = nullptr;
+  int32_t* d_span_off = nullptr;
+  int total_tasks = 0, x_bytes = 0;
   size_t smem = 0;
   int x_need = 0;
-  int l2_ahead = 0;
+  // The x buffer: whatever shared memory the fixed slots leave. A product whose x does not fit is
+  // split along K into partial products.
+  int x_cap = 0;
+  int prefetch_bytes = 0;
 
   void* alloc(size_t bytes) {
     void* p = nullptr;
@@ -87,7 +82,8 @@ struct lx_program {
   }
 
   // Adds an op: infers what it waits on from its regions, reduced to the ops it needs directly.
-  int add(OpDesc d, std::vector<Region> regs, double task_cost, std::vector<Region> pre = {}) {
+  // task_cost balances the layout.
+  int add(OpDesc d, std::vector<Region> regs, double task_cost) {
     if (built || failed) return -1;
     const int id = static_cast<int>(ops.size());
     const int words = (id + 64) / 64;
@@ -105,11 +101,6 @@ struct lx_program {
       }
       if (hit) direct.push_back(i);
     }
-    // A static op's early reads must not be anything an earlier op of the step writes.
-    for (const Region& p : pre)
-      for (int i = 0; i < id; ++i)
-        for (const Region& a : regions[i])
-          if (a.write && a.lo < p.hi && p.lo < a.hi) failed = true;
     std::vector<uint64_t> anc(words, 0);
     for (int i : direct) {
       anc[i / 64] |= 1ull << (i % 64);
@@ -134,7 +125,6 @@ struct lx_program {
     }
     ops.push_back(d);
     regions.push_back(std::move(regs));
-    prefetch.push_back(std::move(pre));
     cost.push_back(task_cost);
     ancestors.push_back(std::move(anc));
     return id;
@@ -172,13 +162,11 @@ OpDesc blank(int kind, int ntasks) {
   return d;
 }
 
-// Rows per product tile: as many as fit a page, the scale slots and the reduction slots, but spread
-// over every SM when the product is small (its latency is then one tile).
-int tile_rows(int N, int row_bytes, int mc, int blocks, int factor = 1) {
-  int rows = std::min({kMaxTileRows, kPageData / (row_bytes * factor), 256 / (4 * factor)});
-  rows = std::min(rows, std::max(1, ceil_div(N, blocks)));
-  while (rows > 1 && !red_fits(rows * factor, mc, 256)) --rows;
-  return std::max(rows, 1);
+// Rows per product task: up to kTileBytes of weights, but spread over every SM when the product is
+// small (its latency is then one task's).
+int tile_rows(int N, int row_bytes, int blocks, int factor = 1) {
+  int rows = std::max(1, std::min(kMaxTileRows, kTileBytes / (row_bytes * factor)));
+  return std::max(1, std::min(rows, ceil_div(N, blocks)));
 }
 
 }  // namespace
@@ -190,12 +178,14 @@ lx_program* lx_program_create(int M, const int32_t* tokens, const int32_t* slots
   if (M < 1 || M > kMaxM) return nullptr;
   auto* p = new lx_program();
   p->M = M;
+  int dev = 0, smem_max = 0;
+  cudaGetDevice(&dev);
+  cudaDeviceGetAttribute(&smem_max, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+  p->x_cap = (smem_max - kXOff) / 128 * 128;
   p->tokens = tokens;
   p->slots = slots;
   p->has_state = has_state;
   p->start_pos = start_pos;
-  int dev = 0;
-  cudaGetDevice(&dev);
   cudaDeviceGetAttribute(&p->blocks, cudaDevAttrMultiProcessorCount, dev);
   return p;
 }
@@ -206,10 +196,9 @@ void lx_program_destroy(lx_program* p) {
   cudaFree(p->d_ops);
   cudaFree(p->d_lists);
   cudaFree(p->d_off);
-  cudaFree(p->d_slists);
-  cudaFree(p->d_soff);
-  cudaFree(p->d_dlists);
-  cudaFree(p->d_doff);
+  cudaFree(p->d_ahead);
+  cudaFree(p->d_spans);
+  cudaFree(p->d_span_off);
   cudaFree(p->d_done);
   cudaFree(p->d_trace);
   delete p;
@@ -222,6 +211,30 @@ int lx_program_tasks(const lx_program* p, int op) {
 
 // ---- Products -----------------------------------------------------------------------------------
 
+// How many parts (2^sh) each row's k is read in, from the shape alone: the tensor-core reader takes
+// the fewest parts for the least time per warp (units per warp times steps per unit, plus about a
+// step of overhead per unit), the FMA reader splits rows across warps when a block has fewer rows
+// than warps. A block of the run's rows by every part by kMaxM tokens must fit the scratch.
+static int k_split(const Gemv& g, int ntasks, int blocks, bool parts) {
+  const int R = ceil_div(ntasks, blocks) * g.rows, Kc = g.k1 - g.k0;
+  int sh = 0;
+  if (g.mma) {
+    const int spr = Kc / (g.mma == 1 || g.mma == 3 ? 32 : 64), groups = ceil_div(R, 16);
+    int best = 1 << 30;
+    for (int k = 0; (1 << k) <= spr && k <= 6; ++k) {
+      const int cost = ceil_div(groups << k, kComputeWarps) * (ceil_div(spr, 1 << k) + 1);
+      if (cost < best) {
+        best = cost;
+        sh = k;
+      }
+    }
+  } else {
+    while ((1 << sh) < kComputeWarps && (2 << sh) * R <= kComputeWarps) ++sh;
+  }
+  while (sh > 0 && g.rows * ((1 << sh) + (parts ? 1 : 0)) * kMaxM > kScratchFloats) --sh;
+  return sh;
+}
+
 int lx_program_gemv(lx_program* p, const lx_fx* x, const lx_weight* w, const lx_fy* y, int N, int K) {
   if (!p || p->built || !x || !w || !y || N < 1 || K < 8 || K % 8) return -1;
   const int M = p->M, wtype = static_cast<int>(w->type), bpv = bytes_per_value(wtype);
@@ -231,11 +244,22 @@ int lx_program_gemv(lx_program* p, const lx_fx* x, const lx_weight* w, const lx_
                  (x->kind == LX_FX_PLAIN && x->dtype == LX_BF16) ||
                  (x->kind == LX_FX_CONCAT && x->round_bf16);
   if (wtype == LX_W_F32) xs_bf16 = false;
-  const int xe = xs_bf16 ? 2 : 4;
-  // K chunks: a row of the chunk must fit a page, and the chunk's x the x buffer.
-  int chunks = std::max(ceil_div(static_cast<int64_t>(K) * bpv, kPageData), ceil_div(static_cast<int64_t>(M) * K * xe, x_cap(M)));
-  int Kc = round_up(ceil_div(K, chunks), 8);
+  // The tensor-core reader takes bf16 rows, and int8 rows (which convert to f16 exactly), in whole
+  // steps of four 16-byte chunks; x is staged as bf16 or f16, its rows padded against bank conflicts.
+  const int cv = wtype == LX_W_BF16 ? 8 : wtype == LX_W_INT8 ? 16 : 0;  // values per 16-byte chunk
+  int mma = 0;
+  if (cv && K % (4 * cv) == 0 && reinterpret_cast<uintptr_t>(w->data) % 16 == 0 && !std::getenv("LX_PROGRAM_FMA"))
+    mma = (wtype == LX_W_BF16 ? 1 : 2) + (xs_bf16 ? 0 : 2);
+  const int xe = mma >= 3 ? 4 : mma || xs_bf16 ? 2 : 4;  // bytes of x staged per value
+  const int xpad = mma == 1 || mma == 3 ? 32 : mma ? 8 : 0;
+  const int kstep = mma ? 4 * cv : 8;
+  // K chunks: the chunk's x must fit the x buffer. A norm over the whole row needs the whole row.
+  // Sized for the most tokens a step takes, so a row is summed the same way whatever M is.
+  int chunks = ceil_div(static_cast<int64_t>(kMaxM) * (K + xpad) * xe, p->x_cap);
+  if (x->kind == LX_FX_GATED && chunks > 1) chunks = 1 << static_cast<int>(std::ceil(std::log2(chunks)));
+  int Kc = round_up(ceil_div(K, chunks), kstep);
   chunks = ceil_div(K, Kc);
+  if (chunks > 1 && (x->kind == LX_FX_RMS || (x->kind == LX_FX_GATED && Kc % x->group))) return -1;
 
   // The x regions every chunk reads.
   std::vector<Region> xr;
@@ -252,6 +276,7 @@ int lx_program_gemv(lx_program* p, const lx_fx* x, const lx_weight* w, const lx_
   base.group = x->group;
   base.round_bf16 = x->round_bf16;
   base.xs_bf16 = xs_bf16;
+  base.mma = mma;
   base.x = x->x;
   base.parts = x->parts;
   base.norm_w = x->norm_w;
@@ -294,9 +319,9 @@ int lx_program_gemv(lx_program* p, const lx_fx* x, const lx_weight* w, const lx_
     g.k0 = c * Kc;
     g.k1 = std::min(K, g.k0 + Kc);
     g.row_bytes = (g.k1 - g.k0) * bpv;
-    g.rows = tile_rows(N, g.row_bytes, M, p->blocks);
-    g.scale_off = kPageData;
+    g.rows = tile_rows(N, g.row_bytes, p->blocks);
     const int ntasks = ceil_div(N, g.rows);
+    g.sh = k_split(g, ntasks, p->blocks, y->kind == LX_FY_WRITE && y->next_parts && c == chunks - 1);
     std::vector<Region> regs = xr;
     const bool final_chunk = c == chunks - 1;
     if (!final_chunk) {
@@ -359,9 +384,8 @@ int lx_program_gemv(lx_program* p, const lx_fx* x, const lx_weight* w, const lx_
     }
     OpDesc d = blank(kGemv, ntasks);
     d.pool = kStatic;
-    d.npages = 1;
     d.gemv = g;
-    p->x_need = std::max(p->x_need, M * (g.k1 - g.k0) * xe);
+    p->x_need = std::max(p->x_need, M * (g.k1 - g.k0 + xpad) * xe);
     last = p->add(d, std::move(regs), static_cast<double>(g.rows) * g.row_bytes);
   }
   return p->failed ? -1 : last;
@@ -375,8 +399,9 @@ int lx_program_embed(lx_program* p, const void* table, const void* stream_emb, f
   const int M = p->M, chunks = std::max(1, std::min(8, p->blocks / M));
   OpDesc d = blank(kEmbed, M * chunks);
   d.embed = {table, stream_emb, streams, previous, history, continuation, S, D, R, chunks};
-  std::vector<Region> regs = {wr(streams, static_cast<size_t>(M) * S * D * 4), wr(previous, static_cast<size_t>(M) * D * 4),
-                              wr(history, static_cast<size_t>(M) * R * 4), wr(continuation, static_cast<size_t>(M) * 4)};
+  std::vector<Region> regs = {wr(streams, static_cast<size_t>(M) * S * D * 4),
+                              wr(previous, static_cast<size_t>(M) * D * 4), wr(history, static_cast<size_t>(M) * R * 4),
+                              wr(continuation, static_cast<size_t>(M) * 4)};
   return p->add(d, std::move(regs), 4096.0);
 }
 
@@ -434,20 +459,18 @@ int lx_program_ssm(lx_program* p, const lx_ssm_args* a) {
   const int ni = a->N / (4 * lpr);
   if (ni != 1 && ni != 2 && ni != 4 && ni != 8) return -1;
   const int state_bytes = a->P * a->N * 4;
-  if (state_bytes > 2 * kPageData || (state_bytes > kPageData && kPageData % (a->N * 4))) return -1;
   if (a->P + 2 * a->N + a->P > kScratchFloats) return -1;
   const int M = p->M, conv_dim = a->I + 2 * a->G * a->N;
   OpDesc d = blank(kSsm, M * a->H);
   d.pool = kStatic;
-  d.npages = state_bytes > kPageData ? 2 : 1;
   d.ssm = {a->zxbcdt, a->conv_w, a->conv_b, a->conv_state, a->ssm_state, a->A_log, a->D, a->dt_bias, a->v, a->head_ss,
            a->ld, a->I, a->H, a->P, a->G, a->N, a->W};
   (void)conv_dim;
   // The persistent state is touched only by its own layer's ops: its first byte stands for all of it.
   std::vector<Region> regs = {rd(a->zxbcdt, span(M, a->ld, a->ld, 4)), rd(a->conv_state, 1), wr(a->conv_state, 1),
-                              rd(a->ssm_state, 1), wr(a->ssm_state, 1),
-                              wr(a->v, static_cast<size_t>(M) * a->I * 4), wr(a->head_ss, static_cast<size_t>(M) * a->H * 4)};
-  const int step = p->add(d, std::move(regs), state_bytes * 2.0, {rd(a->ssm_state, 1)});
+                              rd(a->ssm_state, 1), wr(a->ssm_state, 1), wr(a->v, static_cast<size_t>(M) * a->I * 4),
+                              wr(a->head_ss, static_cast<size_t>(M) * a->H * 4)};
+  const int step = p->add(d, std::move(regs), state_bytes * 2.0);
   if (step < 0) return -1;
   OpDesc c = blank(kConvBC, M);
   c.ssm = d.ssm;
@@ -479,7 +502,7 @@ int lx_program_experts(lx_program* p, const lx_experts_args* a) {
   if (gt != LX_W_BF16 && gt != LX_W_INT8) return -1;
   if (dt != LX_W_BF16 && dt != LX_W_INT8) return -1;
   if (sgt != LX_W_BF16 && sgt != LX_W_INT8) return -1;
-  if (K * I * 2 > x_cap(M)) return -1;
+  if (K * I * 2 > p->x_cap) return -1;
   float* shared_gu = static_cast<float*>(p->alloc(static_cast<size_t>(M) * 2 * Is * 4));
   void* inter_r = p->alloc(static_cast<size_t>(M) * K * I * 2);
   float* shared_out = static_cast<float*>(p->alloc(static_cast<size_t>(M) * L * 4));
@@ -511,14 +534,13 @@ int lx_program_experts(lx_program* p, const lx_experts_args* a) {
   // the routed experts: gate|up rows per (token, pick), then the down rows per token
   {
     const int rb = L * bytes_per_value(gt);
-    const int rows = tile_rows(I, rb, 1, p->blocks, 2);
+    const int rows = tile_rows(I, rb, p->blocks, 2);
     if (I % rows) return -1;
     const int bpp = I / rows;
     OpDesc d = blank(kExpUp, M * K * bpp);
     d.pool = kDynamic;
-    d.npages = 1;
     d.dyn_dep = select;
-    d.up = {a->latent, a->ids, a->gate_up, inter_r, gt, L, I, K, 0, rows, rb, kPageData, bpp};
+    d.up = {a->latent, a->ids, a->gate_up, inter_r, gt, L, I, K, 0, rows, rb, bpp};
     p->x_need = std::max(p->x_need, L * 2);
     std::vector<Region> regs = {rd(a->latent, lat), rd(a->ids, static_cast<size_t>(M) * K * 4),
                                 wr(inter_r, static_cast<size_t>(M) * K * I * 2)};
@@ -526,18 +548,19 @@ int lx_program_experts(lx_program* p, const lx_experts_args* a) {
   }
   {
     const int rb = I * bytes_per_value(dt);
-    const int rows = tile_rows(L, rb, 1, p->blocks, K);
+    const int rows = tile_rows(L, rb, p->blocks, K);
     if (L % rows) return -1;
     const int bpt = L / rows;
     OpDesc d = blank(kExpDown, M * bpt);
     d.pool = kDynamic;
-    d.npages = 1;
     d.dyn_dep = select;
-    d.down = {inter_r, a->ids, a->weights, a->down, a->out, shared_out, dt, L, I, K, rows, rb, kPageData, bpt};
+    d.down = {inter_r, a->ids, a->weights, a->down, a->out, shared_out, dt, L, I, K, rows, rb, bpt};
     p->x_need = std::max(p->x_need, K * I * 2);
     std::vector<Region> regs = {rd(inter_r, static_cast<size_t>(M) * K * I * 2),
-                                rd(a->ids, static_cast<size_t>(M) * K * 4), rd(a->weights, static_cast<size_t>(M) * K * 4),
-                                rd(shared_out, static_cast<size_t>(M) * L * 4), wr(a->out, static_cast<size_t>(M) * L * 4)};
+                                rd(a->ids, static_cast<size_t>(M) * K * 4),
+                                rd(a->weights, static_cast<size_t>(M) * K * 4),
+                                rd(shared_out, static_cast<size_t>(M) * L * 4),
+                                wr(a->out, static_cast<size_t>(M) * L * 4)};
     return p->add(d, std::move(regs), static_cast<double>(K) * rows * rb);
   }
 }
@@ -580,22 +603,17 @@ int lx_program_memory_entry(lx_program* p, const lx_entry_args* a) {
   e.mem_dim = a->mem_dim;
   e.state_bytes = D * bytes_per_value(wt);
   const int mb = Km * 2;
-  int rows = std::min(kPageData / (e.state_bytes + mb), 64);
-  rows = std::min(rows, std::max(1, ceil_div(a->mem_dim, p->blocks)));
-  while (rows > 1 && !red_fits(rows, M, 256)) --rows;
+  const int rows = tile_rows(a->mem_dim, e.state_bytes + mb, p->blocks);
   e.rows = rows;
-  e.meta_off = round_up(rows * e.state_bytes, 16);
-  if (e.meta_off + rows * mb > kPageData) return -1;
-  e.scale_off = kPageData;
   int kc = D;
-  while (M * (Km + kc) * 4 > x_cap(M) && kc % 16 == 0) kc /= 2;
-  if (M * (Km + kc) * 4 > x_cap(M) || D % kc) return -1;
+  while (kMaxM * (Km + kc) * 4 > p->x_cap && kc % 16 == 0) kc /= 2;  // whatever M is
+  if (kMaxM * (Km + kc) * 4 > p->x_cap || D % kc) return -1;
   e.kc = kc;
   d.ntasks = ceil_div(a->mem_dim, rows);
   d.pool = kStatic;
-  d.npages = 1;
   p->x_need = std::max(p->x_need, M * (Km + kc) * 4);
-  std::vector<Region> regs = {rd(a->state, static_cast<size_t>(M) * D * 4), rd(a->summary, static_cast<size_t>(M) * a->R * 4),
+  std::vector<Region> regs = {rd(a->state, static_cast<size_t>(M) * D * 4),
+                              rd(a->summary, static_cast<size_t>(M) * a->R * 4),
                               rd(a->entropy, static_cast<size_t>(M) * 4), rd(a->confidence, static_cast<size_t>(M) * 4),
                               rd(a->continuation, static_cast<size_t>(M) * 4),
                               wr(a->entry, static_cast<size_t>(M) * a->mem_dim * 4)};
@@ -615,77 +633,125 @@ int lx_program_continuation(lx_program* p, const float* hidden, const float* w_o
 
 // ---- Layout and launch --------------------------------------------------------------------------
 
+// What a static task reads that the step does not write, for its block to have L2 fetch ahead of
+// time: its weight rows (and their scales), or the Mamba state of its head.
+static void task_spans(const OpDesc& d, int task, std::vector<PfSpan>& out) {
+  auto span = [&](const void* a, int64_t bytes, int m = 0, int64_t stride = 0) {
+    if (bytes <= 0) return;
+    PfSpan s{};
+    s.addr = reinterpret_cast<uint64_t>(a);
+    s.bytes = static_cast<uint32_t>(bytes);
+    s.m = m;
+    s.stride = static_cast<uint64_t>(stride);
+    out.push_back(s);
+  };
+  switch (d.kind) {
+    case kGemv: {
+      const Gemv& g = d.gemv;
+      const int n0 = task * g.rows, rows = std::min(g.rows, g.N - n0);
+      const int64_t bpv = g.row_bytes / (g.k1 - g.k0);
+      const char* w = static_cast<const char*>(g.w.data);
+      // a K chunk's rows are not contiguous: the span runs from the first row's chunk to the last
+      // row's (the other chunks' bytes in between are read by their own ops right after)
+      const int64_t a = (static_cast<int64_t>(n0) * g.K + g.k0) * bpv;
+      const int64_t b = (static_cast<int64_t>(n0 + rows - 1) * g.K + g.k1) * bpv;
+      span(w + a, b - a);
+      if (row_scaled_type(g.wtype)) span(static_cast<const float*>(g.w.scale) + n0, rows * 4);
+      break;
+    }
+    case kSsm: {
+      const Ssm& a = d.ssm;
+      const int64_t head = static_cast<int64_t>(a.P) * a.N * 4;
+      span(reinterpret_cast<const char*>(a.ssm_state) + (task % a.H) * head, head, task / a.H + 1, a.H * head);
+      break;
+    }
+    case kEntry: {
+      const Entry& a = d.entry;
+      const int r0 = task * a.rows, rows = std::min(a.rows, a.mem_dim - r0);
+      span(static_cast<const char*>(a.w_state.data) + static_cast<int64_t>(r0) * a.state_bytes,
+           static_cast<int64_t>(rows) * a.state_bytes);
+      span(static_cast<const char*>(a.w_meta) + static_cast<int64_t>(r0) * (a.R + 4) * 2,
+           static_cast<int64_t>(rows) * (a.R + 4) * 2);
+      if (row_scaled_type(a.wtype)) span(static_cast<const float*>(a.w_state.scale) + r0, rows * 4);
+      break;
+    }
+    default: break;
+  }
+}
+
 int lx_program_build(lx_program* p) {
   if (!p || p->built || p->failed || p->ops.empty()) return static_cast<int>(cudaErrorInvalidValue);
   const int nops = static_cast<int>(p->ops.size()), B = p->blocks;
   if (nops >= (1 << 15)) return static_cast<int>(cudaErrorInvalidValue);
-  bool dynamic = false;
-  for (const OpDesc& d : p->ops) {
+  for (const OpDesc& d : p->ops)
     if (d.ntasks < 1 || d.ntasks > 0xffff) return static_cast<int>(cudaErrorInvalidValue);
-    dynamic |= d.pool == kDynamic;
-  }
 
-  // Shared memory: the x buffer the ops need, then as many pages as the rest holds.
-  int dev = 0, smem_max = 0;
-  cudaGetDevice(&dev);
-  cudaDeviceGetAttribute(&smem_max, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+  // Shared memory: the fixed slots, then the x buffer the ops need.
   p->x_bytes = round_up(std::max(p->x_need, 1024), 128);
-  int npages = 0;
-  while (npages < kMaxPages && step_smem_bytes(npages + 1, p->x_bytes) <= static_cast<size_t>(smem_max)) ++npages;
-  p->pages_dynamic = dynamic ? 2 : 0;
-  p->pages_static = npages - p->pages_dynamic;
-  if (const char* e = std::getenv("LX_PROGRAM_PAGES")) {  // static pages, for tuning the ring
-    const int want = std::atoi(e);
-    if (want >= 2 && want <= p->pages_static) p->pages_static = want;
-  }
-  if (p->pages_static < 2) return static_cast<int>(cudaErrorInvalidConfiguration);
-  p->smem = step_smem_bytes(p->pages_static + p->pages_dynamic, p->x_bytes);
+  if (p->x_bytes > p->x_cap) return static_cast<int>(cudaErrorInvalidConfiguration);
+  p->smem = step_smem_bytes(p->x_bytes);
   if (int e = step_configure(p->smem)) return e;
 
-  // Tasks to blocks: each task to the block with the least work so far (ties to the next block in
-  // turn), so the bytes every SM streams stay even and each op spreads over the SMs.
+  // Tasks to blocks. The ops of a step mostly wait on each other, so what matters is that each op
+  // is even over the blocks: every block gets the same number of its tasks, the remainder going to
+  // the blocks with the least work so far (ties in turn), each block a contiguous range of tasks.
   std::vector<double> load(B, 0.0);
   std::vector<std::vector<uint32_t>> lists(B);
+  std::vector<int> order(B), count(B);
   int turn = 0;
   for (int op = 0; op < nops; ++op) {
     OpDesc& d = p->ops[op];
-    std::vector<char> used(B, 0);
-    for (int t = 0; t < d.ntasks; ++t) {
-      int best = -1;
-      for (int k = 0; k < B; ++k) {
-        const int b = (turn + k) % B;
-        if (best < 0 || load[b] < load[best]) best = b;
-      }
-      load[best] += p->cost[op];
-      lists[best].push_back(static_cast<uint32_t>(op) << 16 | static_cast<uint32_t>(t));
-      used[best] = 1;
-      turn = (best + 1) % B;
-    }
+    for (int k = 0; k < B; ++k) order[k] = (turn + k) % B;
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return load[a] < load[b]; });
+    const int q = d.ntasks / B, r = d.ntasks % B;
+    for (int k = 0; k < B; ++k) count[order[k]] = q + (k < r ? 1 : 0);
+    int t = 0;
     d.nblocks = 0;
-    for (int b = 0; b < B; ++b) d.nblocks += used[b];
-  }
-  // Flattened per-block lists: every task (the compute warps), and the static and dynamic tiles alone
-  // (the loader).
-  auto flatten = [&](int pool, std::vector<uint32_t>& flat, std::vector<int32_t>& off) {
-    off.assign(B + 1, 0);
     for (int b = 0; b < B; ++b) {
-      off[b] = static_cast<int32_t>(flat.size());
-      for (uint32_t e : lists[b])
-        if (pool < 0 || p->ops[e >> 16].pool == pool) flat.push_back(e);
+      if (!count[b]) continue;
+      ++d.nblocks;
+      for (int i = 0; i < count[b]; ++i, ++t)
+        lists[b].push_back(static_cast<uint32_t>(op) << 16 | static_cast<uint32_t>(t));
+      load[b] += count[b] * p->cost[op];
     }
-    off[B] = static_cast<int32_t>(flat.size());
-    if (flat.empty()) flat.push_back(0);  // a valid pointer for an empty pool
-  };
-  std::vector<uint32_t> flat, sflat, dflat;
-  std::vector<int32_t> off, soff, doff;
-  flatten(-1, flat, off);
-  flatten(kStatic, sflat, soff);
-  flatten(kDynamic, dflat, doff);
+    if (r) turn = (order[r - 1] + 1) % B;
+  }
+  // The flattened lists; per block its prefetch spans (adjacent ones merged up to 32 KB) and per
+  // entry the block's prefetch bytes before it.
+  std::vector<uint32_t> flat, ahead;
+  std::vector<int32_t> off(B + 1, 0), soff(B + 1, 0);
+  std::vector<PfSpan> spans, tmp;
+  for (int b = 0; b < B; ++b) {
+    off[b] = static_cast<int32_t>(flat.size());
+    soff[b] = static_cast<int32_t>(spans.size());
+    uint32_t sum = 0;
+    for (uint32_t e : lists[b]) {
+      flat.push_back(e);
+      ahead.push_back(sum);
+      const OpDesc& d = p->ops[e >> 16];
+      if (d.pool != kStatic) continue;
+      tmp.clear();
+      task_spans(d, static_cast<int>(e & 0xffff), tmp);
+      for (PfSpan s : tmp) {
+        PfSpan* last = spans.size() > static_cast<size_t>(soff[b]) ? &spans.back() : nullptr;
+        if (last && !s.m && !last->m && last->addr + last->bytes == s.addr && last->bytes + s.bytes <= 32768) {
+          last->bytes += s.bytes;
+        } else {
+          s.cum = sum;
+          spans.push_back(s);
+        }
+        sum += s.bytes;
+      }
+    }
+  }
+  soff[B] = static_cast<int32_t>(spans.size());
+  if (spans.empty()) spans.push_back(PfSpan{});  // so the upload has something to copy
+  off[B] = static_cast<int32_t>(flat.size());
   p->total_tasks = off[B];
   p->bulk = lx_arch() >= 90;
-  // L2 lookahead: tiles per SM the loader has L2 fetch beyond the ring (LX_PROGRAM_PREFETCH tunes it)
-  p->l2_ahead = 8;
-  if (const char* e = std::getenv("LX_PROGRAM_PREFETCH")) p->l2_ahead = std::max(0, std::atoi(e));
+  // How far ahead of the compute warps the loader keeps a block's weights in L2 (LX_PROGRAM_AHEAD_KB)
+  p->prefetch_bytes = 192 * 1024;
+  if (const char* e = std::getenv("LX_PROGRAM_AHEAD_KB")) p->prefetch_bytes = std::max(0, std::atoi(e)) * 1024;
 
   auto upload = [](void** dst, const void* src, size_t bytes) {
     if (cudaMalloc(dst, bytes) != cudaSuccess) return false;
@@ -694,10 +760,9 @@ int lx_program_build(lx_program* p) {
   if (!upload(reinterpret_cast<void**>(&p->d_ops), p->ops.data(), sizeof(OpDesc) * nops) ||
       !upload(reinterpret_cast<void**>(&p->d_lists), flat.data(), flat.size() * 4) ||
       !upload(reinterpret_cast<void**>(&p->d_off), off.data(), off.size() * 4) ||
-      !upload(reinterpret_cast<void**>(&p->d_slists), sflat.data(), sflat.size() * 4) ||
-      !upload(reinterpret_cast<void**>(&p->d_soff), soff.data(), soff.size() * 4) ||
-      !upload(reinterpret_cast<void**>(&p->d_dlists), dflat.data(), dflat.size() * 4) ||
-      !upload(reinterpret_cast<void**>(&p->d_doff), doff.data(), doff.size() * 4) ||
+      !upload(reinterpret_cast<void**>(&p->d_ahead), ahead.data(), ahead.size() * 4) ||
+      !upload(reinterpret_cast<void**>(&p->d_spans), spans.data(), spans.size() * sizeof(PfSpan)) ||
+      !upload(reinterpret_cast<void**>(&p->d_span_off), soff.data(), soff.size() * 4) ||
       cudaMalloc(&p->d_done, (nops + 1) * 4) != cudaSuccess)
     return static_cast<int>(cudaErrorMemoryAllocation);
   cudaMemset(p->d_done, 0, (nops + 1) * 4);
@@ -716,12 +781,9 @@ int lx_program_run(const lx_program* p, void* stream) {
   P.ops = p->d_ops;
   P.lists = p->d_lists;
   P.list_off = p->d_off;
-  P.static_lists = p->d_slists;
-  P.static_off = p->d_soff;
-  P.dynamic_lists = p->d_dlists;
-  P.dynamic_off = p->d_doff;
-  P.bulk = p->bulk ? 1 : 0;
-  P.prefetch = p->l2_ahead;
+  P.ahead = p->d_ahead;
+  P.spans = p->d_spans;
+  P.span_off = p->d_span_off;
   P.done = p->d_done;
   P.trace = p->d_trace;
   P.tokens = p->tokens;
@@ -730,11 +792,12 @@ int lx_program_run(const lx_program* p, void* stream) {
   P.start_pos = p->start_pos;
   P.nops = static_cast<int>(p->ops.size());
   P.M = p->M;
-  P.pages_static = p->pages_static;
-  P.pages_dynamic = p->pages_dynamic;
   P.x_bytes = p->x_bytes;
+  P.bulk = p->bulk ? 1 : 0;
+  P.prefetch_bytes = p->prefetch_bytes;
   return step_launch(P, p->blocks, p->smem, static_cast<cudaStream_t>(stream));
 }
+
 
 int lx_program_trace(const lx_program* p, int64_t* out, int capacity) {
   if (!p || !p->built || !p->d_trace || !out) return 0;

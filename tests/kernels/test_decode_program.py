@@ -692,8 +692,10 @@ def test_continuation(lx, M):
 
 @pytest.mark.parametrize("M", [1, 8])
 def test_long_chain(lx, M):
-    """Forty dependent products, each reading the one before: the ring streams weights well ahead of
-    the dependencies, and repeated runs must match (the counters reset between steps)."""
+    """Forty dependent products, each reading the one before: the weights stream ahead of the
+    dependencies, and repeated runs must match (the counters reset between steps). The outputs shrink
+    by four orders of magnitude down the chain, so the tensor cores' accumulation (less careful than a
+    chain of FMAs) shows at 1e-4; 1e-3 still catches any real mistake."""
     torch.manual_seed(M)
     D = 1024
     ws = [weight(D, D, ["int8", "bf16"][i % 2]) for i in range(40)]
@@ -707,4 +709,93 @@ def test_long_chain(lx, M):
         want = torch.tanh(want @ ws[i][1].T)
     for _ in range(3):
         prog.run()
-        check(bufs[-1], want, rel=1e-4)
+        check(bufs[-1], want, rel=1e-3)
+
+
+# ---- Batch invariance ---------------------------------------------------------------------------
+
+INVARIANCE_CASES = [  # N, K, weight kind, x dtype
+    (10304, 2048, "int8", torch.bfloat16),  # in_proj
+    (2048, 4096, "bf16", torch.bfloat16),   # out_proj: x near the buffer's size at eight tokens
+    (2048, 1024, "int8", torch.float32),    # latent_up: f32 x, read as a 16-bit pair
+    (2048, 1024, "bf16", torch.float32),
+    (256, 6400, "f32", torch.float32),      # K split into chunks
+    (128, 1280, "f32", torch.float32),      # a router
+    (4100, 256, "bf16", torch.bfloat16),
+    (40, 72, "int8", torch.bfloat16),       # the FMA reader
+]
+
+
+@pytest.mark.parametrize("N,K,kind,xdt", INVARIANCE_CASES)
+def test_rows_do_not_depend_on_m(lx, N, K, kind, xdt):
+    """A token's output is the same to the bit whether it is decoded alone or among eight: speculative
+    verification checks a draft against the bits a single step would give."""
+    torch.manual_seed(N + K)
+    w, _, keep = weight(N, K, kind)
+    x8 = torch.randn(8, K, device="cuda").to(xdt)
+    outs = {}
+    for M, x in [(8, x8), (1, x8[5:6].clone())]:
+        out = torch.zeros(M, N, device="cuda")
+        prog = Program(lx, M)
+        prog.gemv(fx_plain(x), w, fy_store(out), N, K)
+        prog.build()
+        prog.run()
+        outs[M] = out
+    assert torch.equal(outs[8][5], outs[1][0])
+
+
+@pytest.mark.parametrize("kind", ["int8", "bf16"])
+def test_chain_and_experts_do_not_depend_on_m(lx, kind):
+    """A write, the RMS read of what it left, routing and the experts: token 3 among eight against
+    token 3 alone, to the bit."""
+    torch.manual_seed(17)
+    S, D, I, E, K, L, Ie, R = 4, 2048, 4096, 128, 4, 1024, 512, 256
+    matrix = torch.softmax(torch.randn(S, S, device="cuda"), 1).contiguous()
+    write = torch.softmax(torch.randn(S, device="cuda"), 0)
+    read2 = torch.softmax(torch.randn(S, device="cuda"), 0)
+    norm_w = (torch.rand(D, device="cuda") + 0.5).to(torch.bfloat16)
+    w1, _, k1 = weight(D, I, kind)
+    w2, _, k2 = weight(L, D, kind)
+    wr, _, k3 = weight(E, L, "f32")
+    gu, _, k4 = expert_stack(E, 2 * Ie, L, kind)
+    dn, _, k5 = expert_stack(E, L, Ie, kind)
+    sgu, _, k6 = weight(2 * Ie, L, kind)
+    sdn, _, k7 = weight(L, Ie, kind)
+    bias = torch.zeros(E, device="cuda")
+    emb = torch.randn(E, R, device="cuda").to(torch.bfloat16)
+    v8 = torch.randn(8, I, device="cuda").to(torch.bfloat16)
+    s8 = torch.randn(8, S, D, device="cuda")
+    res = {}
+    for M, sl in [(8, slice(0, 8)), (1, slice(3, 4))]:
+        streams = s8[sl].clone()
+        v = v8[sl].clone()
+        next_src = torch.zeros(M, D, device="cuda")
+        parts = torch.zeros(M, 4096, device="cuda")
+        latent = torch.zeros(M, L, device="cuda")
+        latent_bf = torch.zeros(M, L, device="cuda").to(torch.bfloat16)
+        logits = torch.zeros(M, E, device="cuda")
+        ids = torch.zeros(M, K, dtype=torch.int32, device="cuda")
+        rw = torch.zeros(M, K, device="cuda")
+        scratch = [torch.zeros(M, device="cuda") for _ in range(2)] + [torch.zeros(M, R, device="cuda") for _ in range(2)]
+        out = torch.zeros(M, L, device="cuda")
+        prog = Program(lx, M)
+        fy = Fy()
+        fy.kind, fy.streams, fy.matrix, fy.write, fy.S = FY_WRITE, streams.data_ptr(), matrix.data_ptr(), write.data_ptr(), S
+        fy.next_read, fy.next_src, fy.next_parts = read2.data_ptr(), next_src.data_ptr(), parts.data_ptr()
+        op1 = prog.gemv(fx_plain(v), w1, fy, D, I)
+        fx = Fx()
+        fx.kind, fx.x, fx.dtype, fx.ld = FX_RMS, next_src.data_ptr(), F32, D
+        fx.parts, fx.n_parts, fx.norm_w, fx.eps = parts.data_ptr(), prog.tasks(op1), norm_w.data_ptr(), 1e-6
+        prog.gemv(fx, w2, fy_store(latent, out_bf=latent_bf), L, D)
+        prog.gemv(fx_plain(latent), wr, fy_store(logits), E, L)
+        sel = SelectArgs(logits.data_ptr(), bias.data_ptr(), ids.data_ptr(), rw.data_ptr(), scratch[0].data_ptr(),
+                         scratch[1].data_ptr(), emb.data_ptr(), scratch[2].data_ptr(), scratch[3].data_ptr(), E, K, R)
+        prog.add("select", ctypes.byref(sel))
+        a = ExpertsArgs(latent_bf.data_ptr(), ids.data_ptr(), rw.data_ptr(), gu, dn, sgu, sdn, out.data_ptr(), L, Ie,
+                        Ie, K)
+        prog.add("experts", ctypes.byref(a))
+        prog.build()
+        prog.run()
+        res[M] = [t[3 if M == 8 else 0] for t in (streams, latent, logits, rw, out)]
+    for a, b in zip(res[8], res[1]):
+        assert torch.equal(a, b)

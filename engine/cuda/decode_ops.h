@@ -11,34 +11,28 @@
 
 namespace lx::decode {
 
-// One block per SM: 16 compute warps, one epilogue warp (the products' outputs), one loader warp.
+// One block per SM: 16 compute warps and one loader warp, which keeps L2 ahead of them.
 constexpr int kComputeWarps = 16;
 constexpr int kComputeThreads = 32 * kComputeWarps;
-constexpr int kEpilogueWarp = kComputeWarps;
-constexpr int kLoaderWarp = kComputeWarps + 1;
-constexpr int kBlockThreads = kComputeThreads + 64;
+constexpr int kBlockThreads = kComputeThreads;  // 16 warps: four per scheduler, so 128 registers each
 constexpr int kMaxM = 8;                     // tokens per step
 constexpr int kMaxDeps = 32;                 // ops a task waits on, after the transitive reduction
 constexpr int kMaxStreams = 4;               // hyper-connection streams (Metis runs 4)
 constexpr int kMaxEntries = 8;               // depth-memory entries per token
-constexpr int kPageData = 16384;             // a page holds up to 16 KB of weight rows...
-constexpr int kPageBytes = kPageData + 256;  // ...and their per-row scales
-constexpr int kScratchFloats = 1024;         // per-block reduction space
-constexpr int kMaxTileRows = 64;             // rows of a product tile; rows * M <= kComputeThreads too
-constexpr int kDescBytes = 512;              // shared-memory copy of the current op's descriptor
-constexpr int kMaxPages = 16;                // pages in both rings together
+constexpr int kTileBytes = 16384;            // weight bytes of one product task, at most (one row may be more)
+constexpr int kMaxTileRows = 64;             // rows of a product task
+constexpr int kScratchFloats = 6144;         // per-block reduction space
+constexpr int kDescBytes = 512;              // shared-memory copy of an op's descriptor
 
-// The kernel's shared memory: fixed slots, then the x buffer, then the pages.
+// The kernel's shared memory: fixed slots, then the x buffer (as large as the rest allows).
 constexpr int kCtxBytes = 128;
 constexpr int kCtxOff = 0;
 constexpr int kDescOff = kCtxOff + kCtxBytes;
-constexpr int kLoaderDescOff = kDescOff + kDescBytes;
-constexpr int kScratchOff = kLoaderDescOff + 3 * kDescBytes;
-constexpr int kBarOff = kScratchOff + kScratchFloats * 4;
-constexpr int kBarCount = 2 * kMaxPages + 4;  // full, empty per page; the products' reduction slots: ready, free
-constexpr int kMiscOff = kBarOff + kBarCount * 8;
-constexpr int kXOff = (kMiscOff + 16 + 127) / 128 * 128;
-__host__ __device__ constexpr int pages_offset(int x_bytes) { return kXOff + (x_bytes + 127) / 128 * 128; }
+constexpr int kMaxRunTasks = 256;  // tasks of one run (a block's longer run of an op is cut into runs)
+constexpr int kMiscOff = kDescOff + kDescBytes;
+constexpr int kRunOff = kMiscOff + 128;  // the run's task numbers, uint16
+constexpr int kScratchOff = kRunOff + kMaxRunTasks * 2;
+constexpr int kXOff = kScratchOff + kScratchFloats * 4;
 
 enum Kind : int32_t {
   kEmbed,
@@ -54,18 +48,16 @@ enum Kind : int32_t {
   kContinuation,
 };
 
-// Where a task's weight tile goes: the static ring (addresses known when the program is built, so the
-// loader streams them as far ahead as pages allow) or the dynamic ring (expert rows, whose addresses
-// come from the routing; the loader waits for the op named in dyn_dep before it can issue them).
+// Whether the loader can have L2 fetch a task's weights ahead of time: static ops know their addresses
+// when the program is built; a dynamic op's (the expert rows) come from the routing op in dyn_dep.
 enum Pool : int32_t { kNoPool = 0, kStatic = 1, kDynamic = 2 };
 
 struct Gemv {
   lx_weight w;
   int wtype;            // w.type (LX_W_F32 included)
   int N, K, k0, k1;     // this op multiplies columns [k0, k1) of the [N, K] weight
-  int rows;             // rows per tile (the last tile may have fewer)
-  int row_bytes;        // bytes of one row's [k0, k1) in the tile
-  int scale_off;        // byte offset of the per-row scales in the page (INT8 / FP8)
+  int rows;             // rows per task (the last task may have fewer)
+  int row_bytes;        // bytes of one row's [k0, k1)
   // x
   int x_kind, x_dtype, ld_x, n_parts, group, nseg, round_bf16, xs_bf16;
   const void* x;
@@ -92,6 +84,10 @@ struct Gemv {
   // K-split partials: y += sum_c y_add[c * M * N + m * N + n] before the epilogue (null for none)
   const float* y_add;
   int n_add;
+  // the reader: 0 FMA (x f32 or bf16); tensor cores on 1 bf16 (x bf16), 2 int8 as f16 (x f16), and 3, 4
+  // the same for f32 x, staged as two 16-bit planes (hi + lo) read one product each
+  int mma;
+  int sh;   // each row's k is read in 2^sh parts, summed in order: fixed by the shape, never by M
 };
 
 struct Embed {
@@ -157,7 +153,7 @@ struct ExpUp {
   const int32_t* ids;
   lx_weight w;          // [E, 2I, L] (routed) or [2I, L] (shared)
   void* inter;          // bf16 [pairs, I] (routed: pair = m * top_k + k; shared: pair = m)
-  int wtype, L, I, top_k, shared, rows, row_bytes, scale_off, blocks_per_pair;
+  int wtype, L, I, top_k, shared, rows, row_bytes, blocks_per_pair;
 };
 
 // Expert down rows for one token: rows [l0, l0 + rows) of each of the token's top_k experts.
@@ -168,7 +164,7 @@ struct ExpDown {
   lx_weight w;          // [E, L, I]
   float* out;           // f32 [M, L]
   const float* add;     // f32 [M, L] added after the routed sum (the shared expert), or null
-  int wtype, L, I, top_k, rows, row_bytes, scale_off, blocks_per_token;
+  int wtype, L, I, top_k, rows, row_bytes, blocks_per_token;
 };
 
 struct Attention {
@@ -194,7 +190,7 @@ struct Entry {
   const void* anchor_emb;
   float* entry;
   float mean_k, inv_log_e;
-  int wtype, D, R, mem_dim, rows, state_bytes, scale_off, meta_off;
+  int wtype, D, R, mem_dim, rows, state_bytes;
   int kc;  // columns of the state staged at a time (D when it fits the x buffer at once)
 };
 
@@ -209,9 +205,10 @@ struct Continuation {
 };
 
 // nblocks: the blocks that run any of the op's tasks. Each signals the op's counter once, after its
-// last task of the op, so an op is complete when its counter reaches nblocks.
-struct OpDesc {
-  int32_t kind, ntasks, nblocks, ndeps, pool, npages, dyn_dep;
+// last task of the op, so an op is complete when its counter reaches nblocks. Copied to shared
+// memory 16 bytes at a time, so its size is a multiple of 16.
+struct alignas(16) OpDesc {
+  int32_t kind, ntasks, nblocks, ndeps, pool, dyn_dep;
   int32_t deps[kMaxDeps];
   union {
     Gemv gemv;
@@ -228,29 +225,38 @@ struct OpDesc {
 };
 static_assert(sizeof(OpDesc) <= kDescBytes, "an op descriptor must fit its shared-memory copy");
 
+// An L2 prefetch of [addr, addr + bytes); for the Mamba state of token m - 1 (m > 0), at
+// addr + slots[m - 1] * stride, when the token has state. cum: the block's prefetch bytes before it.
+struct PfSpan {
+  uint64_t addr;
+  uint64_t stride;
+  uint32_t bytes;
+  int32_t m;
+  uint32_t cum;
+  uint32_t pad;
+};
+
 // The kernel's argument.
 struct Program {
   const OpDesc* ops;
   const uint32_t* lists;     // per block: (op << 16) | task, in run order
   const int32_t* list_off;   // [blocks + 1]
-  // the same lists split by pool, for the loader: static tiles, and dynamic ones
-  const uint32_t* static_lists;
-  const int32_t* static_off;
-  const uint32_t* dynamic_lists;
-  const int32_t* dynamic_off;
-  uint32_t* done;            // [nops + 1]: tasks finished per op, then blocks finished
-  int64_t* trace;            // optional: per list entry (op << 32 | block, wait start, start, end)
+  const uint32_t* ahead;     // per list entry: the block's prefetch bytes for the entries before it
+  const PfSpan* spans;       // per block, in list order
+  const int32_t* span_off;   // [blocks + 1]
+  uint32_t* done;            // [nops + 1]: blocks finished per op, then blocks finished with the step
+  int64_t* trace;            // optional: the timestamps of lx_program_trace
   const int32_t* tokens;
   const int32_t* slots;
   const int32_t* has_state;
   const int32_t* start_pos;
-  int nops, M, pages_static, pages_dynamic, x_bytes;
-  int bulk;      // copy tiles with bulk copies (sm_90 and newer), else with cp.async (sm_80)
-  int prefetch;  // static tiles the loader asks L2 for ahead of the ring (0: none)
+  int nops, M, x_bytes;
+  int bulk;                  // L2 prefetches as bulk prefetches (sm_90 and newer), else per line
+  int prefetch_bytes;        // how far past a run's start its block keeps L2 fetched (0: off)
 };
 
 // decode_kernel.cu: the kernel's shared memory for a layout, its attributes, and the launch.
-size_t step_smem_bytes(int npages, int x_bytes);
+size_t step_smem_bytes(int x_bytes);
 int step_configure(size_t smem);
 int step_launch(const Program& P, int blocks, size_t smem, cudaStream_t stream);
 
