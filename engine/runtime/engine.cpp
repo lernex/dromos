@@ -1,0 +1,621 @@
+#include "runtime/engine.h"
+
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <cstdio>
+#include <deque>
+#include <mutex>
+#include <set>
+#include <stdexcept>
+#include <thread>
+
+#include "core/device.h"
+#include "core/safetensors.h"
+#include "cuda/kernels.h"
+#include "model/metis.h"
+#include "runtime/scheduler.h"
+
+namespace lx::runtime {
+namespace {
+
+using Clock = std::chrono::steady_clock;
+
+void check_cuda(cudaError_t status, const char* what) {
+  if (status != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(status));
+}
+
+void check_lx(int status, const char* what) {
+  if (status != 0) throw std::runtime_error(std::string(what) + " failed with CUDA error " + std::to_string(status));
+}
+
+lx::WeightLookup lookup_for(const lx::Weights& weights) {
+  return [&weights](const std::string& name) {
+    lx::WeightView view;
+    const lx::Tensor* t = weights.find(name);
+    if (!t) return view;
+    view.data = t->data;
+    view.dtype = t->dtype == lx::DType::F32 ? LX_F32 : t->dtype == lx::DType::BF16 ? LX_BF16 : -1;
+    view.shape = t->shape;
+    return view;
+  };
+}
+
+// Pinned host memory, so the step's copies are asynchronous.
+template <typename T>
+class PinnedArray {
+ public:
+  explicit PinnedArray(size_t count) : count_(count) {
+    check_cuda(cudaMallocHost(reinterpret_cast<void**>(&data_), sizeof(T) * std::max<size_t>(count, 1)),
+               "cudaMallocHost");
+  }
+  ~PinnedArray() {
+    if (data_) cudaFreeHost(data_);
+  }
+  PinnedArray(const PinnedArray&) = delete;
+  PinnedArray& operator=(const PinnedArray&) = delete;
+  T* data() const { return data_; }
+  size_t size() const { return count_; }
+
+ private:
+  T* data_ = nullptr;
+  size_t count_ = 0;
+};
+
+// The bytes at the end of `text` that could be the start of a stop string: they wait until the
+// next token says whether the stop string completes.
+size_t held_suffix(const std::string& text, const std::vector<std::string>& strings) {
+  size_t hold = 0;
+  for (const std::string& s : strings) {
+    const size_t longest = std::min(s.size() - 1, text.size());
+    for (size_t k = longest; k > hold; --k) {
+      if (text.compare(text.size() - k, k, s, 0, k) == 0) {
+        hold = k;
+        break;
+      }
+    }
+  }
+  return hold;
+}
+
+}  // namespace
+
+struct Sequence {
+  uint64_t id = 0;
+  GenerateRequest request;
+  RequestCallbacks callbacks;
+  std::vector<int32_t> stop_ids;                       // the request's, plus the tokenizer's end ids
+  std::unique_ptr<lx::text::Tokenizer::Stream> detok;  // null without a tokenizer
+  std::unique_ptr<lx::text::OutputParser> parser;      // null without a tokenizer
+  std::string held;                                    // text that may begin a stop string
+  int slot = -1;
+  int prompt_fed = 0;
+  int generated = 0;
+  bool has_pending = false;  // a sampled token waits to be fed
+  int32_t pending = 0;
+  bool cancelled = false;
+  bool ended = false;
+  double submitted_at = 0.0, first_token_at = 0.0;
+};
+
+struct Engine::Impl {
+  Impl(const std::string& dir, const Plan& plan, const EngineOptions& options)
+      : config(lx::load_config(dir)),
+        V(config.vocab_size),
+        max_slots(plan.max_slots),
+        kv_capacity(plan.kv_capacity),
+        max_step_tokens(plan.max_step_tokens),
+        prefill_chunk(plan.prefill_chunk > 0 ? plan.prefill_chunk : plan.max_step_tokens),
+        max_queue(options.max_queue) {
+    if (max_slots < 1 || kv_capacity < 2 || max_step_tokens < 1)
+      throw std::invalid_argument("the plan leaves no room for a sequence");
+    if (plan.weights != LX_W_BF16)
+      throw std::invalid_argument("this build loads BF16 weights only; the other formats are not wired into the engine yet");
+    if (options.load_tokenizer) tokenizer = lx::text::Tokenizer::load(dir);
+
+    check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
+    const lx::SafetensorsSet set = lx::SafetensorsSet::open(dir);
+    weights = std::make_unique<lx::Weights>(lx::Weights::upload(set));
+    model = std::make_unique<lx::MetisModel>(config, lookup_for(*weights), max_slots, kv_capacity, max_step_tokens);
+
+    const size_t slots = static_cast<size_t>(max_slots);
+    logits = DeviceBuffer(sizeof(float) * slots * V);
+    seen = DeviceBuffer(sizeof(int32_t) * slots * V);
+    out_counts = DeviceBuffer(sizeof(int32_t) * slots * V);
+    work = DeviceBuffer(sizeof(float) * slots * V);
+    params = DeviceBuffer(sizeof(lx_sampling) * slots);
+    tokens = DeviceBuffer(sizeof(int32_t) * slots);
+    token_lp = DeviceBuffer(sizeof(float) * slots);
+    top_ids = DeviceBuffer(sizeof(int32_t) * slots * kMaxTopLogprobs);
+    top_lp = DeviceBuffer(sizeof(float) * slots * kMaxTopLogprobs);
+    prompt_scratch = DeviceBuffer(sizeof(int32_t) * static_cast<size_t>(kv_capacity));
+    check_cuda(cudaMemset(seen.data(), 0, seen.size()), "cudaMemset");
+    check_cuda(cudaMemset(out_counts.data(), 0, out_counts.size()), "cudaMemset");
+
+    host_params = std::make_unique<PinnedArray<lx_sampling>>(slots);
+    host_tokens = std::make_unique<PinnedArray<int32_t>>(slots);
+    host_lp = std::make_unique<PinnedArray<float>>(slots);
+    host_top_ids = std::make_unique<PinnedArray<int32_t>>(slots * kMaxTopLogprobs);
+    host_top_lp = std::make_unique<PinnedArray<float>>(slots * kMaxTopLogprobs);
+
+    for (int s = max_slots - 1; s >= 0; --s) free_slots.push_back(s);
+    stats.slots = max_slots;
+    epoch = Clock::now();
+  }
+
+  ~Impl() {
+    if (stream) cudaStreamDestroy(stream);
+  }
+
+  double now() const { return std::chrono::duration<double>(Clock::now() - epoch).count(); }
+
+  // scheduler thread
+  void loop();
+  void admit();
+  void step();
+  void sample(const std::vector<int>& rows, const std::vector<std::shared_ptr<Sequence>>& seqs);
+  bool accept(const std::shared_ptr<Sequence>& s, int32_t token, float logprob, const int32_t* top_ids_row,
+              const float* top_lp_row, int top_n);
+  void end(const std::shared_ptr<Sequence>& s, FinishReason reason, const std::string& error, bool show_held);
+  void deliver(const std::shared_ptr<Sequence>& s, const TokenDelta& delta);
+  void retire(const std::shared_ptr<Sequence>& s);
+  void fail_all(const std::string& reason);
+  void publish_stats();
+
+  lx::MetisConfig config;
+  std::unique_ptr<lx::Weights> weights;
+  std::unique_ptr<lx::MetisModel> model;
+  std::unique_ptr<lx::text::Tokenizer> tokenizer;
+  cudaStream_t stream = nullptr;
+  int V;
+  int max_slots, kv_capacity, max_step_tokens, prefill_chunk;
+  size_t max_queue;
+
+  DeviceBuffer logits, seen, out_counts, work, params, tokens, token_lp, top_ids, top_lp, prompt_scratch;
+  std::unique_ptr<PinnedArray<lx_sampling>> host_params;
+  std::unique_ptr<PinnedArray<int32_t>> host_tokens, host_top_ids;
+  std::unique_ptr<PinnedArray<float>> host_lp, host_top_lp;
+
+  Clock::time_point epoch;
+  std::thread thread;
+
+  // shared with submitters, under mu
+  std::mutex mu;
+  std::condition_variable cv;
+  bool stopping = false;
+  bool broken = false;
+  std::string broken_reason;
+  std::deque<std::shared_ptr<Sequence>> incoming;
+  std::set<uint64_t> cancel_ids;
+  size_t queued = 0;  // requests submitted and not yet admitted or ended
+  EngineStats stats;
+
+  // scheduler thread only
+  std::deque<std::shared_ptr<Sequence>> waiting;
+  std::vector<std::shared_ptr<Sequence>> running;
+  std::vector<int> free_slots;
+  unsigned cursor = 0;
+};
+
+Engine::Engine(const std::string& model_dir, const Plan& plan, const EngineOptions& options) : plan_(plan) {
+  impl_ = std::make_unique<Impl>(model_dir, plan, options);
+  impl_->thread = std::thread([this] { impl_->loop(); });
+}
+
+Engine::~Engine() {
+  {
+    std::lock_guard<std::mutex> lock(impl_->mu);
+    impl_->stopping = true;
+  }
+  impl_->cv.notify_all();
+  if (impl_->thread.joinable()) impl_->thread.join();
+}
+
+const lx::MetisConfig& Engine::config() const { return impl_->config; }
+
+const lx::text::Tokenizer* Engine::tokenizer() const { return impl_->tokenizer.get(); }
+
+double Engine::now() const { return impl_->now(); }
+
+uint64_t Engine::submit(GenerateRequest request, RequestCallbacks callbacks) {
+  Impl& m = *impl_;
+  if (request.prompt.empty()) throw std::invalid_argument("the prompt has no tokens");
+  if (static_cast<int>(request.prompt.size()) >= m.kv_capacity)
+    throw std::invalid_argument("the prompt is " + std::to_string(request.prompt.size()) +
+                                " tokens, which leaves no room in the context of " +
+                                std::to_string(m.kv_capacity));
+  for (int32_t id : request.prompt)
+    if (id < 0 || id >= m.V) throw std::invalid_argument("token id " + std::to_string(id) + " is outside the vocabulary");
+  if (request.max_tokens < 1) throw std::invalid_argument("max_tokens must be at least 1");
+  const SamplingParams& sp = request.sampling;
+  if (!(sp.temperature >= 0.0f) || !std::isfinite(sp.temperature))
+    throw std::invalid_argument("temperature must be 0 or more");
+  if (!(sp.top_p > 0.0f && sp.top_p <= 1.0f)) throw std::invalid_argument("top_p must be above 0 and at most 1");
+  if (sp.top_k < 0) throw std::invalid_argument("top_k must be 0 or more");
+  if (!(sp.min_p >= 0.0f && sp.min_p <= 1.0f)) throw std::invalid_argument("min_p must be between 0 and 1");
+  if (!(sp.repetition_penalty > 0.0f)) throw std::invalid_argument("repetition_penalty must be above 0");
+  if (sp.top_logprobs < 0 || sp.top_logprobs > kMaxTopLogprobs)
+    throw std::invalid_argument("top_logprobs must be between 0 and " + std::to_string(kMaxTopLogprobs));
+  for (const std::string& s : request.stop_strings)
+    if (s.empty()) throw std::invalid_argument("a stop string is empty");
+  if (!request.stop_strings.empty() && !m.tokenizer)
+    throw std::invalid_argument("stop strings need a tokenizer, and this engine has none");
+  request.max_tokens = std::min(request.max_tokens, m.kv_capacity - static_cast<int>(request.prompt.size()));
+
+  auto seq = std::make_shared<Sequence>();
+  seq->stop_ids = request.stop_ids;
+  if (!request.ignore_eos && m.tokenizer)
+    for (int32_t id : m.tokenizer->stop_ids()) seq->stop_ids.push_back(id);
+  if (m.tokenizer) {
+    seq->detok = m.tokenizer->stream(false);
+    seq->parser = std::make_unique<lx::text::OutputParser>(request.thinking);
+  }
+  seq->request = std::move(request);
+  seq->callbacks = std::move(callbacks);
+  seq->submitted_at = m.now();
+  seq->id = next_id_.fetch_add(1);
+  const uint64_t id = seq->id;
+  {
+    std::lock_guard<std::mutex> lock(m.mu);
+    if (m.broken) throw std::runtime_error("the engine stopped: " + m.broken_reason);
+    if (m.stopping) throw std::runtime_error("the engine is shutting down");
+    if (m.queued >= m.max_queue) throw std::runtime_error("the request queue is full");
+    m.queued += 1;
+    m.incoming.push_back(std::move(seq));
+  }
+  m.cv.notify_all();
+  return id;
+}
+
+void Engine::cancel(uint64_t id) {
+  {
+    std::lock_guard<std::mutex> lock(impl_->mu);
+    impl_->cancel_ids.insert(id);
+  }
+  impl_->cv.notify_all();
+}
+
+EngineStats Engine::stats() const {
+  std::lock_guard<std::mutex> lock(impl_->mu);
+  return impl_->stats;
+}
+
+// ---- the scheduler thread ------------------------------------------------------------------
+
+void Engine::Impl::loop() {
+  while (true) {
+    std::deque<std::shared_ptr<Sequence>> arrived;
+    std::set<uint64_t> cancels;
+    {
+      std::unique_lock<std::mutex> lock(mu);
+      cv.wait(lock, [this] {
+        return stopping || !incoming.empty() || !cancel_ids.empty() || !running.empty() || !waiting.empty();
+      });
+      if (stopping) break;
+      arrived.swap(incoming);
+      cancels.swap(cancel_ids);
+    }
+    try {
+      for (auto& s : arrived) waiting.push_back(std::move(s));
+      for (uint64_t id : cancels) {
+        auto w = std::find_if(waiting.begin(), waiting.end(), [id](const auto& s) { return s->id == id; });
+        if (w != waiting.end()) {
+          auto s = *w;
+          waiting.erase(w);
+          {
+            std::lock_guard<std::mutex> lock(mu);
+            queued -= 1;
+          }
+          end(s, FinishReason::Cancelled, "", false);
+          continue;
+        }
+        for (auto& r : running)
+          if (r->id == id) r->cancelled = true;
+      }
+      for (auto& r : std::vector<std::shared_ptr<Sequence>>(running))
+        if (r->cancelled) {
+          end(r, FinishReason::Cancelled, "", false);
+          retire(r);
+        }
+      admit();
+      if (!running.empty()) step();
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "lernex: the engine stopped: %s\n", e.what());
+      fail_all(e.what());
+      return;
+    }
+    publish_stats();
+  }
+  fail_all("the engine is shutting down");
+}
+
+void Engine::Impl::publish_stats() {
+  std::lock_guard<std::mutex> lock(mu);
+  stats.running = static_cast<int>(running.size());
+  stats.waiting = static_cast<int>(waiting.size() + incoming.size());
+}
+
+void Engine::Impl::admit() {
+  while (!free_slots.empty() && !waiting.empty()) {
+    auto s = waiting.front();
+    waiting.pop_front();
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      queued -= 1;
+    }
+    s->slot = free_slots.back();
+    free_slots.pop_back();
+    model->reset_slot(s->slot);
+    check_lx(lx_sampler_reset(static_cast<int32_t*>(seen.data()), static_cast<int32_t*>(out_counts.data()), s->slot,
+                              V, stream),
+             "lx_sampler_reset");
+    // the prompt counts toward the repetition penalty from its first token on
+    const size_t n = s->request.prompt.size();
+    check_cuda(cudaMemcpyAsync(prompt_scratch.data(), s->request.prompt.data(), sizeof(int32_t) * n,
+                               cudaMemcpyHostToDevice, stream),
+               "cudaMemcpyAsync");
+    check_lx(lx_sampler_observe(static_cast<int32_t*>(seen.data()), static_cast<int32_t*>(out_counts.data()), s->slot,
+                                V, static_cast<const int32_t*>(prompt_scratch.data()), static_cast<int>(n), 0, stream),
+             "lx_sampler_observe");
+    running.push_back(s);
+  }
+}
+
+void Engine::Impl::step() {
+  std::vector<SchedSeq> view;
+  view.reserve(running.size());
+  for (const auto& s : running)
+    view.push_back(SchedSeq{static_cast<int>(s->request.prompt.size()) - s->prompt_fed, s->has_pending});
+  const SchedPlan plan = plan_step(view, max_step_tokens, prefill_chunk, cursor);
+  if (plan.entries.empty()) return;
+
+  // Entry e is one sequence's tokens; its logits are row e of the model's output.
+  lx::StepBatch batch;
+  batch.cu_seqlens.push_back(0);
+  std::vector<int> rows;
+  std::vector<std::shared_ptr<Sequence>> sampled;
+  uint64_t prompt_tokens = 0;
+  bool all_decode = true;
+  for (size_t e = 0; e < plan.entries.size(); ++e) {
+    const std::shared_ptr<Sequence> s = running[plan.entries[e].seq];
+    if (s->has_pending) {
+      batch.tokens.push_back(s->pending);
+      s->has_pending = false;
+      rows.push_back(static_cast<int>(e));
+      sampled.push_back(s);
+    } else {
+      all_decode = false;
+      const int n = plan.entries[e].tokens;
+      const auto& prompt = s->request.prompt;
+      for (int k = 0; k < n; ++k) batch.tokens.push_back(prompt[s->prompt_fed + k]);
+      s->prompt_fed += n;
+      prompt_tokens += static_cast<uint64_t>(n);
+      if (s->prompt_fed == static_cast<int>(prompt.size())) {
+        rows.push_back(static_cast<int>(e));
+        sampled.push_back(s);
+      }
+    }
+    batch.cu_seqlens.push_back(static_cast<int32_t>(batch.tokens.size()));
+    batch.slots.push_back(s->slot);
+  }
+
+  model->forward(batch, static_cast<float*>(logits.data()), false, stream);
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    stats.steps += 1;
+    if (all_decode) stats.decode_steps += 1;
+    stats.prompt_tokens += prompt_tokens;
+  }
+  if (!sampled.empty()) sample(rows, sampled);
+}
+
+void Engine::Impl::sample(const std::vector<int>& rows, const std::vector<std::shared_ptr<Sequence>>& seqs) {
+  const int n = static_cast<int>(seqs.size());
+  int top_n = 0;
+  bool want_lp = false;
+  for (int j = 0; j < n; ++j) {
+    const Sequence& s = *seqs[j];
+    const SamplingParams& sp = s.request.sampling;
+    lx_sampling& p = host_params->data()[j];
+    p = lx_sampling{};
+    p.seed = sp.seed;
+    p.position = static_cast<uint64_t>(s.generated);
+    p.slot = s.slot;
+    p.row = rows[j];
+    p.temperature = sp.temperature;
+    p.top_p = sp.top_p;
+    p.top_k = sp.top_k;
+    p.min_p = sp.min_p;
+    p.repetition_penalty = sp.repetition_penalty;
+    p.presence_penalty = sp.presence_penalty;
+    p.frequency_penalty = sp.frequency_penalty;
+    if (sp.logprobs) {
+      want_lp = true;
+      top_n = std::max(top_n, sp.top_logprobs);
+    }
+  }
+  check_cuda(cudaMemcpyAsync(params.data(), host_params->data(), sizeof(lx_sampling) * n, cudaMemcpyHostToDevice, stream),
+             "cudaMemcpyAsync");
+  check_lx(lx_sample(static_cast<const float*>(logits.data()), V, static_cast<const lx_sampling*>(params.data()), n,
+                     static_cast<int32_t*>(seen.data()), static_cast<int32_t*>(out_counts.data()),
+                     static_cast<float*>(work.data()), static_cast<int32_t*>(tokens.data()),
+                     want_lp ? static_cast<float*>(token_lp.data()) : nullptr, top_n,
+                     static_cast<int32_t*>(top_ids.data()), static_cast<float*>(top_lp.data()), stream),
+           "lx_sample");
+  check_cuda(cudaMemcpyAsync(host_tokens->data(), tokens.data(), sizeof(int32_t) * n, cudaMemcpyDeviceToHost, stream),
+             "cudaMemcpyAsync");
+  if (want_lp) {
+    check_cuda(cudaMemcpyAsync(host_lp->data(), token_lp.data(), sizeof(float) * n, cudaMemcpyDeviceToHost, stream),
+               "cudaMemcpyAsync");
+  }
+  if (top_n > 0) {
+    check_cuda(cudaMemcpyAsync(host_top_ids->data(), top_ids.data(), sizeof(int32_t) * n * top_n,
+                               cudaMemcpyDeviceToHost, stream),
+               "cudaMemcpyAsync");
+    check_cuda(cudaMemcpyAsync(host_top_lp->data(), top_lp.data(), sizeof(float) * n * top_n, cudaMemcpyDeviceToHost,
+                               stream),
+               "cudaMemcpyAsync");
+  }
+  check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+
+  std::vector<std::shared_ptr<Sequence>> ended;
+  for (int j = 0; j < n; ++j) {
+    const int top_offset = j * top_n;
+    const bool done = accept(seqs[j], host_tokens->data()[j], want_lp ? host_lp->data()[j] : 0.0f,
+                             top_n > 0 ? host_top_ids->data() + top_offset : nullptr,
+                             top_n > 0 ? host_top_lp->data() + top_offset : nullptr, top_n);
+    if (done) ended.push_back(seqs[j]);
+  }
+  for (const auto& s : ended) retire(s);
+}
+
+// One sampled token of a sequence: it is shown (or ends the reply), and the sequence either
+// queues the token to feed next step or ends. Returns true when the sequence ended.
+bool Engine::Impl::accept(const std::shared_ptr<Sequence>& s, int32_t token, float logprob, const int32_t* top_ids_row,
+                          const float* top_lp_row, int top_n) {
+  Sequence& q = *s;
+  if (std::find(q.stop_ids.begin(), q.stop_ids.end(), token) != q.stop_ids.end()) {
+    end(s, FinishReason::Stop, "", true);
+    return true;
+  }
+  q.generated += 1;
+  if (q.generated == 1) q.first_token_at = now();
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    stats.generated_tokens += 1;
+  }
+
+  TokenDelta delta;
+  delta.token = token;
+  if (q.request.sampling.logprobs) {
+    delta.logprob = logprob;
+    const int want = q.request.sampling.top_logprobs;
+    for (int k = 0; k < want && k < top_n; ++k) delta.top.emplace_back(top_ids_row[k], top_lp_row[k]);
+    if (tokenizer) delta.piece = tokenizer->decode({token}, false);
+  }
+
+  if (q.detok) {
+    const std::string raw = q.detok->push(token);
+    const std::string buf = q.held + raw;
+    size_t cut = std::string::npos;
+    for (const std::string& stop : q.request.stop_strings) cut = std::min(cut, buf.find(stop));
+    std::string shown;
+    bool stopped = cut != std::string::npos;
+    if (stopped) {
+      shown = buf.substr(0, cut);
+      q.held.clear();
+    } else {
+      const size_t hold = held_suffix(buf, q.request.stop_strings);
+      shown = buf.substr(0, buf.size() - hold);
+      q.held = buf.substr(buf.size() - hold);
+    }
+    auto parsed = q.parser->push(shown);
+    delta.reasoning += parsed.reasoning;
+    delta.content += parsed.content;
+    delta.tool_calls.insert(delta.tool_calls.end(), parsed.tool_calls.begin(), parsed.tool_calls.end());
+    deliver(s, delta);
+    if (stopped) {
+      end(s, FinishReason::Stop, "", false);
+      return true;
+    }
+  } else {
+    deliver(s, delta);
+  }
+
+  if (q.generated >= q.request.max_tokens ||
+      q.prompt_fed + q.generated >= kv_capacity) {
+    end(s, FinishReason::Length, "", true);
+    return true;
+  }
+  q.pending = token;
+  q.has_pending = true;
+  return false;
+}
+
+void Engine::Impl::deliver(const std::shared_ptr<Sequence>& s, const TokenDelta& delta) {
+  if (!s->callbacks.on_token) return;
+  try {
+    s->callbacks.on_token(delta);
+  } catch (...) {
+    // A callback that throws has lost its client; the request ends as cancelled.
+    s->cancelled = true;
+  }
+}
+
+// Finishes a sequence: its held-back text and the parser's tail go out as one last delta (unless
+// the reply was cut by a stop string or cancelled), then the result is reported. The caller
+// removes it from the batch and frees its slot with retire().
+void Engine::Impl::end(const std::shared_ptr<Sequence>& s, FinishReason reason, const std::string& error,
+                       bool show_held) {
+  if (s->ended) return;
+  s->ended = true;
+  if (s->parser && reason != FinishReason::Cancelled && reason != FinishReason::Error) {
+    std::string tail = show_held ? s->held + s->detok->flush() : std::string();
+    s->held.clear();
+    TokenDelta d;
+    d.token = -1;
+    auto pushed = s->parser->push(tail);
+    auto fin = s->parser->finish();
+    d.reasoning = pushed.reasoning + fin.reasoning;
+    d.content = pushed.content + fin.content;
+    d.tool_calls = std::move(pushed.tool_calls);
+    d.tool_calls.insert(d.tool_calls.end(), fin.tool_calls.begin(), fin.tool_calls.end());
+    if (!d.reasoning.empty() || !d.content.empty() || !d.tool_calls.empty()) deliver(s, d);
+  }
+
+  RequestResult result;
+  result.reason = reason;
+  result.error = error;
+  result.prompt_tokens = static_cast<int>(s->request.prompt.size());
+  result.completion_tokens = s->generated;
+  result.first_token_at = s->first_token_at;
+  result.finished_at = now();
+  result.seconds = result.finished_at - s->submitted_at;
+  result.time_to_first_token = s->generated > 0 ? s->first_token_at - s->submitted_at : 0.0;
+  if (s->callbacks.on_finish) {
+    try {
+      s->callbacks.on_finish(result);
+    } catch (...) {
+    }
+  }
+}
+
+void Engine::Impl::retire(const std::shared_ptr<Sequence>& s) {
+  auto it = std::find(running.begin(), running.end(), s);
+  if (it != running.end()) running.erase(it);
+  if (s->slot >= 0) {
+    free_slots.push_back(s->slot);
+    s->slot = -1;
+  }
+}
+
+// A CUDA failure or shutdown: the engine cannot continue, so every request ends with an error.
+void Engine::Impl::fail_all(const std::string& reason) {
+  std::vector<std::shared_ptr<Sequence>> all;
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    broken = true;
+    broken_reason = reason;
+    while (!incoming.empty()) {
+      all.push_back(incoming.front());
+      incoming.pop_front();
+    }
+    queued = 0;
+    stats.waiting = 0;
+    stats.running = 0;
+  }
+  for (auto& s : waiting) all.push_back(s);
+  for (auto& s : running) all.push_back(s);
+  waiting.clear();
+  running.clear();
+  for (const auto& s : all) {
+    if (s->ended) continue;
+    s->slot = -1;
+    end(s, FinishReason::Error, reason, false);
+  }
+}
+
+}  // namespace lx::runtime

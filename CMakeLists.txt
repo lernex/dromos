@@ -48,7 +48,7 @@ file(GLOB LX_CORE_SOURCES CONFIGURE_DEPENDS engine/core/*.cpp engine/model/*.cpp
      engine/runtime/*.cu engine/text/*.cpp engine/server/*.cpp)
 if(LX_CORE_SOURCES)
   add_library(lernex_core STATIC ${LX_CORE_SOURCES})
-  target_include_directories(lernex_core PUBLIC engine third_party)
+  target_include_directories(lernex_core PUBLIC engine third_party third_party/httplib)
   target_link_libraries(lernex_core PUBLIC lernex_kernels)
   # The architectures this build has code for, for the device report. A header, not a definition: nvcc
   # splits a -D value on its commas.
@@ -62,15 +62,23 @@ endif()
 file(GLOB LX_CLI_SOURCES CONFIGURE_DEPENDS cli/*.cpp)
 if(LX_CLI_SOURCES AND TARGET lernex_core)
   add_executable(lernex ${LX_CLI_SOURCES})
+  target_include_directories(lernex PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(lernex PRIVATE lernex_core)
 endif()
 
-# Unit tests for the C++ modules (plan, device report, tuner), with doctest (third_party/doctest).
-file(GLOB LX_UNIT_SOURCES CONFIGURE_DEPENDS tests/unit/*.cpp)
-if(LX_UNIT_SOURCES AND TARGET lernex_core)
-  add_executable(lernex_unit ${LX_UNIT_SOURCES})
-  target_include_directories(lernex_unit PRIVATE third_party/doctest)
-  target_link_libraries(lernex_unit PRIVATE lernex_core)
+# The C++ unit tests (doctest): host-side policy, parsing and protocol code, run on the server.
+file(GLOB LX_TEST_SOURCES CONFIGURE_DEPENDS tests/cpp/*.cpp)
+if(LX_TEST_SOURCES AND TARGET lernex_core)
+  add_executable(lernex_tests ${LX_TEST_SOURCES})
+  target_include_directories(lernex_tests PRIVATE engine third_party)
+  target_link_libraries(lernex_tests PRIVATE lernex_core)
+endif()
+
+# GPU checks: the engine end to end on a real model (run by hand on the server, see tests/gpu).
+file(GLOB LX_GPU_CHECK_SOURCES CONFIGURE_DEPENDS tests/gpu/*.cpp)
+if(LX_GPU_CHECK_SOURCES AND TARGET lernex_core)
+  add_executable(lernex_gpu_check ${LX_GPU_CHECK_SOURCES})
+  target_link_libraries(lernex_gpu_check PRIVATE lernex_core)
 endif()
 
 # The text stack's tests: tokenizer, chat template and output parser. No CUDA; the goldens come from
@@ -79,3 +87,11 @@ file(GLOB LX_TEXT_TEST_SOURCES CONFIGURE_DEPENDS tests/text/*.cpp)
 file(GLOB LX_TEXT_SOURCES CONFIGURE_DEPENDS engine/text/*.cpp)
 add_executable(lx_text_tests ${LX_TEXT_TEST_SOURCES} ${LX_TEXT_SOURCES})
 target_include_directories(lx_text_tests PRIVATE engine third_party)
+
+# Unit tests for the C++ modules (plan, device report, tuner), with doctest (third_party/doctest).
+file(GLOB LX_UNIT_SOURCES CONFIGURE_DEPENDS tests/unit/*.cpp)
+if(LX_UNIT_SOURCES AND TARGET lernex_core)
+  add_executable(lernex_unit ${LX_UNIT_SOURCES})
+  target_include_directories(lernex_unit PRIVATE third_party/doctest)
+  target_link_libraries(lernex_unit PRIVATE lernex_core)
+endif()
