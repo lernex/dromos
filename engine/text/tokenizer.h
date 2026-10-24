@@ -53,13 +53,17 @@ struct Message {
 };
 
 struct ChatOptions {
-  bool thinking = true;           // the template's thinking switch
+  std::string model_dir;          // the model folder: its chat_template.jinja (or tokenizer_config.json)
+  bool thinking = true;           // the template's enable_thinking
   std::string tools_json;         // OpenAI-style tools array as JSON text, or empty
   bool add_generation_prompt = true;
 };
 
-// The prompt text chat_template.jinja renders for these messages (byte-identical).
+// The prompt text the model folder's chat template renders for these messages (byte-identical to
+// transformers' apply_chat_template(tokenize=False)). Rendered by the Jinja interpreter in jinja.h.
 std::string render_chat(const std::vector<Message>& messages, const ChatOptions& options);
+
+struct OutputParserState;  // defined in output_parser.cpp
 
 // Splits streamed model output into reasoning, visible content and tool calls, incrementally.
 class OutputParser {
@@ -68,14 +72,17 @@ class OutputParser {
     std::string reasoning, content;
     std::vector<ToolCall> tool_calls;  // complete calls only
   };
+  // thinking: the prompt opened a reasoning block (thinking on). Without a tools array, arguments
+  // stay strings.
   explicit OutputParser(bool thinking);
+  // tools_json: the request's OpenAI-style tools array, used to type each argument by its schema.
+  OutputParser(bool thinking, std::string_view tools_json);
   ~OutputParser();
   Delta push(std::string_view text);
   Delta finish();
 
  private:
-  struct State;
-  std::unique_ptr<State> state_;
+  std::unique_ptr<OutputParserState> state_;
 };
 
 }  // namespace lx::text

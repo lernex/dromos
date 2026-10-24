@@ -1,0 +1,139 @@
+// OutputParser against the vLLM reference (metis parsers), for whole outputs and for every chunking:
+// one byte at a time, and random chunk sizes. The goldens come from tools/text/golden_parser.py.
+#include <cstdio>
+#include <random>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "doctest/doctest.h"
+#include "support.h"
+#include "text/json.h"
+#include "text/tokenizer.h"
+
+using lx::text::JValue;
+using lx::text::OutputParser;
+using lx::text::test::for_each_json_line;
+using lx::text::test::golden_dir;
+using lx::text::test::str_of;
+
+namespace {
+
+struct Out {
+  std::string reasoning;
+  std::string content;
+  std::vector<std::pair<std::string, std::string>> calls;  // name, arguments JSON
+
+  bool operator==(const Out& other) const {
+    return reasoning == other.reasoning && content == other.content && calls == other.calls;
+  }
+};
+
+struct Case {
+  std::string name;
+  bool thinking;
+  std::string text;
+  Out expected;
+};
+
+// Parses text, pushed in pieces split at `cuts` (ascending byte offsets), then finished.
+Out parse_pieces(bool thinking, const std::string& tools, const std::string& text, const std::vector<size_t>& cuts) {
+  OutputParser parser(thinking, tools);
+  Out out;
+  auto add = [&](OutputParser::Delta d) {
+    out.reasoning += d.reasoning;
+    out.content += d.content;
+    for (const auto& call : d.tool_calls) out.calls.emplace_back(call.name, call.arguments_json);
+  };
+  size_t pos = 0;
+  for (size_t cut : cuts) {
+    add(parser.push(std::string_view(text).substr(pos, cut - pos)));
+    pos = cut;
+  }
+  add(parser.push(std::string_view(text).substr(pos)));
+  add(parser.finish());
+  return out;
+}
+
+std::string show(const Out& o) {
+  std::string s = "reasoning=[" + o.reasoning + "] content=[" + o.content + "] calls=[";
+  for (const auto& c : o.calls) s += "(" + c.first + ", " + c.second + ")";
+  return s + "]";
+}
+
+}  // namespace
+
+TEST_CASE("output parser matches the vLLM reference whole, byte by byte, and under random chunking") {
+  if (golden_dir().empty()) {
+    std::printf("output parser tests skipped: set LX_TEXT_GOLDEN\n");
+    return;
+  }
+  std::string tools;
+  std::vector<Case> cases;
+  for_each_json_line(golden_dir() + "/parser/parser.jsonl", [&](const JValue& line) {
+    if (line.get("vllm") != nullptr) {
+      tools = lx::text::json_dumps(*line.get("tools"));
+      return;
+    }
+    if (line.get("error") != nullptr) return;  // the reference raised: no expectation
+    Case c;
+    c.name = str_of(line, "name");
+    c.thinking = line.get("thinking")->boolean;
+    c.text = str_of(line, "text");
+    const JValue* exp = line.get("expected");
+    c.expected.reasoning = str_of(*exp, "reasoning");
+    c.expected.content = str_of(*exp, "content");
+    for (const JValue& call : exp->get("tool_calls")->items) {
+      c.expected.calls.emplace_back(call.items[0].text, call.items[1].text);
+    }
+    cases.push_back(std::move(c));
+  });
+  REQUIRE(!cases.empty());
+
+  size_t whole_bad = 0, byte_bad = 0, random_bad = 0, random_runs = 0;
+  for (const Case& c : cases) {
+    const Out whole = parse_pieces(c.thinking, tools, c.text, {});
+    if (!(whole == c.expected)) {
+      if (whole_bad < 5) {
+        std::printf("whole mismatch %s\n  want %s\n  got  %s\n  text %s\n", c.name.c_str(),
+                    show(c.expected).c_str(), show(whole).c_str(), c.text.c_str());
+      }
+      ++whole_bad;
+    }
+    std::vector<size_t> every_byte;
+    for (size_t i = 1; i < c.text.size(); ++i) every_byte.push_back(i);
+    if (!(parse_pieces(c.thinking, tools, c.text, every_byte) == whole)) {
+      if (byte_bad < 5) std::printf("byte-chunk mismatch %s\n", c.name.c_str());
+      ++byte_bad;
+    }
+    std::mt19937 rng(static_cast<uint32_t>(c.text.size() * 2654435761u + c.name.size()));
+    for (int run = 0; run < 6; ++run) {
+      std::vector<size_t> cuts;
+      size_t at = 0;
+      while (true) {
+        at += 1 + rng() % 9;
+        if (at >= c.text.size()) break;
+        cuts.push_back(at);
+      }
+      ++random_runs;
+      const Out chunked = parse_pieces(c.thinking, tools, c.text, cuts);
+      if (!(chunked == whole)) {
+        if (random_bad < 3) {
+          std::printf("random-chunk mismatch %s (run %d)\n  whole   %s\n  chunked %s\n  text %s\n", c.name.c_str(), run,
+                      show(whole).c_str(), show(chunked).c_str(), c.text.c_str());
+          std::printf("  cuts:");
+          for (size_t cut : cuts) std::printf(" %zu", cut);
+          std::printf("\n");
+        }
+        ++random_bad;
+      }
+    }
+  }
+  std::printf("parser cases %zu: whole-text mismatches %zu, byte-chunk mismatches %zu, "
+              "random-chunk mismatches %zu of %zu runs\n",
+              cases.size(), whole_bad, byte_bad, random_bad, random_runs);
+  CHECK(cases.size() >= 4000);
+  CHECK(whole_bad == 0);
+  CHECK(byte_bad == 0);
+  CHECK(random_bad == 0);
+}
