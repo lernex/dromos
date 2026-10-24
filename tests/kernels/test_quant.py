@@ -12,7 +12,7 @@ import pytest
 import torch
 
 from conftest import DTYPE, F32, close
-from formats import LxWeight, W_FP8, W_INT8, W_NVFP4, _e2m1_values, random_weight, stack_weight
+from formats import LxWeight, W_BF16, W_FP8, W_INT8, W_NVFP4, _e2m1_values, random_weight, stack_weight
 
 MIDS = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
 
@@ -186,3 +186,27 @@ def test_random_roundtrip_matches_the_dense_reference(lx):
     lx("gemv_w", x, F32, K, ctypes.pointer(lw), None, F32, y, F32, N, 3, N, K, 1.0, 0.0)
     want = x.double() @ dense.T
     close(y, want.float(), atol=2e-4 * want.abs().max().item())
+
+
+@pytest.mark.parametrize("fmt", [W_BF16, W_INT8, W_FP8, W_NVFP4])
+@pytest.mark.parametrize("N,K", [(1, 16), (33, 512), (96, 1024)])
+def test_dequantize_matches_the_dense_reference(lx, fmt, N, K):
+    # lx_dequantize_weight writes the values each format encodes, rounded once to bf16: every element
+    # is within half a bf16 ulp of the float64 reference that formats.py builds from the same bytes.
+    w = random_weight(fmt, N, K, seed=11 + fmt + N)
+    out = torch.empty(N, K, dtype=torch.bfloat16, device="cuda")
+    lx("dequantize_weight", ctypes.pointer(w.lx()), out, ctypes.c_int64(N), K)
+    close(out.float(), w.dense.float(), atol=1e-30, rtol=2.0**-8)
+
+
+def test_dequantize_nvfp4_global_multiplies_once(lx):
+    # The global is applied once, in the dequantized values: halving it halves every output exactly.
+    N, K = 64, 256
+    w = random_weight(W_NVFP4, N, K, seed=3)
+    a = torch.empty(N, K, dtype=torch.bfloat16, device="cuda")
+    lx("dequantize_weight", ctypes.pointer(w.lx()), a, ctypes.c_int64(N), K)
+    half = LxWeight(type=W_NVFP4, data=w.data.data_ptr(), scale=w.scale.data_ptr(), global_=w.glob * 0.5,
+                    expert_global=None)
+    b = torch.empty(N, K, dtype=torch.bfloat16, device="cuda")
+    lx("dequantize_weight", ctypes.pointer(half), b, ctypes.c_int64(N), K)
+    assert torch.equal(b.float(), a.float() * 0.5)

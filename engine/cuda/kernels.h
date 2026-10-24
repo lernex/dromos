@@ -280,6 +280,11 @@ LX_API int64_t lx_moe_grouped_workspace_bytes(int T, int L, int I, int E, int to
 // for a format the file is not stored in; checkpoints made with GPTQ are loaded as they are.
 LX_API int lx_quantize_weight(const void* w, lx_weight* out, int64_t rows, int cols, void* stream);
 
+// The reverse: out[r, c] = w[r, c] as bf16 for an [rows, cols] matrix in any format, with its row
+// factor applied (the row scale, or the NVFP4 global). The loader uses it to hold a quantized
+// embedding's bf16 gather table, and the acceptance checks compare dequantized weights with BF16.
+LX_API int lx_dequantize_weight(const lx_weight* w, void* out, int64_t rows, int cols, void* stream);
+
 #ifdef __cplusplus
 }
 #endif
