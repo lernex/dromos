@@ -80,7 +80,7 @@ __global__ void __launch_bounds__(kThreads, kMinBlocksA) w8_gate_up_pair_vec(con
                                                                              const float* __restrict__ gate_up_scale,
                                                                              bf16* __restrict__ inter, int L,
                                                                              int I, int top_k, int rows) {
-  cudaTriggerProgrammaticLaunchCompletion();  // stage 2 may start its prologue now
+  lx::pdl_trigger();  // stage 2 may start its prologue now
   const int p = blockIdx.x / rows;
   const int i = (blockIdx.x % rows) * kWarps + (threadIdx.x >> 5);
   if (i >= I) return;
@@ -129,7 +129,7 @@ __global__ void __launch_bounds__(kThreads) w8_gate_up_pair_scalar(const bf16* _
                                                                    const float* __restrict__ gate_up_scale,
                                                                    bf16* __restrict__ inter, int L, int I,
                                                                    int top_k, int rows) {
-  cudaTriggerProgrammaticLaunchCompletion();
+  lx::pdl_trigger();
   const int p = blockIdx.x / rows;
   const int i = (blockIdx.x % rows) * kWarps + (threadIdx.x >> 5);
   if (i >= I) return;
@@ -186,7 +186,7 @@ __global__ void __launch_bounds__(kThreads, kMinBlocksA) w8_gate_up_chain_vec(co
                                                                               const int32_t* __restrict__ next,
                                                                               const int32_t* __restrict__ lead,
                                                                               int L, int I, int top_k, int rows) {
-  cudaTriggerProgrammaticLaunchCompletion();
+  lx::pdl_trigger();
   const int p = blockIdx.x / rows;
   const int i = (blockIdx.x % rows) * kWarps + (threadIdx.x >> 5);
   if (!lead[p] || i >= I) return;
@@ -236,7 +236,7 @@ __global__ void __launch_bounds__(kThreads) w8_gate_up_chain_scalar(const bf16* 
                                                                     const int32_t* __restrict__ next,
                                                                     const int32_t* __restrict__ lead, int L, int I,
                                                                     int top_k, int rows) {
-  cudaTriggerProgrammaticLaunchCompletion();
+  lx::pdl_trigger();
   const int p = blockIdx.x / rows;
   const int i = (blockIdx.x % rows) * kWarps + (threadIdx.x >> 5);
   if (!lead[p] || i >= I) return;
@@ -294,7 +294,7 @@ __global__ void __launch_bounds__(kThreads, kMinBlocksB) w8_down_vec(const bf16*
     }
   }
 
-  cudaGridDependencySynchronize();  // stage 1 has written the intermediates
+  lx::pdl_wait();  // stage 1 has written the intermediates
   cp_async_wait_all();              // this thread's rows have landed
   const uint4* src = reinterpret_cast<const uint4*>(inter + static_cast<int64_t>(t) * top_k * I);
   uint4* dst = reinterpret_cast<uint4*>(h);
@@ -333,7 +333,7 @@ __global__ void __launch_bounds__(kThreads) w8_down_scalar(const bf16* __restric
   const int lane = threadIdx.x & 31;
   const bool live = l < L;
 
-  cudaGridDependencySynchronize();
+  lx::pdl_wait();
   for (int v = threadIdx.x; v < top_k * I; v += kThreads) h[v] = inter[static_cast<int64_t>(t) * top_k * I + v];
   __syncthreads();
   if (!live) return;
@@ -368,7 +368,7 @@ cudaError_t launch_kernel(void (*kernel)(Params...), unsigned int grid, size_t s
   cfg.dynamicSmemBytes = smem;
   cfg.stream = s;
   cfg.attrs = &attr;
-  cfg.numAttrs = dependent ? 1 : 0;
+  cfg.numAttrs = dependent && lx::pdl_available() ? 1 : 0;  // below sm_90 an ordinary launch: stream order holds
   return cudaLaunchKernelEx(&cfg, kernel, args...);
 }
 

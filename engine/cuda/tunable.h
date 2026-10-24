@@ -32,12 +32,47 @@ LX_API const char* lx_tune_variant_name(const char* kernel, int variant);
 }
 
 #include <initializer_list>
+#include <string>
 
 namespace lx {
+
+// The first architecture with thread-block clusters and programmatic dependent launch (sm_90).
+// Kernels take their one-block paths below it, and the host checks this before a cluster launch.
+constexpr int kClusterArch = 90;
+
+// One problem a tunable kernel is timed on: a product of M rows with an N x K weight, or with
+// `experts` such weights (an expert stack), in the weight format and math the plan runs it in.
+// `weight` is an lx_wtype and `math` an lx_math (0 for both when the kernel has no such choice).
+struct TuneProblem {
+  int M = 1, N = 1, K = 1;
+  int experts = 1;
+  int weight = 0;
+  int math = 0;
+};
+
+// Runs variant `variant` of a kernel on a problem. The kernel makes its own inputs (deterministic,
+// and cached per problem), launches that variant rather than the table's choice, and writes its
+// result as f32 to `out`, M * N elements, so the tuner can check every variant against variant 0.
+// Returns a cudaError_t. cudaErrorNotSupported marks a variant or a problem this device or build
+// cannot run; the tuner skips it.
+using TuneRunner = int (*)(int variant, const TuneProblem& problem, float* out, void* stream);
+
+// The key a kernel's table entries live under: the kernel's name, with its format, math and expert
+// count appended when they are not the defaults, so one kernel keeps a winner per format it runs.
+// Kernels call lx_tune_get with the same string.
+std::string tune_key(const char* kernel, const TuneProblem& problem);
+
+// The runner registered for a kernel, or null.
+TuneRunner tunable_runner(const char* kernel);
+
 // Registers a kernel's variants at load time:
 //   static const lx::TunableRegistration reg("gemv_w", {"rg2_s1", "rg4_s1", "rg4_s2"});
+// and, for the autotuner, its runner too:
+//   static const lx::TunableRegistration reg("mhc_read", {"block", "cluster8"}, &run_mhc_read);
 struct TunableRegistration {
   TunableRegistration(const char* kernel, std::initializer_list<const char*> variants);
+  TunableRegistration(const char* kernel, std::initializer_list<const char*> variants, TuneRunner runner);
 };
+
 }  // namespace lx
 #endif
