@@ -65,7 +65,7 @@ target_link_libraries(lernex_kernels PUBLIC CUDA::cudart CUDA::cublasLt)
 
 # The prefix cache snapshots the model's slot state. That needs MetisModel::save_slot and restore_slot,
 # which live in docs/handoff/serving-metis.diff until the lead applies it to engine/model/metis.cpp.
-option(LX_SLOT_STATE "Build the prefix cache on the model's slot state (needs the serving-metis handoff)" OFF)
+option(LX_SLOT_STATE "Build the prefix cache on the model's slot state" ON)
 if(LX_SLOT_STATE)
   add_compile_definitions(LX_SLOT_STATE=1)
 endif()

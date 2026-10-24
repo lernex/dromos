@@ -54,6 +54,15 @@ class MetisModel {
   void reset_slot(int slot);
   int slot_length(int slot) const { return slot_len_[slot]; }
 
+  // A slot's complete state after its first `length` tokens, so a prefix can be restored without
+  // re-running it. The Mamba state is a recurrence and cannot be cut back, so a snapshot is only
+  // valid at the length it was taken. Layout, per (pass, layer): a Mamba layer's conv state then its
+  // SSM state; an attention layer's K then V for the first `length` positions. `dst` and `src` are
+  // device or pinned host memory; the copies run on `stream` in order with the model's steps.
+  size_t slot_state_bytes(int length) const;
+  void save_slot(int slot, void* dst, int length, cudaStream_t stream);
+  void restore_slot(int slot, const void* src, int length, cudaStream_t stream);  // the slot now holds `length`
+
   // Runs one step. Writes f32 logits to `logits` (device): every token's row [T, V] when
   // all_rows, otherwise each sequence's last row [n_seq, V]. A slot with pending positions folds
   // them into its state first (it can no longer be truncated before this step).

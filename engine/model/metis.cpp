@@ -344,6 +344,18 @@ float* connection_params(Impl& m, const WeightLookup& lookup, const std::string&
 MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slots, int kv_capacity,
                        int max_tokens, offload::ExpertOffload* experts, bool speculative)
     : cfg_(c), slot_len_(max_slots, 0), folded_(max_slots, 0), pending_(max_slots, 0), impl_(new Impl) {
+  // A constructor that throws (a cudaMalloc that fails, say) never reaches the destructor, so the device
+  // memory this build took would stay allocated for the life of the process: free it on the way out.
+  struct FreeOnThrow {
+    Impl*& impl;
+    bool armed = true;
+    ~FreeOnThrow() {
+      if (armed) {
+        delete impl;
+        impl = nullptr;
+      }
+    }
+  } free_on_throw{impl_};
   Impl& m = *impl_;
   m.offload = experts;
   if (const char* trace = std::getenv("LX_ROUTE_TRACE")) {
@@ -621,6 +633,7 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
     check(static_cast<int>(cudaStreamCreateWithFlags(&m.stage_stream, cudaStreamNonBlocking)), "cudaStreamCreate");
   }
   m.use_graphs = std::getenv("LX_NO_GRAPHS") == nullptr && !m.route_trace;
+  free_on_throw.armed = false;
 }
 
 MetisModel::~MetisModel() { delete impl_; }
@@ -677,6 +690,69 @@ const float* MetisModel::features() const { return impl_->tap_out; }
 
 MetisModel::HeadWeights MetisModel::head_weights() const {
   return {impl_->head.w, impl_->head.q, impl_->head.scale};
+}
+
+namespace {
+
+// The snapshot's pieces for one slot, in layout order: `piece(device_ptr, bytes, is_kv)`.
+template <typename Fn>
+void each_piece(const Impl& m, int slot, int length, Fn&& piece) {
+  const size_t kv_row = static_cast<size_t>(m.KVH) * m.Dh;  // elements per position
+  for (int pass = 0; pass < m.P_passes; ++pass) {
+    for (int i = 0; i < m.L_layers; ++i) {
+      const int idx = pass * m.L_layers + i;
+      if (m.layers[i].attention) {
+        const size_t base = static_cast<size_t>(slot) * m.kv_capacity * kv_row;  // elements
+        const size_t bytes = sizeof(uint16_t) * static_cast<size_t>(length) * kv_row;
+        piece(static_cast<char*>(m.k_cache[idx]) + sizeof(uint16_t) * base, bytes, true);
+        piece(static_cast<char*>(m.v_cache[idx]) + sizeof(uint16_t) * base, bytes, true);
+      } else {
+        const size_t conv = static_cast<size_t>(m.W - 1) * m.conv_dim;
+        const size_t ssm = static_cast<size_t>(m.H) * m.Pd * m.N;
+        piece(m.conv_state[idx] + static_cast<size_t>(slot) * conv, sizeof(float) * conv, false);
+        piece(m.ssm_state[idx] + static_cast<size_t>(slot) * ssm, sizeof(float) * ssm, false);
+      }
+    }
+  }
+}
+
+}  // namespace
+
+size_t MetisModel::slot_state_bytes(int length) const {
+  const Impl& m = *impl_;
+  size_t total = 0;
+  each_piece(m, 0, length, [&total](const void*, size_t bytes, bool) { total += bytes; });
+  return total;
+}
+
+void MetisModel::save_slot(int slot, void* dst, int length, cudaStream_t stream) {
+  Impl& m = *impl_;
+  if (slot < 0 || slot >= m.max_slots || length < 0 || length > m.kv_capacity)
+    throw std::runtime_error("save_slot: slot or length out of range");
+  // A speculative slot's Mamba state stops at its folded positions: fold the pending ones first.
+  if (pending_.at(slot) != 0) throw std::runtime_error("save_slot: the slot has pending positions (fold_pending)");
+  char* out = static_cast<char*>(dst);
+  size_t off = 0;
+  each_piece(m, slot, length, [&](const void* src, size_t bytes, bool) {
+    check(static_cast<int>(cudaMemcpyAsync(out + off, src, bytes, cudaMemcpyDefault, stream)), "cudaMemcpyAsync");
+    off += bytes;
+  });
+}
+
+void MetisModel::restore_slot(int slot, const void* src, int length, cudaStream_t stream) {
+  Impl& m = *impl_;
+  if (slot < 0 || slot >= m.max_slots || length < 0 || length > m.kv_capacity)
+    throw std::runtime_error("restore_slot: slot or length out of range");
+  const char* in = static_cast<const char*>(src);
+  size_t off = 0;
+  each_piece(m, slot, length, [&](const void* dst, size_t bytes, bool) {
+    check(static_cast<int>(cudaMemcpyAsync(const_cast<void*>(dst), in + off, bytes, cudaMemcpyDefault, stream)),
+          "cudaMemcpyAsync");
+    off += bytes;
+  });
+  slot_len_.at(slot) = length;
+  folded_.at(slot) = length;
+  pending_.at(slot) = 0;
 }
 
 namespace {
