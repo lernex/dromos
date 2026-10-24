@@ -10,7 +10,7 @@ import ctypes
 import pytest
 import torch
 
-from conftest import close
+from conftest import DEVICE, close
 
 
 def _lib(lx):
@@ -42,16 +42,16 @@ def test_mhc_read_table_paths_agree(lx, T, S, D):
     """Both paths of the decode read give the same result, so the tuner may choose either."""
     lib = _lib(lx)
     torch.manual_seed(1)
-    streams = torch.randn(T, S, D, device="cuda")
-    matrix = torch.randn(S, S, device="cuda")
-    read = torch.randn(S, device="cuda")
-    norm_w = (torch.rand(D, device="cuda") + 0.5).to(torch.bfloat16)
+    streams = torch.randn(T, S, D, device=DEVICE)
+    matrix = torch.randn(S, S, device=DEVICE)
+    read = torch.randn(S, device=DEVICE)
+    norm_w = (torch.rand(D, device=DEVICE) + 0.5).to(torch.bfloat16)
     outs = []
     for variant in (0, 1):
         lib.lx_tune_clear()
         lib.lx_tune_set(b"mhc_read", T, D, S, variant)
-        mixed = torch.empty(T, S, D, device="cuda")
-        h = torch.empty(T, D, device="cuda", dtype=torch.bfloat16)
+        mixed = torch.empty(T, S, D, device=DEVICE)
+        h = torch.empty(T, D, device=DEVICE, dtype=torch.bfloat16)
         lx("mhc_read", streams, matrix, read, norm_w, 1e-6, mixed, h, T, S, D)
         outs.append((mixed, h))
     lib.lx_tune_clear()
@@ -63,15 +63,15 @@ def test_mhc_read_table_paths_agree(lx, T, S, D):
 def test_memory_fuse_table_paths_agree(lx, T, S, D):
     lib = _lib(lx)
     torch.manual_seed(2)
-    projected = torch.randn(T, S, D, device="cuda")
-    gate = (torch.randn(S, D, device="cuda") * 0.1).to(torch.bfloat16)
-    gate_bias = (torch.randn(S, device="cuda") * 0.1).to(torch.bfloat16)
+    projected = torch.randn(T, S, D, device=DEVICE)
+    gate = (torch.randn(S, D, device=DEVICE) * 0.1).to(torch.bfloat16)
+    gate_bias = (torch.randn(S, device=DEVICE) * 0.1).to(torch.bfloat16)
     outs = []
     for variant in (0, 1):
         lib.lx_tune_clear()
         lib.lx_tune_set(b"memory_fuse", T, D, S, variant)
-        streams = torch.randn(T, S, D, device="cuda", generator=torch.Generator("cuda").manual_seed(3))
-        summary = torch.empty(T, D, device="cuda")
+        streams = torch.randn(T, S, D, device=DEVICE, generator=torch.Generator(DEVICE).manual_seed(3))
+        summary = torch.empty(T, D, device=DEVICE)
         lx("memory_fuse", streams, projected, gate, gate_bias, summary, T, S, D)
         outs.append((streams, summary))
     lib.lx_tune_clear()
@@ -90,19 +90,19 @@ def test_attention_split_and_whole_items_agree(lx, T, H, KVH, Dh, p0):
     session = lib.lx_arch()
     torch.manual_seed(4)
     capacity, slots = 512, 1
-    qkv = torch.randn(T, (H + 2 * KVH) * Dh, device="cuda")
-    k0 = torch.randn(slots, capacity, KVH, Dh, device="cuda").to(torch.bfloat16)
-    v0 = torch.randn(slots, capacity, KVH, Dh, device="cuda").to(torch.bfloat16)
-    slot_ids = torch.zeros(1, dtype=torch.int32, device="cuda")
-    start = torch.tensor([p0], dtype=torch.int32, device="cuda")
-    cu = torch.tensor([0, T], dtype=torch.int32, device="cuda")
+    qkv = torch.randn(T, (H + 2 * KVH) * Dh, device=DEVICE)
+    k0 = torch.randn(slots, capacity, KVH, Dh, device=DEVICE).to(torch.bfloat16)
+    v0 = torch.randn(slots, capacity, KVH, Dh, device=DEVICE).to(torch.bfloat16)
+    slot_ids = torch.zeros(1, dtype=torch.int32, device=DEVICE)
+    start = torch.tensor([p0], dtype=torch.int32, device=DEVICE)
+    cu = torch.tensor([0, T], dtype=torch.int32, device=DEVICE)
     scale = 1.0 / Dh**0.5
     outs = []
     try:
         for arch in (0, 80):  # 0: the card as it is, 80: the whole-items path
             lib.lx_set_arch_override(arch)
             kc, vc = k0.clone(), v0.clone()
-            out = torch.empty(T, H * Dh, device="cuda", dtype=torch.bfloat16)
+            out = torch.empty(T, H * Dh, device=DEVICE, dtype=torch.bfloat16)
             lx("attention_varlen", qkv, (H + 2 * KVH) * Dh, kc, vc, slot_ids, start, cu, 1, capacity, out, H, KVH, Dh,
                scale)
             outs.append((out, kc))

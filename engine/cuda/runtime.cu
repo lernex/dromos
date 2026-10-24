@@ -93,4 +93,17 @@ int lx_rt_graph_launch(void* graph, void* stream) {
 int lx_rt_graph_destroy(void* graph) { return status(cudaGraphExecDestroy(static_cast<cudaGraphExec_t>(graph))); }
 int lx_rt_last_error(void) { return status(cudaGetLastError()); }
 
+// Device memory is the GPU's own: a mapped checkpoint is copied instead (kernels.h).
+int lx_rt_map_host(void* ptr, int64_t bytes, void** device_ptr) {
+  (void)ptr;
+  (void)bytes;
+  if (device_ptr) *device_ptr = nullptr;
+  return LX_ERR_NOT_SUPPORTED;
+}
+
+int lx_rt_unmap_host(void* ptr) {
+  (void)ptr;
+  return LX_ERR_NOT_SUPPORTED;
+}
+
 }  // extern "C"

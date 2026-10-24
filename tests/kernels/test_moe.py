@@ -12,7 +12,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from conftest import close
+from conftest import DEVICE, close
 
 METIS_E = [128, 192]
 TOP_K = 4
@@ -33,10 +33,10 @@ def route_reference(logits, bias, top_k):
 
 def run_route(lx, logits, bias, top_k):
     T, E = logits.shape
-    ids = torch.empty(T, top_k, dtype=torch.int32, device="cuda")
-    weights = torch.empty(T, top_k, dtype=torch.float32, device="cuda")
-    entropy = torch.empty(T, dtype=torch.float32, device="cuda")
-    confidence = torch.empty(T, dtype=torch.float32, device="cuda")
+    ids = torch.empty(T, top_k, dtype=torch.int32, device=DEVICE)
+    weights = torch.empty(T, top_k, dtype=torch.float32, device=DEVICE)
+    entropy = torch.empty(T, dtype=torch.float32, device=DEVICE)
+    confidence = torch.empty(T, dtype=torch.float32, device=DEVICE)
     lx("moe_route", logits, bias, ids, weights, entropy, confidence, T, E, top_k)
     return ids, weights, entropy, confidence
 
@@ -61,33 +61,33 @@ def check_route(lx, logits, bias, top_k):
 @pytest.mark.parametrize("E,T", [(128, 1), (128, 7), (128, 300), (192, 1), (192, 7), (192, 300)])
 def test_moe_route_metis(lx, E, T):
     torch.manual_seed(E * 1000 + T)
-    logits = (torch.randn(T, E, device="cuda") * 2).float().contiguous()
-    bias = (torch.randn(E, device="cuda") * 0.5).float().contiguous()
+    logits = (torch.randn(T, E, device=DEVICE) * 2).float().contiguous()
+    bias = (torch.randn(E, device=DEVICE) * 0.5).float().contiguous()
     check_route(lx, logits, bias, TOP_K)
 
 
 @pytest.mark.parametrize("E,T,top_k", [(5, 3, 2), (37, 7, 3), (7, 2, 7), (64, 1, 1)])
 def test_moe_route_small_odd(lx, E, T, top_k):
     torch.manual_seed(E * 100 + T * 10 + top_k)
-    logits = (torch.randn(T, E, device="cuda") * 2).float().contiguous()
-    bias = (torch.randn(E, device="cuda") * 0.5).float().contiguous()
+    logits = (torch.randn(T, E, device=DEVICE) * 2).float().contiguous()
+    bias = (torch.randn(E, device=DEVICE) * 0.5).float().contiguous()
     check_route(lx, logits, bias, top_k)
 
 
 def test_moe_route_without_bias(lx):
     # A null selection_bias means zero bias: the picks are the plain top-k of the logits.
     torch.manual_seed(7)
-    logits = (torch.randn(33, 128, device="cuda") * 2).float().contiguous()
+    logits = (torch.randn(33, 128, device=DEVICE) * 2).float().contiguous()
     check_route(lx, logits, None, TOP_K)
 
 
 def test_moe_route_ties_resolve_to_lower_index(lx):
     # Three experts share the top logit: the picks are the lowest-numbered of them, and the
     # weights over the three equal logits are uniform.
-    logits = torch.tensor([[0.5, 2.0, 2.0, -1.0, 2.0, 0.0, 1.0, 0.0]], device="cuda")
+    logits = torch.tensor([[0.5, 2.0, 2.0, -1.0, 2.0, 0.0, 1.0, 0.0]], device=DEVICE)
     ids, weights, entropy, confidence = run_route(lx, logits, None, 3)
     assert ids.tolist() == [[1, 2, 4]]
-    close(weights, torch.full((1, 3), 1.0 / 3.0, device="cuda"), atol=1e-6)
+    close(weights, torch.full((1, 3), 1.0 / 3.0, device=DEVICE), atol=1e-6)
     _, _, want_h, want_c = route_reference(logits, None, 3)
     close(entropy, want_h, atol=1e-5)
     close(confidence, want_c, atol=1e-5)
@@ -96,11 +96,11 @@ def test_moe_route_ties_resolve_to_lower_index(lx):
 def test_moe_route_ties_from_bias(lx):
     # The bias makes three biased logits equal (1.0). The picks follow the biased order, but the
     # weights come from the unbiased logits of the picks: softmax([1.0, 0.0]).
-    logits = torch.tensor([[1.0, 0.0, 0.5, -2.0, -3.0]], device="cuda")
-    bias = torch.tensor([0.0, 1.0, 0.5, 0.0, 0.0], device="cuda")
+    logits = torch.tensor([[1.0, 0.0, 0.5, -2.0, -3.0]], device=DEVICE)
+    bias = torch.tensor([0.0, 1.0, 0.5, 0.0, 0.0], device=DEVICE)
     ids, weights, entropy, confidence = run_route(lx, logits, bias, 2)
     assert ids.tolist() == [[0, 1]]
-    close(weights, torch.softmax(torch.tensor([[1.0, 0.0]], device="cuda"), -1), atol=1e-6)
+    close(weights, torch.softmax(torch.tensor([[1.0, 0.0]], device=DEVICE), -1), atol=1e-6)
     _, _, want_h, want_c = route_reference(logits, bias, 2)
     close(entropy, want_h, atol=1e-5)
     close(confidence, want_c, atol=1e-5)
@@ -125,12 +125,12 @@ def experts_reference(latent, ids, weights, gate_up, down):
 
 
 def make_experts(T, E, L, I, top_k):
-    latent = torch.randn(T, L, device="cuda").to(torch.bfloat16).contiguous()
-    gate_up = (torch.randn(E, 2 * I, L, device="cuda") / L**0.5).to(torch.bfloat16).contiguous()
-    down = (torch.randn(E, L, I, device="cuda") / I**0.5).to(torch.bfloat16).contiguous()
+    latent = torch.randn(T, L, device=DEVICE).to(torch.bfloat16).contiguous()
+    gate_up = (torch.randn(E, 2 * I, L, device=DEVICE) / L**0.5).to(torch.bfloat16).contiguous()
+    down = (torch.randn(E, L, I, device=DEVICE) / I**0.5).to(torch.bfloat16).contiguous()
     # Distinct experts per token, as routing produces.
-    ids = torch.rand(T, E, device="cuda").argsort(-1)[:, :top_k].to(torch.int32).contiguous()
-    weights = torch.softmax(torch.randn(T, top_k, device="cuda"), -1).contiguous()
+    ids = torch.rand(T, E, device=DEVICE).argsort(-1)[:, :top_k].to(torch.int32).contiguous()
+    weights = torch.softmax(torch.randn(T, top_k, device=DEVICE), -1).contiguous()
     return latent, ids, weights, gate_up, down
 
 
@@ -141,7 +141,7 @@ def test_moe_experts_metis(lx, E, T):
     L, I = 1024, 512
     latent, ids, weights, gate_up, down = make_experts(T, E, L, I, TOP_K)
     # Written, not accumulated: the output starts as NaN and must come out fully written.
-    out = torch.full((T, L), float("nan"), device="cuda")
+    out = torch.full((T, L), float("nan"), device=DEVICE)
     lx("moe_experts", latent, ids, weights, gate_up, down, out, T, L, I, TOP_K)
     want = experts_reference(latent, ids, weights, gate_up, down)
     scale = want.abs().max().item()
@@ -161,7 +161,7 @@ def test_moe_experts_metis(lx, E, T):
 def test_moe_experts_small_odd(lx, T, E, L, I, top_k):
     torch.manual_seed(T * 100 + E * 10 + L + I)
     latent, ids, weights, gate_up, down = make_experts(T, E, L, I, top_k)
-    out = torch.full((T, L), float("nan"), device="cuda")
+    out = torch.full((T, L), float("nan"), device=DEVICE)
     lx("moe_experts", latent, ids, weights, gate_up, down, out, T, L, I, top_k)
     want = experts_reference(latent, ids, weights, gate_up, down)
     scale = want.abs().max().item()
@@ -173,8 +173,8 @@ def test_moe_experts_deterministic(lx):
     torch.manual_seed(11)
     T, E, L, I = 300, 128, 1024, 512
     latent, ids, weights, gate_up, down = make_experts(T, E, L, I, TOP_K)
-    first = torch.empty(T, L, device="cuda")
-    second = torch.empty(T, L, device="cuda")
+    first = torch.empty(T, L, device=DEVICE)
+    second = torch.empty(T, L, device=DEVICE)
     lx("moe_experts", latent, ids, weights, gate_up, down, first, T, L, I, TOP_K)
     lx("moe_experts", latent, ids, weights, gate_up, down, second, T, L, I, TOP_K)
     assert torch.equal(first, second)
@@ -185,10 +185,10 @@ def test_moe_experts_deterministic(lx):
 def test_moe_summary_metis(lx, E, T):
     torch.manual_seed(E * 1000 + T)
     R = 256
-    emb = torch.randn(E, R, device="cuda").to(torch.bfloat16).contiguous()
-    ids = torch.rand(T, E, device="cuda").argsort(-1)[:, :TOP_K].to(torch.int32).contiguous()
-    weights = torch.softmax(torch.randn(T, TOP_K, device="cuda"), -1).contiguous()
-    summary = torch.empty(T, R, device="cuda")
+    emb = torch.randn(E, R, device=DEVICE).to(torch.bfloat16).contiguous()
+    ids = torch.rand(T, E, device=DEVICE).argsort(-1)[:, :TOP_K].to(torch.int32).contiguous()
+    weights = torch.softmax(torch.randn(T, TOP_K, device=DEVICE), -1).contiguous()
+    summary = torch.empty(T, R, device=DEVICE)
     lx("moe_summary", ids, weights, emb, summary, T, R, TOP_K)
     want = (weights.double()[:, :, None] * emb[ids.long()].double()).sum(1)
     close(summary, want, atol=1e-5, rtol=1e-5)
@@ -197,10 +197,10 @@ def test_moe_summary_metis(lx, E, T):
 @pytest.mark.parametrize("T,E,R,top_k", [(3, 5, 7, 2), (2, 9, 13, 9)])
 def test_moe_summary_small_odd(lx, T, E, R, top_k):
     torch.manual_seed(T * 100 + E)
-    emb = torch.randn(E, R, device="cuda").to(torch.bfloat16).contiguous()
-    ids = torch.rand(T, E, device="cuda").argsort(-1)[:, :top_k].to(torch.int32).contiguous()
-    weights = torch.softmax(torch.randn(T, top_k, device="cuda"), -1).contiguous()
-    summary = torch.empty(T, R, device="cuda")
+    emb = torch.randn(E, R, device=DEVICE).to(torch.bfloat16).contiguous()
+    ids = torch.rand(T, E, device=DEVICE).argsort(-1)[:, :top_k].to(torch.int32).contiguous()
+    weights = torch.softmax(torch.randn(T, top_k, device=DEVICE), -1).contiguous()
+    summary = torch.empty(T, R, device=DEVICE)
     lx("moe_summary", ids, weights, emb, summary, T, R, top_k)
     want = (weights.double()[:, :, None] * emb[ids.long()].double()).sum(1)
     close(summary, want, atol=1e-5, rtol=1e-5)

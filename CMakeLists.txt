@@ -1,4 +1,19 @@
 cmake_minimum_required(VERSION 3.28)
+# -DLX_BACKEND_METAL=ON builds the Metal backend (liblernex_metal.dylib, Apple silicon) and nothing that
+# needs CUDA; everything below it is the CUDA build.
+option(LX_BACKEND_METAL "Build the Metal backend (Apple silicon) instead of CUDA" OFF)
+if(LX_BACKEND_METAL)
+  project(lernex_engine LANGUAGES C CXX OBJCXX)
+  set(CMAKE_CXX_STANDARD 20)
+  set(CMAKE_CXX_STANDARD_REQUIRED ON)
+  set(CMAKE_OBJCXX_STANDARD 20)
+  if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+  endif()
+  include(engine/metal/metal.cmake)
+  include(engine/metal/e2e/e2e.cmake)
+  return()
+endif()
 # The CUDA architectures this build compiles for, chosen with -DLX_ARCHS:
 #   120a-real  the development default (RTX 50), so an edit-compile loop stays fast
 #   all        every architecture the engine runs on: RTX 30 / A100 (80, 86), RTX 40 (89), H100 (90a),

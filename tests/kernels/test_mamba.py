@@ -8,13 +8,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from conftest import close
+from conftest import DEVICE, close
 
 NAN = float("nan")
 
 
 def i32(values):
-    return torch.tensor(values, dtype=torch.int32, device="cuda")
+    return torch.tensor(values, dtype=torch.int32, device=DEVICE)
 
 
 def cumulative(lengths):
@@ -25,7 +25,7 @@ def cumulative(lengths):
 
 
 def nan_padded(rows, width, data):
-    buf = torch.full((rows, width), NAN, device="cuda")
+    buf = torch.full((rows, width), NAN, device=DEVICE)
     buf[:, : data.shape[1]] = data
     return buf
 
@@ -36,11 +36,11 @@ def nan_padded(rows, width, data):
 def conv_reference(x, w, bias, state, slots, has, lengths, W):
     x, w, bias = x.double(), w.double(), bias.double()
     state = state.double().clone()
-    out = torch.zeros(x.shape[0], x.shape[1], dtype=torch.float64, device="cuda")
+    out = torch.zeros(x.shape[0], x.shape[1], dtype=torch.float64, device=DEVICE)
     start = 0
     for s, (slot, n) in enumerate(zip(slots, lengths)):
         C = x.shape[1]
-        hist = state[slot] if has[s] else torch.zeros(W - 1, C, dtype=torch.float64, device="cuda")
+        hist = state[slot] if has[s] else torch.zeros(W - 1, C, dtype=torch.float64, device=DEVICE)
         full = torch.cat([hist, x[start : start + n]], 0)
         windows = full.unfold(0, W, 1)  # [n, C, W]: windows[t, c, k] = full[t + k, c]
         out[start : start + n] = F.silu(bias + (windows * w).sum(-1))
@@ -62,11 +62,11 @@ CONV_CASES = [
 def test_conv1d_varlen(lx, C, W, lengths, slots, has):
     torch.manual_seed(0)
     T = sum(lengths)
-    x = nan_padded(T, C + 11, torch.randn(T, C, device="cuda"))
-    w = (torch.randn(C, W, device="cuda") * 0.5).to(torch.bfloat16)
-    bias = (torch.randn(C, device="cuda") * 0.1).to(torch.bfloat16)
-    state = torch.randn(max(slots) + 1, W - 1, C, device="cuda")
-    out = torch.full((T, C), NAN, device="cuda")
+    x = nan_padded(T, C + 11, torch.randn(T, C, device=DEVICE))
+    w = (torch.randn(C, W, device=DEVICE) * 0.5).to(torch.bfloat16)
+    bias = (torch.randn(C, device=DEVICE) * 0.1).to(torch.bfloat16)
+    state = torch.randn(max(slots) + 1, W - 1, C, device=DEVICE)
+    out = torch.full((T, C), NAN, device=DEVICE)
     state_k = state.clone()
 
     want, want_state = conv_reference(x[:, :C], w, bias, state, slots, has, lengths, W)
@@ -80,21 +80,21 @@ def test_conv1d_decode_matches_prefill(lx):
     """Prefill, then one token per call, must match the whole sequence in one call."""
     torch.manual_seed(1)
     C, W, L, K = 6144, 4, 37, 9
-    x = torch.randn(L + K, C, device="cuda")
-    w = (torch.randn(C, W, device="cuda") * 0.5).to(torch.bfloat16)
-    bias = (torch.randn(C, device="cuda") * 0.1).to(torch.bfloat16)
+    x = torch.randn(L + K, C, device=DEVICE)
+    w = (torch.randn(C, W, device=DEVICE) * 0.5).to(torch.bfloat16)
+    bias = (torch.randn(C, device=DEVICE) * 0.1).to(torch.bfloat16)
 
-    whole_state = torch.zeros(1, W - 1, C, device="cuda")
-    whole = torch.empty(L + K, C, device="cuda")
+    whole_state = torch.zeros(1, W - 1, C, device=DEVICE)
+    whole = torch.empty(L + K, C, device=DEVICE)
     lx("conv1d_varlen", x, C, w, bias, whole_state, i32([0]), i32([0]), cumulative([L + K]), 1, whole, C, W)
 
-    step_state = torch.zeros(2, W - 1, C, device="cuda")
+    step_state = torch.zeros(2, W - 1, C, device=DEVICE)
     parts = []
-    prefill = torch.empty(L, C, device="cuda")
+    prefill = torch.empty(L, C, device=DEVICE)
     lx("conv1d_varlen", x[:L], C, w, bias, step_state, i32([1]), i32([0]), cumulative([L]), 1, prefill, C, W)
     parts.append(prefill)
     for i in range(K):
-        step = torch.empty(1, C, device="cuda")
+        step = torch.empty(1, C, device=DEVICE)
         lx("conv1d_varlen", x[L + i : L + i + 1], C, w, bias, step_state, i32([1]), i32([1]),
            cumulative([1]), 1, step, C, W)
         parts.append(step)
@@ -109,12 +109,12 @@ def scan_reference(x, dt_raw, B, C, A_log, D, dt_bias, state, slots, has, length
     x, dt_raw, B, C = x.double(), dt_raw.double(), B.double(), C.double()
     A_log, D, dt_bias = A_log.double(), D.double(), dt_bias.double()
     state = state.double().clone()
-    y = torch.zeros(x.shape[0], H, P, dtype=torch.float64, device="cuda")
+    y = torch.zeros(x.shape[0], H, P, dtype=torch.float64, device=DEVICE)
     negA = -torch.exp(A_log)
     rep = H // G
     start = 0
     for s, (slot, n) in enumerate(zip(slots, lengths)):
-        S = state[slot].clone() if has[s] else torch.zeros(H, P, N, dtype=torch.float64, device="cuda")
+        S = state[slot].clone() if has[s] else torch.zeros(H, P, N, dtype=torch.float64, device=DEVICE)
         for t in range(start, start + n):
             dt = F.softplus(dt_raw[t] + dt_bias)  # [H]
             decay = torch.exp(dt * negA)
@@ -133,21 +133,21 @@ def scan_inputs(H, P, G, N, lengths, n_slots, seed, pad_bc=9):
     torch.manual_seed(seed)
     T = sum(lengths)
     ld_x, ld_dt, ld_bc = H * P + 7, H + 3, G * N + pad_bc
-    x = nan_padded(T, ld_x, torch.randn(T, H * P, device="cuda") * 0.5)
-    dt_raw = nan_padded(T, ld_dt, torch.randn(T, H, device="cuda"))
-    B = nan_padded(T, ld_bc, torch.randn(T, G * N, device="cuda") * 0.5)
-    C = nan_padded(T, ld_bc, torch.randn(T, G * N, device="cuda") * 0.5)
-    A_log = torch.log(torch.rand(H, device="cuda") * 3.5 + 0.5)
-    D = torch.randn(H, device="cuda")
-    dt_bias = torch.randn(H, device="cuda") * 0.5
-    state = torch.randn(n_slots, H, P, N, device="cuda") * 0.5  # junk for has_state == 0
+    x = nan_padded(T, ld_x, torch.randn(T, H * P, device=DEVICE) * 0.5)
+    dt_raw = nan_padded(T, ld_dt, torch.randn(T, H, device=DEVICE))
+    B = nan_padded(T, ld_bc, torch.randn(T, G * N, device=DEVICE) * 0.5)
+    C = nan_padded(T, ld_bc, torch.randn(T, G * N, device=DEVICE) * 0.5)
+    A_log = torch.log(torch.rand(H, device=DEVICE) * 3.5 + 0.5)
+    D = torch.randn(H, device=DEVICE)
+    dt_bias = torch.randn(H, device=DEVICE) * 0.5
+    state = torch.randn(n_slots, H, P, N, device=DEVICE) * 0.5  # junk for has_state == 0
     return dict(x=x, ld_x=ld_x, dt_raw=dt_raw, ld_dt=ld_dt, B=B, C=C, ld_bc=ld_bc,
                 A_log=A_log, D=D, dt_bias=dt_bias, state=state)
 
 
 def run_scan(lx, inp, slots, has, lengths, H, P, G, N, state):
     T = sum(lengths)
-    y = torch.full((T, H, P), NAN, device="cuda")
+    y = torch.full((T, H, P), NAN, device=DEVICE)
     lx("ssm_scan_varlen", inp["x"], inp["ld_x"], inp["dt_raw"], inp["ld_dt"], inp["B"], inp["C"],
        inp["ld_bc"], inp["A_log"], inp["D"], inp["dt_bias"], state, i32(slots), i32(has),
        cumulative(lengths), len(lengths), y, H, P, G, N)
@@ -183,10 +183,10 @@ def test_ssm_scan_decode_matches_prefill(lx):
     """Prefill, then one token per call, must match the whole sequence in one call."""
     H, P, G, N, L, K = 64, 64, 8, 128, 40, 8
     inp = scan_inputs(H, P, G, N, [L + K], 2, seed=3)
-    whole_state = torch.zeros(2, H, P, N, device="cuda")
+    whole_state = torch.zeros(2, H, P, N, device=DEVICE)
     whole = run_scan(lx, inp, [1], [0], [L + K], H, P, G, N, whole_state)
 
-    step_state = torch.zeros(2, H, P, N, device="cuda")
+    step_state = torch.zeros(2, H, P, N, device=DEVICE)
     parts = []
     parts.append(run_scan(lx, _slice(inp, 0, L), [1], [0], [L], H, P, G, N, step_state))
     for i in range(K):
@@ -218,10 +218,10 @@ def gated_norm_reference(y, z, w, groups, eps):
 def test_gated_rmsnorm(lx, T, I, groups):
     torch.manual_seed(0)
     eps = 1e-5
-    y = torch.randn(T, I, device="cuda")
-    z = nan_padded(T, I + 5, torch.randn(T, I, device="cuda"))
-    w = (torch.rand(I, device="cuda") + 0.5).to(torch.bfloat16)
-    out = torch.full((T, I), NAN, device="cuda", dtype=torch.bfloat16)
+    y = torch.randn(T, I, device=DEVICE)
+    z = nan_padded(T, I + 5, torch.randn(T, I, device=DEVICE))
+    w = (torch.rand(I, device=DEVICE) + 0.5).to(torch.bfloat16)
+    out = torch.full((T, I), NAN, device=DEVICE, dtype=torch.bfloat16)
     lx("gated_rmsnorm", y, z, z.shape[1], w, out, T, I, groups, eps)
     want = gated_norm_reference(y, z[:, :I], w, groups, eps)
     close(out, want, atol=1e-6, rtol=1e-2)

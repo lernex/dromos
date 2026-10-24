@@ -3,7 +3,7 @@ import math
 import pytest
 import torch
 
-from conftest import close
+from conftest import DEVICE, close
 
 
 @pytest.mark.parametrize(
@@ -27,13 +27,13 @@ from conftest import close
 )
 def test_memory_attend(lx, T, S, M, E, n):
     torch.manual_seed(0)
-    q = torch.randn(T, S, M, device="cuda")
-    bank_k = torch.randn(T, E, M, device="cuda")
-    bank_v = torch.randn(T, E, M, device="cuda")
+    q = torch.randn(T, S, M, device=DEVICE)
+    bank_k = torch.randn(T, E, M, device=DEVICE)
+    bank_v = torch.randn(T, E, M, device=DEVICE)
     # Entries past n are never valid, so they hold NaN: any read of them would show in the output.
     bank_k[:, n:] = float("nan")
     bank_v[:, n:] = float("nan")
-    out = torch.empty(T, S, M, device="cuda", dtype=torch.bfloat16)
+    out = torch.empty(T, S, M, device=DEVICE, dtype=torch.bfloat16)
 
     lx("memory_attend", q, bank_k, bank_v, n, E, out, T, S, M)
 
@@ -64,11 +64,11 @@ def test_memory_attend(lx, T, S, M, E, n):
 )
 def test_memory_fuse(lx, T, S, D):
     torch.manual_seed(0)
-    streams = torch.randn(T, S, D, device="cuda")
-    projected = torch.randn(T, S, D, device="cuda") * 0.5
-    gate = torch.randn(S, D, device="cuda").to(torch.bfloat16)
-    gate_bias = torch.randn(S, device="cuda").to(torch.bfloat16)
-    summary = torch.empty(T, D, device="cuda")
+    streams = torch.randn(T, S, D, device=DEVICE)
+    projected = torch.randn(T, S, D, device=DEVICE) * 0.5
+    gate = torch.randn(S, D, device=DEVICE).to(torch.bfloat16)
+    gate_bias = torch.randn(S, device=DEVICE).to(torch.bfloat16)
+    summary = torch.empty(T, D, device=DEVICE)
 
     # The gate reads the streams before the projected memory is added, so the reference gates
     # the original values. The kernel updates streams in place, so take the reference first.
@@ -87,12 +87,12 @@ def test_memory_fuse(lx, T, S, D):
 @pytest.mark.parametrize("limit", [6.0, 0.5])
 def test_continuation_finish(lx, T, D, limit):
     torch.manual_seed(0)
-    logit = torch.randn(T, device="cuda") * 3.0
-    state = torch.randn(T, D, device="cuda")
-    difference = torch.randn(T, D, device="cuda") * 0.3
+    logit = torch.randn(T, device=DEVICE) * 3.0
+    state = torch.randn(T, D, device=DEVICE)
+    difference = torch.randn(T, D, device=DEVICE) * 0.3
     if T > 1:
         state[0] = 0.0  # an all-zero state takes the 1e-6 floor on the scale
-    out = torch.empty(T, device="cuda")
+    out = torch.empty(T, device=DEVICE)
 
     lx("continuation_finish", logit, state, difference, limit, out, T, D)
 
@@ -106,12 +106,12 @@ def test_continuation_finish(lx, T, D, limit):
 @pytest.mark.parametrize("T,S,M,E,n", [(8, 4, 256, 8, 8), (1, 4, 256, 8, 3)])
 def test_decode_attend_is_repeatable(lx, T, S, M, E, n):
     torch.manual_seed(0)
-    q = torch.randn(T, S, M, device="cuda")
-    bank_k = torch.randn(T, E, M, device="cuda")
-    bank_v = torch.randn(T, E, M, device="cuda")
+    q = torch.randn(T, S, M, device=DEVICE)
+    bank_k = torch.randn(T, E, M, device=DEVICE)
+    bank_v = torch.randn(T, E, M, device=DEVICE)
     first = None
     for _ in range(20):
-        out = torch.empty(T, S, M, device="cuda", dtype=torch.bfloat16)
+        out = torch.empty(T, S, M, device=DEVICE, dtype=torch.bfloat16)
         lx("memory_attend", q, bank_k, bank_v, n, E, out, T, S, M)
         if first is None:
             first = out
@@ -122,14 +122,14 @@ def test_decode_attend_is_repeatable(lx, T, S, M, E, n):
 @pytest.mark.parametrize("T,S,D", [(8, 4, 2048), (1, 8, 2560)])
 def test_decode_fuse_is_repeatable(lx, T, S, D):
     torch.manual_seed(0)
-    streams0 = torch.randn(T, S, D, device="cuda")
-    projected = torch.randn(T, S, D, device="cuda") * 0.5
-    gate = torch.randn(S, D, device="cuda").to(torch.bfloat16)
-    gate_bias = torch.randn(S, device="cuda").to(torch.bfloat16)
+    streams0 = torch.randn(T, S, D, device=DEVICE)
+    projected = torch.randn(T, S, D, device=DEVICE) * 0.5
+    gate = torch.randn(S, D, device=DEVICE).to(torch.bfloat16)
+    gate_bias = torch.randn(S, device=DEVICE).to(torch.bfloat16)
     first = None
     for _ in range(20):
         streams = streams0.clone()  # the kernel updates streams in place
-        summary = torch.empty(T, D, device="cuda")
+        summary = torch.empty(T, D, device=DEVICE)
         lx("memory_fuse", streams, projected, gate, gate_bias, summary, T, S, D)
         if first is None:
             first = (streams, summary)

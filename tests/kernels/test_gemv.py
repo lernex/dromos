@@ -13,7 +13,7 @@ import ctypes
 import pytest
 import torch
 
-from conftest import DTYPE, F32, close
+from conftest import DEVICE, DTYPE, F32, close
 
 W_BF16, W_INT8 = 0, 1
 METIS_SHAPES = [  # (N, K)
@@ -36,9 +36,9 @@ METIS_SHAPES = [  # (N, K)
 
 def make_weights(N, K, w_type):
     if w_type == "bf16":
-        return torch.randn(N, K, device="cuda").to(torch.bfloat16), None
-    q = torch.randint(-127, 128, (N, K), device="cuda").to(torch.int8)
-    scale = (torch.rand(N, device="cuda") * 0.02 + 0.001).float()
+        return torch.randn(N, K, device=DEVICE).to(torch.bfloat16), None
+    q = torch.randint(-127, 128, (N, K), device=DEVICE).to(torch.int8)
+    scale = (torch.rand(N, device=DEVICE) * 0.02 + 0.001).float()
     return q, scale
 
 
@@ -84,12 +84,12 @@ def check(got, want):
 def test_gemv_dtype_matrix(lx, M, x_dtype, w_type, bias_dtype, y_dtype, alpha, beta, K):
     N = 37  # not a multiple of any block's row count
     torch.manual_seed(M * 101 + K + N)
-    x = torch.randn(M, K, device="cuda").to(x_dtype)
+    x = torch.randn(M, K, device=DEVICE).to(x_dtype)
     w, w_scale = make_weights(N, K, w_type)
-    bias = None if bias_dtype is None else torch.randn(N, device="cuda").to(bias_dtype)
-    y0 = torch.randn(M, N, device="cuda").to(y_dtype)
+    bias = None if bias_dtype is None else torch.randn(N, device=DEVICE).to(bias_dtype)
+    y0 = torch.randn(M, N, device=DEVICE).to(y_dtype)
     # With beta 0 the kernel must not read y, so the buffer starts as NaN.
-    y = y0.clone() if beta != 0.0 else torch.full((M, N), float("nan"), device="cuda", dtype=y_dtype)
+    y = y0.clone() if beta != 0.0 else torch.full((M, N), float("nan"), device=DEVICE, dtype=y_dtype)
 
     run_gemv(lx, x, w, w_scale, bias, y, alpha, beta, M, N, K, ld_x=K, ld_y=N)
     check(y, reference(x, w, w_scale, bias, alpha, beta, y0))
@@ -101,10 +101,10 @@ def test_gemv_dtype_matrix(lx, M, x_dtype, w_type, bias_dtype, y_dtype, alpha, b
 def test_gemv_every_m(lx, x_dtype, w_type, M):
     N, K = 300, 1024
     torch.manual_seed(M)
-    x = torch.randn(M, K, device="cuda").to(x_dtype)
+    x = torch.randn(M, K, device=DEVICE).to(x_dtype)
     w, w_scale = make_weights(N, K, w_type)
-    bias = torch.randn(N, device="cuda")
-    y = torch.empty(M, N, device="cuda")
+    bias = torch.randn(N, device=DEVICE)
+    y = torch.empty(M, N, device=DEVICE)
     run_gemv(lx, x, w, w_scale, bias, y, 1.0, 0.0, M, N, K, ld_x=K, ld_y=N)
     check(y, reference(x, w, w_scale, bias, 1.0, 0.0, None))
 
@@ -116,10 +116,10 @@ def test_gemv_every_m(lx, x_dtype, w_type, M):
 def test_gemv_strided(lx, M, x_dtype, w_type, pad):
     N, K = 300, 1024
     torch.manual_seed(M * 7 + pad)
-    x_buf = torch.randn(M, K + pad, device="cuda").to(x_dtype)
+    x_buf = torch.randn(M, K + pad, device=DEVICE).to(x_dtype)
     w, w_scale = make_weights(N, K, w_type)
-    bias = torch.randn(N, device="cuda").to(torch.bfloat16)
-    y0 = torch.randn(M, N + pad, device="cuda")
+    bias = torch.randn(N, device=DEVICE).to(torch.bfloat16)
+    y0 = torch.randn(M, N + pad, device=DEVICE)
     y_buf = y0.clone()
 
     run_gemv(lx, x_buf, w, w_scale, bias, y_buf, 2.0, 0.5, M, N, K, ld_x=K + pad, ld_y=N + pad)
@@ -134,9 +134,9 @@ def test_gemv_strided(lx, M, x_dtype, w_type, pad):
 def test_gemv_odd_and_small_k(lx, x_dtype, w_type, K):
     N, M = 21, 3
     torch.manual_seed(K)
-    x = torch.randn(M, K, device="cuda").to(x_dtype)
+    x = torch.randn(M, K, device=DEVICE).to(x_dtype)
     w, w_scale = make_weights(N, K, w_type)
-    y = torch.empty(M, N, device="cuda")
+    y = torch.empty(M, N, device=DEVICE)
     run_gemv(lx, x, w, w_scale, None, y, 1.0, 0.0, M, N, K, ld_x=K, ld_y=N)
     check(y, reference(x, w, w_scale, None, 1.0, 0.0, None))
 
@@ -146,9 +146,9 @@ def test_gemv_odd_and_small_k(lx, x_dtype, w_type, K):
 @pytest.mark.parametrize("w_type", ["bf16", "int8"])
 def test_gemv_metis_shapes(lx, N, K, M, w_type):
     torch.manual_seed(N * 31 + K + M)
-    x = torch.randn(M, K, device="cuda")
+    x = torch.randn(M, K, device=DEVICE)
     w, w_scale = make_weights(N, K, w_type)
-    y = torch.empty(M, N, device="cuda")
+    y = torch.empty(M, N, device=DEVICE)
     run_gemv(lx, x, w, w_scale, None, y, 1.0, 0.0, M, N, K, ld_x=K, ld_y=N)
     check(y, reference(x, w, w_scale, None, 1.0, 0.0, None))
 
@@ -158,10 +158,10 @@ def test_gemv_metis_shapes(lx, N, K, M, w_type):
 def test_gemv_is_deterministic(lx, M, N, K, w_type):
     # No atomics: split-K sums combine in a fixed order, so two runs agree bit for bit.
     torch.manual_seed(M + N)
-    x = torch.randn(M, K, device="cuda")
+    x = torch.randn(M, K, device=DEVICE)
     w, w_scale = make_weights(N, K, w_type)
-    first = torch.empty(M, N, device="cuda")
-    second = torch.empty(M, N, device="cuda")
+    first = torch.empty(M, N, device=DEVICE)
+    second = torch.empty(M, N, device=DEVICE)
     run_gemv(lx, x, w, w_scale, None, first, 1.0, 0.0, M, N, K, ld_x=K, ld_y=N)
     run_gemv(lx, x, w, w_scale, None, second, 1.0, 0.0, M, N, K, ld_x=K, ld_y=N)
     assert torch.equal(first, second)
@@ -171,11 +171,11 @@ def test_gemv_int8_is_exactly_the_dequantized_product(lx):
     # Scales are applied once per row: a row of q with scale s must match x @ (q * s) in float64.
     N, K, M = 64, 2048, 2
     torch.manual_seed(5)
-    x = torch.randn(M, K, device="cuda")
-    q = torch.full((N, K), 127, dtype=torch.int8, device="cuda")
+    x = torch.randn(M, K, device=DEVICE)
+    q = torch.full((N, K), 127, dtype=torch.int8, device=DEVICE)
     q[::2] = -127
-    scale = torch.linspace(0.5, 2.0, N, device="cuda")
-    y = torch.empty(M, N, device="cuda")
+    scale = torch.linspace(0.5, 2.0, N, device=DEVICE)
+    y = torch.empty(M, N, device=DEVICE)
     run_gemv(lx, x, q, scale, None, y, 1.0, 0.0, M, N, K, ld_x=K, ld_y=N)
     check(y, reference(x, q, scale, None, 1.0, 0.0, None))
 
@@ -193,9 +193,9 @@ def quant_reference(w):
 @pytest.mark.parametrize("rows,cols", [(1, 8), (7, 2048), (300, 1000), (2048, 1024), (131072, 1024)])
 def test_quantize_w8_matches_reference(lx, rows, cols):
     torch.manual_seed(rows + cols)
-    w = (torch.randn(rows, cols, device="cuda") * torch.rand(rows, 1, device="cuda") * 4).to(torch.bfloat16)
-    q = torch.empty(rows, cols, dtype=torch.int8, device="cuda")
-    scale = torch.empty(rows, dtype=torch.float32, device="cuda")
+    w = (torch.randn(rows, cols, device=DEVICE) * torch.rand(rows, 1, device=DEVICE) * 4).to(torch.bfloat16)
+    q = torch.empty(rows, cols, dtype=torch.int8, device=DEVICE)
+    scale = torch.empty(rows, dtype=torch.float32, device=DEVICE)
     lx("quantize_w8", w, q, scale, ctypes.c_int64(rows), cols)
     q_ref, s_ref = quant_reference(w)
     assert torch.equal(scale, s_ref), "row scales differ from absmax / 127"
@@ -209,11 +209,11 @@ def test_quantize_w8_ties_round_half_even_and_zero_rows(lx):
             [0.0] * 8,  # all zero: scale 1, q 0
             [254.0, 1.0, 3.0, -5.0, 0.0, 0.0, 0.0, 0.0],  # scale 2: 0.5 and 1.5 and -2.5 are ties
         ],
-        device="cuda",
+        device=DEVICE,
         dtype=torch.bfloat16,
     )
-    q = torch.empty(3, 8, dtype=torch.int8, device="cuda")
-    scale = torch.empty(3, dtype=torch.float32, device="cuda")
+    q = torch.empty(3, 8, dtype=torch.int8, device=DEVICE)
+    scale = torch.empty(3, dtype=torch.float32, device=DEVICE)
     lx("quantize_w8", w, q, scale, ctypes.c_int64(3), 8)
     assert scale.tolist() == [1.0, 1.0, 2.0]
     assert q.tolist() == [

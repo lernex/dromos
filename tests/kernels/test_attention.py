@@ -13,7 +13,7 @@ from itertools import accumulate
 import pytest
 import torch
 
-from conftest import close
+from conftest import DEVICE, close
 
 NAN = float("nan")
 torch.backends.cuda.matmul.allow_tf32 = False  # the reference is full float32
@@ -21,12 +21,12 @@ torch.backends.cuda.matmul.allow_tf32 = False  # the reference is full float32
 
 def caches(n_slots, capacity, kvh, dh, seqs):
     """K and V caches: NaN, except earlier steps' random rows before each sequence's start."""
-    k = torch.full((n_slots, capacity, kvh, dh), NAN, device="cuda", dtype=torch.bfloat16)
+    k = torch.full((n_slots, capacity, kvh, dh), NAN, device=DEVICE, dtype=torch.bfloat16)
     v = torch.full_like(k, NAN)
     for slot, start, _ in seqs:
         if start:
-            k[slot, :start] = torch.randn(start, kvh, dh, device="cuda").to(torch.bfloat16)
-            v[slot, :start] = torch.randn(start, kvh, dh, device="cuda").to(torch.bfloat16)
+            k[slot, :start] = torch.randn(start, kvh, dh, device=DEVICE).to(torch.bfloat16)
+            v[slot, :start] = torch.randn(start, kvh, dh, device=DEVICE).to(torch.bfloat16)
     return k, v
 
 
@@ -35,7 +35,7 @@ def reference(qkv, k_ref, v_ref, slots, starts, cu, H, KVH, Dh):
     G = H // KVH
     scale = 1.0 / math.sqrt(Dh)
     qw, kw = H * Dh, KVH * Dh
-    out = torch.empty(qkv.shape[0], H * Dh, device="cuda", dtype=torch.float32)
+    out = torch.empty(qkv.shape[0], H * Dh, device=DEVICE, dtype=torch.float32)
     for s, (slot, start) in enumerate(zip(slots, starts)):
         a, b = cu[s], cu[s + 1]
         n = b - a
@@ -46,7 +46,7 @@ def reference(qkv, k_ref, v_ref, slots, starts, cu, H, KVH, Dh):
         for j in range(n):
             t = a + j
             # Explicit causal mask over the whole cache: token j sees rows 0 .. start + j.
-            visible = torch.arange(k_ref.shape[1], device="cuda") < start + j + 1
+            visible = torch.arange(k_ref.shape[1], device=DEVICE) < start + j + 1
             k = torch.where(visible[:, None, None], k_ref[slot].float(), 0.0)
             v = torch.where(visible[:, None, None], v_ref[slot].float(), 0.0)
             q = qkv[t, :qw].reshape(KVH, G, Dh) * scale
@@ -58,7 +58,7 @@ def reference(qkv, k_ref, v_ref, slots, starts, cu, H, KVH, Dh):
 
 def run(lx, qkv, col, k_cache, v_cache, slots, starts, cu, H, KVH, Dh):
     """One kernel step. qkv is a f32 buffer, possibly wider than the step; q | k | v start at col."""
-    out = torch.empty(qkv.shape[0], H * Dh, device="cuda", dtype=torch.bfloat16)
+    out = torch.empty(qkv.shape[0], H * Dh, device=DEVICE, dtype=torch.bfloat16)
     lx("attention_varlen", ctypes.c_void_p(qkv.data_ptr() + 4 * col), qkv.stride(0), k_cache, v_cache,
        slots, starts, cu, slots.numel(), k_cache.shape[1], out, H, KVH, Dh, 1.0 / math.sqrt(Dh))
     return out
@@ -76,15 +76,15 @@ def check_step(lx, *, H, KVH, Dh, capacity, seqs, n_slots, seed, col=0, pad=0):
     cu = [0, *accumulate(lens)]
     slot_list, start_list = [s for s, _, _ in seqs], [p for _, p, _ in seqs]
     torch.manual_seed(seed)
-    qkv = torch.randn(sum(lens), col + width + pad, device="cuda")
+    qkv = torch.randn(sum(lens), col + width + pad, device=DEVICE)
     qkv[:, :col] = NAN
     qkv[:, col + width:] = NAN
     k, v = caches(n_slots, capacity, KVH, Dh, seqs)
     k_ref, v_ref = k.clone(), v.clone()
     want = reference(qkv[:, col:col + width], k_ref, v_ref, slot_list, start_list, cu, H, KVH, Dh)
-    t_slots = torch.tensor(slot_list, dtype=torch.int32, device="cuda")
-    t_starts = torch.tensor(start_list, dtype=torch.int32, device="cuda")
-    t_cu = torch.tensor(cu, dtype=torch.int32, device="cuda")
+    t_slots = torch.tensor(slot_list, dtype=torch.int32, device=DEVICE)
+    t_starts = torch.tensor(start_list, dtype=torch.int32, device=DEVICE)
+    t_cu = torch.tensor(cu, dtype=torch.int32, device=DEVICE)
     out = run(lx, qkv, col, k, v, t_slots, t_starts, t_cu, H, KVH, Dh)
     close(out, want, atol=1e-2, rtol=1e-2)
     same_bits(k, k_ref)
@@ -121,10 +121,10 @@ def test_prefill_then_decode_matches_single_shot(lx):
     H, KVH, Dh, T, cap = 8, 2, 64, 30, 64
     width = (H + 2 * KVH) * Dh
     torch.manual_seed(3)
-    qkv = torch.randn(T, width, device="cuda")
-    slots = torch.tensor([2], dtype=torch.int32, device="cuda")
-    one_shot_cu = torch.tensor([0, T], dtype=torch.int32, device="cuda")
-    starts = torch.tensor([0], dtype=torch.int32, device="cuda")
+    qkv = torch.randn(T, width, device=DEVICE)
+    slots = torch.tensor([2], dtype=torch.int32, device=DEVICE)
+    one_shot_cu = torch.tensor([0, T], dtype=torch.int32, device=DEVICE)
+    starts = torch.tensor([0], dtype=torch.int32, device=DEVICE)
 
     k, v = caches(4, cap, KVH, Dh, [(2, 0, T)])
     k_ref, v_ref = k.clone(), v.clone()
@@ -136,8 +136,8 @@ def test_prefill_then_decode_matches_single_shot(lx):
     kc, vc = caches(4, cap, KVH, Dh, [(2, 0, T)])
     parts = []
     for a, b in [(0, 12)] + [(j, j + 1) for j in range(12, T)]:
-        cu = torch.tensor([0, b - a], dtype=torch.int32, device="cuda")
-        start = torch.tensor([a], dtype=torch.int32, device="cuda")
+        cu = torch.tensor([0, b - a], dtype=torch.int32, device=DEVICE)
+        start = torch.tensor([a], dtype=torch.int32, device=DEVICE)
         parts.append(run(lx, qkv[a:b], 0, kc, vc, slots, start, cu, H, KVH, Dh))
     close(torch.cat(parts), single, atol=1e-2, rtol=1e-2)
     same_bits(kc, k)
