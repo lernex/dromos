@@ -289,7 +289,8 @@ typedef struct {
 typedef enum { LX_MATH_BF16 = 0, LX_MATH_INT8 = 1, LX_MATH_FP8 = 2, LX_MATH_FP4 = 3 } lx_math;
 
 // Decode GEMV on any weight format (generalizes lx_gemv; same contract for x, bias, y, alpha,
-// beta, M <= 8). Weight-only: the weight is expanded in registers, the math is f32.
+// beta, M <= 8). Weight-only: the weight is expanded in registers, the math is f32. LX_W_BF16X
+// weights are run by lx_gemv_bf16x (below), so every format enters through this one call.
 LX_API int lx_gemv_w(const void* x, lx_dtype x_dtype, int ld_x, const lx_weight* w, const void* bias,
                      lx_dtype bias_dtype, void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K, float alpha,
                      float beta, void* stream);
@@ -345,6 +346,11 @@ LX_API int64_t lx_moe_grouped_workspace_bytes(int T, int L, int I, int E, int to
 // block's e4m3 scale as its absmax / (6 * global), rounded to e4m3. Used when the engine is asked
 // for a format the file is not stored in; checkpoints made with GPTQ are loaded as they are.
 LX_API int lx_quantize_weight(const void* w, lx_weight* out, int64_t rows, int cols, void* stream);
+
+// The reverse: out[r, c] = w[r, c] as bf16 for an [rows, cols] matrix in any format, with its row
+// factor applied (the row scale, or the NVFP4 global). The loader uses it to hold a quantized
+// embedding's bf16 gather table, and the acceptance checks compare dequantized weights with BF16.
+LX_API int lx_dequantize_weight(const lx_weight* w, void* out, int64_t rows, int cols, void* stream);
 
 // ---- Sampling (sampler.cu) ------------------------------------------------------------------
 // One launch draws the next token of every sequence in a batch. Row i reads logits row

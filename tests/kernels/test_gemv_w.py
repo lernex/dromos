@@ -7,10 +7,12 @@ stored bytes stand for. Tolerances are relative to the largest output magnitude:
 rounded once (2^-8 of its value), an f32 output differs only in summation order (2e-4 is generous).
 """
 
+import ctypes
+
 import pytest
 import torch
 
-from conftest import DTYPE, F32, close
+from conftest import BF16, DTYPE, F32, close
 from formats import FORMATS, W_BF16, W_FP8, W_INT8, W_NVFP4, random_weight
 
 FMT_NAMES = list(FORMATS)
@@ -183,3 +185,60 @@ def test_lx_gemv_wrapper_matches_gemv_w(lx):
             lx("gemv", x, DTYPE[x.dtype], K, w.data, 0, None, None, F32, a, F32, N, M, N, K, 1.0, 0.0)
         run_w(lx, x, w, None, b, 1.0, 0.0, M, N, K)
         assert torch.equal(a, b)
+
+
+@pytest.mark.parametrize("x_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("fmt", FMT_NAMES)
+def test_gemv_w_every_variant(lx, fmt, x_dtype):
+    # The autotuner may pin any built variant for a shape, so each one must compute the same product:
+    # row counts that leave partial row groups, a K whose last step is partial (1040 = 4 * 256 + 16,
+    # and 1296 = 5 * 256 + 16 in the M = 8 bucket, where both loop styles are built), splits with more
+    # parts than steps, and M below its bucket.
+    import ctypes
+
+    lib = lx.lib
+    lib.lx_tune_set.restype = None
+    lib.lx_tune_set.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+    lib.lx_tune_clear.restype = None
+    lib.lx_tune_clear.argtypes = []
+    lib.lx_tune_variants.restype = ctypes.c_int
+    lib.lx_tune_variants.argtypes = [ctypes.c_char_p]
+    kernel = f"gemv_w_{fmt}".encode()
+    variants = lib.lx_tune_variants(kernel)
+    assert variants > 0
+    try:
+        for M, N, K in [(1, 300, 1040), (3, 77, 2048), (8, 129, 1024), (5, 50, 1296), (2, 64, 528)]:
+            torch.manual_seed(M * 13 + N + K)
+            x = torch.randn(M, K, device="cuda").to(x_dtype)
+            w = random_weight(FORMATS[fmt], N, K, seed=N + K)
+            bias = torch.randn(N, device="cuda")
+            want = reference(x, w.dense, bias, 1.0, 0.0, None)
+            for v in range(variants):
+                lib.lx_tune_clear()
+                lib.lx_tune_set(kernel, M, N, K, v)
+                y = torch.full((M, N), float("nan"), device="cuda")
+                run_w(lx, x, w, bias, y, 1.0, 0.0, M, N, K)
+                check(y, want)
+    finally:
+        lib.lx_tune_clear()
+
+
+@pytest.mark.parametrize("M", [1, 2, 4, 8])
+def test_bf16x_routes_to_the_lossless_gemv(lx, M):
+    # lx_gemv_w on LX_W_BF16X is lx_gemv_bf16x, bit for bit, and that is the product of the bf16 matrix.
+    from test_bf16x import encode
+    from formats import LxWeight, W_BF16X
+
+    N, K = 1024, 2048
+    torch.manual_seed(40 + M)
+    w = (torch.randn(N, K, device="cuda") * 0.1).to(torch.bfloat16)
+    data = encode(lx, w)
+    lw = LxWeight(type=W_BF16X, data=data.data_ptr(), scale=None, global_=1.0, expert_global=None)
+    x = torch.randn(M, K, device="cuda").to(torch.bfloat16)
+    y = torch.empty(M, N, dtype=torch.float32, device="cuda")
+    lx("gemv_w", x, BF16, K, ctypes.pointer(lw), None, F32, y, F32, N, M, N, K, 1.0, 0.0)
+    direct = torch.empty(M, N, dtype=torch.float32, device="cuda")
+    lx("gemv_bf16x", x, BF16, K, data, None, F32, direct, F32, N, M, N, K, 1.0, 0.0)
+    assert torch.equal(y, direct)
+    want = x.double() @ w.double().T
+    close(y, want.float(), atol=2e-4 * want.abs().max().item())
