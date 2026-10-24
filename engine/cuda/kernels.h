@@ -183,7 +183,7 @@ LX_API int lx_moe_summary(const int32_t* ids, const float* weights, const void* 
 //   y[m, n] = alpha * (sum_k x[m, k] * w[n, k] + bias[n]) + beta * y[m, n]
 // x: [M, K] (x_dtype, row stride ld_x); bias: [N] (bias_dtype, or null); y: [M, N] (y_dtype,
 // row stride ld_y; read only when beta != 0). Accumulation in f32. Deterministic (no atomics).
-typedef enum { LX_W_BF16 = 0, LX_W_INT8 = 1, LX_W_FP8 = 2, LX_W_NVFP4 = 3 } lx_wtype;
+typedef enum { LX_W_BF16 = 0, LX_W_INT8 = 1, LX_W_FP8 = 2, LX_W_NVFP4 = 3, LX_W_BF16X = 4 } lx_wtype;
 LX_API int lx_gemv(const void* x, lx_dtype x_dtype, int ld_x, const void* w, lx_wtype w_type, const float* w_scale,
                    const void* bias, lx_dtype bias_dtype, void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K,
                    float alpha, float beta, void* stream);
@@ -216,8 +216,16 @@ LX_API int64_t lx_moe_workspace_bytes(int T, int I, int top_k);
 //                                                     w[n, k] = e2m1[n, k] * scale[n, k / 16] * global
 //               (requires K % 16 == 0; the loader folds a checkpoint's global scale so the
 //               engine always multiplies)
+//   LX_W_BF16X  lossless compressed bf16: exactly the checkpoint's bf16 values in ~12.1 to 12.3 bits
+//               each. data is a sequence of N fixed-size rows of lx_bf16x_row_bytes(K) bytes (then
+//               rarely an overflow area); scale unused. Each row: u32 patch slots (at least 2 + K /
+//               2048), one base exponent byte per 128 k, padding to 8 bytes, then per 128 k a 192-byte block:
+//               128 bytes of sign << 7 | mantissa, then 64 bytes of 4-bit codes (exponent = base -
+//               code). Values further than 15 binades below their block's base are listed in the
+//               row's patch slots as (k << 8 | exponent). Full layout: cuda/bf16x.cuh.
 // Stacked expert weights are [E, N, K] in the same format, every expert laid out as above, one
 // after the other (scales likewise [E, N] or [E, N, K / 16]; global is one value for the stack).
+// For LX_W_BF16X a stack is simply E * N rows.
 typedef struct {
   lx_wtype type;
   const void* data;
@@ -275,6 +283,46 @@ LX_API int64_t lx_moe_grouped_workspace_bytes(int T, int L, int I, int E, int to
 // block's e4m3 scale as its absmax / (6 * global), rounded to e4m3. Used when the engine is asked
 // for a format the file is not stored in; checkpoints made with GPTQ are loaded as they are.
 LX_API int lx_quantize_weight(const void* w, lx_weight* out, int64_t rows, int cols, void* stream);
+
+// ---- Lossless BF16 (bf16x.cu) ---------------------------------------------------------------
+// LX_W_BF16X: the checkpoint's bf16 weights in 12.1 to 12.3 bits each, reproducing every bit, so a
+// decode product reads ~1.3x fewer bytes with no change at all to its result. The products below are
+// bit-identical to the bf16 kernels they stand in for (same lane mapping, split and summation order):
+// a model that swaps them in produces the same logits to the last bit.
+
+// Bytes of one encoded row of K values (-1 for K out of range: 0 < K < 2^23).
+LX_API int64_t lx_bf16x_row_bytes(int K);
+// Bytes the encoding of w (bf16 [rows, K], row-major; a stack [E, N, K] is E * N rows) needs: rows *
+// lx_bf16x_row_bytes(K), plus overflow records for rows with more patches than their slots (none in
+// Praxis). Synchronizes the stream; scratch from cudaMallocAsync. Returns -(CUDA error) on failure.
+LX_API int64_t lx_bf16x_bytes(const void* w, int64_t rows, int K, void* stream);
+// Encodes w into out (8-byte aligned, out_bytes >= lx_bf16x_bytes). Deterministic: the same weights
+// always give the same bytes. Synchronizes the stream once; for load time, not for graph capture.
+LX_API int lx_bf16x_encode(const void* w, int64_t rows, int K, void* out, int64_t out_bytes, void* stream);
+// Decodes an encoding back to bf16 [rows, K] (for tests and for checking a load).
+LX_API int lx_bf16x_decode(const void* data, int64_t rows, int K, void* w, void* stream);
+
+// lx_gemv for LX_W_BF16X weights w ([N, K] encoded, 8-byte aligned): the same contract (x, bias, y,
+// alpha, beta, M <= 8, f32 accumulation, deterministic, programmatic dependent launch), and y equal
+// bit for bit to lx_gemv on the bf16 weights the encoding came from.
+LX_API int lx_gemv_bf16x(const void* x, lx_dtype x_dtype, int ld_x, const void* w, const void* bias,
+                         lx_dtype bias_dtype, void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K, float alpha,
+                         float beta, void* stream);
+
+// Routed experts on LX_W_BF16X stacks, for decode (few tokens): the contract of lx_moe_experts with
+// gate_up the encoding of [E, 2I, L] and down of [E, L, I] (16-byte aligned), a caller-owned
+// workspace (16-byte aligned, at least lx_moe_bf16x_workspace_bytes(T, I, top_k)), and top_k <= 8.
+// out equals lx_moe_experts on the bf16 stacks bit for bit. Nothing is allocated, so the call can be
+// captured in a CUDA graph.
+LX_API int lx_moe_experts_bf16x(const void* latent, const int32_t* ids, const float* weights, const void* gate_up,
+                                const void* down, float* out, void* workspace, int T, int L, int I, int top_k,
+                                void* stream);
+// The same kernels on plain bf16 stacks: the baseline the format is measured against, and a
+// drop-in decode replacement for lx_moe_experts (bit-identical to it, graph-capturable).
+LX_API int lx_moe_experts_decode_bf16(const void* latent, const int32_t* ids, const float* weights,
+                                      const void* gate_up, const void* down, float* out, void* workspace, int T,
+                                      int L, int I, int top_k, void* stream);
+LX_API int64_t lx_moe_bf16x_workspace_bytes(int T, int I, int top_k);
 
 #ifdef __cplusplus
 }
