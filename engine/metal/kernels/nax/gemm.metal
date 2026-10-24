@@ -8,8 +8,9 @@
 // bf16 values and int8 codes are staged as they are stored; the other formats as their exact decoded
 // values (as in gemm.metal: a quantized code times its block scale has at most 6 significant bits) in
 // bf16, which represents every one of them. The accelerators multiply bf16 by bf16 or by int8 into
-// f32, and int8 by int8 (INT8 math) exactly into int32. Row factors are applied once in the epilogue,
-// which reads the finished tile back from threadgroup memory.
+// f32, and int8 by int8 (INT8 math) exactly into int32. (Staging int8 codes as bf16, to multiply bf16
+// by bf16, the accelerators' faster pair, measured no faster on the M5.) Row factors are applied once in
+// the epilogue, which reads the finished tile back from threadgroup memory.
 //
 // Two stages of threadgroup memory: the next step's values are loaded into registers before the
 // accelerators run on the current stage and stored into the other one after, so one barrier per step
@@ -178,3 +179,48 @@ LX_GEMM_NAX(0, 0, 1) LX_GEMM_NAX(0, 1, 1) LX_GEMM_NAX(0, 2, 1) LX_GEMM_NAX(0, 3,
 LX_GEMM_NAX(2, 1, 1) LX_GEMM_NAX(3, 2, 1) LX_GEMM_NAX(3, 3, 1) LX_GEMM_NAX(4, 3, 1)
 LX_GEMM_NAX(0, 0, 2) LX_GEMM_NAX(0, 1, 2) LX_GEMM_NAX(0, 2, 2) LX_GEMM_NAX(0, 3, 2)
 LX_GEMM_NAX(2, 1, 2) LX_GEMM_NAX(3, 2, 2) LX_GEMM_NAX(3, 3, 2) LX_GEMM_NAX(4, 3, 2)
+
+// ---- Straight from device memory ---------------------------------------------------------------
+// A plain product of bf16 activations with BF16 or INT8 weights (the common ones under BF16 math) needs
+// no decoding, so the accelerators read both operands from device memory themselves: one matmul2d over
+// device tensors, K looped inside the op. On the M5 that runs 1.3x to 1.7x faster than staging the tiles
+// through threadgroup memory (Praxis prefill shapes). The finished 64 x 64 tile goes through threadgroup
+// memory to the epilogue, which writes it row by row so each simdgroup's stores are contiguous.
+// Grid (N / 64, M / 64), 128 threads, 16 KB of threadgroup memory. The host takes this path only when
+// the rows are 16-byte aligned and K is a multiple of 16.
+template <int WF>
+kernel void gemm_nax_dev(constant GemmArgs& a [[buffer(0)]], threadgroup float* smem [[threadgroup(0)]],
+                         uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+  using TB = typename NaxB<WF>::T;
+  const int M = a.M, N = a.N, K = a.K;
+  const int m0 = int(tg.y) * kTileM, n0 = int(tg.x) * kTileN;
+  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> A((device bfloat*)a.x, dextents<int32_t, 2>(K, M),
+                                                              array<int32_t, 2>{1, a.ld_x});
+  tensor<device TB, dextents<int32_t, 2>, tensor_inline> B((device TB*)a.w.data, dextents<int32_t, 2>(K, N),
+                                                          array<int32_t, 2>{1, K});
+  constexpr auto desc = matmul2d_descriptor(kTileM, kTileN, static_cast<int>(dynamic_extent), false, true, false,
+                                            matmul2d_descriptor::mode::multiply);
+  matmul2d<desc, execution_simdgroups<4>> op;
+  auto mA = A.slice(0, m0);
+  auto mB = B.slice(0, n0);
+  auto acc = op.template get_destination_cooperative_tensor<decltype(mA), decltype(mB), float>();
+  op.run(mA, mB, acc);
+  tensor<threadgroup float, extents<int32_t, kTileN, kTileM>, tensor_inline> tc(smem, extents<int32_t, kTileN, kTileM>());
+  acc.store(tc);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int e = int(tid); e < kTileM * kTileN; e += 128) {
+    const int m = m0 + e / kTileN, n = n0 + e % kTileN;
+    if (m >= M || n >= N) continue;
+    float val = smem[e] * row_factor<WF>(a.w.scale, n, a.w.global);
+    if (a.bias) val += load_val(a.bias, n, a.bias_bf16);
+    val *= a.alpha;
+    const long at = long(m) * a.ld_y + n;
+    if (a.beta != 0.0f) val += a.beta * load_val(a.y, at, a.y_bf16);
+    store_val(a.y, at, val, a.y_bf16);
+  }
+}
+
+template [[host_name("gemm_nax_dev_0")]] kernel void gemm_nax_dev<W_BF16>(constant GemmArgs&, threadgroup float*, uint2,
+                                                                          uint);
+template [[host_name("gemm_nax_dev_1")]] kernel void gemm_nax_dev<W_INT8>(constant GemmArgs&, threadgroup float*, uint2,
+                                                                          uint);

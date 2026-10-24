@@ -26,6 +26,8 @@ std::string gemm_nax_name(int i) {
 }
 KernelSet<90> g_gemm(gemm_name);
 KernelSet<90> g_gemm_nax(gemm_nax_name, true);
+std::string gemm_nax_dev_name(int i) { return "gemm_nax_dev_" + std::to_string(i); }
+KernelSet<2> g_gemm_nax_dev(gemm_nax_dev_name, true);  // BF16, INT8 weights from bf16 activations
 
 }  // namespace
 
@@ -111,7 +113,12 @@ int lx_gemm_w(const void* x, lx_dtype x_dtype, int ld_x, const lx_weight* w, lx_
   a.beta = beta;
   a.bias_bf16 = bias_dtype == LX_BF16;
   a.y_bf16 = y_dtype == LX_BF16;
-  return launch_gemm(af, w->type, 0, stream, a, size2(ceil_div(N, kTileN), ceil_div(M, kTileM)));
+  const MTLSize groups = size2(ceil_div(N, kTileN), ceil_div(M, kTileM));
+  // bf16 activations on BF16 or INT8 weights: the accelerators read both from device memory.
+  if (af == kActBf16 && (w->type == LX_W_BF16 || w->type == LX_W_INT8) && a.x_vec && K % 16 == 0 &&
+      (reinterpret_cast<uintptr_t>(w->data) & 15) == 0 && Device::get().nax())
+    return g_gemm_nax_dev.launch(w->type, stream, a, groups, size1(kGemmThreads), kGemmSmemNax);
+  return launch_gemm(af, w->type, 0, stream, a, groups);
 }
 
 int lx_gemm_bf16(const void* x, int ld_x, const void* w, const void* bias, void* y, lx_dtype y_dtype, int ld_y, int M,
