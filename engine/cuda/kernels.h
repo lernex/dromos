@@ -201,6 +201,43 @@ LX_API int lx_moe_experts_w8(const void* latent, const int32_t* ids, const float
                              void* workspace, int T, int L, int I, int top_k, void* stream);
 LX_API int64_t lx_moe_workspace_bytes(int T, int I, int top_k);
 
+// ---- Runtime (every backend) ----------------------------------------------------------------
+// The kernels.h ABI is the backend interface: the CUDA, HIP, Metal and CPU backends are each one
+// shared library exporting every lx_* function here, and the model code calls nothing else (no
+// CUDA runtime calls), so one model implementation runs on all of them. "Device memory" is what
+// the backend's kernels read: VRAM on CUDA/HIP, shared MTLBuffers on Metal (pointers are their
+// contents addresses), host memory on the CPU. A stream orders work (a CUDA/HIP stream, a Metal
+// command queue, a CPU work queue); null is the backend's default. Errors use the CUDA codes
+// (0 success, LX_ERR_NOT_SUPPORTED when a backend lacks a feature, e.g. graph capture).
+#define LX_ERR_NOT_SUPPORTED 801
+typedef enum { LX_BACKEND_CUDA = 0, LX_BACKEND_HIP = 1, LX_BACKEND_METAL = 2, LX_BACKEND_CPU = 3 } lx_backend;
+typedef enum { LX_COPY_H2D = 0, LX_COPY_D2H = 1, LX_COPY_D2D = 2 } lx_copy_kind;
+
+LX_API int lx_rt_backend(void);
+LX_API int lx_rt_device_count(void);
+LX_API int lx_rt_set_device(int ordinal);
+LX_API int lx_rt_alloc(void** ptr, int64_t bytes);  // zeroed
+LX_API int lx_rt_free(void* ptr);
+LX_API int lx_rt_host_alloc(void** ptr, int64_t bytes);  // pinned / page-locked host memory where it exists
+LX_API int lx_rt_host_free(void* ptr);
+LX_API int lx_rt_memset(void* ptr, int value, int64_t bytes, void* stream);
+LX_API int lx_rt_copy(void* dst, const void* src, int64_t bytes, lx_copy_kind kind, void* stream);
+LX_API int lx_rt_stream_create(void** stream);
+LX_API int lx_rt_stream_destroy(void* stream);
+LX_API int lx_rt_stream_sync(void* stream);
+// Events: record on a stream, wait for on the host.
+LX_API int lx_rt_event_create(void** event);
+LX_API int lx_rt_event_destroy(void* event);
+LX_API int lx_rt_event_record(void* event, void* stream);
+LX_API int lx_rt_event_sync(void* event);
+// Capture the work issued on a stream into a replayable graph (CUDA graphs, HIP graphs; a backend
+// without it returns LX_ERR_NOT_SUPPORTED from capture_begin and the model runs eagerly).
+LX_API int lx_rt_capture_begin(void* stream);
+LX_API int lx_rt_capture_end(void* stream, void** graph);
+LX_API int lx_rt_graph_launch(void* graph, void* stream);
+LX_API int lx_rt_graph_destroy(void* graph);
+LX_API int lx_rt_last_error(void);  // and clears it
+
 // ---- Weight formats ------------------------------------------------------------------------
 // A projection is held once, in one format, and every kernel that multiplies by it (the decode
 // GEMV, the tensor-core GEMM for prefill and batches, the expert kernels) reads that one copy.
