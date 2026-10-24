@@ -9,7 +9,7 @@ include(CheckCXXCompilerFlag)
 
 set(LX_CPU_SOURCES
   attention.cpp elementwise.cpp gemm.cpp isa.cpp mamba.cpp memory.cpp moe.cpp pool.cpp quant.cpp runtime.cpp
-  tunable.cpp)
+  sampler.cpp tunable.cpp)
 
 # One object library per ISA level: name, level code (tunable.h's lx_arch on the CPU), flags.
 set(LX_CPU_LEVELS)
