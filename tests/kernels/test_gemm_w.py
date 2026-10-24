@@ -159,6 +159,12 @@ def test_gemm_w_tuned_variants(lx):
     by_kind = {"bf16": PAIRS[0], "w8i8": PAIRS[1], "w8f8": PAIRS[2], "w4a16": PAIRS[3], "i8": PAIRS[4], "f8": PAIRS[5],
                "w4a8": PAIRS[6], "f4": PAIRS[7]}
     have = native_arch(lx)
+    # The family each kind runs on this card without an override.
+    native = {}
+    for fam in families:
+        _, kind, sm = fam.split(".")
+        if int(sm[2:]) <= have:
+            native[kind] = max(native.get(kind, 0), int(sm[2:]))
     M, N, K = 200, 384, 1024
     for fam in families:
         _, kind, sm = fam.split(".")
@@ -168,14 +174,56 @@ def test_gemm_w_tuned_variants(lx):
             continue
         bias = "f32" if kind == "bf16" else None
         for v in range(lx.lib.lx_tune_variants(fam.encode())):
+            vname = lx.lib.lx_tune_variant_name(fam.encode(), v).decode()
+            split = "_x" in vname
+            # Split-K variants need thread block clusters (sm_90+), so an override below 90 never picks
+            # them: they run on the families this card reaches natively, and the f8.sm89 and w8f8.sm80 ones
+            # only on an sm_90 or sm_100 card.
+            if split and (have < 90 or fam_arch != native[kind]):
+                continue
             lx.lib.lx_tune_set(fam.encode(), M, N, K, v)
             try:
-                set_arch(lx, fam_arch if fam_arch < have else 0)
+                set_arch(lx, 0 if split else (fam_arch if fam_arch < have else 0))
                 status, y, y0, (x, w, b) = run_case(lx, name, wtype, math, M, N, K, torch.bfloat16, torch.float32, 1.0, 0.0, bias, 0)
             finally:
                 set_arch(lx, 0)
                 lx.lib.lx_tune_clear()
-            label = f"{fam} variant {lx.lib.lx_tune_variant_name(fam.encode(), v)}"
+            label = f"{fam} variant {vname}"
             assert status == 0, f"{label} returned {status}"
             want = reference(x, w, math, b, 1.0, 0.0, None)
             close(y, want.float(), atol=2e-4 * want.abs().max().item())
+
+
+@pytest.mark.parametrize("split", [2, 4])
+@pytest.mark.parametrize("name,wtype,math,oldest", PAIRS)
+def test_gemm_w_split_k(lx, name, wtype, math, oldest, split):
+    # The split-K variants (clusters along K, sm_90+) at a size where some CTAs of a cluster get no K tile
+    # at all, with partial tiles, bias, beta and padded strides; the sum over the cluster runs in rank
+    # order, so two calls give the same bits.
+    have = native_arch(lx)
+    if have < max(oldest, 90):
+        pytest.skip("not on this GPU")
+    kind = {"bf16": "bf16", "w8a16_int8": "w8i8", "w8a16_fp8": "w8f8", "w4a16": "w4a16", "int8": "i8", "fp8": "f8",
+            "w4a8": "w4a8", "fp4": "f4"}[name]
+    names = (ctypes.c_char_p * 256)()
+    count = lx.lib.lx_tune_kernels(names, 256)
+    fams = [names[i].decode() for i in range(min(count, 256)) if names[i].decode().startswith(f"gemm_w.{kind}.sm")]
+    fam = max((f for f in fams if int(f.split(".sm")[1]) <= have), key=lambda f: int(f.split(".sm")[1])).encode()
+    lx.lib.lx_tune_variant_name.restype = ctypes.c_char_p
+    pick = [v for v in range(lx.lib.lx_tune_variants(fam)) if lx.lib.lx_tune_variant_name(fam, v).decode().endswith(f"_x{split}")]
+    assert len(pick) == 1, f"{fam} has no _x{split} variant"
+    M, N, K = 5, 136, 256
+    outs = []
+    lx.lib.lx_tune_set(fam, M, N, K, pick[0])
+    try:
+        for _ in range(2):
+            status, y, y0, (x, w, bias) = run_case(lx, name, wtype, math, M, N, K, torch.bfloat16, torch.float32, 1.0, 1.0,
+                                                   "f32", 4)
+            assert status == 0, f"lx_gemm_w returned CUDA error {status}"
+            outs.append(y)
+    finally:
+        lx.lib.lx_tune_clear()
+    want = reference(x, w, math, bias, 1.0, 1.0, y0[:, :N])
+    close(outs[0][:, :N], want.float(), atol=2e-4 * want.abs().max().item())
+    assert torch.equal(outs[0], outs[1]), "split-K sum is not deterministic"
+    assert torch.equal(outs[0][:, N:], y0[:, N:]), "wrote past the N columns of y"

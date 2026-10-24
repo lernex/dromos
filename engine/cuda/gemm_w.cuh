@@ -35,9 +35,9 @@ struct DenseProb {
     int tiles_m, tiles_n, group;  // raster: `group` M tiles walk across the N tiles together
   };
   template <int BM, int BN>
-  static __device__ __forceinline__ bool tile(const Params& p, Tile& t) {
+  static __device__ __forceinline__ bool tile(const Params& p, Tile& t, int cta) {
     const int per_group = p.group * p.tiles_n;
-    const int g = blockIdx.x / per_group, in = blockIdx.x % per_group;
+    const int g = cta / per_group, in = cta % per_group;
     const int gm = min(p.group, p.tiles_m - g * p.group);
     const int mt = g * p.group + in % gm, nt = in / gm;
     t.m0 = mt * BM;
@@ -114,19 +114,20 @@ struct DenseEpi {
   }
 };
 
-template <int kKind, int kArch, int BM, int BN, int WM, int WN, int ST, int RB>
+template <int kKind, int kArch, int BM, int BN, int WM, int WN, int ST, int RB, int kSplit>
 __global__ void __launch_bounds__(WM * WN * 32, (lx::tc::Config<kKind, kArch, BM, BN, WM, WN, ST, RB>::kMinBlocks))
     dense_kernel(const DenseProb::Params pp, const DenseEpi::Params ep) {
   extern __shared__ __align__(128) uint8_t smem[];
-  lx::tc::gemm_body<kKind, kArch, BM, BN, WM, WN, ST, RB, DenseProb, DenseEpi>(pp, ep, smem);
+  lx::tc::gemm_body<kKind, kArch, BM, BN, WM, WN, ST, RB, DenseProb, DenseEpi, kSplit>(pp, ep, smem);
 }
 
 using LaunchFn = int (*)(DenseProb::Params, const DenseEpi::Params&, cudaStream_t);
 
-template <int kKind, int kArch, int BM, int BN, int WM, int WN, int ST, int RB>
+// kSplit > 1: clusters of kSplit CTAs share each tile, split along K (gemm_body); sm_90+ only.
+template <int kKind, int kArch, int BM, int BN, int WM, int WN, int ST, int RB, int kSplit = 1>
 inline int launch_dense(DenseProb::Params pp, const DenseEpi::Params& ep, cudaStream_t s) {
   using C = lx::tc::Config<kKind, kArch, BM, BN, WM, WN, ST, RB>;
-  auto kernel = dense_kernel<kKind, kArch, BM, BN, WM, WN, ST, RB>;
+  auto kernel = dense_kernel<kKind, kArch, BM, BN, WM, WN, ST, RB, kSplit>;
   static const cudaError_t attr = [&] {
     cudaError_t e = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, C::kSmem);
     if (e == cudaSuccess)
@@ -137,14 +138,33 @@ inline int launch_dense(DenseProb::Params pp, const DenseEpi::Params& ep, cudaSt
   pp.tiles_m = (pp.M + BM - 1) / BM;
   pp.tiles_n = (pp.N + BN - 1) / BN;
   pp.group = std::min(pp.tiles_m, 8);
-  kernel<<<pp.tiles_m * pp.tiles_n, C::kThreads, C::kSmem, s>>>(pp, ep);
-  return lx::launch_status();
+  const unsigned grid = static_cast<unsigned>(pp.tiles_m * pp.tiles_n * kSplit);
+  if constexpr (kSplit == 1) {
+    kernel<<<grid, C::kThreads, C::kSmem, s>>>(pp, ep);
+    return lx::launch_status();
+  } else {
+    cudaLaunchConfig_t cfg{};
+    cfg.gridDim = dim3(grid);
+    cfg.blockDim = dim3(C::kThreads);
+    cfg.dynamicSmemBytes = C::kSmem;
+    cfg.stream = s;
+    cudaLaunchAttribute a[1];
+    a[0].id = cudaLaunchAttributeClusterDimension;
+    a[0].val.clusterDim.x = kSplit;
+    a[0].val.clusterDim.y = 1;
+    a[0].val.clusterDim.z = 1;
+    cfg.attrs = a;
+    cfg.numAttrs = 1;
+    return static_cast<int>(cudaLaunchKernelEx(&cfg, kernel, pp, ep));
+  }
 }
 
 struct Variant {
   const char* name;
   int bm;
   LaunchFn fn;
+  int split;     // CTAs per tile along K (1: none)
+  int min_arch;  // 90 for the split variants (thread block clusters)
 };
 
 template <int kKind, int kArch>
@@ -173,7 +193,13 @@ LX_GEMMW_FAMILY(kW4A8, 120)
 // A family's definition: its tuner name and its variants, BMxBN, warps along M x N, stages, A bytes per
 // row per k-tile.
 #define LX_V(K, A, BM, BN, WM, WN, ST, RB) \
-  Variant { #BM "x" #BN "_w" #WM "x" #WN "_s" #ST "_k" #RB, BM, launch_dense<lx::tc::K, A, BM, BN, WM, WN, ST, RB> }
+  Variant { #BM "x" #BN "_w" #WM "x" #WN "_s" #ST "_k" #RB, BM, launch_dense<lx::tc::K, A, BM, BN, WM, WN, ST, RB>, 1, 0 }
+// A split-K variant: kSplit CTAs per tile along K (sm_90+).
+#define LX_VS(K, A, BM, BN, WM, WN, ST, RB, S)                                                          \
+  Variant {                                                                                            \
+    #BM "x" #BN "_w" #WM "x" #WN "_s" #ST "_k" #RB "_x" #S, BM, launch_dense<lx::tc::K, A, BM, BN, WM, WN, ST, RB, S>, \
+        S, 90                                                                                          \
+  }
 #define LX_FAMILY(K, A, NAME, ...)                                  \
   template <>                                                       \
   const char* Family<lx::tc::K, A>::name() {                        \

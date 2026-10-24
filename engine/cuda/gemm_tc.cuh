@@ -22,12 +22,17 @@
 //     block's B values zeroed), into fresh registers that are scaled and accumulated in f32. The same
 //     K permutation puts all of a thread's B values in one block.
 // The per-row and per-token scales and the globals are applied once, in the epilogue.
+//
+// Split-K (sm_90+, small problems): a cluster of 2 or 4 CTAs shares one tile, each running the mainloop
+// over its part of K; the partial tiles are summed across the cluster in rank order through distributed
+// shared memory, so the result does not depend on scheduling.
 #pragma once
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
 
+#include <cooperative_groups.h>
 #include <type_traits>
 
 #include "cuda/common.cuh"
@@ -163,20 +168,31 @@ __device__ __forceinline__ float row_col_scale(float row, float col, float globa
 }
 
 // The kernel body. Prob: tile assignment and row addresses; Epi: what to do with the results.
-template <int kKind, int kArch, int BM, int BN, int WM, int WN, int ST, int RB, class Prob, class Epi>
+//
+// kSplit > 1 (sm_90+, launched as clusters of kSplit CTAs along x): the cluster shares one tile and each
+// CTA takes a contiguous part of K, for small problems whose tiles alone would leave SMs idle. The
+// partial accumulators meet in distributed shared memory: every CTA writes its own, then reduces a
+// slice of the tile's rows across the cluster in rank order (deterministic) and runs the epilogue on it.
+template <int kKind, int kArch, int BM, int BN, int WM, int WN, int ST, int RB, class Prob, class Epi, int kSplit = 1>
 __device__ __forceinline__ void gemm_body(const typename Prob::Params& pp, const typename Epi::Params& ep,
                                           uint8_t* smem) {
   using C = Config<kKind, kArch, BM, BN, WM, WN, ST, RB>;
   using T = typename C::T;
   constexpr int kThreads = C::kThreads, kMT = C::kMT, kNT = C::kNT;
   using Acc = std::conditional_t<kKind == kI8, int, float>;
+  constexpr int kRedLd = BN + 4;  // split-K: the partial tile's row stride in shared memory
+  static_assert(kSplit == 1 || (!Epi::kGated && BM % kSplit == 0 && BM * kRedLd * 4 <= C::kSmem), "split-K tile");
 
   Tile t;
-  if (!Prob::template tile<BM, BN>(pp, t)) return;
+  const int cta = static_cast<int>(blockIdx.x) / kSplit;  // every CTA of a cluster has the same tile
+  if (!Prob::template tile<BM, BN>(pp, t, cta)) return;
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const int wm = warp / WN, wn = warp % WN;
   const int K = pp.K;
-  const int KT = (K + C::kKTile - 1) / C::kKTile;
+  const int KT_all = (K + C::kKTile - 1) / C::kKTile;
+  const int rank = kSplit > 1 ? static_cast<int>(blockIdx.x) % kSplit : 0;
+  const int kt0 = rank * KT_all / kSplit;                  // this CTA's K tiles: kt0 .. kt0 + KT - 1
+  const int KT = (rank + 1) * KT_all / kSplit - kt0;
   const uint32_t s0 = mma::smem_addr(smem);
 
   // ---- loader: each thread copies fixed chunks of every tile, so its source rows are set up once ----
@@ -220,6 +236,7 @@ __device__ __forceinline__ void gemm_body(const typename Prob::Params& pp, const
   const int k_bytes_a = K * T::kABits / 8, k_bytes_b = K * T::kBBits / 8, k_sf = K / 16;
 
   auto load_tile = [&](int stage, int kt) {
+    kt += kt0;
     const uint32_t base = s0 + stage * C::kStage;
     const int ka = kt * C::kARow, kb = kt * C::kBRow;
 #pragma unroll
@@ -475,47 +492,87 @@ __device__ __forceinline__ void gemm_body(const typename Prob::Params& pp, const
   }
   mma::cp_async_wait<0>();
 
-  // ---- epilogue: per-kind scaling, then the policy ----
-  // Epi::row gives the policy's per-row context once (destination, routing weight); then each pair of
-  // columns goes to Epi::store2, or, for a gated policy, each gate pair with its up pair to
-  // Epi::store_gated: the Prob then interleaves the weight rows so that every even n8 tile holds gate
-  // columns and the odd tile after it the matching up columns (tile widths are multiples of 16).
   const int r = fr, q = fq;
   const float global = pp.b_global;
   auto col_scale = [&](int tc) -> float {
     if constexpr (T::kColScale) return tc < t.cols ? t.b_scale[Prob::b_row(pp, t, tc)] : 0.0f;
     else return 1.0f;
   };
+
+  if constexpr (kSplit > 1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    // ---- split-K: partial tiles to shared memory, a rank-ordered sum over the cluster, the epilogue ----
+    namespace cg = cooperative_groups;
+    const cg::cluster_group cluster = cg::this_cluster();
+    __syncthreads();  // every warp is past its last fragment load: the stages can be reused
+    Acc* red = reinterpret_cast<Acc*>(smem);
 #pragma unroll
-  for (int mt = 0; mt < kMT; ++mt) {
+    for (int mt = 0; mt < kMT; ++mt)
 #pragma unroll
-    for (int h = 0; h < 2; ++h) {
-      const int tr = row0 + mt * 16 + r + 8 * h;
-      if (tr >= t.rows) continue;
-      float rs = 1.0f;
-      if constexpr (T::kRowScale) rs = Prob::a_scale(pp, t, tr);
-      const typename Epi::Row row = Epi::row(ep, t, tr);
-      if constexpr (Epi::kGated) {
-        static_assert(kNT % 2 == 0, "gated epilogue: n8 tiles in pairs");
-#pragma unroll
-        for (int nt = 0; nt < kNT; nt += 2) {
-          const int tc = col0 + nt * 8 + 2 * q;
-          if (tc >= t.cols) continue;
-          const float g0 = static_cast<float>(acc[mt][nt][2 * h]) * row_col_scale<kKind>(rs, col_scale(tc), global);
-          const float g1 = static_cast<float>(acc[mt][nt][2 * h + 1]) * row_col_scale<kKind>(rs, col_scale(tc + 1), global);
-          const float u0 = static_cast<float>(acc[mt][nt + 1][2 * h]) * row_col_scale<kKind>(rs, col_scale(tc + 8), global);
-          const float u1 =
-              static_cast<float>(acc[mt][nt + 1][2 * h + 1]) * row_col_scale<kKind>(rs, col_scale(tc + 9), global);
-          Epi::store_gated(ep, t, row, tc, g0, g1, u0, u1);
-        }
-      } else {
+      for (int h = 0; h < 2; ++h)
 #pragma unroll
         for (int nt = 0; nt < kNT; ++nt) {
-          const int tc = col0 + nt * 8 + 2 * q;
-          if (tc >= t.cols) continue;
-          const float v0 = static_cast<float>(acc[mt][nt][2 * h]) * row_col_scale<kKind>(rs, col_scale(tc), global);
-          const float v1 = static_cast<float>(acc[mt][nt][2 * h + 1]) * row_col_scale<kKind>(rs, col_scale(tc + 1), global);
-          Epi::store2(ep, t, row, tc, v0, v1);
+          Acc* d = red + (row0 + mt * 16 + r + 8 * h) * kRedLd + col0 + nt * 8 + 2 * q;
+          d[0] = acc[mt][nt][2 * h];
+          d[1] = acc[mt][nt][2 * h + 1];
+        }
+    cluster.sync();
+    constexpr int kRows = BM / kSplit;
+    for (int idx = tid; idx < kRows * (BN / 2); idx += kThreads) {
+      const int tr = rank * kRows + idx / (BN / 2), tc = 2 * (idx % (BN / 2));
+      if (tr >= t.rows || tc >= t.cols) continue;
+      Acc sum0 = 0, sum1 = 0;
+#pragma unroll
+      for (int p = 0; p < kSplit; ++p) {
+        const Acc* peer = cluster.map_shared_rank(red, p) + tr * kRedLd + tc;
+        sum0 += peer[0];
+        sum1 += peer[1];
+      }
+      float rs = 1.0f;
+      if constexpr (T::kRowScale) rs = Prob::a_scale(pp, t, tr);
+      const float v0 = static_cast<float>(sum0) * row_col_scale<kKind>(rs, col_scale(tc), global);
+      const float v1 = static_cast<float>(sum1) * row_col_scale<kKind>(rs, col_scale(tc + 1), global);
+      Epi::store2(ep, t, Epi::row(ep, t, tr), tc, v0, v1);
+    }
+    cluster.sync();  // no CTA leaves while a peer still reads its partial tile
+#endif
+  } else {
+    // ---- epilogue: per-kind scaling, then the policy ----
+    // Epi::row gives the policy's per-row context once (destination, routing weight); then each pair of
+    // columns goes to Epi::store2, or, for a gated policy, each gate pair with its up pair to
+    // Epi::store_gated: the Prob then interleaves the weight rows so that every even n8 tile holds gate
+    // columns and the odd tile after it the matching up columns (tile widths are multiples of 16).
+#pragma unroll
+    for (int mt = 0; mt < kMT; ++mt) {
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const int tr = row0 + mt * 16 + r + 8 * h;
+        if (tr >= t.rows) continue;
+        float rs = 1.0f;
+        if constexpr (T::kRowScale) rs = Prob::a_scale(pp, t, tr);
+        const typename Epi::Row row = Epi::row(ep, t, tr);
+        if constexpr (Epi::kGated) {
+          static_assert(kNT % 2 == 0, "gated epilogue: n8 tiles in pairs");
+#pragma unroll
+          for (int nt = 0; nt < kNT; nt += 2) {
+            const int tc = col0 + nt * 8 + 2 * q;
+            if (tc >= t.cols) continue;
+            const float g0 = static_cast<float>(acc[mt][nt][2 * h]) * row_col_scale<kKind>(rs, col_scale(tc), global);
+            const float g1 = static_cast<float>(acc[mt][nt][2 * h + 1]) * row_col_scale<kKind>(rs, col_scale(tc + 1), global);
+            const float u0 = static_cast<float>(acc[mt][nt + 1][2 * h]) * row_col_scale<kKind>(rs, col_scale(tc + 8), global);
+            const float u1 =
+                static_cast<float>(acc[mt][nt + 1][2 * h + 1]) * row_col_scale<kKind>(rs, col_scale(tc + 9), global);
+            Epi::store_gated(ep, t, row, tc, g0, g1, u0, u1);
+          }
+        } else {
+#pragma unroll
+          for (int nt = 0; nt < kNT; ++nt) {
+            const int tc = col0 + nt * 8 + 2 * q;
+            if (tc >= t.cols) continue;
+            const float v0 = static_cast<float>(acc[mt][nt][2 * h]) * row_col_scale<kKind>(rs, col_scale(tc), global);
+            const float v1 = static_cast<float>(acc[mt][nt][2 * h + 1]) * row_col_scale<kKind>(rs, col_scale(tc + 1), global);
+            Epi::store2(ep, t, row, tc, v0, v1);
+          }
         }
       }
     }

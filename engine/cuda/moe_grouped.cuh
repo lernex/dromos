@@ -61,8 +61,8 @@ struct GroupedParams {
 };
 
 template <int BM, int BN>
-__device__ __forceinline__ bool grouped_tile(const GroupedParams& p, Tile& t) {
-  const int i = blockIdx.x / p.tiles_n, j = blockIdx.x % p.tiles_n;
+__device__ __forceinline__ bool grouped_tile(const GroupedParams& p, Tile& t, int cta) {
+  const int i = cta / p.tiles_n, j = cta % p.tiles_n;
   const int2 e = p.tiles[i];
   const int rows = e.y & 0xffff;
   if (rows == 0) return false;
@@ -82,8 +82,8 @@ __device__ __forceinline__ bool grouped_tile(const GroupedParams& p, Tile& t) {
 struct GateUpProb {
   using Params = GroupedParams;
   template <int BM, int BN>
-  static __device__ __forceinline__ bool tile(const Params& p, Tile& t) {
-    return grouped_tile<BM, BN>(p, t);
+  static __device__ __forceinline__ bool tile(const Params& p, Tile& t, int cta) {
+    return grouped_tile<BM, BN>(p, t, cta);
   }
   static __device__ __forceinline__ int64_t token(const Params& p, const Tile& t, int r) {
     return __ldg(p.pairs + t.m0 + r) / p.top_k;
@@ -109,8 +109,8 @@ struct GateUpProb {
 struct DownProb {
   using Params = GroupedParams;
   template <int BM, int BN>
-  static __device__ __forceinline__ bool tile(const Params& p, Tile& t) {
-    return grouped_tile<BM, BN>(p, t);
+  static __device__ __forceinline__ bool tile(const Params& p, Tile& t, int cta) {
+    return grouped_tile<BM, BN>(p, t, cta);
   }
   static __device__ __forceinline__ const uint8_t* a_row(const Params& p, const Tile& t, int r) {
     return p.a + (t.m0 + r) * p.lda;

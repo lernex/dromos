@@ -15,16 +15,19 @@
 // Kernel families by architecture (lx_arch, so an override runs an older family on a newer card):
 //   sm_80  bf16 and int8 mma.sync, cp.async, ldmatrix; weight expansion through f32 and prmt
 //   sm_89  adds the e4m3 mma.sync (FP8 math at the legacy rate)
-//   sm_90  as sm_89 (wgmma is not used: it cannot be tested here; dense BF16 stays on cuBLASLt)
+//   sm_90  as sm_89, plus split-K over thread block clusters for small problems (wgmma is not used: it
+//          cannot be tested here; dense BF16 stays on cuBLASLt)
 //   sm_120 FP8 through the block-scaled kind (twice the legacy rate), FP4 and W4A8, and the
 //          single-instruction e4m3 -> bf16 conversion for W8A16 on FP8 weights
 // Each family has tile variants registered with the tuner as "gemm_w.<kind>.sm<arch>"; lx_tune_get picks
-// one per shape, and a measured default (default_tile) stands in when the table has no entry.
+// one per shape, and a measured default (default_tile, then split_for on sm_90+) stands in when the
+// table has no entry.
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <cstring>
+#include <utility>
 
 #include "cuda/gemm_w.cuh"
 #include "cuda/tunable.h"
@@ -43,25 +46,25 @@ using lx::gemmw::kind_for;
 using lx::gemmw::Variant;
 using lx::gemmw::weight_bits;
 
+// TunableRegistration takes an initializer list: expand the family's names into one.
+template <size_t... I>
+void register_names(const char* kernel, const char* const* m, std::index_sequence<I...>) {
+  lx::TunableRegistration(kernel, {m[I]...});
+}
+template <int N = 1>
+void register_n(const char* kernel, const char* const* m, int n) {
+  if (n == N) register_names(kernel, m, std::make_index_sequence<N>{});
+  else if constexpr (N < 16) register_n<N + 1>(kernel, m, n);
+}
+
 template <int kKind, int kArch>
 struct Registered {
   Registered() {
     int n = 0;
     const Variant* v = Family<kKind, kArch>::variants(n);
-    // TunableRegistration takes an initializer list; up to 8 variants per family.
-    const char* names[8] = {};
-    for (int i = 0; i < n && i < 8; ++i) names[i] = v[i].name;
-    const char* const* m = names;
-    switch (n) {
-      case 1: lx::TunableRegistration(Family<kKind, kArch>::name(), {m[0]}); break;
-      case 2: lx::TunableRegistration(Family<kKind, kArch>::name(), {m[0], m[1]}); break;
-      case 3: lx::TunableRegistration(Family<kKind, kArch>::name(), {m[0], m[1], m[2]}); break;
-      case 4: lx::TunableRegistration(Family<kKind, kArch>::name(), {m[0], m[1], m[2], m[3]}); break;
-      case 5: lx::TunableRegistration(Family<kKind, kArch>::name(), {m[0], m[1], m[2], m[3], m[4]}); break;
-      case 6: lx::TunableRegistration(Family<kKind, kArch>::name(), {m[0], m[1], m[2], m[3], m[4], m[5]}); break;
-      case 7: lx::TunableRegistration(Family<kKind, kArch>::name(), {m[0], m[1], m[2], m[3], m[4], m[5], m[6]}); break;
-      default: lx::TunableRegistration(Family<kKind, kArch>::name(), {m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]});
-    }
+    const char* names[16] = {};
+    for (int i = 0; i < n && i < 16; ++i) names[i] = v[i].name;
+    register_n(Family<kKind, kArch>::name(), names, n);
   }
 };
 const Registered<kBF16, 80> reg_bf16;
@@ -87,7 +90,10 @@ const char* default_tile(int kind, int M, int N) {
     return M <= 512 ? "64x128_w2x4_s4_k128" : "128x128_w2x4_s3_k128";
   }
   const bool f4 = kind == kF4;
-  if (M <= 128) return N >= 4096 ? (f4 ? "64x128_w2x4_s3_k64" : "64x128_w2x4_s4_k64") : (f4 ? "32x128_w1x4_s4_k64" : "32x128_w1x4_s4_k128");
+  if (M <= 128) {
+    if (N >= 4096 || (M > 64 && N >= 3072)) return f4 ? "64x128_w2x4_s3_k64" : "64x128_w2x4_s4_k64";
+    return f4 ? "32x128_w1x4_s4_k64" : "32x128_w1x4_s4_k128";
+  }
   if (M <= 512) {
     if (N >= 4096) return f4 ? "64x128_w2x4_s3_k64" : "128x128_w2x2_s3_k64";
     if (N >= 2048) return f4 ? "64x128_w2x4_s3_k64" : "64x128_w2x4_s4_k64";
@@ -102,16 +108,36 @@ const char* default_tile(int kind, int M, int N) {
   return f4 ? "256x128_w4x2_s3_k64" : "128x128_w2x2_s3_k64";
 }
 
+// Small problems on sm_90+: the 32x128 tile split along K over a cluster of 2 or 4 CTAs when its tiles
+// alone would leave SMs idle (measured, bench/tune_gemm_w.py: at most one CTA per SM after the split).
+// The kernels that expand weights in the mainloop (W8A16, W4A16, W4A8) are bound by that arithmetic and
+// gain from any more CTAs (up to 2.7x at M = 16), even with a couple of K tiles each; the homogeneous
+// kinds are reading weights at small M and gain up to ~20%, only while each CTA keeps 8 K tiles or more.
+int split_for(int kind, int tiles, int k_tiles, int arch) {
+  if (arch < 90) return 1;
+  const bool mixed = kind == kW8I8 || kind == kW8F8 || kind == kW4A16 || kind == kW4A8;
+  const int min_kt = mixed ? 2 : 8;  // K tiles each CTA keeps
+  if (tiles <= 17 && k_tiles >= 4 * min_kt) return 4;
+  if (tiles <= 35 && k_tiles >= 2 * min_kt) return 2;
+  return 1;
+}
+
 template <int kKind, int kArch>
 int run_family(const DenseProb::Params& pp, const DenseEpi::Params& ep, cudaStream_t s) {
   int n = 0;
   const Variant* v = Family<kKind, kArch>::variants(n);
+  const int arch = lx_arch();
   int pick = lx_tune_get(Family<kKind, kArch>::name(), pp.M, pp.N, pp.K);
-  if (pick < 0 || pick >= n) {
+  if (pick < 0 || pick >= n || v[pick].min_arch > arch) {
     const char* want = default_tile(kKind, pp.M, pp.N);
     pick = 0;
     for (int i = 0; i < n; ++i)
       if (!std::strcmp(v[i].name, want)) pick = i;
+    const int k_tile = lx::tc::Config<kKind, kArch, 32, 128, 1, 4, 4, (kKind == kF4 ? 64 : 128)>::kKTile;
+    const int tiles = ((pp.M + 31) / 32) * ((pp.N + 127) / 128);
+    const int split = v[pick].bm == 32 ? split_for(kKind, tiles, (pp.K + k_tile - 1) / k_tile, arch) : 1;
+    for (int i = 0; split > 1 && i < n; ++i)
+      if (v[i].split == split && v[i].bm == 32) pick = i;
   }
   return v[pick].fn(pp, ep, s);
 }
