@@ -19,11 +19,12 @@
 //   sm_120 FP8 through the block-scaled kind (twice the legacy rate), FP4 and W4A8, and the
 //          single-instruction e4m3 -> bf16 conversion for W8A16 on FP8 weights
 // Each family has tile variants registered with the tuner as "gemm_w.<kind>.sm<arch>"; lx_tune_get picks
-// one per shape, and a heuristic on M stands in when the table has no entry.
+// one per shape, and a measured default (default_tile) stands in when the table has no entry.
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstring>
 
 #include "cuda/gemm_w.cuh"
 #include "cuda/tunable.h"
@@ -74,21 +75,43 @@ const Registered<kW8F8, 120> reg_w8f8_120;
 const Registered<kW4A16, 80> reg_w4a16;
 const Registered<kW4A8, 120> reg_w4a8;
 
+// The default tile when the tuner has no entry: the variant measured fastest on an RTX 5070 Ti at the
+// nearest of Praxis's shapes (N = 256 to 10304, M = 64 to 8192; bench/tune_gemm_w.py). The W8A16 and
+// W4A16 kernels are bound by expanding the weight to bf16, so the narrow tile, which expands each weight
+// once per 32 rows on a single warp row, wins at every shape. The others want CTAs enough to fill the GPU
+// at small M, and the largest tiles once there are plenty.
+const char* default_tile(int kind, int M, int N) {
+  if (kind == kW8I8 || kind == kW8F8 || kind == kW4A16) return "32x128_w1x4_s4_k128";
+  if (kind == kW4A8) {
+    if (M <= 128 || N < 768) return "32x128_w1x4_s4_k128";
+    return M <= 512 ? "64x128_w2x4_s4_k128" : "128x128_w2x4_s3_k128";
+  }
+  const bool f4 = kind == kF4;
+  if (M <= 128) return N >= 4096 ? (f4 ? "64x128_w2x4_s3_k64" : "64x128_w2x4_s4_k64") : (f4 ? "32x128_w1x4_s4_k64" : "32x128_w1x4_s4_k128");
+  if (M <= 512) {
+    if (N >= 4096) return f4 ? "64x128_w2x4_s3_k64" : "128x128_w2x2_s3_k64";
+    if (N >= 2048) return f4 ? "64x128_w2x4_s3_k64" : "64x128_w2x4_s4_k64";
+    return f4 ? "32x128_w1x4_s4_k64" : "32x128_w1x4_s4_k128";
+  }
+  if (M <= 2048) {
+    if (N >= 4096) return f4 ? "128x256_w2x4_s3_k64" : "128x128_w2x2_s3_k64";
+    if (N >= 2048) return f4 ? "256x128_w4x2_s3_k64" : "256x128_w4x2_s4_k64";
+    if (N >= 768) return f4 ? "128x128_w2x4_s3_k64" : "128x128_w2x4_s3_k64";
+    return f4 ? "32x128_w1x4_s4_k64" : "32x128_w1x4_s4_k128";
+  }
+  return f4 ? "256x128_w4x2_s3_k64" : "128x128_w2x2_s3_k64";
+}
+
 template <int kKind, int kArch>
 int run_family(const DenseProb::Params& pp, const DenseEpi::Params& ep, cudaStream_t s) {
   int n = 0;
   const Variant* v = Family<kKind, kArch>::variants(n);
   int pick = lx_tune_get(Family<kKind, kArch>::name(), pp.M, pp.N, pp.K);
   if (pick < 0 || pick >= n) {
-    // Heuristic: the largest BM that M fills, then enough CTAs for the GPU (about two waves of 70 SMs).
+    const char* want = default_tile(kKind, pp.M, pp.N);
     pick = 0;
     for (int i = 0; i < n; ++i)
-      if (v[i].bm <= pp.M) pick = i;
-    while (pick > 0) {
-      const int64_t ctas = static_cast<int64_t>((pp.M + v[pick].bm - 1) / v[pick].bm) * ((pp.N + 127) / 128);
-      if (ctas >= 140) break;
-      --pick;
-    }
+      if (!std::strcmp(v[i].name, want)) pick = i;
   }
   return v[pick].fn(pp, ep, s);
 }
