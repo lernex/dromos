@@ -164,7 +164,7 @@ struct Variant {
   int bm;
   LaunchFn fn;
   int split;     // CTAs per tile along K (1: none)
-  int min_arch;  // 90 for the split variants (thread block clusters)
+  int min_arch;  // lx::kClusterArch for the split variants (thread block clusters)
 };
 
 template <int kKind, int kArch>
@@ -198,7 +198,7 @@ LX_GEMMW_FAMILY(kW4A8, 120)
 #define LX_VS(K, A, BM, BN, WM, WN, ST, RB, S)                                                          \
   Variant {                                                                                            \
     #BM "x" #BN "_w" #WM "x" #WN "_s" #ST "_k" #RB "_x" #S, BM, launch_dense<lx::tc::K, A, BM, BN, WM, WN, ST, RB, S>, \
-        S, 90                                                                                          \
+        S, lx::kClusterArch                                                                            \
   }
 #define LX_FAMILY(K, A, NAME, ...)                                  \
   template <>                                                       \

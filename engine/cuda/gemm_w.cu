@@ -86,7 +86,7 @@ const Registered<kW4A8, 120> reg_w4a8;
 const char* default_tile(int kind, int M, int N) {
   if (kind == kW8I8 || kind == kW8F8 || kind == kW4A16) return "32x128_w1x4_s4_k128";
   if (kind == kW4A8) {
-    if (M <= 128 || N < 768) return "32x128_w1x4_s4_k128";
+    if (M <= 128 || N <= 1024) return "32x128_w1x4_s4_k128";
     return M <= 512 ? "64x128_w2x4_s4_k128" : "128x128_w2x4_s3_k128";
   }
   const bool f4 = kind == kF4;

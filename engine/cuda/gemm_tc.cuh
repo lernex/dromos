@@ -32,7 +32,6 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 
-#include <cooperative_groups.h>
 #include <type_traits>
 
 #include "cuda/common.cuh"
@@ -500,10 +499,8 @@ __device__ __forceinline__ void gemm_body(const typename Prob::Params& pp, const
   };
 
   if constexpr (kSplit > 1) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if LX_SM90_DEVICE
     // ---- split-K: partial tiles to shared memory, a rank-ordered sum over the cluster, the epilogue ----
-    namespace cg = cooperative_groups;
-    const cg::cluster_group cluster = cg::this_cluster();
     __syncthreads();  // every warp is past its last fragment load: the stages can be reused
     Acc* red = reinterpret_cast<Acc*>(smem);
 #pragma unroll
@@ -516,7 +513,7 @@ __device__ __forceinline__ void gemm_body(const typename Prob::Params& pp, const
           d[0] = acc[mt][nt][2 * h];
           d[1] = acc[mt][nt][2 * h + 1];
         }
-    cluster.sync();
+    lx::cluster_sync();
     constexpr int kRows = BM / kSplit;
     for (int idx = tid; idx < kRows * (BN / 2); idx += kThreads) {
       const int tr = rank * kRows + idx / (BN / 2), tc = 2 * (idx % (BN / 2));
@@ -524,7 +521,7 @@ __device__ __forceinline__ void gemm_body(const typename Prob::Params& pp, const
       Acc sum0 = 0, sum1 = 0;
 #pragma unroll
       for (int p = 0; p < kSplit; ++p) {
-        const Acc* peer = cluster.map_shared_rank(red, p) + tr * kRedLd + tc;
+        const Acc* peer = lx::cluster_peer(red, p) + tr * kRedLd + tc;
         sum0 += peer[0];
         sum1 += peer[1];
       }
@@ -534,7 +531,7 @@ __device__ __forceinline__ void gemm_body(const typename Prob::Params& pp, const
       const float v1 = static_cast<float>(sum1) * row_col_scale<kKind>(rs, col_scale(tc + 1), global);
       Epi::store2(ep, t, Epi::row(ep, t, tr), tc, v0, v1);
     }
-    cluster.sync();  // no CTA leaves while a peer still reads its partial tile
+    lx::cluster_sync();  // no CTA leaves while a peer still reads its partial tile
 #endif
   } else {
     // ---- epilogue: per-kind scaling, then the policy ----

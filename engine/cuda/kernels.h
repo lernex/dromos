@@ -298,6 +298,8 @@ LX_API int lx_gemv_w(const void* x, lx_dtype x_dtype, int ld_x, const lx_weight*
 //   y[M, N] = alpha * (x[M, K] @ W[N, K]^T + bias[N]) + beta * y
 // x bf16 or f32 (quantized on the fly when math needs it, into `workspace`, at least
 // lx_gemm_workspace_bytes(M, K, math) bytes). Same dtype rules for bias and y as lx_gemm_bf16.
+// Deterministic: the same call gives the same bits (small products on sm_90+ may split K across a
+// thread block cluster; the partial sums are added in a fixed order).
 LX_API int lx_gemm_w(const void* x, lx_dtype x_dtype, int ld_x, const lx_weight* w, lx_math math, const void* bias,
                      lx_dtype bias_dtype, void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K, float alpha,
                      float beta, void* workspace, void* stream);
@@ -325,6 +327,9 @@ LX_API int lx_quantize_act(const void* x, lx_dtype x_dtype, int ld_x, lx_math ma
 //                          weight-only, f32 math. Workspace: lx_moe_decode_workspace_bytes.
 //   lx_moe_experts_grouped any T: tokens grouped by expert, a tensor-core grouped GEMM per
 //                          stage with the given math. Workspace: lx_moe_grouped_workspace_bytes.
+//                          The top_k weighted rows of a token are summed with f32 atomics, so the
+//                          last bits of out can differ between calls; LX_MOE_ORDERED=1 sums them in
+//                          a fixed order instead (3 to 25% slower at T >= 1024 on Praxis).
 LX_API int lx_moe_experts_decode(const void* latent, const int32_t* ids, const float* weights,
                                  const lx_weight* gate_up, const lx_weight* down, float* out, void* workspace, int T,
                                  int L, int I, int top_k, void* stream);
