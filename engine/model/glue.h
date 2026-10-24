@@ -13,4 +13,7 @@ int sub(const float* a, const float* b, float* out, int64_t n, cudaStream_t s);
 int meta_scalars(const float* entropy, const float* confidence, const float* continuation, float mean_k,
                  float inv_log_experts, void* meta, int ld, int col, int T, cudaStream_t s);
 
+// out[i, :] = src[cu[i + 1] - 1, :] for each of n_seq sequences (cu on the device).
+int gather_last(const float* src, const int32_t* cu, float* out, int n_seq, int D, cudaStream_t s);
+
 }  // namespace lx::glue

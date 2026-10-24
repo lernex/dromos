@@ -29,6 +29,13 @@ __global__ void meta_scalars_kernel(const float* entropy, const float* confidenc
   row[3] = __float2bfloat16_rn(continuation[t]);
 }
 
+// out[i, :] = src[cu[i + 1] - 1, :]: each sequence's last token, read on the device so a captured
+// graph stays valid for any sequence lengths with the same counts.
+__global__ void gather_last_kernel(const float* src, const int32_t* cu, float* out, int D) {
+  const int64_t row = cu[blockIdx.x + 1] - 1;
+  for (int d = threadIdx.x; d < D; d += blockDim.x) out[static_cast<int64_t>(blockIdx.x) * D + d] = src[row * D + d];
+}
+
 int blocks(int64_t n) { return static_cast<int>((n + 255) / 256); }
 
 }  // namespace
@@ -50,6 +57,11 @@ int meta_scalars(const float* entropy, const float* confidence, const float* con
   if (T > 0)
     meta_scalars_kernel<<<blocks(T), 256, 0, s>>>(entropy, confidence, continuation, mean_k, inv_log_experts,
                                                   static_cast<__nv_bfloat16*>(meta), ld, col, T);
+  return launch_status();
+}
+
+int gather_last(const float* src, const int32_t* cu, float* out, int n_seq, int D, cudaStream_t s) {
+  if (n_seq > 0) gather_last_kernel<<<n_seq, 256, 0, s>>>(src, cu, out, D);
   return launch_status();
 }
 

@@ -14,7 +14,7 @@ host=${LX_HOST:-lernex}
 here=$(cd "$(dirname "$0")/.." && pwd)
 remote="lernex-engine-dev/$slot"
 ssh "$host" "mkdir -p $remote"
-rsync -az --delete --exclude build/ --exclude .git/ --exclude __pycache__/ --exclude .pytest_cache/ "$here/" "$host:$remote/"
+rsync -az --delete --exclude build/ --exclude out/ --exclude .git/ --exclude __pycache__/ --exclude .pytest_cache/ "$here/" "$host:$remote/"
 env='export PATH=/usr/local/cuda/bin:$PATH; export LX_KERNELS=$PWD/build/liblernex_kernels.so; PY=$HOME/venvs/hfport/bin/python'
 build='cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release >/dev/null && nice -n 5 cmake --build build -j 6'
 q() { printf '%q ' "$@"; }

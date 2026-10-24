@@ -1,6 +1,10 @@
 #include "model/metis.h"
 
 #include <cmath>
+#include <cstdlib>
+#include <map>
+#include <set>
+#include <tuple>
 #include <cstring>
 #include <stdexcept>
 
@@ -91,7 +95,17 @@ struct MetisModel::Impl {
       *cont_in, *cont_hidden, *cont_logit, *continuation, *update, *zxbcdt, *xbc, *ssm_y, *qkv_buf, *latent,
       *router_in, *router_logits, *route_w, *entropy, *confidence, *routed, *shared_gu, *summary, *bank_k,
       *bank_v, *entry;
-  int32_t *route_ids, *d_tokens, *d_cu, *d_slots, *d_has_state, *d_start_pos;
+  int32_t *route_ids, *d_meta, *d_tokens, *d_cu, *d_slots, *d_has_state, *d_start_pos;
+  int32_t* h_meta = nullptr;  // pinned staging for d_meta, so the upload is one async copy
+  size_t meta_count = 0;
+  cudaEvent_t meta_copied = nullptr;
+  float* last_rows = nullptr;
+  // Decode steps (one token per sequence) replay a captured graph: the first step of a shape runs
+  // eagerly (which also warms cuBLASLt up), the second captures, every later one replays.
+  using GraphKey = std::tuple<int, int, bool, float*>;
+  std::set<GraphKey> seen;
+  std::map<GraphKey, cudaGraphExec_t> graphs;
+  bool use_graphs = true;
   void *streams_bf, *retrieved_bf, *feat_in_bf, *h_bf, *normed_bf, *lora_bf, *att_bf, *latent_bf, *shared_bf,
       *routed_bf, *entry_bf, *meta_bf, *out_bf;
 
@@ -104,6 +118,9 @@ struct MetisModel::Impl {
     return static_cast<T*>(p);
   }
   ~Impl() {
+    for (auto& [key, exec] : graphs) cudaGraphExecDestroy(exec);
+    if (meta_copied) cudaEventDestroy(meta_copied);
+    if (h_meta) cudaFreeHost(h_meta);
     for (void* p : allocations) cudaFree(p);
   }
 };
@@ -353,11 +370,17 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
   m.entry_bf = m.alloc<uint16_t>(T * Mm);
   m.meta_bf = m.alloc<uint16_t>(T * (R + 4));
   m.out_bf = m.alloc<uint16_t>(T * D);
-  m.d_tokens = m.alloc<int32_t>(T);
-  m.d_cu = m.alloc<int32_t>(max_slots + 1);
-  m.d_slots = m.alloc<int32_t>(max_slots);
-  m.d_has_state = m.alloc<int32_t>(max_slots);
-  m.d_start_pos = m.alloc<int32_t>(max_slots);
+  m.last_rows = m.alloc<float>(static_cast<size_t>(max_slots) * D);
+  m.meta_count = T + (max_slots + 1) + 3 * static_cast<size_t>(max_slots);
+  m.d_meta = m.alloc<int32_t>(m.meta_count);
+  m.d_tokens = m.d_meta;
+  m.d_cu = m.d_tokens + T;
+  m.d_slots = m.d_cu + max_slots + 1;
+  m.d_has_state = m.d_slots + max_slots;
+  m.d_start_pos = m.d_has_state + max_slots;
+  check(static_cast<int>(cudaMallocHost(&m.h_meta, m.meta_count * 4)), "cudaMallocHost");
+  check(static_cast<int>(cudaEventCreateWithFlags(&m.meta_copied, cudaEventDisableTiming)), "cudaEventCreate");
+  m.use_graphs = std::getenv("LX_NO_GRAPHS") == nullptr;
 }
 
 MetisModel::~MetisModel() { delete impl_; }
@@ -438,16 +461,23 @@ void memory_write(Impl& m, const MetisConfig& c, int T, int pass, int anchor, in
 
 void MetisModel::forward(const StepBatch& b, float* logits, bool all_rows, cudaStream_t s) {
   Impl& m = *impl_;
-  const MetisConfig& c = cfg_;
   const int T = static_cast<int>(b.tokens.size());
   const int n_seq = static_cast<int>(b.slots.size());
   if (T == 0) return;
   if (T > m.max_tokens) throw std::runtime_error("step has more tokens than max_tokens");
   if (n_seq > m.max_slots || static_cast<int>(b.cu_seqlens.size()) != n_seq + 1)
     throw std::runtime_error("bad step batch");
-  const int S = m.S, D = m.D, R = m.R, Lat = m.Lat, E = m.E;
 
-  std::vector<int32_t> has_state(n_seq), start_pos(n_seq);
+  // stage the step's metadata (wait until the previous step's copy has left the staging buffer)
+  cudaEventSynchronize(m.meta_copied);
+  int32_t* tokens = m.h_meta;
+  int32_t* cu = tokens + (m.d_cu - m.d_tokens);
+  int32_t* slots = tokens + (m.d_slots - m.d_tokens);
+  int32_t* has_state = tokens + (m.d_has_state - m.d_tokens);
+  int32_t* start_pos = tokens + (m.d_start_pos - m.d_tokens);
+  std::memcpy(tokens, b.tokens.data(), 4 * T);
+  std::memcpy(cu, b.cu_seqlens.data(), 4 * (n_seq + 1));
+  std::memcpy(slots, b.slots.data(), 4 * n_seq);
   for (int i = 0; i < n_seq; ++i) {
     const int slot = b.slots[i];
     has_state[i] = slot_len_[slot] > 0;
@@ -455,11 +485,41 @@ void MetisModel::forward(const StepBatch& b, float* logits, bool all_rows, cudaS
     if (start_pos[i] + b.cu_seqlens[i + 1] - b.cu_seqlens[i] > m.kv_capacity)
       throw std::runtime_error("sequence longer than the KV capacity");
   }
-  cudaMemcpyAsync(m.d_tokens, b.tokens.data(), 4 * T, cudaMemcpyHostToDevice, s);
-  cudaMemcpyAsync(m.d_cu, b.cu_seqlens.data(), 4 * (n_seq + 1), cudaMemcpyHostToDevice, s);
-  cudaMemcpyAsync(m.d_slots, b.slots.data(), 4 * n_seq, cudaMemcpyHostToDevice, s);
-  cudaMemcpyAsync(m.d_has_state, has_state.data(), 4 * n_seq, cudaMemcpyHostToDevice, s);
-  cudaMemcpyAsync(m.d_start_pos, start_pos.data(), 4 * n_seq, cudaMemcpyHostToDevice, s);
+  cudaMemcpyAsync(m.d_meta, m.h_meta, m.meta_count * 4, cudaMemcpyHostToDevice, s);
+  cudaEventRecord(m.meta_copied, s);
+
+  const bool decode = T == n_seq;
+  const Impl::GraphKey key{T, n_seq, all_rows, logits};
+  if (m.use_graphs && decode) {
+    auto it = m.graphs.find(key);
+    if (it == m.graphs.end() && m.seen.count(key)) {
+      cudaGraph_t graph;
+      check(static_cast<int>(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal)), "cudaStreamBeginCapture");
+      run(T, n_seq, all_rows, logits, s);
+      check(static_cast<int>(cudaStreamEndCapture(s, &graph)), "cudaStreamEndCapture");
+      cudaGraphExec_t exec;
+      check(static_cast<int>(cudaGraphInstantiate(&exec, graph, 0)), "cudaGraphInstantiate");
+      cudaGraphDestroy(graph);
+      it = m.graphs.emplace(key, exec).first;
+    }
+    if (it != m.graphs.end()) {
+      check(static_cast<int>(cudaGraphLaunch(it->second, s)), "cudaGraphLaunch");
+    } else {
+      run(T, n_seq, all_rows, logits, s);
+      m.seen.insert(key);
+    }
+  } else {
+    run(T, n_seq, all_rows, logits, s);
+  }
+  for (int i = 0; i < n_seq; ++i) slot_len_[b.slots[i]] += b.cu_seqlens[i + 1] - b.cu_seqlens[i];
+}
+
+// The step's device work, from the token ids in d_meta to the logits. Everything it decides on the
+// host depends only on (T, n_seq, all_rows), which is what makes it capturable.
+void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, cudaStream_t s) {
+  Impl& m = *impl_;
+  const MetisConfig& c = cfg_;
+  const int S = m.S, D = m.D, R = m.R, Lat = m.Lat, E = m.E;
 
   LX_CHECK(lx_embed_streams(m.embedding, m.d_tokens, m.stream_emb, m.streams, T, S, D, s));
   LX_CHECK(lx_stream_mean(m.streams, m.previous, T, S, D, s));
@@ -553,16 +613,10 @@ void MetisModel::forward(const StepBatch& b, float* logits, bool all_rows, cudaS
     LX_CHECK(lx_rmsnorm(m.state, LX_F32, m.final_norm, m.out_bf, LX_BF16, T, D, c.rms_norm_eps, s));
     gemm(m.out_bf, D, m.embedding, nullptr, logits, LX_F32, c.vocab_size, T, c.vocab_size, D, s);
   } else {
-    for (int i = 0; i < n_seq; ++i) {
-      const int last = b.cu_seqlens[i + 1] - 1;
-      LX_CHECK(lx_rmsnorm(m.state + static_cast<size_t>(last) * D, LX_F32, m.final_norm,
-                          static_cast<uint16_t*>(m.out_bf) + static_cast<size_t>(i) * D, LX_BF16, 1, D, c.rms_norm_eps,
-                          s));
-    }
+    LX_CHECK(glue::gather_last(m.state, m.d_cu, m.last_rows, n_seq, D, s));
+    LX_CHECK(lx_rmsnorm(m.last_rows, LX_F32, m.final_norm, m.out_bf, LX_BF16, n_seq, D, c.rms_norm_eps, s));
     gemm(m.out_bf, D, m.embedding, nullptr, logits, LX_F32, c.vocab_size, n_seq, c.vocab_size, D, s);
   }
-
-  for (int i = 0; i < n_seq; ++i) slot_len_[b.slots[i]] += b.cu_seqlens[i + 1] - b.cu_seqlens[i];
 }
 
 }  // namespace lx

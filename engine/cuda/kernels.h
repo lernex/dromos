@@ -175,6 +175,32 @@ LX_API int lx_moe_experts(const void* latent, const int32_t* ids, const float* w
 LX_API int lx_moe_summary(const int32_t* ids, const float* weights, const void* expert_emb, float* summary,
                           int T, int R, int top_k, void* stream);
 
+// ---- Decode GEMV (gemv.cu) ------------------------------------------------------------------
+// Matrix-vector products for decode steps (M <= 8 rows), memory-bound by design: one pass over
+// the weights, which dominate the traffic, at close to DRAM bandwidth. Weights are bf16, or int8
+// with one f32 scale per output row (w = q * scale[n], symmetric, see lx_quantize_w8). The input
+// may be f32 or bf16 and is read directly, so no cast pass is needed before the product.
+//   y[m, n] = alpha * (sum_k x[m, k] * w[n, k] + bias[n]) + beta * y[m, n]
+// x: [M, K] (x_dtype, row stride ld_x); bias: [N] (bias_dtype, or null); y: [M, N] (y_dtype,
+// row stride ld_y; read only when beta != 0). Accumulation in f32. Deterministic (no atomics).
+typedef enum { LX_W_BF16 = 0, LX_W_INT8 = 1 } lx_wtype;
+LX_API int lx_gemv(const void* x, lx_dtype x_dtype, int ld_x, const void* w, lx_wtype w_type, const float* w_scale,
+                   const void* bias, lx_dtype bias_dtype, void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K,
+                   float alpha, float beta, void* stream);
+
+// Per-row symmetric int8: scale[n] = max_k |w[n, k]| / 127 (1 if the row is all zero),
+// q[n, k] = round_half_even(w[n, k] / scale[n]) clamped to [-127, 127]. w bf16 [rows, cols];
+// q int8 [rows, cols]; scale f32 [rows]. Rows may be the flattened leading dims of a 3-D tensor.
+LX_API int lx_quantize_w8(const void* w, int8_t* q, float* scale, int64_t rows, int cols, void* stream);
+
+// lx_moe_experts with int8 expert weights (per-row scales as above: gate_up_scale [E, 2I],
+// down_scale [E, L]) and a caller-owned workspace of at least lx_moe_workspace_bytes(T, I, top_k)
+// bytes, so nothing is allocated per call (and the call can be captured in a CUDA graph).
+LX_API int lx_moe_experts_w8(const void* latent, const int32_t* ids, const float* weights, const int8_t* gate_up,
+                             const float* gate_up_scale, const int8_t* down, const float* down_scale, float* out,
+                             void* workspace, int T, int L, int I, int top_k, void* stream);
+LX_API int64_t lx_moe_workspace_bytes(int T, int I, int top_k);
+
 #ifdef __cplusplus
 }
 #endif

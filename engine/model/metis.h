@@ -50,6 +50,8 @@ class MetisModel {
   struct Impl;
 
  private:
+  void run(int T, int n_seq, bool all_rows, float* logits, cudaStream_t stream);
+
   MetisConfig cfg_;
   std::vector<int> slot_len_;
   Impl* impl_;
