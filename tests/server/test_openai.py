@@ -20,7 +20,10 @@ import requests
 
 LX_BIN = os.environ.get("LX_BIN", "build/lernex")
 LX_MODEL = os.environ["LX_MODEL"]
-PROMPT = [1001, 2002, 3003]  # greedy from these ids continues "xxokmq" on the test tokenizer
+# Greedy from these ids the Praxis checkpoint continues EXPECTED: the engine's tokens
+# [205, 205, 534, 1726, 324, 8232] agree with the reference argmax at every step (tests/gpu).
+PROMPT = [1001, 2002, 3003]
+EXPECTED = "\n\nThe user is asking"
 
 
 def free_port():
@@ -72,7 +75,7 @@ def test_health_and_models(server, client):
 
 def test_completion_with_token_ids(client):
     r = client.completions.create(model="praxis", prompt=PROMPT, max_tokens=6, temperature=0)
-    assert r.choices[0].text == "xxokmq"
+    assert r.choices[0].text == EXPECTED
     assert r.choices[0].finish_reason == "length"
     assert r.usage.prompt_tokens == 3 and r.usage.completion_tokens == 6
 
@@ -89,13 +92,13 @@ def test_completion_stream_matches_and_ends_with_usage(client):
         )
     )
     text = "".join(c.choices[0].text for c in chunks if c.choices)
-    assert text == "xxokmq"
+    assert text == EXPECTED
     assert chunks[-1].usage is not None and chunks[-1].usage.completion_tokens == 6
 
 
 def test_stop_string_ends_the_reply_before_it(client):
-    r = client.completions.create(model="praxis", prompt=PROMPT, max_tokens=20, temperature=0, stop=["km"])
-    assert r.choices[0].text == "xxo"
+    r = client.completions.create(model="praxis", prompt=PROMPT, max_tokens=20, temperature=0, stop=["asking"])
+    assert r.choices[0].text == "\n\nThe user is "
     assert r.choices[0].finish_reason == "stop"
 
 
@@ -123,9 +126,9 @@ def test_chat_streaming_with_usage(client):
     )
     chunks = list(stream)
     assert chunks[0].choices[0].delta.role == "assistant"
-    content = "".join(c.choices[0].delta.content or "" for c in chunks if c.choices)
-    assert len(content) == 4
     assert chunks[-1].usage.completion_tokens == 4
+    finish = [c.choices[0].finish_reason for c in chunks if c.choices and c.choices[0].finish_reason]
+    assert finish == ["length"]
 
 
 def test_chat_logprobs(client):
@@ -244,4 +247,4 @@ def test_a_disconnected_stream_is_cancelled(server, client):
         time.sleep(0.2)
     assert h["running"] == 0, h
     r = client.completions.create(model="praxis", prompt=PROMPT, max_tokens=6, temperature=0)
-    assert r.choices[0].text == "xxokmq"
+    assert r.choices[0].text == EXPECTED

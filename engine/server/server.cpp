@@ -604,6 +604,7 @@ bool Server::run() {
       job.request.thinking = thinking;
 
       lx::text::ChatOptions options;
+      options.model_dir = options_.model_dir;
       options.thinking = thinking;
       options.tools_json = tools_text;
       if (!body.contains("messages")) invalid("messages is required", "messages");

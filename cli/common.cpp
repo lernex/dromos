@@ -65,7 +65,8 @@ runtime::Plan plan_for(const Model& model, int sequences, int context, int weigh
   request.sequences = sequences;
   request.context = context;
   request.weights = weights;
-  return runtime::make_plan(runtime::query_device(0), config, runtime::CheckpointInfo{}, request);
+  const runtime::CheckpointInfo checkpoint = runtime::inspect_checkpoint(model.dir.string());
+  return runtime::make_plan(runtime::query_device(0), config, checkpoint, request);
 }
 
 runtime::SamplingParams recommended_sampling(const Model& model) {
