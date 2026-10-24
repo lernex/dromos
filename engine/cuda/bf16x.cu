@@ -99,7 +99,7 @@ cudaLaunchConfig_t pdl_config(unsigned blocks, int threads, cudaStream_t stream,
   attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attr.val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = &attr;
-  cfg.numAttrs = 1;
+  cfg.numAttrs = lx::pdl_available() ? 1 : 0;  // programmatic launch exists on sm_90 and up
   return cfg;
 }
 
@@ -395,7 +395,7 @@ gemv_vec_kernel(const TX* __restrict__ x, int ld_x, const uint8_t* __restrict__ 
   constexpr int kGroups = kWarps / S;
   __shared__ float partial[kWarps][RG * MT];
 
-  cudaTriggerProgrammaticLaunchCompletion();
+  lx::pdl_trigger();
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int group = warp / S, part = warp % S;
   const int64_t first = (static_cast<int64_t>(blockIdx.x) * kGroups + group) * RG;
@@ -430,7 +430,7 @@ gemv_vec_kernel(const TX* __restrict__ x, int ld_x, const uint8_t* __restrict__ 
     pc[r].next = fx::kNoPatch;
     if (kX && rows[r] != nullptr) pc[r].prefetch(rows[r]);
   }
-  cudaGridDependencySynchronize();
+  lx::pdl_wait();
 
   if (first < N) {
     for (int j = u0; j < u1; j += KU) {
@@ -535,7 +535,7 @@ __global__ void __launch_bounds__(32 * kSmallWarps)
 gemv_small_kernel(const TX* __restrict__ x, int ld_x, const uint8_t* __restrict__ w, const void* __restrict__ bias,
                   bool bias_bf16, void* __restrict__ y, bool y_bf16, int ld_y, int M, int N, int K, int lpr, int e,
                   bool octet, float alpha, float beta) {
-  cudaTriggerProgrammaticLaunchCompletion();
+  lx::pdl_trigger();
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int slot = lane / lpr, c = lane % lpr;
   const int64_t n = (static_cast<int64_t>(blockIdx.x) * kSmallWarps + warp) * (32 / lpr) + slot;
@@ -548,7 +548,7 @@ gemv_small_kernel(const TX* __restrict__ x, int ld_x, const uint8_t* __restrict_
     float wv[8];
     const bool live = n < N && 8 * c < K;
     if (live) small_octet<kX>(w, n, K, c, wv);
-    cudaGridDependencySynchronize();
+    lx::pdl_wait();
     if (live) {
 #pragma unroll
       for (int m = 0; m < kMaxM; ++m) {
@@ -563,7 +563,7 @@ gemv_small_kernel(const TX* __restrict__ x, int ld_x, const uint8_t* __restrict_
       }
     }
   } else if (n < N && !kX) {
-    cudaGridDependencySynchronize();
+    lx::pdl_wait();
     const bf16* row = reinterpret_cast<const bf16*>(w) + n * K;
     for (int i = 0; i < e; ++i) {
       const int k = c * e + i;
@@ -574,7 +574,7 @@ gemv_small_kernel(const TX* __restrict__ x, int ld_x, const uint8_t* __restrict_
         if (m < M) acc[m] = fmaf(wv, lx::to_f32(x[static_cast<int64_t>(m) * ld_x + k]), acc[m]);
     }
   } else if (n < N) {
-    cudaGridDependencySynchronize();
+    lx::pdl_wait();
     const uint8_t* row = w + n * fx::row_bytes(K);
     fx::Patches pc;
     pc.start(row, fx::patch_slots(K));
@@ -611,7 +611,7 @@ gemv_small_kernel(const TX* __restrict__ x, int ld_x, const uint8_t* __restrict_
       }
     }
   } else {
-    cudaGridDependencySynchronize();
+    lx::pdl_wait();
   }
   for (int off = lpr / 2; off > 0; off >>= 1)
 #pragma unroll
@@ -942,8 +942,8 @@ __global__ void __launch_bounds__(kThreads) experts_gate_up(const bf16* __restri
                                                             int row_blocks) {
   // The routing comes from the previous kernel. Triggering only after the wait lets stage 2 read
   // the routing in its own prologue: once it starts, every block here has seen the routing complete.
-  cudaGridDependencySynchronize();
-  cudaTriggerProgrammaticLaunchCompletion();
+  lx::pdl_wait();
+  lx::pdl_trigger();
   const int64_t p = blockIdx.x / row_blocks;
   const int i = (blockIdx.x % row_blocks) * kWarps + (threadIdx.x >> 5);
   if (i >= I) return;
@@ -972,7 +972,7 @@ __global__ void __launch_bounds__(kThreads) experts_down(const bf16* __restrict_
                                                          const float* __restrict__ weights,
                                                          const uint8_t* __restrict__ down, float* __restrict__ out,
                                                          int L, int I, int top_k, int row_blocks) {
-  cudaTriggerProgrammaticLaunchCompletion();  // the next kernel waits for this one before reading `out`
+  lx::pdl_trigger();  // the next kernel waits for this one before reading `out`
   const int64_t t = blockIdx.x / row_blocks;
   const int l = (blockIdx.x % row_blocks) * kWarps + (threadIdx.x >> 5);
   const int lane = threadIdx.x & 31;
@@ -1006,7 +1006,7 @@ __global__ void __launch_bounds__(kThreads) experts_down(const bf16* __restrict_
     for (int k = 0; k < KMAX; ++k)
       if (k < top_k && live) pc[k].resolve(fx::patch_slots(I));
   }
-  cudaGridDependencySynchronize();  // stage 1 has written the intermediates
+  lx::pdl_wait();  // stage 1 has written the intermediates
   if (!live) return;
 
   float acc = 0.0f;
@@ -1045,8 +1045,8 @@ __global__ void __launch_bounds__(kThreads) experts_down_scalar(const bf16* __re
                                                                 const uint8_t* __restrict__ down,
                                                                 float* __restrict__ out, int L, int I, int top_k,
                                                                 int row_blocks) {
-  cudaTriggerProgrammaticLaunchCompletion();
-  cudaGridDependencySynchronize();
+  lx::pdl_trigger();
+  lx::pdl_wait();
   const int64_t t = blockIdx.x / row_blocks;
   const int l = (blockIdx.x % row_blocks) * kWarps + (threadIdx.x >> 5);
   if (l >= L) return;
