@@ -66,6 +66,7 @@ struct Linear {
   float* scale = nullptr;      // f32 [N]
   int N = 0, K = 0;
   bool host = false;           // w is in pinned host memory (offload): prefill stages it into VRAM
+  lx_weight pw{LX_W_BF16, nullptr, nullptr, 1.0f};  // what prefill multiplies by (LX_PREFILL): w, or a copy
 };
 
 struct MetisModel::Impl {
@@ -88,6 +89,7 @@ struct MetisModel::Impl {
     const void *expert_emb, *gate_up, *down;      // bf16 experts, for prefill
     int8_t *gate_up_q = nullptr, *down_q = nullptr;  // int8 experts, for decode
     float *gate_up_scale = nullptr, *down_scale = nullptr;
+    lx_weight gate_up_pw{}, down_pw{};  // the experts as prefill multiplies them (LX_PREFILL)
     const float *router_w, *router_b, *selection_bias;
     Connection mixer_conn, moe_conn;
   };
@@ -164,6 +166,18 @@ struct MetisModel::Impl {
   int stage_next = 0;
   cudaStream_t stage_stream = nullptr;
   cudaEvent_t stage_copied[2] = {nullptr, nullptr}, stage_free[2] = {nullptr, nullptr};
+  // Prefill products (more than kGemvRows rows): lx_gemm_w and lx_moe_experts_grouped on the weight
+  // format and math LX_PREFILL names (bf16, w8a16, w4a16, int8, fp8, w4a8, fp4); LX_PREFILL_KEEP lists
+  // name fragments that stay bf16. The default keeps what the FP8 release keeps (the Mamba-2 output
+  // projection, the tied LM head, the depth memory, the latent projections and the shared expert), so
+  // only the experts, the Mamba-2 input projections and the attention projections are quantized: the
+  // measured best trade (W8A16 then sits at the BF16 noise floor; INT8 at 0.010 / 0.024 / 0.0058).
+  lx_wtype prefill_w = LX_W_BF16;
+  lx_math prefill_math = LX_MATH_BF16;
+  std::string prefill_keep;
+  bool grouped_experts = true;  // LX_OLD_EXPERTS=1: lx_moe_experts for prefill, as before
+  void* gemm_ws = nullptr;
+  void* moe_grouped_ws = nullptr;
   std::string w8_keep;  // LX_W8_KEEP: comma-separated name fragments that stay bf16 for decode
   void *streams_bf, *retrieved_bf, *feat_in_bf, *h_bf, *normed_bf, *lora_bf, *att_bf, *latent_bf, *shared_bf,
       *routed_bf, *entry_bf, *meta_bf, *out_bf;
@@ -212,14 +226,33 @@ const void* need(const WeightLookup& lookup, const std::string& name, int dtype,
 
 // Whether a weight stays bf16 for decode: LX_W8_KEEP lists name fragments to keep, for measuring
 // what quantizing each part of the model costs.
-bool kept_bf16(const Impl& m, const std::string& name) {
-  for (size_t pos = 0; pos < m.w8_keep.size();) {
-    const size_t end = m.w8_keep.find(',', pos);
-    const std::string frag = m.w8_keep.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+bool listed(const std::string& list, const std::string& name) {
+  for (size_t pos = 0; pos < list.size();) {
+    const size_t end = list.find(',', pos);
+    const std::string frag = list.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
     if (!frag.empty() && name.find(frag) != std::string::npos) return true;
-    pos = end == std::string::npos ? m.w8_keep.size() : end + 1;
+    pos = end == std::string::npos ? list.size() : end + 1;
   }
   return false;
+}
+bool kept_bf16(const Impl& m, const std::string& name) { return listed(m.w8_keep, name); }
+
+// The prefill copy of a bf16 [rows, cols] weight (rows may be a whole expert stack) in m.prefill_w;
+// an int8 decode copy is shared when the formats agree.
+lx_weight prefill_weight(Impl& m, const void* w, int8_t* q, float* scale, int64_t rows, int64_t cols) {
+  lx_weight out{LX_W_BF16, w, nullptr, 1.0f};
+  if (m.prefill_w == LX_W_BF16) return out;
+  if (m.prefill_w == LX_W_INT8 && q) return lx_weight{LX_W_INT8, q, scale, 1.0f};
+  out.type = m.prefill_w;
+  if (m.prefill_w == LX_W_NVFP4) {
+    out.data = m.alloc<uint8_t>(static_cast<size_t>(rows) * cols / 2);
+    out.scale = m.alloc<uint8_t>(static_cast<size_t>(rows) * cols / 16);
+  } else {
+    out.data = m.alloc<uint8_t>(static_cast<size_t>(rows) * cols);
+    out.scale = m.alloc<float>(rows);
+  }
+  LX_CHECK(lx_quantize_weight(w, &out, rows, static_cast<int>(cols), nullptr));
+  return out;
 }
 
 // A projection from the checkpoint; with `quantize`, also its int8 decode copy, unless its name
@@ -247,6 +280,8 @@ Linear make_linear(Impl& m, const WeightLookup& lw, const std::string& weight, c
     l.scale = m.alloc<float>(N);
     LX_CHECK(lx_quantize_w8(l.w, l.q, l.scale, N, static_cast<int>(K), nullptr));
   }
+  l.pw = lx_weight{LX_W_BF16, l.w, nullptr, 1.0f};
+  if (quantize && !listed(m.prefill_keep, weight)) l.pw = prefill_weight(m, l.w, l.q, l.scale, N, K);
   return l;
 }
 
@@ -350,6 +385,29 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
   // 0.026), as it was for the GGUF, FP8 and MLX releases. LX_W8_KEEP overrides the list.
   m.w8_keep = std::getenv("LX_W8_KEEP") ? std::getenv("LX_W8_KEEP") : "out_proj";
   if (std::getenv("LX_NO_W8")) m.w8_keep = "layers,depth_memory,embedding";
+  m.prefill_keep = std::getenv("LX_PREFILL_KEEP") ? std::getenv("LX_PREFILL_KEEP")
+                                                  : "out_proj,embedding,depth_memory,latent_down,latent_up,shared_expert";
+  m.grouped_experts = std::getenv("LX_OLD_EXPERTS") == nullptr;
+  if (const char* p = std::getenv("LX_PREFILL")) {
+    const std::string v = p;
+    struct Mode {
+      const char* name;
+      lx_wtype w;
+      lx_math math;
+    };
+    const Mode modes[] = {{"bf16", LX_W_BF16, LX_MATH_BF16},   {"w8a16", LX_W_INT8, LX_MATH_BF16},
+                          {"w8a16f", LX_W_FP8, LX_MATH_BF16},  {"w4a16", LX_W_NVFP4, LX_MATH_BF16},
+                          {"int8", LX_W_INT8, LX_MATH_INT8},   {"fp8", LX_W_FP8, LX_MATH_FP8},
+                          {"w4a8", LX_W_NVFP4, LX_MATH_FP8},   {"fp4", LX_W_NVFP4, LX_MATH_FP4}};
+    bool found = false;
+    for (const Mode& mode : modes)
+      if (v == mode.name) {
+        m.prefill_w = mode.w;
+        m.prefill_math = mode.math;
+        found = true;
+      }
+    if (!found) throw std::runtime_error("LX_PREFILL: unknown mode " + v);
+  }
   m.embedding = need(lw, "embedding.weight", LX_BF16, {V, D});
   m.head = make_linear(m, lw, "embedding.weight", "", V, D, true);
   m.stream_emb = need(lw, "stream_embeddings", LX_BF16, {S, D});
@@ -417,6 +475,14 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
       layer.down_scale = m.alloc<float>(dn_rows);
       LX_CHECK(lx_quantize_w8(layer.gate_up, layer.gate_up_q, layer.gate_up_scale, gu_rows, Lat, nullptr));
       LX_CHECK(lx_quantize_w8(layer.down, layer.down_q, layer.down_scale, dn_rows, m.Iexp, nullptr));
+    }
+    if (listed(m.prefill_keep, e + "local_experts.gate_up.weight")) {
+      layer.gate_up_pw = lx_weight{LX_W_BF16, layer.gate_up, nullptr, 1.0f};
+      layer.down_pw = lx_weight{LX_W_BF16, layer.down, nullptr, 1.0f};
+    } else {
+      layer.gate_up_pw = prefill_weight(m, layer.gate_up, layer.gate_up_q, layer.gate_up_scale,
+                                        static_cast<int64_t>(E) * 2 * m.Iexp, Lat);
+      layer.down_pw = prefill_weight(m, layer.down, layer.down_q, layer.down_scale, static_cast<int64_t>(E) * Lat, m.Iexp);
     }
     layer.router_w = static_cast<const float*>(need(lw, e + "expert_router.weight", LX_F32, {E, Lat + R}));
     layer.router_b = static_cast<const float*>(need(lw, e + "expert_router.bias", LX_F32, {E}));
@@ -504,7 +570,16 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
   m.cast_capacity = TS * static_cast<size_t>(std::max({3 * D + R, m.I, m.proj, D}));
   m.cast_bf = m.alloc<uint16_t>(m.cast_capacity);
   m.moe_workspace = m.alloc<char>(static_cast<size_t>(lx_moe_workspace_bytes(Impl::kGemvRows, m.Iexp, m.K)));
-  m.meta_count = T + (max_slots + 1) + 5 * static_cast<size_t>(max_slots);
+  {
+    const int kmax = std::max({3 * D + R, m.I, m.proj, D, Lat, m.Ishared, m.AH * m.Dh});
+    const int rows = static_cast<int>(T);
+    const int64_t ws =
+        std::max(lx_gemm_workspace_bytes(rows, kmax, m.prefill_math), lx_gemm_workspace_bytes(rows, kmax, LX_MATH_BF16));
+    m.gemm_ws = m.alloc<char>(static_cast<size_t>(ws));
+    m.moe_grouped_ws =
+        m.alloc<char>(static_cast<size_t>(lx_moe_grouped_workspace_bytes(rows, Lat, m.Iexp, E, m.K, m.prefill_math)));
+  }
+    m.meta_count = T + (max_slots + 1) + 5 * static_cast<size_t>(max_slots);
   m.d_meta = m.alloc<int32_t>(m.meta_count);
   m.d_tokens = m.d_meta;
   m.d_cu = m.d_tokens + T;
@@ -622,6 +697,13 @@ void linear(Impl& m, const Linear& l, const void* x, lx_dtype x_dtype, int ld_x,
                        l.q ? static_cast<const void*>(l.q) : l.w, l.q ? LX_W_INT8 : LX_W_BF16, l.scale, l.bias,
                        LX_BF16, static_cast<char*>(y) + ys * r0 * ld_y, y_dtype, ld_y, rows, l.N, l.K, alpha, beta, s));
     }
+    return;
+  }
+  if (l.pw.type != LX_W_BF16 || m.prefill_math != LX_MATH_BF16) {
+    // a weight kept bf16 multiplies under BF16 math whatever the mode
+    const lx_math math = l.pw.type == LX_W_BF16 ? LX_MATH_BF16 : m.prefill_math;
+    LX_CHECK(lx_gemm_w(x, x_dtype, ld_x, &l.pw, math, l.bias, LX_BF16, y, y_dtype, ld_y, M, l.N, l.K, alpha, beta,
+                       m.gemm_ws, s));
     return;
   }
   if (x_dtype == LX_F32) {
@@ -971,6 +1053,10 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
       } else if (T <= Impl::kGemvRows && layer.gate_up_q)
         LX_CHECK(lx_moe_experts_w8(m.latent_bf, m.route_ids, m.route_w, layer.gate_up_q, layer.gate_up_scale,
                                    layer.down_q, layer.down_scale, m.routed, m.moe_workspace, T, Lat, m.Iexp, m.K, s));
+      else if (m.grouped_experts)
+        LX_CHECK(lx_moe_experts_grouped(m.latent_bf, m.route_ids, m.route_w, &layer.gate_up_pw, &layer.down_pw,
+                                        layer.gate_up_pw.type == LX_W_BF16 ? LX_MATH_BF16 : m.prefill_math, m.routed,
+                                        m.moe_grouped_ws, T, Lat, m.Iexp, E, m.K, s));
       else
         LX_CHECK(lx_moe_experts(m.latent_bf, m.route_ids, m.route_w, layer.gate_up, layer.down, m.routed, T, Lat,
                                 m.Iexp, m.K, s));

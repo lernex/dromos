@@ -19,6 +19,7 @@ int cmd_spec_cost(int argc, char** argv);
 int cmd_features(int argc, char** argv);
 int cmd_block_check(int argc, char** argv);
 int cmd_weights(int argc, char** argv);
+int cmd_prefill(int argc, char** argv);
 
 namespace {
 
@@ -45,7 +46,8 @@ void usage() {
                "  features MODEL_DIR DATA_JSONL OUT_DIR     hidden-state shards for training draft models\n"
                "  block-check MODEL_DIR HEAD PROMPTS OUT    a block drafter's proposal, for check_block.py\n"
                "  weights MODEL_DIR bf16|int8|fp8|nvfp4|bf16x [--reference DIR] [--bytes-against DIR]\n"
-               "                                            load a folder in a weight format and check it\n");
+               "                                            load a folder in a weight format and check it\n"
+               "  prefill MODEL_DIR PROMPTS_JSON T [RUNS]   time one T-token prefill\n");
 }
 
 }  // namespace
@@ -73,6 +75,7 @@ int main(int argc, char** argv) {
     if (!std::strcmp(cmd, "features")) return cmd_features(argc - 1, argv + 1);
     if (!std::strcmp(cmd, "block-check")) return cmd_block_check(argc - 1, argv + 1);
     if (!std::strcmp(cmd, "weights")) return cmd_weights(argc - 1, argv + 1);
+    if (!std::strcmp(cmd, "prefill")) return cmd_prefill(argc - 1, argv + 1);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "lernex: %s\n", e.what());
     return 1;
