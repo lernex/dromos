@@ -1,5 +1,6 @@
 // Embedding, the residual streams and the depth memory (kernels/streams.metal, kernels/memory.metal).
 #include <algorithm>
+#include <initializer_list>
 
 #include "cuda/tunable.h"
 #include "metal/backend.h"
@@ -16,6 +17,18 @@ constexpr int kDecodeTokens = 8;  // at most this many tokens take the spread-ou
 NSUInteger row_threads(int dim, int cap = 256) {
   return static_cast<NSUInteger>(std::min(cap, std::max(32, (dim + 31) / 32 * 32)));
 }
+
+// Whether rows of D floats can take the float4 kernels: D a multiple of 4, the f32 buffers 16-byte
+// aligned and the bf16 ones 8-byte aligned.
+bool vec4(int D, std::initializer_list<const void*> f32, std::initializer_list<const void*> bf16 = {}) {
+  if (D % 4 != 0) return false;
+  for (const void* p : f32)
+    if (reinterpret_cast<uintptr_t>(p) & 15) return false;
+  for (const void* p : bf16)
+    if (reinterpret_cast<uintptr_t>(p) & 7) return false;
+  return true;
+}
+constexpr int kReadKeep = 4;  // kernels/streams.metal mhc_read_vec
 
 // Variants the tests and the tuner may pick (tunable.h); -1 in the table means the heuristic.
 const lx::TunableRegistration reg_mhc("mhc_read", {"row", "split"});
@@ -38,13 +51,15 @@ int lx_embed_streams(const void* table, const int32_t* ids, const void* stream_e
 int lx_stream_mean(const float* streams, float* mean, int T, int S, int D, void* stream) {
   static Kernel k("stream_mean");
   if (T <= 0 || S <= 0 || D <= 0) return kOk;
+  static Kernel kv("stream_mean_vec");
   StreamMeanArgs a{addr(stream, streams, size_t(T) * S * D * 4), addr_w(stream, mean, size_t(T) * D * 4), T, S, D};
+  if (vec4(D, {streams, mean})) return kv.launch(stream, a, size1(ceil_div(size_t(T) * (D / 4), 256)), size1(256));
   return k.launch(stream, a, size2(ceil_div(D, 256), std::min(T, 65535)), size1(256));
 }
 
 int lx_mhc_read(const float* streams, const float* matrix, const float* read, const void* norm_w, float eps, float* mixed,
                 void* h, int T, int S, int D, void* stream) {
-  static Kernel row("mhc_read_row"), split("mhc_read_split");
+  static Kernel row("mhc_read_row"), split("mhc_read_split"), vec("mhc_read_vec");
   if (T <= 0 || S <= 0 || D <= 0) return kOk;
   if (S > kMaxStreams) return kInvalidValue;
   int variant = lx_tune_get("mhc_read", T, D, S);
@@ -54,8 +69,14 @@ int lx_mhc_read(const float* streams, const float* matrix, const float* read, co
   MhcReadArgs a{addr(stream, streams, size_t(T) * S * D * 4), addr(stream, matrix, size_t(S) * S * 4),
                 addr(stream, read, size_t(S) * 4), addr(stream, norm_w, size_t(D) * 2),
                 addr_w(stream, mixed, size_t(T) * S * D * 4), addr_w(stream, h, size_t(T) * D * 2), eps, S, D, 1};
+  const bool v4 = vec4(D, {streams, mixed}, {norm_w, h});
+  if (v4 && variant == 0 && D / 4 <= kReadKeep * 1024) {
+    // Two chunks of four per thread, so a token's loads are all in flight at once.
+    return vec.launch(stream, a, size1(T), size1(row_threads(ceil_div(D / 4, 2), 1024)));
+  }
   if (variant == 0) return row.launch(stream, a, size1(T), size1(row_threads(D, 1024)), size_t(D) * 4);
   a.split = std::max(1, std::min(8, D / 256));
+  if (v4) return vec.launch(stream, a, size1(size_t(T) * a.split), size1(256));
   return split.launch(stream, a, size1(size_t(T) * a.split), size1(256));
 }
 
@@ -63,8 +84,10 @@ int lx_mhc_write(const float* mixed, const float* write, const float* update, fl
                  void* stream) {
   static Kernel k("mhc_write");
   if (T <= 0 || S <= 0 || D <= 0) return kOk;
+  static Kernel kv("mhc_write_vec");
   MhcWriteArgs a{addr(stream, mixed, size_t(T) * S * D * 4), addr(stream, write, size_t(S) * 4),
                  addr(stream, update, size_t(T) * D * 4), addr_w(stream, streams, size_t(T) * S * D * 4), T, S, D};
+  if (vec4(D, {mixed, update, streams})) return kv.launch(stream, a, size1(ceil_div(size_t(T) * (D / 4), 256)), size1(256));
   return k.launch(stream, a, size2(ceil_div(D, 256), std::min(T, 65535)), size1(256));
 }
 
@@ -83,7 +106,7 @@ int lx_memory_attend(const float* q, const float* bank_k, const float* bank_v, i
 
 int lx_memory_fuse(float* streams, const float* projected, const void* gate, const void* gate_bias, float* summary,
                    int T, int S, int D, void* stream) {
-  static Kernel k("memory_fuse");
+  static Kernel k("memory_fuse"), kv("memory_fuse_vec");
   if (T <= 0 || S <= 0 || D <= 0) return kOk;
   int variant = lx_tune_get("memory_fuse", T, D, S);
   if (variant < 0) variant = T <= kDecodeTokens && lx_arch() >= 1000 ? 1 : 0;
@@ -92,6 +115,8 @@ int lx_memory_fuse(float* streams, const float* projected, const void* gate, con
                    addr(stream, gate_bias, size_t(S) * 2), addr_w(stream, summary, size_t(T) * D * 4), S, D,
                    variant == 1 ? S : 1};
   const NSUInteger groups = variant == 1 ? size_t(T) * S : size_t(T);
+  if (vec4(D, {streams, projected, summary}, {gate}))
+    return kv.launch(stream, a, size1(groups), size1(row_threads(D / 4, variant == 1 ? 256 : 1024)));
   return k.launch(stream, a, size1(groups), size1(row_threads(D, variant == 1 ? 256 : 1024)));
 }
 

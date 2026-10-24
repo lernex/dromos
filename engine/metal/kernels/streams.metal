@@ -115,3 +115,107 @@ kernel void mhc_write(constant MhcWriteArgs& a [[buffer(0)]], uint2 gid [[thread
     for (int s = 0; s < a.S; ++s) a.streams[base + s * a.D] = a.mixed[base + s * a.D] + a.write[s] * u;
   }
 }
+
+// ---- the same on float4 ---------------------------------------------------------------------------
+// Rows of a multiple of 4 floats, 16-byte aligned (bf16 rows 8-byte aligned): the kernels above with
+// each thread taking four columns per step, the same arithmetic per column. At prefill the rows do not
+// fit the cache and these run at the memory's pace; the scalar forms above serve every other shape.
+inline float4 bf4(uint2 w) { return float4(bf_lo(w.x), bf_hi(w.x), bf_lo(w.y), bf_hi(w.y)); }
+inline uint2 to_bf4(float4 v) {
+  return uint2(uint(to_bf(v.x)) | (uint(to_bf(v.y)) << 16), uint(to_bf(v.z)) | (uint(to_bf(v.w)) << 16));
+}
+
+constant constexpr int kReadKeep = 4;  // source chunks a thread keeps in registers (one per token form)
+
+// mhc_read on float4. split == 1: one threadgroup per token, the source chunks kept in registers until
+// the sum of squares is known (the host sizes the threadgroup so they fit). split > 1: the decode form,
+// each part going over the whole row for the sum of squares and then writing its own columns.
+kernel void mhc_read_vec(constant MhcReadArgs& a [[buffer(0)]], uint g [[threadgroup_position_in_grid]],
+                         uint tid [[thread_index_in_threadgroup]], uint threads [[threads_per_threadgroup]]) {
+  threadgroup float scratch[32];
+  const int S = a.S, D = a.D, D4 = D / 4;
+  const int t = g / a.split, part = g % a.split;
+  const device float4* in = (const device float4*)(a.streams + long(t) * S * D);
+  device float4* mix = (device float4*)(a.mixed + long(t) * S * D);
+  device uint2* h = (device uint2*)(a.h + long(t) * D);
+  const device uint2* nw = (const device uint2*)a.norm_w;
+  float rd[kMaxStreams], mat[kMaxStreams * kMaxStreams];
+  for (int i = 0; i < kMaxStreams; ++i) rd[i] = i < S ? a.read[i] : 0.0f;
+  for (int i = 0; i < kMaxStreams * kMaxStreams; ++i) mat[i] = i < S * S ? a.matrix[i] : 0.0f;
+
+  if (a.split == 1) {
+    float4 keep[kReadKeep];
+    float sq = 0.0f;
+    for (int j = 0; j < kReadKeep; ++j) {
+      const int c = int(tid) + j * int(threads);
+      keep[j] = float4(0.0f);
+      if (c >= D4) continue;
+      float4 x[kMaxStreams];
+      for (int i = 0; i < kMaxStreams; ++i) x[i] = i < S ? in[i * D4 + c] : float4(0.0f);
+      float4 src = float4(0.0f);
+      for (int i = 0; i < kMaxStreams; ++i)
+        if (i < S) src += rd[i] * x[i];
+      for (int o = 0; o < S; ++o) {
+        float4 acc = float4(0.0f);
+        for (int i = 0; i < kMaxStreams; ++i)
+          if (i < S) acc += mat[o * S + i] * x[i];
+        mix[o * D4 + c] = acc;
+      }
+      keep[j] = src;
+      sq += dot(src, src);
+    }
+    const float scale = rsqrt(group_sum(sq, scratch, tid, threads) / D + a.eps);
+    for (int j = 0; j < kReadKeep; ++j) {
+      const int c = int(tid) + j * int(threads);
+      if (c < D4) h[c] = to_bf4(keep[j] * scale * bf4(nw[c]));
+    }
+    return;
+  }
+
+  const int W = (D4 + a.split - 1) / a.split;
+  const int c0 = part * W, c1 = min(D4, c0 + W);
+  float sq = 0.0f;
+  for (int c = tid; c < D4; c += threads) {
+    float4 src = float4(0.0f);
+    for (int i = 0; i < kMaxStreams; ++i)
+      if (i < S) src += rd[i] * in[i * D4 + c];
+    sq += dot(src, src);
+  }
+  const float scale = rsqrt(group_sum(sq, scratch, tid, threads) / D + a.eps);
+  for (int c = c0 + tid; c < c1; c += threads) {
+    float4 x[kMaxStreams];
+    for (int i = 0; i < kMaxStreams; ++i) x[i] = i < S ? in[i * D4 + c] : float4(0.0f);
+    float4 src = float4(0.0f);
+    for (int i = 0; i < kMaxStreams; ++i)
+      if (i < S) src += rd[i] * x[i];
+    for (int o = 0; o < S; ++o) {
+      float4 acc = float4(0.0f);
+      for (int i = 0; i < kMaxStreams; ++i)
+        if (i < S) acc += mat[o * S + i] * x[i];
+      mix[o * D4 + c] = acc;
+    }
+    h[c] = to_bf4(src * scale * bf4(nw[c]));
+  }
+}
+
+// mhc_write on float4: one thread per (token, four columns).
+kernel void mhc_write_vec(constant MhcWriteArgs& a [[buffer(0)]], uint i [[thread_position_in_grid]]) {
+  const int D4 = a.D / 4;
+  if (long(i) >= long(a.T) * D4) return;
+  const long t = i / D4, c = i % D4;
+  const float4 u = ((const device float4*)a.update)[t * D4 + c];
+  const long base = t * a.S * D4 + c;
+  for (int s = 0; s < a.S; ++s)
+    ((device float4*)a.streams)[base + s * D4] = ((const device float4*)a.mixed)[base + s * D4] + a.write[s] * u;
+}
+
+// stream_mean on float4.
+kernel void stream_mean_vec(constant StreamMeanArgs& a [[buffer(0)]], uint i [[thread_position_in_grid]]) {
+  const int D4 = a.D / 4;
+  if (long(i) >= long(a.T) * D4) return;
+  const long t = i / D4, c = i % D4;
+  const device float4* in = (const device float4*)a.streams + t * a.S * D4 + c;
+  float4 acc = float4(0.0f);
+  for (int s = 0; s < a.S; ++s) acc += in[s * D4];
+  ((device float4*)a.mean)[t * D4 + c] = acc / a.S;
+}

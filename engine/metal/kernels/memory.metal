@@ -74,6 +74,38 @@ kernel void memory_fuse(constant MemoryFuseArgs& a [[buffer(0)]], uint g [[threa
   }
 }
 
+// memory_fuse on float4 (D a multiple of 4, rows 16-byte aligned, the gate 8-byte aligned).
+kernel void memory_fuse_vec(constant MemoryFuseArgs& a [[buffer(0)]], uint g [[threadgroup_position_in_grid]],
+                            uint tid [[thread_index_in_threadgroup]], uint threads [[threads_per_threadgroup]]) {
+  threadgroup float scratch[32];
+  const int S = a.S, D = a.D, D4 = D / 4;
+  const int per = a.split == 1 ? S : 1;
+  const int t = a.split == 1 ? int(g) : int(g) / S;
+  const int s0 = a.split == 1 ? 0 : int(g) % S;
+  const float inv_sqrt_d = rsqrt(float(D));
+  const long base = long(t) * S * D4;
+  const device uint2* gate = (const device uint2*)a.gate;
+  for (int s = s0; s < s0 + per; ++s) {
+    device float4* row = (device float4*)a.streams + base + long(s) * D4;
+    const device float4* proj = (const device float4*)a.projected + base + long(s) * D4;
+    float dt = 0.0f;
+    for (int c = tid; c < D4; c += threads) {
+      const uint2 w = gate[s * D4 + c];
+      dt += dot(row[c], float4(bf_lo(w.x), bf_hi(w.x), bf_lo(w.y), bf_hi(w.y)));
+    }
+    const float gte = sigmoid(group_sum(dt, scratch, tid, threads) * inv_sqrt_d + bf(a.gate_bias[s]));
+    for (int c = tid; c < D4; c += threads) row[c] += gte * proj[c];
+  }
+  if (s0 == 0) {
+    const device float4* proj = (const device float4*)a.projected + base;
+    for (int c = tid; c < D4; c += threads) {
+      float4 acc = float4(0.0f);
+      for (int s = 0; s < S; ++s) acc += proj[long(s) * D4 + c];
+      ((device float4*)a.summary)[long(t) * D4 + c] = acc / S;
+    }
+  }
+}
+
 // out[t] = sigmoid(clip(logit + tanh(innovation / scale) - 0.5, +-limit)), one threadgroup per token.
 kernel void continuation_finish(constant ContinuationArgs& a [[buffer(0)]], uint t [[threadgroup_position_in_grid]],
                                 uint tid [[thread_index_in_threadgroup]], uint threads [[threads_per_threadgroup]]) {
