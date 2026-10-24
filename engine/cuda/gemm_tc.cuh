@@ -119,9 +119,17 @@ struct Config {
   static constexpr int kKTile = kARow * 8 / T::kABits;     // K per k-tile
   static constexpr int kBRow = kKTile * T::kBBits / 8;     // B bytes per row per k-tile
   static constexpr int kSfRow = kKTile / 16;               // scale bytes per row per k-tile (FP4 / NVFP4)
-  // Scale rows are padded by one row every 8 so the 32 rows the FP4 scale loads touch fall in 32 banks.
-  static constexpr int kASfBytes = T::kASf ? (BM + BM / 8) * kSfRow : 0;
-  static constexpr int kBSfBytes = T::kBSf ? (BN + BN / 8 + 8) * kSfRow : 0;
+  // Scale tiles. An FP4 scale load reads one 4-byte word from each of 32 rows: with 8-byte rows the tile
+  // is stored word-major ([word][row]) so those rows fall in 32 banks; otherwise rows are padded by one
+  // row every 8, which does the same for 16-byte rows and keeps the 4- and 8-byte NVFP4 rows aligned.
+  static constexpr bool kSfWordMajor = kKind == kF4 && kSfRow == 8;
+  static constexpr int kASfBytes = T::kASf ? (kSfWordMajor ? BM * kSfRow : (BM + BM / 8) * kSfRow) : 0;
+  static constexpr int kBSfBytes = T::kBSf ? (kSfWordMajor ? BN * kSfRow : (BN + BN / 8 + 8) * kSfRow) : 0;
+  template <int R>
+  static __device__ __forceinline__ int sf_off(int r, int w) {
+    if constexpr (kSfWordMajor) return (w * R + r) * 4;
+    else return (r + r / 8) * kSfRow + 4 * w;
+  }
   static constexpr int kAOff = 0;
   static constexpr int kBOff = kAOff + BM * kARow;
   static constexpr int kASfOff = kBOff + BN * kBRow;
@@ -134,6 +142,10 @@ struct Config {
   static_assert(BM % (16 * WM) == 0 && BN % (8 * WN) == 0, "warp tile");
   static_assert(T::kLdm == false || kNT % 2 == 0, "ldmatrix loads B in pairs of n8 tiles");
   static_assert(kSmem <= 101376, "shared memory");
+  // Two CTAs per SM when they fit (sm_80-family SMs hold 100 KB, 1 KB of it reserved per CTA): one CTA's
+  // epilogue then overlaps the other's mainloop. The output write is first order here: at K = 2048 an f32
+  // result carries 1024 FLOPs per byte, so at the FP4 peak the stores alone need most of DRAM's bandwidth.
+  static constexpr int kMinBlocks = 2 * (kSmem + 1024) <= 102400 && kThreads <= 128 ? 2 : 1;
   static_assert(RB == 128 || (RB == 64 && T::kLdm), "64-byte rows: homogeneous kinds only");
 };
 
@@ -225,25 +237,39 @@ __device__ __forceinline__ void gemm_body(const typename Prob::Params& pp, const
       }
     }
     const int ks = kt * C::kSfRow;
+    if constexpr (T::kASf) {
 #pragma unroll
     for (int i = 0; i < kASfIt; ++i) {
       const int rr = tid + i * kThreads;
       if (rr < BM) {
         const bool ok = asf_src[i] != nullptr && ks < k_sf;
-        const uint32_t dst = base + C::kASfOff + (rr + rr / 8) * C::kSfRow;
-        if constexpr (C::kSfRow == 16) mma::cp_async16(dst, ok ? asf_src[i] + ks : t.b, ok);
-        else mma::cp_async_small<C::kSfRow>(dst, ok ? asf_src[i] + ks : t.b, ok);
+        if constexpr (C::kSfWordMajor) {
+          mma::cp_async_small<4>(base + C::kASfOff + C::template sf_off<BM>(rr, 0), ok ? asf_src[i] + ks : t.b, ok);
+          mma::cp_async_small<4>(base + C::kASfOff + C::template sf_off<BM>(rr, 1), ok ? asf_src[i] + ks + 4 : t.b, ok);
+        } else {
+          const uint32_t dst = base + C::kASfOff + C::template sf_off<BM>(rr, 0);
+          if constexpr (C::kSfRow == 16) mma::cp_async16(dst, ok ? asf_src[i] + ks : t.b, ok);
+          else mma::cp_async_small<C::kSfRow>(dst, ok ? asf_src[i] + ks : t.b, ok);
+        }
       }
     }
+    }
+    if constexpr (T::kBSf) {
 #pragma unroll
     for (int i = 0; i < kBSfIt; ++i) {
       const int rr = tid + i * kThreads;
       if (rr < BN) {
         const bool ok = bsf_src[i] != nullptr && ks < k_sf;
-        const uint32_t dst = base + C::kBSfOff + (rr + rr / 8) * C::kSfRow;
-        if constexpr (C::kSfRow == 16) mma::cp_async16(dst, ok ? bsf_src[i] + ks : t.b, ok);
-        else mma::cp_async_small<C::kSfRow>(dst, ok ? bsf_src[i] + ks : t.b, ok);
+        if constexpr (C::kSfWordMajor) {
+          mma::cp_async_small<4>(base + C::kBSfOff + C::template sf_off<BN>(rr, 0), ok ? bsf_src[i] + ks : t.b, ok);
+          mma::cp_async_small<4>(base + C::kBSfOff + C::template sf_off<BN>(rr, 1), ok ? bsf_src[i] + ks + 4 : t.b, ok);
+        } else {
+          const uint32_t dst = base + C::kBSfOff + C::template sf_off<BN>(rr, 0);
+          if constexpr (C::kSfRow == 16) mma::cp_async16(dst, ok ? bsf_src[i] + ks : t.b, ok);
+          else mma::cp_async_small<C::kSfRow>(dst, ok ? bsf_src[i] + ks : t.b, ok);
+        }
       }
+    }
     }
   };
 
@@ -257,185 +283,200 @@ __device__ __forceinline__ void gemm_body(const typename Prob::Params& pp, const
 
   const int row0 = wm * C::kWTM, col0 = wn * C::kWTN;
 
-  // ---- compute on one stage ----
-  auto compute = [&](int stage) {
-    const uint32_t base = s0 + stage * C::kStage;
+  // ---- fragments: loaded from shared memory one k-step ahead of the MMAs that use them ----
+  // A k-step is 32 bytes of A per row (ldmatrix kinds, W4A8) or 64 (bf16 x expanded weight).
+  constexpr int KS = T::kLdm || kKind == kW4A8 ? C::kARow / 32 : C::kARow / 64;
+  struct Frag {
+    uint32_t a[kMT][2][4];  // A fragments; [1] is the bf16 kinds' second MMA of the step
+    uint32_t b[kNT][2];     // B registers (ldmatrix kinds), or the raw NVFP4 word and its scale word
+    uint2 bw[kNT];          // raw 8-bit weights (W8A16)
+    uint32_t s1[kNT];       // W4A8: the scale word of the thread's second result column
+    uint32_t sfa[(kMT + 1) / 2], sfb[(kNT + 3) / 4];  // FP4 scale registers
+  };
+  const int a_r = (lane & 7) + ((lane >> 3) & 1) * 8, a_c = lane >> 4;  // ldmatrix lanes, A
+  const int b_r = (lane & 7) + (lane >> 4) * 8, b_c = (lane >> 3) & 1;  // ldmatrix lanes, B (two n8 tiles)
+  const int fr = lane >> 2, fq = lane & 3;
+
+  auto load_frags = [&](Frag& f, uint32_t base, int ks) {
     const uint32_t sA = base + C::kAOff, sB = base + C::kBOff;
     if constexpr (T::kLdm) {
-      // ldmatrix lanes: A matrices (rows 0-7 | 8-15) x (bytes 0-15 | 16-31); B two n8 tiles x two halves.
-      const int a_r = (lane & 7) + ((lane >> 3) & 1) * 8, a_c = lane >> 4;
-      const int b_r = (lane & 7) + (lane >> 4) * 8, b_c = (lane >> 3) & 1;
 #pragma unroll
-      for (int ks = 0; ks < C::kARow / 32; ++ks) {
-        uint32_t af[kMT][4], bfr[kNT][2];
+      for (int mt = 0; mt < kMT; ++mt)
+        mma::ldmatrix_x4(f.a[mt][0], sA + swz<C::kARow, 0>(row0 + mt * 16 + a_r, 2 * ks + a_c));
 #pragma unroll
-        for (int mt = 0; mt < kMT; ++mt) mma::ldmatrix_x4(af[mt], sA + swz<C::kARow, 0>(row0 + mt * 16 + a_r, 2 * ks + a_c));
+      for (int p = 0; p < kNT / 2; ++p) {
+        uint32_t r[4];
+        mma::ldmatrix_x4(r, sB + swz<C::kBRow, 0>(col0 + p * 16 + b_r, 2 * ks + b_c));
+        f.b[2 * p][0] = r[0];
+        f.b[2 * p][1] = r[1];
+        f.b[2 * p + 1][0] = r[2];
+        f.b[2 * p + 1][1] = r[3];
+      }
+      if constexpr (kKind == kF4) {
+        // One scale register covers two m16 tiles (A) or four n8 tiles (B); see mma.cuh.
 #pragma unroll
-        for (int p = 0; p < kNT / 2; ++p) {
-          uint32_t r[4];
-          mma::ldmatrix_x4(r, sB + swz<C::kBRow, 0>(col0 + p * 16 + b_r, 2 * ks + b_c));
-          bfr[2 * p][0] = r[0];
-          bfr[2 * p][1] = r[1];
-          bfr[2 * p + 1][0] = r[2];
-          bfr[2 * p + 1][1] = r[3];
+        for (int g = 0; g < (kMT + 1) / 2; ++g) {
+          int r = row0 + (2 * g + (fq >> 1)) * 16 + fr + 8 * (fq & 1);
+          r = r < BM ? r : BM - 1;
+          f.sfa[g] = mma::lds32(base + C::kASfOff + C::template sf_off<BM>(r, ks));
         }
-        if constexpr (kKind == kF4) {
-          // Scale registers: one covers two m16 tiles (A) or four n8 tiles (B); see mma.cuh.
-          constexpr int kSA = (kMT + 1) / 2, kSB = (kNT + 3) / 4;
-          uint32_t sfa[kSA], sfb[kSB];
-          const int q = lane & 3;
 #pragma unroll
-          for (int g = 0; g < kSA; ++g) {
-            int r = row0 + (2 * g + (q >> 1)) * 16 + (lane >> 2) + 8 * (q & 1);
-            r = r < BM ? r : BM - 1;
-            sfa[g] = mma::lds32(base + C::kASfOff + (r + r / 8) * C::kSfRow + 4 * ks);
-          }
-#pragma unroll
-          for (int g = 0; g < kSB; ++g) {
-            int r = col0 + (4 * g + q) * 8 + (lane >> 2);
-            r = r < BN ? r : BN - 1;
-            sfb[g] = mma::lds32(base + C::kBSfOff + (r + r / 8) * C::kSfRow + 4 * ks);
-          }
-#pragma unroll
-          for (int mt = 0; mt < kMT; ++mt)
-#pragma unroll
-            for (int nt = 0; nt < kNT; ++nt) {
-              const uint32_t sa = sfa[mt / 2], sb = sfb[nt / 4];
-              if ((mt & 1) == 0) {
-                switch (nt & 3) {
-                  case 0: mma::mma_nvf4<0, 0>(acc[mt][nt], af[mt], bfr[nt][0], bfr[nt][1], sa, sb); break;
-                  case 1: mma::mma_nvf4<0, 1>(acc[mt][nt], af[mt], bfr[nt][0], bfr[nt][1], sa, sb); break;
-                  case 2: mma::mma_nvf4<0, 2>(acc[mt][nt], af[mt], bfr[nt][0], bfr[nt][1], sa, sb); break;
-                  default: mma::mma_nvf4<0, 3>(acc[mt][nt], af[mt], bfr[nt][0], bfr[nt][1], sa, sb); break;
-                }
-              } else {
-                switch (nt & 3) {
-                  case 0: mma::mma_nvf4<1, 0>(acc[mt][nt], af[mt], bfr[nt][0], bfr[nt][1], sa, sb); break;
-                  case 1: mma::mma_nvf4<1, 1>(acc[mt][nt], af[mt], bfr[nt][0], bfr[nt][1], sa, sb); break;
-                  case 2: mma::mma_nvf4<1, 2>(acc[mt][nt], af[mt], bfr[nt][0], bfr[nt][1], sa, sb); break;
-                  default: mma::mma_nvf4<1, 3>(acc[mt][nt], af[mt], bfr[nt][0], bfr[nt][1], sa, sb); break;
-                }
-              }
-            }
-        } else {
-#pragma unroll
-          for (int mt = 0; mt < kMT; ++mt)
-#pragma unroll
-            for (int nt = 0; nt < kNT; ++nt) {
-              if constexpr (kKind == kBF16) mma::mma_bf16(acc[mt][nt], af[mt], bfr[nt][0], bfr[nt][1]);
-              else if constexpr (kKind == kI8) mma::mma_s8(acc[mt][nt], af[mt], bfr[nt][0], bfr[nt][1]);
-              else if constexpr (kArch >= 120) mma::mma_e4m3_mx(acc[mt][nt], af[mt], bfr[nt][0], bfr[nt][1]);
-              else mma::mma_e4m3(acc[mt][nt], af[mt], bfr[nt][0], bfr[nt][1]);
-            }
+        for (int g = 0; g < (kNT + 3) / 4; ++g) {
+          int r = col0 + (4 * g + fq) * 8 + fr;
+          r = r < BN ? r : BN - 1;
+          f.sfb[g] = mma::lds32(base + C::kBSfOff + C::template sf_off<BN>(r, ks));
         }
       }
-    } else {
-      const int r = lane >> 2, q = lane & 3;
-      if constexpr (T::kABits == 16) {
-        // bf16 x expanded weight: two k32 steps per tile, two MMAs per step.
-        uint32_t sfw[kNT];  // NVFP4: the row's four block scales of this k tile
+    } else if constexpr (T::kABits == 16) {
+#pragma unroll
+      for (int mt = 0; mt < kMT; ++mt) {
+        const uint4 v = mma::lds128(sA + swz<128, 1>(row0 + mt * 16 + fr, 4 * ks + fq));
+        const uint4 u = mma::lds128(sA + swz<128, 1>(row0 + mt * 16 + fr + 8, 4 * ks + fq));
+        f.a[mt][0][0] = v.x; f.a[mt][0][1] = u.x; f.a[mt][0][2] = v.y; f.a[mt][0][3] = u.y;
+        f.a[mt][1][0] = v.z; f.a[mt][1][1] = u.z; f.a[mt][1][2] = v.w; f.a[mt][1][3] = u.w;
+      }
+#pragma unroll
+      for (int nt = 0; nt < kNT; ++nt) {
+        const int row = col0 + nt * 8 + fr;
         if constexpr (kKind == kW4A16) {
+          f.b[nt][0] = mma::lds32(sB + swz<C::kBRow, C::kBPat>(row, ks) + 4 * fq);
+          f.b[nt][1] = mma::lds32(base + C::kBSfOff + C::template sf_off<BN>(row, 0));
+        } else {
+          f.bw[nt] = mma::lds64(sB + swz<C::kBRow, C::kBPat>(row, 2 * ks + (fq >> 1)) + 8 * (fq & 1));
+        }
+      }
+    } else {  // W4A8
 #pragma unroll
-          for (int nt = 0; nt < kNT; ++nt) {
-            const int row = col0 + nt * 8 + r;
-            sfw[nt] = mma::lds32(base + C::kBSfOff + (row + row / 8) * C::kSfRow);
+      for (int mt = 0; mt < kMT; ++mt) {
+        const uint2 v = mma::lds64(sA + swz<128, 2>(row0 + mt * 16 + fr, 2 * ks + (fq >> 1)) + 8 * (fq & 1));
+        const uint2 u = mma::lds64(sA + swz<128, 2>(row0 + mt * 16 + fr + 8, 2 * ks + (fq >> 1)) + 8 * (fq & 1));
+        f.a[mt][0][0] = v.x; f.a[mt][0][1] = u.x; f.a[mt][0][2] = v.y; f.a[mt][0][3] = u.y;
+      }
+#pragma unroll
+      for (int nt = 0; nt < kNT; ++nt) {
+        const int row = col0 + nt * 8 + fr;
+        f.b[nt][0] = mma::lds32(sB + swz<C::kBRow, C::kBPat>(row, ks) + 4 * fq);
+        // the scale words of this thread's two result columns (bytes 2 ks, 2 ks + 1 are this step's blocks)
+        const int c0 = col0 + nt * 8 + 2 * fq;
+        f.b[nt][1] = mma::lds32(base + C::kBSfOff + C::template sf_off<BN>(c0, ks >> 1));
+        f.s1[nt] = mma::lds32(base + C::kBSfOff + C::template sf_off<BN>(c0 + 1, ks >> 1));
+      }
+    }
+  };
+
+  auto do_mma = [&](const Frag& f, int ks) {
+    if constexpr (kKind == kF4) {
+#pragma unroll
+      for (int mt = 0; mt < kMT; ++mt)
+#pragma unroll
+        for (int nt = 0; nt < kNT; ++nt) {
+          const uint32_t sa = f.sfa[mt / 2], sb = f.sfb[nt / 4];
+          const uint32_t(&a)[4] = f.a[mt][0];
+          if ((mt & 1) == 0) {
+            switch (nt & 3) {
+              case 0: mma::mma_nvf4<0, 0>(acc[mt][nt], a, f.b[nt][0], f.b[nt][1], sa, sb); break;
+              case 1: mma::mma_nvf4<0, 1>(acc[mt][nt], a, f.b[nt][0], f.b[nt][1], sa, sb); break;
+              case 2: mma::mma_nvf4<0, 2>(acc[mt][nt], a, f.b[nt][0], f.b[nt][1], sa, sb); break;
+              default: mma::mma_nvf4<0, 3>(acc[mt][nt], a, f.b[nt][0], f.b[nt][1], sa, sb); break;
+            }
+          } else {
+            switch (nt & 3) {
+              case 0: mma::mma_nvf4<1, 0>(acc[mt][nt], a, f.b[nt][0], f.b[nt][1], sa, sb); break;
+              case 1: mma::mma_nvf4<1, 1>(acc[mt][nt], a, f.b[nt][0], f.b[nt][1], sa, sb); break;
+              case 2: mma::mma_nvf4<1, 2>(acc[mt][nt], a, f.b[nt][0], f.b[nt][1], sa, sb); break;
+              default: mma::mma_nvf4<1, 3>(acc[mt][nt], a, f.b[nt][0], f.b[nt][1], sa, sb); break;
+            }
           }
         }
+    } else if constexpr (T::kLdm) {
 #pragma unroll
-        for (int j = 0; j < 2; ++j) {
-          uint32_t a0[kMT][4], a1[kMT][4];
+      for (int mt = 0; mt < kMT; ++mt)
 #pragma unroll
-          for (int mt = 0; mt < kMT; ++mt) {
-            const uint4 v = mma::lds128(sA + swz<128, 1>(row0 + mt * 16 + r, 4 * j + q));
-            const uint4 u = mma::lds128(sA + swz<128, 1>(row0 + mt * 16 + r + 8, 4 * j + q));
-            a0[mt][0] = v.x; a0[mt][1] = u.x; a0[mt][2] = v.y; a0[mt][3] = u.y;
-            a1[mt][0] = v.z; a1[mt][1] = u.z; a1[mt][2] = v.w; a1[mt][3] = u.w;
-          }
-#pragma unroll
-          for (int nt = 0; nt < kNT; ++nt) {
-            const int row = col0 + nt * 8 + r;
-            uint32_t b[4];
-            if constexpr (kKind == kW4A16) {
-              const uint32_t w = mma::lds32(sB + swz<C::kBRow, C::kBPat>(row, j) + 4 * q);
-              const uint32_t s8 = (sfw[nt] >> (8 * (2 * j + (q >> 1)))) & 0xffu;
-              const float sf = mma::e4m3_to_f32(s8);
-              const uint32_t s2 = mma::pack_bf16(sf, sf);
-              mma::e2m1x8_to_bf16(w, s2, b);
-            } else {
-              const uint2 w = mma::lds64(sB + swz<C::kBRow, C::kBPat>(row, 2 * j + (q >> 1)) + 8 * (q & 1));
-              if constexpr (kKind == kW8I8) {
-                mma::i8x4_to_bf16(w.x, b[0], b[1]);
-                mma::i8x4_to_bf16(w.y, b[2], b[3]);
-              } else {
-                mma::e4m3x4_to_bf16<kArch>(w.x, b[0], b[1]);
-                mma::e4m3x4_to_bf16<kArch>(w.y, b[2], b[3]);
-              }
-            }
-#pragma unroll
-            for (int mt = 0; mt < kMT; ++mt) {
-              mma::mma_bf16(acc[mt][nt], a0[mt], b[0], b[1]);
-              mma::mma_bf16(acc[mt][nt], a1[mt], b[2], b[3]);
-            }
-          }
+        for (int nt = 0; nt < kNT; ++nt) {
+          if constexpr (kKind == kBF16) mma::mma_bf16(acc[mt][nt], f.a[mt][0], f.b[nt][0], f.b[nt][1]);
+          else if constexpr (kKind == kI8) mma::mma_s8(acc[mt][nt], f.a[mt][0], f.b[nt][0], f.b[nt][1]);
+          else if constexpr (kArch >= 120) mma::mma_e4m3_mx(acc[mt][nt], f.a[mt][0], f.b[nt][0], f.b[nt][1]);
+          else mma::mma_e4m3(acc[mt][nt], f.a[mt][0], f.b[nt][0], f.b[nt][1]);
         }
-      } else {
-        // W4A8: four k32 steps per tile; per step, one MMA per 16-block of the weight's scales.
+    } else if constexpr (T::kABits == 16) {
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-          uint32_t af[kMT][4];
+      for (int nt = 0; nt < kNT; ++nt) {
+        uint32_t b[4];
+        if constexpr (kKind == kW4A16) {
+          const uint32_t s8 = (f.b[nt][1] >> (8 * (2 * ks + (fq >> 1)))) & 0xffu;
+          const float sf = mma::e4m3_to_f32(s8);
+          mma::e2m1x8_to_bf16(f.b[nt][0], mma::pack_bf16(sf, sf), b);
+        } else if constexpr (kKind == kW8I8) {
+          mma::i8x4_to_bf16(f.bw[nt].x, b[0], b[1]);
+          mma::i8x4_to_bf16(f.bw[nt].y, b[2], b[3]);
+        } else {
+          mma::e4m3x4_to_bf16<kArch>(f.bw[nt].x, b[0], b[1]);
+          mma::e4m3x4_to_bf16<kArch>(f.bw[nt].y, b[2], b[3]);
+        }
 #pragma unroll
-          for (int mt = 0; mt < kMT; ++mt) {
-            const uint2 v = mma::lds64(sA + swz<128, 2>(row0 + mt * 16 + r, 2 * j + (q >> 1)) + 8 * (q & 1));
-            const uint2 u = mma::lds64(sA + swz<128, 2>(row0 + mt * 16 + r + 8, 2 * j + (q >> 1)) + 8 * (q & 1));
-            af[mt][0] = v.x; af[mt][1] = u.x; af[mt][2] = v.y; af[mt][3] = u.y;
-          }
+        for (int mt = 0; mt < kMT; ++mt) {
+          mma::mma_bf16(acc[mt][nt], f.a[mt][0], b[0], b[1]);
+          mma::mma_bf16(acc[mt][nt], f.a[mt][1], b[2], b[3]);
+        }
+      }
+    } else {  // W4A8: one MMA per 16-block of the step, the other block's B values zeroed
+      const bool lo = fq < 2;
+      const int sh = 16 * (ks & 1);
 #pragma unroll
-          for (int nt = 0; nt < kNT; ++nt) {
-            const int row = col0 + nt * 8 + r;
-            const uint32_t w = mma::lds32(sB + swz<C::kBRow, C::kBPat>(row, j) + 4 * q);
-            const uint32_t b0 = mma::e2m1x4_to_e4m3(w), b1 = mma::e2m1x4_to_e4m3(w >> 16);
-            const bool lo = q < 2;
-            // the scales of this thread's two result columns, for the step's two blocks
-            const int c0 = col0 + nt * 8 + 2 * q;
-            const uint32_t sw0 = mma::lds32(base + C::kBSfOff + (c0 + c0 / 8) * C::kSfRow + 4 * (j >> 1));
-            const uint32_t sw1 = mma::lds32(base + C::kBSfOff + (c0 + 1 + (c0 + 1) / 8) * C::kSfRow + 4 * (j >> 1));
-            const int sh = 16 * (j & 1);
-            const float s00 = mma::e4m3_to_f32((sw0 >> sh) & 0xffu), s01 = mma::e4m3_to_f32((sw0 >> (sh + 8)) & 0xffu);
-            const float s10 = mma::e4m3_to_f32((sw1 >> sh) & 0xffu), s11 = mma::e4m3_to_f32((sw1 >> (sh + 8)) & 0xffu);
+      for (int nt = 0; nt < kNT; ++nt) {
+        const uint32_t b0 = mma::e2m1x4_to_e4m3(f.b[nt][0]), b1 = mma::e2m1x4_to_e4m3(f.b[nt][0] >> 16);
+        const uint32_t sw0 = f.b[nt][1], sw1 = f.s1[nt];
+        const float s00 = mma::e4m3_to_f32((sw0 >> sh) & 0xffu), s01 = mma::e4m3_to_f32((sw0 >> (sh + 8)) & 0xffu);
+        const float s10 = mma::e4m3_to_f32((sw1 >> sh) & 0xffu), s11 = mma::e4m3_to_f32((sw1 >> (sh + 8)) & 0xffu);
 #pragma unroll
-            for (int mt = 0; mt < kMT; ++mt) {
-              float d0[4], d1[4];
-              mma::mma_e4m3_mx_zero(d0, af[mt], lo ? b0 : 0u, lo ? b1 : 0u);
-              mma::mma_e4m3_mx_zero(d1, af[mt], lo ? 0u : b0, lo ? 0u : b1);
-              acc[mt][nt][0] = fmaf(d1[0], s01, fmaf(d0[0], s00, acc[mt][nt][0]));
-              acc[mt][nt][1] = fmaf(d1[1], s11, fmaf(d0[1], s10, acc[mt][nt][1]));
-              acc[mt][nt][2] = fmaf(d1[2], s01, fmaf(d0[2], s00, acc[mt][nt][2]));
-              acc[mt][nt][3] = fmaf(d1[3], s11, fmaf(d0[3], s10, acc[mt][nt][3]));
-            }
-          }
+        for (int mt = 0; mt < kMT; ++mt) {
+          float d0[4], d1[4];
+          mma::mma_e4m3_mx_zero(d0, f.a[mt][0], lo ? b0 : 0u, lo ? b1 : 0u);
+          mma::mma_e4m3_mx_zero(d1, f.a[mt][0], lo ? 0u : b0, lo ? 0u : b1);
+          acc[mt][nt][0] = fmaf(d1[0], s01, fmaf(d0[0], s00, acc[mt][nt][0]));
+          acc[mt][nt][1] = fmaf(d1[1], s11, fmaf(d0[1], s10, acc[mt][nt][1]));
+          acc[mt][nt][2] = fmaf(d1[2], s01, fmaf(d0[2], s00, acc[mt][nt][2]));
+          acc[mt][nt][3] = fmaf(d1[3], s11, fmaf(d0[3], s10, acc[mt][nt][3]));
         }
       }
     }
   };
 
   // ---- the pipeline ----
+  // Tile kt + ST - 1 is issued while tile kt is consumed. The barrier for tile kt + 1 sits before the
+  // last k-step of tile kt, so its first fragments load while that step's MMAs run; the barrier also
+  // retires every read of the stage the next issue overwrites.
 #pragma unroll
   for (int s = 0; s < ST - 1; ++s) {
     if (s < KT) load_tile(s, s);
     mma::cp_async_commit();
   }
+  mma::cp_async_wait<ST - 2>();
+  __syncthreads();
+  int rs = 0, wst = ST - 1;
+  Frag f[2];
+  load_frags(f[0], s0, 0);
   for (int kt = 0; kt < KT; ++kt) {
-    mma::cp_async_wait<ST - 2>();
-    __syncthreads();
-    const int nk = kt + ST - 1;
-    if (nk < KT) load_tile(nk % ST, nk);
-    mma::cp_async_commit();
-    compute(kt % ST);
+#pragma unroll
+    for (int ks = 0; ks < KS; ++ks) {
+      if (ks == KS - 1) {
+        mma::cp_async_wait<ST - 2>();
+        __syncthreads();
+        rs = rs + 1 == ST ? 0 : rs + 1;
+      }
+      load_frags(f[(ks + 1) & 1], s0 + rs * C::kStage, (ks + 1) % KS);
+      if (ks == 0) {
+        if (kt + ST - 1 < KT) load_tile(wst, kt + ST - 1);
+        mma::cp_async_commit();
+        wst = wst + 1 == ST ? 0 : wst + 1;
+      }
+      do_mma(f[ks & 1], ks);
+    }
   }
   mma::cp_async_wait<0>();
 
   // ---- epilogue: per-kind scaling, then the policy ----
-  const int r = lane >> 2, q = lane & 3;
+  const int r = fr, q = fq;
   const float global = pp.b_global;
 #pragma unroll
   for (int mt = 0; mt < kMT; ++mt) {
