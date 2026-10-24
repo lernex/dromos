@@ -1,0 +1,310 @@
+// Mamba-2 mixer kernels: the causal conv that carries its state between steps, the selective scan
+// (the SSD recurrence) with f32 state per slot, and the gated RMSNorm that follows the scan.
+#include "cuda/common.cuh"
+
+namespace {
+
+// ---- Causal conv ----------------------------------------------------------------------------
+
+// Each output depends on the W inputs ending at its own token, never on another output, so the
+// tokens of a sequence are spread over the block's rows. A block is 32 channels by 8 token lanes,
+// so a warp reads 32 consecutive floats per token.
+__global__ void conv1d_out_kernel(const float* __restrict__ x, int ld_x, const __nv_bfloat16* __restrict__ w,
+                                  const __nv_bfloat16* __restrict__ bias, const float* __restrict__ state,
+                                  const int32_t* __restrict__ slot_ids, const int32_t* __restrict__ has_state,
+                                  const int32_t* __restrict__ cu, float* __restrict__ out, int C, int W) {
+  const int s = blockIdx.y;
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= C) return;
+  const int start = cu[s], len = cu[s + 1] - start;
+  const bool has = has_state[s] != 0;
+  const float* st = state + static_cast<int64_t>(slot_ids[s]) * (W - 1) * C;
+
+  // Unrolled to a fixed bound so the taps stay in registers.
+  float wk[8];
+#pragma unroll
+  for (int k = 0; k < 8; ++k) wk[k] = k < W ? __bfloat162float(w[c * W + k]) : 0.0f;
+  const float b = __bfloat162float(bias[c]);
+
+  for (int t = threadIdx.y; t < len; t += blockDim.y) {
+    float acc = b;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      if (k < W) {
+        // Position relative to the sequence start; negative positions are the carried state.
+        const int p = t - (W - 1) + k;
+        float v = 0.0f;
+        if (p >= 0) v = x[static_cast<int64_t>(start + p) * ld_x + c];
+        else if (has) v = st[(p + W - 1) * C + c];
+        acc = fmaf(wk[k], v, acc);
+      }
+    }
+    out[static_cast<int64_t>(start + t) * C + c] = lx::silu(acc);
+  }
+}
+
+// The new state is the last W - 1 inputs of [old state rows, x rows]. One thread owns one channel
+// of one slot and writes its rows in order. Row j takes combined input len + j. An old row m is
+// read before it is written, since m > j whenever len > 0, and len = 0 rereads the same row.
+__global__ void conv1d_state_kernel(const float* __restrict__ x, int ld_x, float* __restrict__ state,
+                                    const int32_t* __restrict__ slot_ids, const int32_t* __restrict__ has_state,
+                                    const int32_t* __restrict__ cu, int C, int W) {
+  const int s = blockIdx.y;
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= C) return;
+  const int start = cu[s], len = cu[s + 1] - start;
+  const bool has = has_state[s] != 0;
+  float* st = state + static_cast<int64_t>(slot_ids[s]) * (W - 1) * C;
+  for (int j = 0; j < W - 1; ++j) {
+    const int m = len + j;
+    float v = 0.0f;
+    if (m >= W - 1) v = x[static_cast<int64_t>(start + m - (W - 1)) * ld_x + c];
+    else if (has) v = st[m * C + c];
+    st[j * C + c] = v;
+  }
+}
+
+// ---- Selective scan -------------------------------------------------------------------------
+
+struct ScanArgs {
+  const float* x;
+  int ld_x;
+  const float* dt_raw;
+  int ld_dt;
+  const float* B;
+  const float* C;
+  int ld_bc;
+  const float* A_log;
+  const float* D;
+  const float* dt_bias;
+  float* state;
+  const int32_t* slot_ids;
+  const int32_t* has_state;
+  const int32_t* cu;
+  float* y;
+  int H, P, G, N;
+};
+
+// Tokens staged per chunk: one block barrier pair per chunk, and the next chunk's copies run behind
+// this chunk's math.
+constexpr int kChunk = 8;
+// Floats per staged token at the widest shape (P <= 64, N <= 256): x[64] | B[256] | C[256] | dt | pad.
+constexpr int kRowMax = 64 + 2 * 256 + 4;
+
+__host__ __device__ constexpr int round4(int v) { return (v + 3) & ~3; }
+
+__device__ __forceinline__ void cp_async_f32(float* smem, const float* gmem) {
+  const uint32_t dst = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(dst), "l"(gmem) : "memory");
+}
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
+__device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wait_group 0;\n" ::: "memory"); }
+
+// One block per (head, sequence). Four lanes own each state row p. Lane q holds the chunks of four
+// columns at 4 * (q + 4 i) for i < NI in registers for the whole sequence, so a row needs NI * 4
+// state values per lane. The row's y is summed over its four lanes with two shuffles.
+//
+// Tokens go through shared memory in chunks of kChunk. B and C rows are padded to 16 * NI columns
+// with zeros, which covers every lane's chunks without guards: the padding is zeroed once and copies
+// never write it. The copies for chunk c + 1 are issued before chunk c is computed, so the memory
+// latency is paid behind a whole chunk of math. The per-chunk barriers are the only block-wide
+// synchronization.
+template <int NI>
+__global__ void __launch_bounds__(256) ssm_scan_kernel(const ScanArgs a) {
+  constexpr int BW = 16 * NI;  // B and C row width, padded so every lane's four-column load is in range
+  __shared__ __align__(16) float stage[2][kChunk * kRowMax];
+  __shared__ float dts[2][kChunk], decays[2][kChunk];
+  float* const sm = &stage[0][0];
+
+  const int P = a.P, N = a.N;
+  const int BO = round4(P), CO = BO + BW, DO = CO + BW;
+  const int SW = DO + 4;  // stride of one staged token, a multiple of 4
+  const int bd = blockDim.x;
+  const int tid = threadIdx.x, q = tid & 3, p = tid >> 2;
+  // Lanes past the last row run the shuffles and read finite staging, but store nothing.
+  const bool valid = p < P;
+  const int h = blockIdx.x, s = blockIdx.y;
+  const int g = h / (a.H / a.G);
+  const int start = a.cu[s], len = a.cu[s + 1] - start;
+  const int nchunks = (len + kChunk - 1) / kChunk;
+  float* st = a.state + (static_cast<int64_t>(a.slot_ids[s]) * a.H + h) * P * N;
+  const bool has = a.has_state[s] != 0;
+  const float negA = -expf(a.A_log[h]);
+  const float Dh = a.D[h], dt_bias = a.dt_bias[h];
+
+  // Zero the staging once, padding included. The barrier keeps these stores from landing on a copy.
+  for (int i = tid; i < 2 * kChunk * kRowMax; i += bd) sm[i] = 0.0f;
+  __syncthreads();
+
+  float S[NI][4];
+#pragma unroll
+  for (int i = 0; i < NI; ++i)
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+      const int n = 4 * (q + 4 * i) + e;
+      S[i][e] = (has && valid && n < N) ? st[p * N + n] : 0.0f;
+    }
+
+  // Copies chunk c's tokens into buffer buf, one 4-byte copy per element.
+  auto issue = [&](int c, int buf) {
+    const int base = c * kChunk;
+    const int count = min(kChunk, len - base);
+    float* dst = sm + buf * kChunk * kRowMax;
+    for (int tok = 0; tok < count; ++tok) {
+      const int t = start + base + tok;
+      float* d = dst + tok * SW;
+      const float* xr = a.x + static_cast<int64_t>(t) * a.ld_x + h * P;
+      const float* br = a.B + static_cast<int64_t>(t) * a.ld_bc + g * N;
+      const float* cr = a.C + static_cast<int64_t>(t) * a.ld_bc + g * N;
+      for (int j = tid; j < P; j += bd) cp_async_f32(d + j, xr + j);
+      for (int j = tid; j < N; j += bd) {
+        cp_async_f32(d + BO + j, br + j);
+        cp_async_f32(d + CO + j, cr + j);
+      }
+      if (tid == 0) cp_async_f32(d + DO, a.dt_raw + static_cast<int64_t>(t) * a.ld_dt + h);
+    }
+  };
+
+  if (nchunks > 0) {
+    issue(0, 0);
+    cp_async_commit();
+    cp_async_wait_all();
+    __syncthreads();
+  }
+
+  for (int c = 0; c < nchunks; ++c) {
+    if (c + 1 < nchunks) issue(c + 1, (c + 1) & 1);
+    cp_async_commit();
+    const float* sb = sm + (c & 1) * kChunk * kRowMax;
+    const int count = min(kChunk, len - c * kChunk);
+    // dt and the decay depend on the token and head only, not on the row, so they are formed once
+    // per chunk rather than by every row.
+    if (tid < count) {
+      const float dt = lx::softplus(sb[tid * SW + DO] + dt_bias);
+      dts[c & 1][tid] = dt;
+      decays[c & 1][tid] = expf(dt * negA);
+    }
+    __syncthreads();
+    for (int tok = 0; tok < count; ++tok) {
+      const float* row = sb + tok * SW;
+      const float xp = row[p];
+      const float dtx = dts[c & 1][tok] * xp;
+      const float decay = decays[c & 1][tok];
+      float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+      for (int i = 0; i < NI; ++i) {
+        const int c0 = 4 * (q + 4 * i);  // this lane's four columns within B and within C
+        const float4 bb = *reinterpret_cast<const float4*>(row + BO + c0);
+        const float4 cc = *reinterpret_cast<const float4*>(row + CO + c0);
+        const float bv[4] = {bb.x, bb.y, bb.z, bb.w};
+        const float cv[4] = {cc.x, cc.y, cc.z, cc.w};
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+          // Columns past N have zero B and C, so their state stays zero and adds nothing to y.
+          S[i][e] = fmaf(decay, S[i][e], dtx * bv[e]);
+          acc[e] = fmaf(S[i][e], cv[e], acc[e]);
+        }
+      }
+      float y = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+#pragma unroll
+      for (int o = 1; o < 4; o <<= 1) y += __shfl_xor_sync(0xffffffffu, y, o);
+      if (valid && q == 0) a.y[(static_cast<int64_t>(start + c * kChunk + tok) * a.H + h) * P + p] = y + Dh * xp;
+    }
+    cp_async_wait_all();
+    __syncthreads();
+  }
+
+  if (valid) {
+#pragma unroll
+    for (int i = 0; i < NI; ++i)
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        const int n = 4 * (q + 4 * i) + e;
+        if (n < N) st[p * N + n] = S[i][e];
+      }
+  }
+}
+
+template <int NI>
+int launch_scan(const ScanArgs& args, int n_seq, int threads, cudaStream_t s) {
+  ssm_scan_kernel<NI><<<dim3(args.H, n_seq), threads, 0, s>>>(args);
+  return lx::launch_status();
+}
+
+// ---- Gated RMSNorm --------------------------------------------------------------------------
+
+// One block per (token, group): v = y * silu(z), normalized by the RMS over the group's K channels.
+__global__ void gated_rmsnorm_kernel(const float* __restrict__ y, const float* __restrict__ z, int ld_z,
+                                     const __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ out,
+                                     int I, int groups, float eps) {
+  __shared__ float scratch[32];
+  const int K = I / groups;
+  const int t = blockIdx.x / groups, g = blockIdx.x % groups;
+  const int base = g * K;
+  const float* yr = y + static_cast<int64_t>(t) * I + base;
+  const float* zr = z + static_cast<int64_t>(t) * ld_z + base;
+  float sum = 0.0f;
+  for (int i = threadIdx.x; i < K; i += blockDim.x) {
+    const float v = yr[i] * lx::silu(zr[i]);
+    sum += v * v;
+  }
+  const float scale = rsqrtf(lx::block_sum(sum, scratch) / K + eps);
+  // The gate is recomputed rather than held across the reduction: K is only a few hundred.
+  for (int i = threadIdx.x; i < K; i += blockDim.x) {
+    const float v = yr[i] * lx::silu(zr[i]);
+    out[static_cast<int64_t>(t) * I + base + i] = lx::from_f32<__nv_bfloat16>(v * scale * __bfloat162float(w[base + i]));
+  }
+}
+
+}  // namespace
+
+extern "C" int lx_conv1d_varlen(const float* x, int ld_x, const void* w, const void* bias, float* conv_state,
+                                const int32_t* slot_ids, const int32_t* has_state, const int32_t* cu_seqlens,
+                                int n_seq, float* out, int C, int W, void* stream) {
+  if (n_seq <= 0) return 0;
+  if (C <= 0 || W < 1 || W > 8 || ld_x < C || n_seq > 65535) return static_cast<int>(cudaErrorInvalidValue);
+  auto s = static_cast<cudaStream_t>(stream);
+  // The outputs read the old state, so they launch before the state update.
+  conv1d_out_kernel<<<dim3((C + 31) / 32, n_seq), dim3(32, 8), 0, s>>>(
+      x, ld_x, static_cast<const __nv_bfloat16*>(w), static_cast<const __nv_bfloat16*>(bias), conv_state,
+      slot_ids, has_state, cu_seqlens, out, C, W);
+  conv1d_state_kernel<<<dim3((C + 127) / 128, n_seq), 128, 0, s>>>(x, ld_x, conv_state, slot_ids, has_state,
+                                                                  cu_seqlens, C, W);
+  return lx::launch_status();
+}
+
+extern "C" int lx_ssm_scan_varlen(const float* x, int ld_x, const float* dt_raw, int ld_dt, const float* B,
+                                  const float* C, int ld_bc, const float* A_log, const float* D,
+                                  const float* dt_bias, float* ssm_state, const int32_t* slot_ids,
+                                  const int32_t* has_state, const int32_t* cu_seqlens, int n_seq, float* y,
+                                  int H, int P, int G, int N, void* stream) {
+  if (n_seq <= 0) return 0;
+  if (H <= 0 || G <= 0 || H % G != 0 || P < 1 || P > 64 || N < 1 || N > 256 || n_seq > 65535)
+    return static_cast<int>(cudaErrorInvalidValue);
+  if (ld_x < H * P || ld_dt < H || ld_bc < G * N) return static_cast<int>(cudaErrorInvalidValue);
+
+  // Four lanes per row, rounded up to a whole warp; rows past P are idle.
+  const int threads = (4 * P + 31) / 32 * 32;
+  // N/4 column chunks, dealt to the four lanes of a row: NI chunks each (up to 16 for N = 256).
+  const int ni = ((N + 3) / 4 + 3) / 4;
+  const ScanArgs args{x,      ld_x,     dt_raw,  ld_dt,  B,        C,     ld_bc,   A_log,
+                      D,      dt_bias,  ssm_state, slot_ids, has_state, cu_seqlens, y, H, P, G, N};
+  auto s = static_cast<cudaStream_t>(stream);
+  if (ni <= 1) return launch_scan<1>(args, n_seq, threads, s);
+  if (ni <= 2) return launch_scan<2>(args, n_seq, threads, s);
+  if (ni <= 4) return launch_scan<4>(args, n_seq, threads, s);
+  if (ni <= 8) return launch_scan<8>(args, n_seq, threads, s);
+  return launch_scan<16>(args, n_seq, threads, s);
+}
+
+extern "C" int lx_gated_rmsnorm(const float* y, const float* z, int ld_z, const void* w, void* out, int T, int I,
+                                int groups, float eps, void* stream) {
+  if (T <= 0) return 0;
+  if (I <= 0 || groups <= 0 || I % groups != 0 || ld_z < I) return static_cast<int>(cudaErrorInvalidValue);
+  const int K = I / groups;
+  const int threads = K >= 256 ? 256 : ((K + 31) / 32) * 32;
+  auto s = static_cast<cudaStream_t>(stream);
+  gated_rmsnorm_kernel<<<T * groups, threads, 0, s>>>(y, z, ld_z, static_cast<const __nv_bfloat16*>(w),
+                                                      static_cast<__nv_bfloat16*>(out), I, groups, eps);
+  return lx::launch_status();
+}
