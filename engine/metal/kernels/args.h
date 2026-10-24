@@ -314,3 +314,12 @@ struct QuantActArgs {
   LX_PTR(uchar) block_scale;
   int ld_x, ld_q, ld_bs, M, K, x_bf16;
 };
+
+// ---- speculative decoding -------------------------------------------------------------------
+struct SpecGemvArgs {
+  LX_CPTR(float) x;
+  LX_CPTR(float) w;
+  LX_CPTR(float) bias;  // 0 for none
+  LX_PTR(float) y;
+  int ld_x, ld_y, M, N, K;
+};
