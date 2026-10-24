@@ -9,11 +9,10 @@
 namespace lx::metal {
 
 // The tile GEMMs' shape and threads, and their threadgroup memory: kernels/gemm.metal stages two 64 x 40
-// bf16 tiles (64 x 36 f32 for exact f32), kernels/nax/gemm.metal two stages of two 64 x 32 tiles, then
-// the 64 x 64 f32 result.
+// bf16 tiles, kernels/nax/gemm.metal two stages of two 64 x 32 tiles, then the 64 x 64 f32 result.
 constexpr int kTileM = 64, kTileN = 64;
 constexpr int kGemmThreads = 128;
-constexpr NSUInteger kGemmSmemBf16 = 2 * kTileM * 40 * 2, kGemmSmemF32 = 2 * kTileM * 36 * 4;
+constexpr NSUInteger kGemmSmemBf16 = 2 * kTileM * 40 * 2;
 constexpr NSUInteger kGemmSmemNax = kTileM * kTileN * 4;
 
 // Activation formats (A_* in the kernel) and the f32 weight of lx_gemm_f32.
@@ -25,7 +24,7 @@ inline int gemm_variant(int af, int wf, int mode) { return (af * 5 + wf) * 3 + m
 
 // Launches variant gemm_variant(af, wf, mode) of the tile GEMM over `groups` threadgroups: on the
 // neural accelerators (kernels/nax/gemm.metal) where the GPU has them, else on simdgroup matrices
-// (kernels/gemm.metal). Exact f32 (lx_gemm_f32) always takes the simdgroup kernel.
+// (kernels/gemm.metal).
 int launch_gemm(int af, int wf, int mode, void* stream, const GemmArgs& args, MTLSize groups);
 
 // The activation format a math reads (BF16 math reads x as given).

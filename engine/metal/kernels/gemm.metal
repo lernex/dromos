@@ -7,18 +7,15 @@
 // 4 x 4 accumulators of 8 x 8. Per 32-wide step of K, every thread stages 16 values of one activation
 // row and 16 of one weight row in threadgroup memory as bf16 (copied where they are bf16, else their
 // exact decoded values: a quantized code times its block scale has at most 6 significant bits, which
-// bf16 holds), and the simdgroups multiply bf16 into f32 accumulators. Exact f32 (lx_gemm_f32) stages
-// f32. Row factors (the weight's row scale or global, the activation's per-token scale) are applied
-// once in the epilogue. Products are exact, so only the f32 summation order differs from a float64
-// reference. The next step's values are loaded into registers while the simdgroups multiply.
+// bf16 holds), and the simdgroups multiply bf16 into f32 accumulators. Row factors (the weight's row
+// scale or global, the activation's per-token scale) are applied once in the epilogue. Products are
+// exact, so only the f32 summation order differs from a float64 reference. The next step's values are
+// loaded into registers while the simdgroups multiply. Exact f32 (lx_gemm_f32) has a kernel of its own
+// at the end, gemm_f32x.
 
 template <int AF> struct GemmStage {
   using S = bfloat;
   static constexpr constant int KS = kTileK + 8;  // padded row: 80 bytes
-};
-template <> struct GemmStage<A_F32X> {
-  using S = float;
-  static constexpr constant int KS = kTileK + 4;
 };
 
 // One thread's share of a K step in registers, in the staged type.
@@ -33,20 +30,6 @@ template <int AF, int WF> struct GemmRegs<AF, WF, bfloat> {
   void store(threadgroup bfloat* ad, threadgroup bfloat* bd) const thread {
     stage_store(ad, a);
     stage_store(bd, b);
-  }
-};
-template <int AF, int WF> struct GemmRegs<AF, WF, float> {
-  float a[16], b[16];
-  void load(const device uchar* arow, const device uchar* ablk, const device uchar* brow, const device uchar* bscl,
-            int k, int K, bool xv, bool wv, bool a_valid, bool b_valid) thread {
-    load_act16<AF>(arow, ablk, k, K, xv, a_valid, a);
-    load_w16<WF>(brow, bscl, k, K, wv, b_valid, b);
-  }
-  void store(threadgroup float* ad, threadgroup float* bd) const thread {
-    for (int q = 0; q < 4; ++q) {
-      ((threadgroup float4*)ad)[q] = float4(a[4 * q], a[4 * q + 1], a[4 * q + 2], a[4 * q + 3]);
-      ((threadgroup float4*)bd)[q] = float4(b[4 * q], b[4 * q + 1], b[4 * q + 2], b[4 * q + 3]);
-    }
   }
 };
 
@@ -188,12 +171,98 @@ kernel void gemm(constant GemmArgs& a [[buffer(0)]], threadgroup uchar* smem [[t
   template [[host_name("gemm_" #AF #WF "_" #MODE)]] kernel void gemm<AF, WF, MODE>(constant GemmArgs&,          \
                                                                                     threadgroup uchar*, uint2,  \
                                                                                     uint, uint, uint);
-// Plain: BF16 math on every format from bf16 or f32 activations; the quantized maths; exact f32.
+// Plain: BF16 math on every format from bf16 or f32 activations, and the quantized maths.
 LX_GEMM(0, 0, 0) LX_GEMM(0, 1, 0) LX_GEMM(0, 2, 0) LX_GEMM(0, 3, 0)
 LX_GEMM(1, 0, 0) LX_GEMM(1, 1, 0) LX_GEMM(1, 2, 0) LX_GEMM(1, 3, 0)
-LX_GEMM(2, 1, 0) LX_GEMM(3, 2, 0) LX_GEMM(3, 3, 0) LX_GEMM(4, 3, 0) LX_GEMM(5, 4, 0)
+LX_GEMM(2, 1, 0) LX_GEMM(3, 2, 0) LX_GEMM(3, 3, 0) LX_GEMM(4, 3, 0)
 // Grouped experts, both stages.
 LX_GEMM(0, 0, 1) LX_GEMM(0, 1, 1) LX_GEMM(0, 2, 1) LX_GEMM(0, 3, 1)
 LX_GEMM(2, 1, 1) LX_GEMM(3, 2, 1) LX_GEMM(3, 3, 1) LX_GEMM(4, 3, 1)
 LX_GEMM(0, 0, 2) LX_GEMM(0, 1, 2) LX_GEMM(0, 2, 2) LX_GEMM(0, 3, 2)
 LX_GEMM(2, 1, 2) LX_GEMM(3, 2, 2) LX_GEMM(3, 3, 2) LX_GEMM(4, 3, 2)
+
+// ---- Exact f32 (lx_gemm_f32) ------------------------------------------------------------------
+// The routers and the depth head: f32 weights and a narrow output (a few hundred columns), where 64 x 64
+// tiles would leave most of the GPU idle. A threadgroup of four simdgroups computes a 32 x 32 tile of y,
+// each simdgroup a 16 x 16 quarter as 2 x 2 accumulators (with f32 operands, four times that many
+// accumulators per simdgroup runs several times slower on the M5). Per 32-wide step of K every thread
+// stages 8 values of one activation row and 8 of one weight row; the next step's are loaded into
+// registers while the simdgroups multiply. Grid (N / 32, M / 32), 128 threads.
+constant constexpr int kF32Tile = 32, kF32Step = 32, kF32Pitch = kF32Step + 4;
+
+// 8 f32 values [k, k + 8) of a row, zero past K and for rows past the end.
+inline void load8_f32(const device float* row, int k, int K, bool vec, bool valid, thread float4& lo, thread float4& hi) {
+  if (valid && vec && k + 8 <= K) {
+    lo = ((const device float4*)(row + k))[0];
+    hi = ((const device float4*)(row + k))[1];
+    return;
+  }
+  float v[8];
+  for (int i = 0; i < 8; ++i) v[i] = valid && k + i < K ? row[k + i] : 0.0f;
+  lo = float4(v[0], v[1], v[2], v[3]);
+  hi = float4(v[4], v[5], v[6], v[7]);
+}
+
+kernel void gemm_f32x(constant GemmArgs& a [[buffer(0)]], threadgroup float* smem [[threadgroup(0)]],
+                      uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                      uint sg [[simdgroup_index_in_threadgroup]]) {
+  const int K = a.K, N = a.N, M = a.M;
+  const int m0 = int(tg.y) * kF32Tile, n0 = int(tg.x) * kF32Tile;
+  threadgroup float* As = smem;
+  threadgroup float* Bs = smem + kF32Tile * kF32Pitch;
+  // Thread t stages row t / 4 of the activation and weight blocks, 8 values from column (t % 4) * 8.
+  const int lr = int(tid) >> 2, lc = (int(tid) & 3) * 8;
+  const int am = m0 + lr, bn = n0 + lr;
+  const device float* xr = (const device float*)a.x + long(min(am, M - 1)) * a.ld_x;
+  const device float* wr = (const device float*)a.w.data + long(min(bn, N - 1)) * K;
+  const bool xv = a.x_vec != 0;
+  const bool wv = (ulong(a.w.data) & 15ul) == 0 && (K & 3) == 0;
+  const int sm = int(sg) >> 1, sn = int(sg) & 1;
+
+  simdgroup_float8x8 acc[2][2];
+  for (int i = 0; i < 2; ++i)
+    for (int j = 0; j < 2; ++j) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  float4 a0, a1, b0, b1;
+  load8_f32(xr, lc, K, xv, am < M, a0, a1);
+  load8_f32(wr, lc, K, wv, bn < N, b0, b1);
+  const int steps = (K + kF32Step - 1) / kF32Step;
+  for (int s = 0; s < steps; ++s) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);  // the last step's reads of the staging are done
+    ((threadgroup float4*)(As + lr * kF32Pitch + lc))[0] = a0;
+    ((threadgroup float4*)(As + lr * kF32Pitch + lc))[1] = a1;
+    ((threadgroup float4*)(Bs + lr * kF32Pitch + lc))[0] = b0;
+    ((threadgroup float4*)(Bs + lr * kF32Pitch + lc))[1] = b1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (s + 1 < steps) {
+      const int k = (s + 1) * kF32Step + lc;
+      load8_f32(xr, k, K, xv, am < M, a0, a1);
+      load8_f32(wr, k, K, wv, bn < N, b0, b1);
+    }
+    for (int kk = 0; kk < kF32Step; kk += 8) {
+      simdgroup_float8x8 af[2], bt[2];
+      for (int i = 0; i < 2; ++i) simdgroup_load(af[i], As + (sm * 16 + i * 8) * kF32Pitch + kk, kF32Pitch);
+      for (int j = 0; j < 2; ++j)
+        simdgroup_load(bt[j], Bs + (sn * 16 + j * 8) * kF32Pitch + kk, kF32Pitch, ulong2(0, 0), true);
+      for (int i = 0; i < 2; ++i)
+        for (int j = 0; j < 2; ++j) simdgroup_multiply_accumulate(acc[i][j], af[i], bt[j], acc[i][j]);
+    }
+  }
+
+  // The finished tile over the staging, then the epilogue: thread t takes row t / 4, 8 columns.
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int i = 0; i < 2; ++i)
+    for (int j = 0; j < 2; ++j)
+      simdgroup_store(acc[i][j], smem + (sm * 16 + i * 8) * kF32Tile + sn * 16 + j * 8, kF32Tile);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (am >= M) return;
+  for (int c = lc; c < lc + 8; ++c) {
+    const int n = n0 + c;
+    if (n >= N) break;
+    float val = smem[lr * kF32Tile + c];
+    if (a.bias) val += load_val(a.bias, n, a.bias_bf16);
+    val *= a.alpha;
+    const long o = long(am) * a.ld_y + n;
+    if (a.beta != 0.0f) val += a.beta * load_val(a.y, o, a.y_bf16);
+    store_val(a.y, o, val, a.y_bf16);
+  }
+}

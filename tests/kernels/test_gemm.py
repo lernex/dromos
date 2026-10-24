@@ -16,6 +16,7 @@ SHAPES = [
     (300, 3072, 2048),  # prefill
     (5, 128, 1280),
     (1, 256, 6400),
+    (300, 256, 6400),  # prefill: the depth head, narrow with a long K
     (33, 24, 64),
 ]
 SCALARS = [(1.0, 0.0), (0.5, 0.0), (1.0, 1.0), (0.5, 1.0)]  # (alpha, beta)

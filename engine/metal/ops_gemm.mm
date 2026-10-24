@@ -31,7 +31,6 @@ KernelSet<90> g_gemm_nax(gemm_nax_name, true);
 
 int launch_gemm(int af, int wf, int mode, void* stream, const GemmArgs& args, MTLSize groups) {
   const int v = gemm_variant(af, wf, mode);
-  if (af == kActF32Exact) return g_gemm.launch(v, stream, args, groups, size1(kGemmThreads), kGemmSmemF32);
   if (Device::get().nax()) return g_gemm_nax.launch(v, stream, args, groups, size1(kGemmThreads), kGemmSmemNax);
   return g_gemm.launch(v, stream, args, groups, size1(kGemmThreads), kGemmSmemBf16);
 }
@@ -140,7 +139,9 @@ int lx_gemm_f32(const float* x, int ld_x, const float* w, const float* bias, flo
   a.K = K;
   a.alpha = 1.0f;
   a.beta = 0.0f;
-  return launch_gemm(kActF32Exact, kWeightF32, 0, stream, a, size2(ceil_div(N, kTileN), ceil_div(M, kTileM)));
+  // kernels/gemm.metal gemm_f32x: 32 x 32 tiles, two staged 32 x 36 f32 blocks.
+  static Kernel f32x("gemm_f32x");
+  return f32x.launch(stream, a, size2(ceil_div(N, 32), ceil_div(M, 32)), size1(kGemmThreads), 2 * 32 * 36 * 4);
 }
 
 }  // extern "C"
