@@ -183,7 +183,7 @@ LX_API int lx_moe_summary(const int32_t* ids, const float* weights, const void* 
 //   y[m, n] = alpha * (sum_k x[m, k] * w[n, k] + bias[n]) + beta * y[m, n]
 // x: [M, K] (x_dtype, row stride ld_x); bias: [N] (bias_dtype, or null); y: [M, N] (y_dtype,
 // row stride ld_y; read only when beta != 0). Accumulation in f32. Deterministic (no atomics).
-typedef enum { LX_W_BF16 = 0, LX_W_INT8 = 1 } lx_wtype;
+typedef enum { LX_W_BF16 = 0, LX_W_INT8 = 1, LX_W_FP8 = 2, LX_W_NVFP4 = 3 } lx_wtype;
 LX_API int lx_gemv(const void* x, lx_dtype x_dtype, int ld_x, const void* w, lx_wtype w_type, const float* w_scale,
                    const void* bias, lx_dtype bias_dtype, void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K,
                    float alpha, float beta, void* stream);
@@ -200,6 +200,81 @@ LX_API int lx_moe_experts_w8(const void* latent, const int32_t* ids, const float
                              const float* gate_up_scale, const int8_t* down, const float* down_scale, float* out,
                              void* workspace, int T, int L, int I, int top_k, void* stream);
 LX_API int64_t lx_moe_workspace_bytes(int T, int I, int top_k);
+
+// ---- Weight formats ------------------------------------------------------------------------
+// A projection is held once, in one format, and every kernel that multiplies by it (the decode
+// GEMV, the tensor-core GEMM for prefill and batches, the expert kernels) reads that one copy.
+// All formats keep the checkpoint's row-major [N, K] order, K contiguous, which is what a GEMV
+// streams and what a tensor-core GEMM wants for its B operand (y = x @ W^T, "TN").
+//
+//   LX_W_BF16   data bf16 [N, K]. scale unused.
+//   LX_W_INT8   data int8 [N, K], scale f32 [N]:      w[n, k] = q[n, k] * scale[n]
+//   LX_W_FP8    data e4m3 [N, K], scale f32 [N]:      w[n, k] = fp8[n, k] * scale[n]
+//               (a per-tensor checkpoint scale is expanded to [N] at load)
+//   LX_W_NVFP4  data uint8 [N, K / 2], two e2m1 per byte, the low nibble holding the even k;
+//               scale e4m3 [N, K / 16], one per 16 consecutive k; global f32:
+//                                                     w[n, k] = e2m1[n, k] * scale[n, k / 16] * global
+//               (requires K % 16 == 0; the loader folds a checkpoint's global scale so the
+//               engine always multiplies)
+// Stacked expert weights are [E, N, K] in the same format, every expert laid out as above, one
+// after the other (scales likewise [E, N] or [E, N, K / 16]; global is one value for the stack).
+typedef struct {
+  lx_wtype type;
+  const void* data;
+  const void* scale;  // f32 [N] for INT8 / FP8, e4m3 [N, K / 16] for NVFP4, null for BF16
+  float global;       // NVFP4 only (1 otherwise)
+} lx_weight;
+
+// How a tensor-core product does its math. Weights are always read in their stored format; this
+// says what the activations are converted to and which instruction multiplies them.
+//   LX_MATH_BF16  activations bf16; quantized weights are expanded to bf16 inside the kernel.
+//                 Runs on every GPU (sm_80+).
+//   LX_MATH_INT8  activations quantized per token to int8 (symmetric, absmax / 127); int8 weights
+//                 only. IMMA, sm_80+.
+//   LX_MATH_FP8   activations quantized per token to e4m3 (absmax / 448); FP8 weights, or NVFP4
+//                 weights through the mixed e2m1 x e4m3 instruction (sm_100 / sm_120). sm_89+.
+//   LX_MATH_FP4   activations quantized to NVFP4 (per 16 values along K, e4m3 scale, per-token
+//                 global); NVFP4 weights only. sm_100 / sm_120.
+// A combination the GPU cannot run returns cudaErrorNotSupported; the engine picks the math per
+// GPU (engine/runtime/plan) and never asks for one the card lacks.
+typedef enum { LX_MATH_BF16 = 0, LX_MATH_INT8 = 1, LX_MATH_FP8 = 2, LX_MATH_FP4 = 3 } lx_math;
+
+// Decode GEMV on any weight format (generalizes lx_gemv; same contract for x, bias, y, alpha,
+// beta, M <= 8). Weight-only: the weight is expanded in registers, the math is f32.
+LX_API int lx_gemv_w(const void* x, lx_dtype x_dtype, int ld_x, const lx_weight* w, const void* bias,
+                     lx_dtype bias_dtype, void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K, float alpha,
+                     float beta, void* stream);
+
+// Tensor-core GEMM on any weight format, for prefill and batched decode:
+//   y[M, N] = alpha * (x[M, K] @ W[N, K]^T + bias[N]) + beta * y
+// x bf16 or f32 (quantized on the fly when math needs it, into `workspace`, at least
+// lx_gemm_workspace_bytes(M, K, math) bytes). Same dtype rules for bias and y as lx_gemm_bf16.
+LX_API int lx_gemm_w(const void* x, lx_dtype x_dtype, int ld_x, const lx_weight* w, lx_math math, const void* bias,
+                     lx_dtype bias_dtype, void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K, float alpha,
+                     float beta, void* workspace, void* stream);
+LX_API int64_t lx_gemm_workspace_bytes(int M, int K, lx_math math);
+
+// Routed experts on any weight format (contract of lx_moe_experts; gate_up [E, 2I, L],
+// down [E, L, I] as lx_weight stacks). Two implementations with one contract:
+//   lx_moe_experts_decode  few tokens (T <= 8): one pass over the chosen experts' weights,
+//                          weight-only, f32 math. Workspace: lx_moe_decode_workspace_bytes.
+//   lx_moe_experts_grouped any T: tokens grouped by expert, a tensor-core grouped GEMM per
+//                          stage with the given math. Workspace: lx_moe_grouped_workspace_bytes.
+LX_API int lx_moe_experts_decode(const void* latent, const int32_t* ids, const float* weights,
+                                 const lx_weight* gate_up, const lx_weight* down, float* out, void* workspace, int T,
+                                 int L, int I, int top_k, void* stream);
+LX_API int64_t lx_moe_decode_workspace_bytes(int T, int I, int top_k);
+LX_API int lx_moe_experts_grouped(const void* latent, const int32_t* ids, const float* weights,
+                                  const lx_weight* gate_up, const lx_weight* down, lx_math math, float* out,
+                                  void* workspace, int T, int L, int I, int E, int top_k, void* stream);
+LX_API int64_t lx_moe_grouped_workspace_bytes(int T, int L, int I, int E, int top_k, lx_math math);
+
+// Round-to-nearest quantization of a bf16 [rows, cols] weight into `out`, whose data and scale
+// buffers the caller allocated for out->type (sizes as in the layouts above). INT8 and FP8 take
+// per-row absmax scales (/127, /448); NVFP4 takes the global as max|w| / (448 * 6) and each
+// block's e4m3 scale as its absmax / (6 * global), rounded to e4m3. Used when the engine is asked
+// for a format the file is not stored in; checkpoints made with GPTQ are loaded as they are.
+LX_API int lx_quantize_weight(const void* w, lx_weight* out, int64_t rows, int cols, void* stream);
 
 #ifdef __cplusplus
 }

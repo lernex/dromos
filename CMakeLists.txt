@@ -26,7 +26,8 @@ target_include_directories(lernex_kernels PUBLIC engine)
 target_link_libraries(lernex_kernels PUBLIC CUDA::cudart CUDA::cublasLt)
 
 # The runtime: config, weights, the Metis model, caches and the scheduler.
-file(GLOB LX_CORE_SOURCES CONFIGURE_DEPENDS engine/core/*.cpp engine/model/*.cpp engine/model/*.cu engine/runtime/*.cpp)
+file(GLOB LX_CORE_SOURCES CONFIGURE_DEPENDS engine/core/*.cpp engine/model/*.cpp engine/model/*.cu engine/runtime/*.cpp
+     engine/runtime/*.cu engine/text/*.cpp engine/server/*.cpp)
 if(LX_CORE_SOURCES)
   add_library(lernex_core STATIC ${LX_CORE_SOURCES})
   target_include_directories(lernex_core PUBLIC engine third_party)
