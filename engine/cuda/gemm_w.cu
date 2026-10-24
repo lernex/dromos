@@ -86,8 +86,31 @@ const Registered<kW4A8, 120> reg_w4a8;
 const char* default_tile(int kind, int M, int N) {
   if (kind == kW8I8 || kind == kW8F8 || kind == kW4A16) return "32x128_w1x4_s4_k128";
   if (kind == kW4A8) {
-    if (M <= 128 || N <= 1024) return "32x128_w1x4_s4_k128";
-    return M <= 512 ? "64x128_w2x4_s4_k128" : "128x128_w2x4_s3_k128";
+    // One CTA of each W4A8 tile fits an SM, and once the GPU is full they run at about 74, 81 and 86
+    // TFLOPS: the pick is the fewest waves of tiles, weighted by that rate, which matches the measured
+    // best at every Praxis shape from M = 64 to 8192.
+    static const int sms = [] {
+      int dev = 0, n = 0;
+      cudaGetDevice(&dev);
+      cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev);
+      return n > 0 ? n : 1;
+    }();
+    struct Option {
+      const char* name;
+      int bm;
+      float rate;
+    };
+    const Option options[] = {{"32x128_w1x4_s4_k128", 32, 74.0f},
+                              {"64x128_w2x4_s4_k128", 64, 81.0f},
+                              {"128x128_w2x4_s3_k128", 128, 86.0f}};
+    const char* best = options[0].name;
+    float best_cost = 0.0f;
+    for (const Option& o : options) {
+      const int tiles = (M + o.bm - 1) / o.bm * ((N + 127) / 128);
+      const float cost = static_cast<float>((tiles + sms - 1) / sms) * o.bm / o.rate;
+      if (best_cost == 0.0f || cost < best_cost) best = o.name, best_cost = cost;
+    }
+    return best;
   }
   const bool f4 = kind == kF4;
   if (M <= 128) {
