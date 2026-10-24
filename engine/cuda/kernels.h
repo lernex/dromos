@@ -308,6 +308,12 @@ LX_API int lx_bf16x_decode(const void* data, int64_t rows, int K, void* w, void*
 LX_API int lx_gemv_bf16x(const void* x, lx_dtype x_dtype, int ld_x, const void* w, const void* bias,
                          lx_dtype bias_dtype, void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K, float alpha,
                          float beta, void* stream);
+// The same kernel on plain bf16 weights ([N, K], 16-byte aligned for the vector path): the
+// like-for-like baseline the format is measured against, and itself bit-identical to lx_gemv. Built
+// per M bucket, it is faster than lx_gemv at M = 1 on every Praxis shape, not at M = 8.
+LX_API int lx_gemv_decode_bf16(const void* x, lx_dtype x_dtype, int ld_x, const void* w, const void* bias,
+                               lx_dtype bias_dtype, void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K,
+                               float alpha, float beta, void* stream);
 
 // Routed experts on LX_W_BF16X stacks, for decode (few tokens): the contract of lx_moe_experts with
 // gate_up the encoding of [E, 2I, L] and down of [E, L, I] (16-byte aligned), a caller-owned

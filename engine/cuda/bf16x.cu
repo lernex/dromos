@@ -269,17 +269,25 @@ __global__ void __launch_bounds__(kThreads) decode_rows(const uint8_t* __restric
 // 4l .. 4l + 3 of each 128-k step (one block), the S warps of a row group split the steps the same
 // way, and the partial sums meet in the same order, so the result is lx_gemv's to the bit. A step's
 // loads per lane: the sign|mantissa word (4 bytes), the codes word it shares with its neighbour
-// lane, and the block's base byte (one address for the whole warp).
+// lane, and the block's base byte (one address for the whole warp). kX = false runs the same kernel
+// on plain bf16 rows (the lane's 8-byte word): the like-for-like baseline for the format.
 
-struct Step {
+template <bool kX>
+struct Step;
+template <>
+struct Step<true> {
   uint32_t sm, cd, base;
+};
+template <>
+struct Step<false> {
+  uint2 w;
 };
 
 // Words for steps u_begin + u (u < KU) of the RG rows at rows[r] (null past N). Steps past u_end and
 // k past K read as zero, so the consumer needs no load-side bounds handling.
-template <int KU, int RG>
+template <bool kX, int KU, int RG>
 __device__ __forceinline__ void load_steps(const uint8_t* const (&rows)[RG], int H, int bo, int K, int lane,
-                                           int u_begin, int u_end, Step (&s)[KU][RG]) {
+                                           int u_begin, int u_end, Step<kX> (&s)[KU][RG]) {
 #pragma unroll
   for (int u = 0; u < KU; ++u) {
     const int j = u_begin + u;
@@ -287,12 +295,16 @@ __device__ __forceinline__ void load_steps(const uint8_t* const (&rows)[RG], int
     const int off = H + j * fx::kBlockBytes;
 #pragma unroll
     for (int r = 0; r < RG; ++r) {
-      s[u][r] = Step{0, 0, 0};
+      s[u][r] = Step<kX>{};
       if (live && rows[r] != nullptr) {
         // Streamed once per token: evict-first, leaving L1 to x and the headers.
-        s[u][r].sm = __ldcs(reinterpret_cast<const unsigned int*>(rows[r] + off) + lane);
-        s[u][r].cd = __ldcs(reinterpret_cast<const unsigned int*>(rows[r] + off + fx::kCodes) + (lane >> 1));
-        s[u][r].base = __ldg(rows[r] + bo + j);
+        if constexpr (kX) {
+          s[u][r].sm = __ldcs(reinterpret_cast<const unsigned int*>(rows[r] + off) + lane);
+          s[u][r].cd = __ldcs(reinterpret_cast<const unsigned int*>(rows[r] + off + fx::kCodes) + (lane >> 1));
+          s[u][r].base = __ldg(rows[r] + bo + j);
+        } else {
+          s[u][r].w = __ldcs(reinterpret_cast<const uint2*>(rows[r]) + j * 32 + lane);
+        }
       }
     }
   }
@@ -302,8 +314,8 @@ __device__ __forceinline__ void load_steps(const uint8_t* const (&rows)[RG], int
 // iteration, whose steps may run past the part's end or past K; every other iteration is free of
 // per-step conditions, so the compiler interleaves its steps. Patches are checked once per row per
 // iteration (a row rarely has any); only a row with one in range walks its steps.
-template <typename TX, int RG, int KU, int MT, bool kGuard>
-__device__ __forceinline__ void consume(const Step (&cur)[KU][RG], fx::Patches (&pc)[RG], float (&acc)[RG][MT],
+template <bool kX, typename TX, int RG, int KU, int MT, bool kGuard>
+__device__ __forceinline__ void consume(const Step<kX> (&cur)[KU][RG], fx::Patches (&pc)[RG], float (&acc)[RG][MT],
                                         const TX* __restrict__ x, int ld_x, int M, int K, int j, int u1, int lane,
                                         int shift) {
   // With one row of x, the iteration's x values are loaded before the decode so their L1 latency
@@ -321,14 +333,16 @@ __device__ __forceinline__ void consume(const Step (&cur)[KU][RG], fx::Patches (
     }
   }
   uint32_t e[KU][RG];
+  if constexpr (kX) {
 #pragma unroll
-  for (int u = 0; u < KU; ++u)
+    for (int u = 0; u < KU; ++u)
 #pragma unroll
-    for (int r = 0; r < RG; ++r) e[u][r] = fx::exponents(cur[u][r].base, cur[u][r].cd >> shift);
+      for (int r = 0; r < RG; ++r) e[u][r] = fx::exponents(cur[u][r].base, cur[u][r].cd >> shift);
+  }
   const uint32_t iter_end = static_cast<uint32_t>((j + KU) * fx::kBlock);
 #pragma unroll
   for (int r = 0; r < RG; ++r) {
-    if (pc[r].pos() < iter_end) {
+    if (kX && pc[r].pos() < iter_end) {
 #pragma unroll
       for (int u = 0; u < KU; ++u) {
         const uint32_t k0 = static_cast<uint32_t>((j + u) * fx::kBlock + 4 * lane);
@@ -346,7 +360,10 @@ __device__ __forceinline__ void consume(const Step (&cur)[KU][RG], fx::Patches (
     if (!kGuard || (j + u < u1 && k0 < K)) {
       float wf[RG][4];
 #pragma unroll
-      for (int r = 0; r < RG; ++r) fx::to_f32(fx::assemble(cur[u][r].sm, e[u][r]), wf[r]);
+      for (int r = 0; r < RG; ++r) {
+        if constexpr (kX) fx::to_f32(fx::assemble(cur[u][r].sm, e[u][r]), wf[r]);
+        else decode4(cur[u][r].w, wf[r]);
+      }
 #pragma unroll
       for (int m = 0; m < MT; ++m) {
         if (MT == 1 || m < M) {
@@ -370,7 +387,7 @@ __device__ __forceinline__ void consume(const Step (&cur)[KU][RG], fx::Patches (
 // MT is the M bucket the kernel is built for (1, 2, 4, 8); M <= MT rows of x are used. Building per
 // bucket keeps the M = 1 kernel free of the predicated-off work of seven unused rows, which would
 // otherwise take most of the issue slots.
-template <typename TX, int RG, int S, int KU, int MT>
+template <bool kX, typename TX, int RG, int S, int KU, int MT>
 __global__ void __launch_bounds__(kThreads)
 gemv_vec_kernel(const TX* __restrict__ x, int ld_x, const uint8_t* __restrict__ w, int K,
                 const void* __restrict__ bias, bool bias_bf16, void* __restrict__ y, bool y_bf16, int ld_y, int M,
@@ -385,7 +402,7 @@ gemv_vec_kernel(const TX* __restrict__ x, int ld_x, const uint8_t* __restrict__ 
   const int steps = fx::blocks(K);
   const int u0 = (part * steps) / S;
   const int u1 = ((part + 1) * steps) / S;
-  const int64_t rb = fx::row_bytes(K);
+  const int64_t rb = kX ? fx::row_bytes(K) : 2 * static_cast<int64_t>(K);
   const int H = fx::header_bytes(K), bo = fx::base_offset(K);
   const int shift = 4 * (lane & 1);
   // Steps before this are whole (all their k < K): K % 128 == 0 leaves none partial.
@@ -403,23 +420,23 @@ gemv_vec_kernel(const TX* __restrict__ x, int ld_x, const uint8_t* __restrict__ 
 
   // Weights do not depend on the previous kernel: the first steps and the patch lists are fetched
   // before the dependency wait.
-  Step cur[KU][RG];
-  load_steps<KU, RG>(rows, H, bo, K, lane, u0, u1, cur);
+  Step<kX> cur[KU][RG];
+  load_steps<kX, KU, RG>(rows, H, bo, K, lane, u0, u1, cur);
   fx::Patches pc[RG];
 #pragma unroll
   for (int r = 0; r < RG; ++r) {
     pc[r].p = nullptr;
     pc[r].left = 0;
     pc[r].next = fx::kNoPatch;
-    if (rows[r] != nullptr) pc[r].prefetch(rows[r]);
+    if (kX && rows[r] != nullptr) pc[r].prefetch(rows[r]);
   }
   cudaGridDependencySynchronize();
 
   if (first < N) {
     for (int j = u0; j < u1; j += KU) {
-      Step nxt[KU][RG];
-      load_steps<KU, RG>(rows, H, bo, K, lane, j + KU, u1, nxt);
-      if (j == u0) {  // the patch lists arrive with the first steps: read them once those are needed
+      Step<kX> nxt[KU][RG];
+      load_steps<kX, KU, RG>(rows, H, bo, K, lane, j + KU, u1, nxt);
+      if (kX && j == u0) {  // the patch lists arrive with the first steps: read them once those are needed
 #pragma unroll
         for (int r = 0; r < RG; ++r) {
           if (rows[r] != nullptr) {
@@ -428,8 +445,8 @@ gemv_vec_kernel(const TX* __restrict__ x, int ld_x, const uint8_t* __restrict__ 
           }
         }
       }
-      if (j + KU <= full) consume<TX, RG, KU, MT, false>(cur, pc, acc, x, ld_x, M, K, j, u1, lane, shift);
-      else consume<TX, RG, KU, MT, true>(cur, pc, acc, x, ld_x, M, K, j, u1, lane, shift);
+      if (j + KU <= full) consume<kX, TX, RG, KU, MT, false>(cur, pc, acc, x, ld_x, M, K, j, u1, lane, shift);
+      else consume<kX, TX, RG, KU, MT, true>(cur, pc, acc, x, ld_x, M, K, j, u1, lane, shift);
 #pragma unroll
       for (int u = 0; u < KU; ++u)
 #pragma unroll
@@ -477,21 +494,87 @@ gemv_vec_kernel(const TX* __restrict__ x, int ld_x, const uint8_t* __restrict__ 
 
 // ---- decode GEMV: small kernel ---------------------------------------------------------------
 // gemv.cu's small kernel (K <= 256, or K % 4 != 0, or misaligned x): lpr lanes per row, lane c reading
-// the e consecutive inputs from c * e, one value at a time.
-template <typename TX>
-__global__ void gemv_small_kernel(const TX* __restrict__ x, int ld_x, const uint8_t* __restrict__ w,
-                                  const void* __restrict__ bias, bool bias_bf16, void* __restrict__ y, bool y_bf16,
-                                  int ld_y, int M, int N, int K, int lpr, int e, float alpha, float beta) {
+// the e consecutive inputs from c * e, multiplied one at a time in k order, then the row's lanes summed
+// by xor shuffles. The arithmetic is per lane, so the block shape is free: kSmallWarps warps a block
+// (gemv.cu runs one) keep enough rows in flight to cover DRAM latency. When each lane takes exactly 8
+// inputs (K = 64, 128, 256) and x is 16-byte aligned, a lane's weights are one load (two quads of this
+// format, or 16 bytes of bf16) issued before the dependency wait, and its x rows are vector loads.
+
+constexpr int kSmallWarps = 4;
+
+template <bool kX>
+__device__ __forceinline__ void small_octet(const uint8_t* __restrict__ w, int64_t n, int K, int c, float (&wv)[8]) {
+  const int q = 8 * c;
+  if constexpr (kX) {
+    const uint8_t* row = w + n * fx::row_bytes(K);
+    const uint8_t* blk = row + fx::header_bytes(K) + (q >> 7) * fx::kBlockBytes;
+    const int off = q & 127;
+    fx::Patches pc;
+    pc.prefetch(row);
+    const uint2 sm = *reinterpret_cast<const uint2*>(blk + off);
+    const uint32_t cd = *reinterpret_cast<const uint32_t*>(blk + fx::kCodes + (off >> 1));  // word off / 8
+    const uint32_t base = row[fx::base_offset(K) + (q >> 7)];
+    pc.resolve(fx::patch_slots(K));
+    uint32_t e0 = fx::exponents(base, cd), e1 = fx::exponents(base, cd >> 4);
+    while (pc.pos() < static_cast<uint32_t>(q + 8)) {  // patches below q are other lanes' and change nothing
+      e0 = fx::patch(e0, pc.next, static_cast<uint32_t>(q));
+      e1 = fx::patch(e1, pc.next, static_cast<uint32_t>(q + 4));
+      pc.advance();
+    }
+    fx::to_f32(fx::assemble(sm.x, e0), wv);
+    fx::to_f32(fx::assemble(sm.y, e1), wv + 4);
+  } else {
+    const uint4 v = __ldcs(reinterpret_cast<const uint4*>(reinterpret_cast<const bf16*>(w) + n * K + q));
+    decode4(make_uint2(v.x, v.y), wv);
+    decode4(make_uint2(v.z, v.w), wv + 4);
+  }
+}
+
+template <bool kX, typename TX>
+__global__ void __launch_bounds__(32 * kSmallWarps)
+gemv_small_kernel(const TX* __restrict__ x, int ld_x, const uint8_t* __restrict__ w, const void* __restrict__ bias,
+                  bool bias_bf16, void* __restrict__ y, bool y_bf16, int ld_y, int M, int N, int K, int lpr, int e,
+                  bool octet, float alpha, float beta) {
   cudaTriggerProgrammaticLaunchCompletion();
-  cudaGridDependencySynchronize();
-  const int lane = threadIdx.x;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int slot = lane / lpr, c = lane % lpr;
-  const int64_t n = static_cast<int64_t>(blockIdx.x) * (32 / lpr) + slot;
+  const int64_t n = (static_cast<int64_t>(blockIdx.x) * kSmallWarps + warp) * (32 / lpr) + slot;
 
   float acc[kMaxM];
 #pragma unroll
   for (int m = 0; m < kMaxM; ++m) acc[m] = 0.0f;
-  if (n < N) {
+  if (octet) {
+    // Weights do not depend on the previous kernel: fetch them before the wait.
+    float wv[8];
+    const bool live = n < N && 8 * c < K;
+    if (live) small_octet<kX>(w, n, K, c, wv);
+    cudaGridDependencySynchronize();
+    if (live) {
+#pragma unroll
+      for (int m = 0; m < kMaxM; ++m) {
+        if (m < M) {
+          float xf[8];
+          const TX* xr = x + static_cast<int64_t>(m) * ld_x + 8 * c;
+          load_x4<TX>(xr, xf);
+          load_x4<TX>(xr + 4, xf + 4);
+#pragma unroll
+          for (int i = 0; i < 8; ++i) acc[m] = fmaf(wv[i], xf[i], acc[m]);
+        }
+      }
+    }
+  } else if (n < N && !kX) {
+    cudaGridDependencySynchronize();
+    const bf16* row = reinterpret_cast<const bf16*>(w) + n * K;
+    for (int i = 0; i < e; ++i) {
+      const int k = c * e + i;
+      if (k >= K) break;
+      const float wv = lx::to_f32(row[k]);
+#pragma unroll
+      for (int m = 0; m < kMaxM; ++m)
+        if (m < M) acc[m] = fmaf(wv, lx::to_f32(x[static_cast<int64_t>(m) * ld_x + k]), acc[m]);
+    }
+  } else if (n < N) {
+    cudaGridDependencySynchronize();
     const uint8_t* row = w + n * fx::row_bytes(K);
     fx::Patches pc;
     pc.start(row, fx::patch_slots(K));
@@ -527,6 +610,8 @@ __global__ void gemv_small_kernel(const TX* __restrict__ x, int ld_x, const uint
           if (m < M) acc[m] = fmaf(wv, lx::to_f32(x[static_cast<int64_t>(m) * ld_x + k]), acc[m]);
       }
     }
+  } else {
+    cudaGridDependencySynchronize();
   }
   for (int off = lpr / 2; off > 0; off >>= 1)
 #pragma unroll
@@ -556,21 +641,26 @@ struct Args {
   cudaStream_t stream;
 };
 
-template <typename TX>
+template <bool kX, typename TX>
 cudaError_t launch_small(const Args& a) {
   int lpr = 1;
   while (lpr < 32 && lpr * 8 < a.K) lpr *= 2;
   const int e = (a.K + lpr - 1) / lpr;
-  const int rows_per_warp = 32 / lpr;
-  const unsigned blocks = static_cast<unsigned>((a.N + rows_per_warp - 1) / rows_per_warp);
+  const int rows_per_block = kSmallWarps * (32 / lpr);
+  const unsigned blocks = static_cast<unsigned>((a.N + rows_per_block - 1) / rows_per_block);
+  // Whole octets per lane, x rows 16-byte aligned, and (bf16) rows 16-byte aligned.
+  const bool octet =
+      e == 8 && a.K % 8 == 0 &&
+      ((reinterpret_cast<uintptr_t>(a.x) | (static_cast<uint64_t>(a.ld_x) * sizeof(TX))) % 16 == 0) &&
+      (kX || reinterpret_cast<uintptr_t>(a.w) % 16 == 0);
   cudaLaunchAttribute attr{};
-  const cudaLaunchConfig_t cfg = pdl_config(blocks, 32, a.stream, attr);
-  cudaLaunchKernelEx(&cfg, gemv_small_kernel<TX>, static_cast<const TX*>(a.x), a.ld_x, a.w, a.bias, a.bias_bf16, a.y,
-                     a.y_bf16, a.ld_y, a.M, a.N, a.K, lpr, e, a.alpha, a.beta);
+  const cudaLaunchConfig_t cfg = pdl_config(blocks, 32 * kSmallWarps, a.stream, attr);
+  cudaLaunchKernelEx(&cfg, gemv_small_kernel<kX, TX>, static_cast<const TX*>(a.x), a.ld_x, a.w, a.bias, a.bias_bf16, a.y,
+                     a.y_bf16, a.ld_y, a.M, a.N, a.K, lpr, e, octet, a.alpha, a.beta);
   return cudaGetLastError();
 }
 
-template <typename TX, int RG, int S, int KU>
+template <bool kX, typename TX, int RG, int S, int KU>
 cudaError_t run_vec(const Args& a) {
   constexpr int kGroups = kWarps / S;
   const int64_t rows_per_block = static_cast<int64_t>(kGroups) * RG;
@@ -579,16 +669,16 @@ cudaError_t run_vec(const Args& a) {
   const cudaLaunchConfig_t cfg = pdl_config(blocks, kThreads, a.stream, attr);
   const TX* x = static_cast<const TX*>(a.x);
   if (a.M == 1)
-    cudaLaunchKernelEx(&cfg, gemv_vec_kernel<TX, RG, S, KU, 1>, x, a.ld_x, a.w, a.K, a.bias, a.bias_bf16, a.y,
+    cudaLaunchKernelEx(&cfg, gemv_vec_kernel<kX, TX, RG, S, KU, 1>, x, a.ld_x, a.w, a.K, a.bias, a.bias_bf16, a.y,
                        a.y_bf16, a.ld_y, a.M, a.N, a.alpha, a.beta);
   else if (a.M == 2)
-    cudaLaunchKernelEx(&cfg, gemv_vec_kernel<TX, RG, S, KU, 2>, x, a.ld_x, a.w, a.K, a.bias, a.bias_bf16, a.y,
+    cudaLaunchKernelEx(&cfg, gemv_vec_kernel<kX, TX, RG, S, KU, 2>, x, a.ld_x, a.w, a.K, a.bias, a.bias_bf16, a.y,
                        a.y_bf16, a.ld_y, a.M, a.N, a.alpha, a.beta);
   else if (a.M <= 4)
-    cudaLaunchKernelEx(&cfg, gemv_vec_kernel<TX, RG, S, KU, 4>, x, a.ld_x, a.w, a.K, a.bias, a.bias_bf16, a.y,
+    cudaLaunchKernelEx(&cfg, gemv_vec_kernel<kX, TX, RG, S, KU, 4>, x, a.ld_x, a.w, a.K, a.bias, a.bias_bf16, a.y,
                        a.y_bf16, a.ld_y, a.M, a.N, a.alpha, a.beta);
   else
-    cudaLaunchKernelEx(&cfg, gemv_vec_kernel<TX, RG, S, KU, 8>, x, a.ld_x, a.w, a.K, a.bias, a.bias_bf16, a.y,
+    cudaLaunchKernelEx(&cfg, gemv_vec_kernel<kX, TX, RG, S, KU, 8>, x, a.ld_x, a.w, a.K, a.bias, a.bias_bf16, a.y,
                        a.y_bf16, a.ld_y, a.M, a.N, a.alpha, a.beta);
   return cudaGetLastError();
 }
@@ -599,6 +689,7 @@ struct Variant {
 };
 constexpr Variant kVariants[] = {{1, 2}, {1, 4}, {2, 2}, {2, 4}};
 const lx::TunableRegistration kTune("gemv_bf16x", {"rg1_ku2", "rg1_ku4", "rg2_ku2", "rg2_ku4"});
+const lx::TunableRegistration kTuneBf16("gemv_decode_bf16", {"rg1_ku2", "rg1_ku4", "rg2_ku2", "rg2_ku4"});
 
 // The split S must be gemv.cu's choice for bf16 weights (steps of 128 k), or the partial sums would
 // meet in a different order. Rows per warp and steps in flight are free.
@@ -609,7 +700,7 @@ int choose_split(int N, int K) {
   return S;
 }
 
-template <typename TX>
+template <bool kX, typename TX>
 const void* vec_kernel_ptr(int RG, int S, int KU, int MT);
 
 // Blocks of a kernel that fit on the GPU at once, cached per (device, kernel).
@@ -632,37 +723,41 @@ int resident_blocks(const void* kernel) {
   return blocks;
 }
 
-// From the sweep on the 5070 Ti (bench/bench_bf16x.py): at M = 1, two rows per warp with four steps
-// in flight is within 6% of the best variant at every Praxis shape; with more rows of x, one row and
-// two steps, which holds the fewest registers. A variant whose blocks would leave the last wave less
-// than three-quarters full gives way to the next (two rows a warp halves the blocks). At M = 8 two rows
-// share each x load, which pays once N is large.
-Variant choose_variant(int N, int M, int S, bool x_bf16) {
-  const Variant one_row{1, 2}, two_rows{2, 2};
+// From the sweeps on the 5070 Ti (bench/bench_bf16x.py): at M = 1, two rows per warp with four steps
+// in flight is within 6% of the best variant at every Praxis shape. At M = 2 to 4, one row a warp,
+// with four steps in flight when that is all of a warp's steps: a grid that fits in one wave keeps
+// every block it can (fewer, two-row blocks only lose parallelism), and so does one of three or more
+// waves, whose tail is a small part of it. Only a grid of just over one wave, whose second wave would
+// be mostly idle, takes two rows a warp to fit in one (3072 x 2048: 12.6 us against 15.7). At M > 4
+// two rows share each x load, which pays once N is large.
+template <bool kX>
+Variant choose_variant(int N, int K, int M, int S, bool x_bf16) {
   if (M == 1) return Variant{2, 4};
-  if (M > 4) return N >= 2048 ? two_rows : one_row;
+  const Variant two_rows{2, 2};
+  if (M > 4) return N >= 2048 ? two_rows : Variant{1, 2};
+  const int per_warp = (fx::blocks(K) + S - 1) / S;
+  const Variant one_row{1, per_warp <= 4 ? 4 : 2};
   const int MT = M == 2 ? 2 : 4;
-  for (const Variant v : {one_row, two_rows}) {
-    const int64_t rows_per_block = static_cast<int64_t>(kWarps / S) * v.RG;
-    const int64_t blocks = (N + rows_per_block - 1) / rows_per_block;
-    const int slots = resident_blocks(x_bf16 ? vec_kernel_ptr<bf16>(v.RG, S, v.KU, MT)
-                                             : vec_kernel_ptr<float>(v.RG, S, v.KU, MT));
-    const int64_t waves = (blocks + slots - 1) / slots;
-    if (4 * blocks >= 3 * waves * slots) return v;
-  }
+  const int64_t rows_per_block = kWarps / S;
+  const int64_t blocks = (N + rows_per_block - 1) / rows_per_block;
+  const int slots = resident_blocks(x_bf16 ? vec_kernel_ptr<kX, bf16>(one_row.RG, S, one_row.KU, MT)
+                                           : vec_kernel_ptr<kX, float>(one_row.RG, S, one_row.KU, MT));
+  const int64_t waves = (blocks + slots - 1) / slots;
+  if (waves == 1 || waves >= 3 || 4 * blocks >= 3 * waves * slots) return one_row;
   return two_rows;
 }
 
+template <bool kX>
 Variant pick_variant(int N, int K, int M, int S, bool x_bf16) {
-  const int tuned = lx_tune_get("gemv_bf16x", M, N, K);
+  const int tuned = lx_tune_get(kX ? "gemv_bf16x" : "gemv_decode_bf16", M, N, K);
   if (tuned >= 0 && tuned < static_cast<int>(sizeof(kVariants) / sizeof(kVariants[0]))) return kVariants[tuned];
-  return choose_variant(N, M, S, x_bf16);
+  return choose_variant<kX>(N, K, M, S, x_bf16);
 }
 
-template <typename TX, int MT>
+template <bool kX, typename TX, int MT>
 const void* vec_kernel_mt(int RG, int S, int KU) {
 #define LX_PTR(S_, RG_, KU_) \
-  if (S == S_ && RG == RG_ && KU == KU_) return reinterpret_cast<const void*>(gemv_vec_kernel<TX, RG_, S_, KU_, MT>);
+  if (S == S_ && RG == RG_ && KU == KU_) return reinterpret_cast<const void*>(gemv_vec_kernel<kX, TX, RG_, S_, KU_, MT>);
 #define LX_PTRS(S_) LX_PTR(S_, 1, 1) LX_PTR(S_, 1, 2) LX_PTR(S_, 1, 4) LX_PTR(S_, 2, 1) LX_PTR(S_, 2, 2) LX_PTR(S_, 2, 4)
   LX_PTRS(1) LX_PTRS(2) LX_PTRS(4) LX_PTRS(8)
 #undef LX_PTRS
@@ -670,22 +765,22 @@ const void* vec_kernel_mt(int RG, int S, int KU) {
   return nullptr;
 }
 
-template <typename TX>
+template <bool kX, typename TX>
 const void* vec_kernel_ptr(int RG, int S, int KU, int MT) {
-  if (MT == 1) return vec_kernel_mt<TX, 1>(RG, S, KU);
-  if (MT == 2) return vec_kernel_mt<TX, 2>(RG, S, KU);
-  if (MT == 4) return vec_kernel_mt<TX, 4>(RG, S, KU);
-  return vec_kernel_mt<TX, 8>(RG, S, KU);
+  if (MT == 1) return vec_kernel_mt<kX, TX, 1>(RG, S, KU);
+  if (MT == 2) return vec_kernel_mt<kX, TX, 2>(RG, S, KU);
+  if (MT == 4) return vec_kernel_mt<kX, TX, 4>(RG, S, KU);
+  return vec_kernel_mt<kX, TX, 8>(RG, S, KU);
 }
 
-template <typename TX>
+template <bool kX, typename TX>
 cudaError_t launch_vec(const Args& a) {
   const int S = choose_split(a.N, a.K);
-  Variant v = pick_variant(a.N, a.K, a.M, S, std::is_same_v<TX, bf16>);
+  Variant v = pick_variant<kX>(a.N, a.K, a.M, S, std::is_same_v<TX, bf16>);
   const int steps = (a.K + 127) / 128;
   while (v.KU > 1 && v.KU > steps / S) v.KU /= 2;
 #define LX_CASE(S_, RG_, KU_) \
-  if (S == S_ && v.RG == RG_ && v.KU == KU_) return run_vec<TX, RG_, S_, KU_>(a);
+  if (S == S_ && v.RG == RG_ && v.KU == KU_) return run_vec<kX, TX, RG_, S_, KU_>(a);
 #define LX_SPLIT(S_) \
   LX_CASE(S_, 1, 1) LX_CASE(S_, 1, 2) LX_CASE(S_, 1, 4) LX_CASE(S_, 2, 1) LX_CASE(S_, 2, 2) LX_CASE(S_, 2, 4)
   LX_SPLIT(1) LX_SPLIT(2) LX_SPLIT(4) LX_SPLIT(8)
@@ -694,14 +789,15 @@ cudaError_t launch_vec(const Args& a) {
   return cudaErrorInvalidValue;
 }
 
-template <typename TX>
+template <bool kX, typename TX>
 cudaError_t launch_gemv(const Args& a) {
-  // gemv.cu's choice of kernel for the same x (its weight is always 16-byte aligned in practice;
-  // this format's rows are 8-byte aligned by construction).
+  // gemv.cu's choice of kernel for the same x and weight (this format's rows are 8-byte aligned by
+  // construction; a bf16 weight must be 16-byte aligned for the vector loads, as in gemv.cu).
   const bool aligned =
-      ((reinterpret_cast<uintptr_t>(a.x) | (static_cast<uint64_t>(a.ld_x) * sizeof(TX))) % 16 == 0);
-  if (a.K <= kSmallK || a.K % 4 != 0 || !aligned) return launch_small<TX>(a);
-  return launch_vec<TX>(a);
+      ((reinterpret_cast<uintptr_t>(a.x) | (static_cast<uint64_t>(a.ld_x) * sizeof(TX))) % 16 == 0) &&
+      (kX || reinterpret_cast<uintptr_t>(a.w) % 16 == 0);
+  if (a.K <= kSmallK || a.K % 4 != 0 || !aligned) return launch_small<kX, TX>(a);
+  return launch_vec<kX, TX>(a);
 }
 
 bool valid_dtype(lx_dtype d) { return d == LX_F32 || d == LX_BF16; }
@@ -1065,15 +1161,16 @@ extern "C" int lx_bf16x_decode(const void* data, int64_t rows, int K, void* w, v
   return lx::launch_status();
 }
 
-extern "C" int lx_gemv_bf16x(const void* x, lx_dtype x_dtype, int ld_x, const void* w, const void* bias,
-                             lx_dtype bias_dtype, void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K, float alpha,
-                             float beta, void* stream) {
+namespace {
+template <bool kX>
+int gemv_entry(const void* x, lx_dtype x_dtype, int ld_x, const void* w, const void* bias, lx_dtype bias_dtype,
+               void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K, float alpha, float beta, void* stream) {
   if (M == 0 || N == 0) return 0;
   if (M < 0 || M > kMaxM || K <= 0 || K >= fx::kMaxK || ld_x < K || ld_y < N)
     return static_cast<int>(cudaErrorInvalidValue);
   if (!valid_dtype(x_dtype) || !valid_dtype(y_dtype) || !valid_dtype(bias_dtype))
     return static_cast<int>(cudaErrorInvalidValue);
-  if (!x || !w || !y || (reinterpret_cast<uintptr_t>(w) & 7) != 0) return static_cast<int>(cudaErrorInvalidValue);
+  if (!x || !w || !y || (kX && (reinterpret_cast<uintptr_t>(w) & 7) != 0)) return static_cast<int>(cudaErrorInvalidValue);
   const Args a{
       .x = x,
       .ld_x = ld_x,
@@ -1090,8 +1187,21 @@ extern "C" int lx_gemv_bf16x(const void* x, lx_dtype x_dtype, int ld_x, const vo
       .beta = beta,
       .stream = static_cast<cudaStream_t>(stream),
   };
-  const cudaError_t e = x_dtype == LX_BF16 ? launch_gemv<bf16>(a) : launch_gemv<float>(a);
+  const cudaError_t e = x_dtype == LX_BF16 ? launch_gemv<kX, bf16>(a) : launch_gemv<kX, float>(a);
   return static_cast<int>(e);
+}
+}  // namespace
+
+extern "C" int lx_gemv_bf16x(const void* x, lx_dtype x_dtype, int ld_x, const void* w, const void* bias,
+                             lx_dtype bias_dtype, void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K, float alpha,
+                             float beta, void* stream) {
+  return gemv_entry<true>(x, x_dtype, ld_x, w, bias, bias_dtype, y, y_dtype, ld_y, M, N, K, alpha, beta, stream);
+}
+
+extern "C" int lx_gemv_decode_bf16(const void* x, lx_dtype x_dtype, int ld_x, const void* w, const void* bias,
+                                   lx_dtype bias_dtype, void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K,
+                                   float alpha, float beta, void* stream) {
+  return gemv_entry<false>(x, x_dtype, ld_x, w, bias, bias_dtype, y, y_dtype, ld_y, M, N, K, alpha, beta, stream);
 }
 
 namespace {

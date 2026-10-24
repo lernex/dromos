@@ -5,7 +5,8 @@ The format must reproduce every bf16 bit, so nothing here has a tolerance:
   - decoding gives back the input bits, including zeros, subnormals, infinities and NaNs, rows with
     more patches than their slots (overflow records), and K that is not a multiple of 128
   - lx_gemv_bf16x equals lx_gemv on the original bf16 weights bit for bit, for every path (vec with
-    each split, small, strided x, every M, every dtype), and is deterministic
+    each split, small, strided x, every M, every dtype), and is deterministic; so does
+    lx_gemv_decode_bf16 (the same kernel on plain bf16), checked in every one of those cases
   - lx_moe_experts_bf16x and lx_moe_experts_decode_bf16 equal lx_moe_experts bit for bit
 """
 
@@ -137,6 +138,9 @@ def gemv(lx, name, x, w, bias, y, alpha, beta, M, N, K, ld_x, ld_y):
     if name == "bf16":
         lx("gemv", x, DTYPE[x.dtype], ld_x, w, W_BF16, None, bias, bias_dtype, y, DTYPE[y.dtype], ld_y, M, N, K,
            float(alpha), float(beta))
+    elif name == "decode_bf16":
+        lx("gemv_decode_bf16", x, DTYPE[x.dtype], ld_x, w, bias, bias_dtype, y, DTYPE[y.dtype], ld_y, M, N, K,
+           float(alpha), float(beta))
     else:
         lx("gemv_bf16x", x, DTYPE[x.dtype], ld_x, w, bias, bias_dtype, y, DTYPE[y.dtype], ld_y, M, N, K,
            float(alpha), float(beta))
@@ -247,10 +251,12 @@ def both_gemv(lx, M, N, K, x_dtype, y_dtype, bias_dtype, alpha, beta, make=train
     bias = None if bias_dtype is None else torch.randn(N, device="cuda").to(bias_dtype)
     y0 = torch.randn(M, N + ld_pad, device="cuda").to(y_dtype)
     ys = {}
-    for name, weight in (("bf16", w), ("bf16x", data)):
+    for name, weight in (("bf16", w), ("bf16x", data), ("decode_bf16", w)):
         y = y0.clone() if beta != 0.0 else torch.full((M, N + ld_pad), float("nan"), device="cuda", dtype=y_dtype)
         gemv(lx, name, x_buf, weight, bias, y, alpha, beta, M, N, K, ld_x=K + ld_pad, ld_y=N + ld_pad)
         ys[name] = y
+    # The plain-bf16 build of the same kernel is lx_gemv's to the bit too, in every case that checks the format.
+    assert same(ys["decode_bf16"], ys["bf16"])
     return ys["bf16"], ys["bf16x"]
 
 
@@ -310,6 +316,18 @@ def test_gemv_strided(lx, M, x_dtype, pad):
 def test_gemv_odd_and_small_k(lx, x_dtype, K):
     torch.manual_seed(K)
     ref, got = both_gemv(lx, 3, 21, K, x_dtype, torch.float32, None, 1.0, 0.0)
+    assert same(got, ref)
+
+
+@pytest.mark.parametrize("make", ["trained", "wide"])
+@pytest.mark.parametrize("pad", [0, 3, 8])  # 3 misaligns x: the small kernel's one-value path, not its octets
+@pytest.mark.parametrize("M", [1, 4, 8])
+@pytest.mark.parametrize("N,K", [(2048, 256), (37, 256), (129, 128), (5, 64)])
+def test_gemv_small_octets(lx, N, K, M, pad, make):
+    torch.manual_seed(N + K + M + pad)
+    fn = trained_like if make == "trained" else (lambda n, k: wide_range(n, k, lo=-40.0, hi=2.0))
+    ref, got = both_gemv(lx, M, N, K, torch.bfloat16 if M != 4 else torch.float32, torch.float32, torch.bfloat16,
+                         1.0, 0.0, make=fn, ld_pad=pad)
     assert same(got, ref)
 
 
