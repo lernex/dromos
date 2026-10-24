@@ -266,7 +266,7 @@ LX_API int64_t lx_gemm_workspace_bytes(int M, int K, lx_math math);
 //   LX_MATH_FP8   q e4m3 [M, ld_q]: q = e4m3(x * (448 / a)); scale[m] = a / 448
 //   LX_MATH_FP4   q [M, ld_q], two e2m1 per byte (low nibble = even k); block_scale e4m3 [M, ld_bs], one
 //                 per 16 k; scale[m] = g = a / (448 * 6). Block b with absmax a_b:
-//                 s_b = e4m3(a_b / (6 * g)), q = e2m1(x / (s_b * g)), and q = 0 where s_b = 0.
+//                 s_b = e4m3(a_b / (6 * g)), q = e2m1(x * (1 / (s_b * g))), and q = 0 where s_b = 0.
 //                 Requires K % 16 == 0.
 // Every rounding is to nearest, ties to even, saturating at the format's largest value; the products
 // and quotients are float32. A zero row gets scale 1 and q = 0. ld_q and ld_bs are in bytes;

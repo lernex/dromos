@@ -154,8 +154,8 @@ def quantize_act(x, math):
     bmax = blocks.abs().amax(-1)
     s8 = e4m3(fdiv(bmax, 6.0 * g.unsqueeze(-1)))
     s = e4m3_decode(s8)
-    d = (s * g.unsqueeze(-1)).unsqueeze(-1)
-    codes = torch.where(s.unsqueeze(-1) > 0, e2m1_rne(fdiv(blocks, d.expand_as(blocks))).int(), 0).to(torch.uint8)
+    r = fdiv(1.0, s * g.unsqueeze(-1)).unsqueeze(-1)  # the kernel multiplies by the block's reciprocal
+    codes = torch.where(s.unsqueeze(-1) > 0, e2m1_rne(blocks * r.expand_as(blocks)).int(), 0).to(torch.uint8)
     return pack_nibbles(codes.view(M, K)), g, s8
 
 
