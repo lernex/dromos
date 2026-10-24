@@ -7,11 +7,13 @@
 //                                                     prompt, then decode the rest one token at a time
 //
 // The plan comes from the environment:
-//   LX_VRAM_BUDGET_GB   everything this process may put on the GPU (default: the card)
+//   LX_VRAM_BUDGET_GB   everything this process may hold on the GPU, CUDA context included (default:
+//                       the card); other processes only limit it through the memory they leave free
 //   LX_RAM_BUDGET_GB    pinned RAM for experts (default: all of them; the rest stay on NVMe)
 //   LX_EXPERTS          bf16 | int8 | fp8 (default: the checkpoint's format; int8 converts from BF16)
 //   LX_ROUTING_STATS    per-layer expert frequencies (tools/routing_stats.py); placement uses them
-//   LX_OFFLOAD_DENSE_HOST=1   bf16 projections decode reads as int8 stay in RAM (read by prefill)
+//   LX_OFFLOAD_DENSE_HOST=1   the bf16 projections decode reads as int8 copies stay in pinned RAM:
+//                       prefill copies each into VRAM while the product before it runs
 //   LX_OFFLOAD_DYNAMIC  share of the VRAM slots under LRU, the rest pinned by frequency (default 1: on
 //                       held-out routing LRU beats any pinned share, see tools/routing_stats.py)
 //   LX_OFFLOAD_CPU_FRACTION, LX_OFFLOAD_CPU_PAIRS   the CPU lane's share of misses, pairs per step
@@ -190,8 +192,14 @@ int cmd_bench(int argc, char** argv) {
       const int T = static_cast<int>(ids.size());
       if (T <= split + 4) continue;
       l.model->reset_slot(0);
+      cudaStreamSynchronize(stream);
+      const auto tp = Clock::now();
       lx::StepBatch step{{ids.begin(), ids.begin() + split}, {0, split}, {0}};
       l.model->forward(step, d_logits, false, stream);
+      cudaStreamSynchronize(stream);
+      const double prefill_s = seconds_since(tp);
+      std::printf("%-20s prefill %d tokens in %.1f ms: %.0f tok/s\n", name.c_str(), split, prefill_s * 1e3,
+                  split / prefill_s);
       // two decode steps warm up (the first runs eagerly, the second captures the graph)
       for (int t = split; t < split + 2; ++t) {
         lx::StepBatch one{{ids[t]}, {0, 1}, {0}};
@@ -219,8 +227,11 @@ int cmd_bench(int argc, char** argv) {
   std::printf("all: %d tokens, %.1f tok/s\n", total_tokens, total_tokens / total_s);
   size_t free_b = 0, total_b = 0;
   cudaMemGetInfo(&free_b, &total_b);
-  std::printf("device memory in use at the end: %.2f GiB of %.2f\n", (total_b - free_b) / 1073741824.0,
+  std::printf("device memory in use at the end: %.2f GiB of %.2f", (total_b - free_b) / 1073741824.0,
               total_b / 1073741824.0);
+  const int64_t mine = off::process_vram_bytes();
+  if (mine >= 0) std::printf(", this process %.2f GiB", mine / 1073741824.0);
+  std::printf("\n");
   cudaFree(d_logits);
   return 0;
 }

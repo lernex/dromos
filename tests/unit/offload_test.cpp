@@ -91,20 +91,25 @@ TEST_CASE("Logos BF16 on a 16 GB card: the dense model resident, most of the exp
   CHECK_FALSE(p.convert_at_load);
 }
 
-TEST_CASE("the VRAM budget bounds the plan, the card's other tenants included") {
+TEST_CASE("the VRAM budget bounds this process; other processes only through the memory they leave") {
   DeviceInfo d = card_16gb();
   PlanRequest req;
   req.weights = LX_W_FP8;
   req.vram_budget = 8 * kGiB;
   const Plan p8 = make_offload_plan(d, logos(), bf16_checkpoint(), req);
-  CHECK(used(p8) + kOffloadMarginBytes + (d.total_bytes - d.free_bytes) <= req.vram_budget);
+  CHECK(used(p8) + kOffloadMarginBytes + kCudaContextBytes <= req.vram_budget);
   CHECK(p8.offload.resident_fraction > 0.4);
   CHECK(p8.offload.resident_fraction < 0.7);
   CHECK(p8.convert_at_load);
-  // another process holding 3 GiB leaves the budget 3 GiB less room
+  // another process holding 3 GiB leaves more than the budget free: nothing changes
   d.free_bytes -= 3 * kGiB;
-  const Plan p5 = make_offload_plan(d, logos(), bf16_checkpoint(), req);
-  CHECK(p5.offload.expert_cache_bytes + 3 * kGiB - p8.offload.expert_cache_bytes < 16ull << 20);
+  CHECK(make_offload_plan(d, logos(), bf16_checkpoint(), req).offload.expert_cache_bytes ==
+        p8.offload.expert_cache_bytes);
+  // holding 10 GiB, it leaves less than the budget: the free memory bounds the cache
+  d.free_bytes = card_16gb().free_bytes - 10 * kGiB;
+  const Plan tight = make_offload_plan(d, logos(), bf16_checkpoint(), req);
+  CHECK(tight.offload.expert_cache_bytes < p8.offload.expert_cache_bytes);
+  CHECK(used(tight) + kOffloadMarginBytes <= static_cast<size_t>(d.free_bytes * req.memory_fraction));
   // a budget the whole FP8 model fits in caches every expert
   req.vram_budget = 14 * kGiB;
   const Plan p14 = make_offload_plan(card_16gb(), logos(), bf16_checkpoint(), req);
@@ -201,12 +206,16 @@ TEST_CASE("the CPU lane's share follows the measured bandwidths") {
   m.zero_copy_gbs = 45;
   const offload::Placement resident = offload::plan_placement(shape, all, -1, &m);
   CHECK(resident.max_cpu_pairs == 0);
-  const offload::Placement part = offload::plan_placement(shape, all / 2, -1, &m);
-  CHECK(part.vram_cache_bytes == all / 2);
+  // most experts cached: read-through fills beat the lane
+  const offload::Placement half = offload::plan_placement(shape, all / 2, -1, &m);
+  CHECK(half.vram_cache_bytes == all / 2);
+  CHECK(half.max_cpu_pairs == 0);
+  // few cached: the CPU's RAM bandwidth adds to the bus's
+  const offload::Placement part = offload::plan_placement(shape, all / 5, -1, &m);
   CHECK(part.cpu_fraction > 0);
   CHECK(part.cpu_fraction <= 0.5);
   CHECK(part.max_cpu_pairs > 0);
-  const offload::Placement unmeasured = offload::plan_placement(shape, all / 2, -1, nullptr);
+  const offload::Placement unmeasured = offload::plan_placement(shape, all / 5, -1, nullptr);
   CHECK(unmeasured.max_cpu_pairs == 0);
   CHECK(offload::plan_placement(shape, all / 2, all / 3, &m).ram_bytes == all / 3);
 }

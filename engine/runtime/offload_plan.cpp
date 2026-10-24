@@ -29,12 +29,11 @@ const char* name_of(lx_wtype t) {
 Plan make_offload_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& ck, const PlanRequest& req,
                        const offload::MachineProfile* machine) {
   // The VRAM this process may take: what is free (times the request's fraction), and no more than the
-  // budget leaves after what the card already holds (the CUDA context, other processes).
+  // budget, which counts this process's CUDA context too. Other processes only limit it through the
+  // memory they leave free.
   size_t budget = static_cast<size_t>(static_cast<double>(d.free_bytes) * req.memory_fraction);
-  if (req.vram_budget > 0) {
-    const size_t used = d.total_bytes > d.free_bytes ? d.total_bytes - d.free_bytes : 0;
-    budget = std::min(budget, req.vram_budget > used ? req.vram_budget - used : 0);
-  }
+  if (req.vram_budget > 0)
+    budget = std::min(budget, req.vram_budget > kCudaContextBytes ? req.vram_budget - kCudaContextBytes : 0);
   budget = budget > kOffloadMarginBytes ? budget - kOffloadMarginBytes : 0;
 
   const int context_cap = c.max_position_embeddings > 0 ? c.max_position_embeddings : 8192;

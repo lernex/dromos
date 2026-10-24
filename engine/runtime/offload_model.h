@@ -1,6 +1,7 @@
 // A Metis checkpoint loaded for running larger than the GPU: the dense tensors in VRAM (or, for the
-// ones only a prefill reads, in pinned host memory the GPU reads across PCIe), the routed experts in
-// an ExpertOffload (RAM, NVMe, and the VRAM slots it allocates last, from what the budget leaves).
+// ones only a prefill reads, in pinned host memory: the model copies each into a VRAM buffer as a
+// prefill product needs it), the routed experts in an ExpertOffload (RAM, NVMe, and the VRAM slots
+// it allocates last, from what the budget leaves).
 //
 //   auto loaded = OffloadedModel::load(dir, config, options);
 //   MetisModel model(config, loaded->lookup(), slots, kv, tokens, &loaded->experts());

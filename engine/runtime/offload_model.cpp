@@ -136,6 +136,9 @@ std::unique_ptr<OffloadedModel> OffloadedModel::load(const std::filesystem::path
   std::unique_ptr<OffloadedModel> m(new OffloadedModel(SafetensorsSet::open(dir)));
   m->options_ = options;
   m->budget_ = options.vram_budget;
+  check(lx_rt_stream_sync(nullptr), "sync");  // the CUDA context exists from here
+  if (const int64_t ctx = process_vram_bytes(); ctx >= 0)
+    m->notes_.push_back("this process before loading (the CUDA context): " + std::to_string(ctx >> 20) + " MiB");
   const auto& tensors = m->set_.tensors();
   if (!options.routing_stats.empty()) m->stats_ = RoutingStats::load(options.routing_stats);
   if (!m->stats_.empty() && (m->stats_.n_layers != c.num_hidden_layers || m->stats_.n_experts != c.n_routed_experts))
@@ -316,15 +319,18 @@ void OffloadedModel::finalize() {
   check(lx_rt_mem_info(&free_b, &total_b), "lx_rt_mem_info");
   const int64_t budget = budget_ > 0 ? std::min(budget_, total_b) : total_b;
   // What this process holds now (the context, the dense weights, the model's scratch and caches),
-  // and a margin for what is allocated lazily (cuBLASLt workspaces, graph memory).
-  const int64_t used = total_b - free_b;
+  // and a margin for what is allocated lazily (cuBLASLt workspaces, graph memory). Without NVML the
+  // whole card's use stands in for it, which charges other processes to this budget too.
+  const int64_t mine = process_vram_bytes();
+  const int64_t used = mine >= 0 ? mine : total_b - free_b;
   const int64_t margin = static_cast<int64_t>(std::getenv("LX_OFFLOAD_MARGIN_MB") ? std::atof(std::getenv("LX_OFFLOAD_MARGIN_MB")) : 384) << 20;
   int64_t cache = std::max<int64_t>(0, std::min(budget - used, free_b) - margin);
   const ExpertShape& s = offload_->shape();
   const int64_t all = static_cast<int64_t>(s.n_layers) * s.n_experts * s.expert_bytes();
   cache = std::min(cache, all);
   notes_.push_back("VRAM budget " + std::to_string(budget >> 20) + " MiB, in use before the expert cache " +
-                   std::to_string(used >> 20) + " MiB, expert cache " + std::to_string(cache >> 20) + " MiB");
+                   std::to_string(used >> 20) + " MiB (" + (mine >= 0 ? "this process" : "the whole card") +
+                   "), expert cache " + std::to_string(cache >> 20) + " MiB");
   offload_->finalize(stats_, cache);
 }
 

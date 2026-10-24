@@ -207,7 +207,9 @@ class ExpertOffload {
 };
 
 // The plan's share: how much VRAM goes to expert slots, and the CPU lane policy, from the budget, the
-// model and the measured machine.
+// model and the measured machine. The CPU lane is planned only when the cache holds less than
+// kCpuLaneBelow of the experts (see plan_placement).
+constexpr double kCpuLaneBelow = 0.5;
 struct Placement {
   int64_t vram_cache_bytes = 0;
   int64_t ram_bytes = -1;
@@ -218,8 +220,12 @@ struct Placement {
 Placement plan_placement(const ExpertShape& shape, int64_t vram_free_for_experts, int64_t ram_available,
                          const MachineProfile* machine);
 
-// The VRAM budget from LX_VRAM_BUDGET_GB (GiB), or the card's total memory when unset.
+// The VRAM budget from LX_VRAM_BUDGET_GB (GiB), or the card's total memory when unset. It bounds what
+// this process holds on the GPU, its CUDA context included; other processes only limit it through
+// the memory they leave free.
 int64_t vram_budget_bytes();
+// What the driver charges this process on the GPU (NVML), or -1 when NVML cannot say.
+int64_t process_vram_bytes();
 // The host RAM budget for experts from LX_RAM_BUDGET_GB (GiB), or -1 for no limit.
 int64_t ram_budget_bytes();
 

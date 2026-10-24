@@ -65,6 +65,7 @@ struct Linear {
   int8_t* q = nullptr;         // int8 [N, K], or null to decode from w
   float* scale = nullptr;      // f32 [N]
   int N = 0, K = 0;
+  bool host = false;           // w is in pinned host memory (offload): prefill stages it into VRAM
 };
 
 struct MetisModel::Impl {
@@ -144,6 +145,14 @@ struct MetisModel::Impl {
   int prefetch = 0;
   cudaStream_t side = nullptr;
   std::vector<cudaEvent_t> fork_events, join_events;  // per (pass, layer)
+  // Projections kept in host memory (offload, LX_OFFLOAD_DENSE_HOST): a prefill product copies its
+  // weight into one of two VRAM buffers on a copy stream, so the next weight crosses PCIe while this
+  // product runs, instead of the product reading host memory tile by tile.
+  size_t stage_bytes = 0;
+  void* stage[2] = {nullptr, nullptr};
+  int stage_next = 0;
+  cudaStream_t stage_stream = nullptr;
+  cudaEvent_t stage_copied[2] = {nullptr, nullptr}, stage_free[2] = {nullptr, nullptr};
   std::string w8_keep;  // LX_W8_KEEP: comma-separated name fragments that stay bf16 for decode
   void *streams_bf, *retrieved_bf, *feat_in_bf, *h_bf, *normed_bf, *lora_bf, *att_bf, *latent_bf, *shared_bf,
       *routed_bf, *entry_bf, *meta_bf, *out_bf;
@@ -161,6 +170,11 @@ struct MetisModel::Impl {
     for (cudaEvent_t e : fork_events) cudaEventDestroy(e);
     for (cudaEvent_t e : join_events) cudaEventDestroy(e);
     if (side) cudaStreamDestroy(side);
+    for (int b = 0; b < 2; ++b) {
+      if (stage_copied[b]) cudaEventDestroy(stage_copied[b]);
+      if (stage_free[b]) cudaEventDestroy(stage_free[b]);
+    }
+    if (stage_stream) cudaStreamDestroy(stage_stream);
     for (auto& [key, exec] : graphs) cudaGraphExecDestroy(exec);
     if (meta_copied) cudaEventDestroy(meta_copied);
     if (h_meta) cudaFreeHost(h_meta);
@@ -206,6 +220,16 @@ Linear make_linear(Impl& m, const WeightLookup& lw, const std::string& weight, c
   if (!bias.empty()) l.bias = need(lw, bias, LX_BF16, {N});
   l.N = static_cast<int>(N);
   l.K = static_cast<int>(K);
+  // A host-resident weight up to kStageMaxBytes is staged for prefill; a larger one (the tied head's
+  // embedding table, 335 MB on Logos, read by prefill only when every row's logits are wanted) is
+  // read across PCIe where it lies rather than doubling its size in VRAM buffers.
+  constexpr size_t kStageMaxBytes = 128ull << 20;
+  const size_t bytes = static_cast<size_t>(N) * static_cast<size_t>(K) * 2;
+  cudaPointerAttributes attr{};
+  if (cudaPointerGetAttributes(&attr, l.w) == cudaSuccess && attr.type == cudaMemoryTypeHost && bytes <= kStageMaxBytes) {
+    l.host = true;
+    m.stage_bytes = std::max(m.stage_bytes, bytes);
+  }
   const bool keep = !quantize || kept_bf16(m, weight);
   if (!keep) {
     l.q = m.alloc<int8_t>(static_cast<size_t>(N) * K);
@@ -493,6 +517,14 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
       m.join_events.push_back(b);
     }
   }
+  if (m.stage_bytes) {
+    for (int b = 0; b < 2; ++b) {
+      m.stage[b] = m.alloc<uint16_t>(m.stage_bytes / 2);
+      check(static_cast<int>(cudaEventCreateWithFlags(&m.stage_copied[b], cudaEventDisableTiming)), "cudaEventCreate");
+      check(static_cast<int>(cudaEventCreateWithFlags(&m.stage_free[b], cudaEventDisableTiming)), "cudaEventCreate");
+    }
+    check(static_cast<int>(cudaStreamCreateWithFlags(&m.stage_stream, cudaStreamNonBlocking)), "cudaStreamCreate");
+  }
   m.use_graphs = std::getenv("LX_NO_GRAPHS") == nullptr && !m.route_trace;
 }
 
@@ -517,6 +549,19 @@ void linear(Impl& m, const Linear& l, const void* x, lx_dtype x_dtype, int ld_x,
     LX_CHECK(lx_copy2d(x, LX_F32, ld_x, m.cast_bf, LX_BF16, l.K, M, l.K, s));
     x = m.cast_bf;
     ld_x = l.K;
+  }
+  if (l.host) {  // copy the weight in on the copy stream once the product that last used the buffer is done
+    const int b = m.stage_next;
+    m.stage_next ^= 1;
+    check(static_cast<int>(cudaStreamWaitEvent(m.stage_stream, m.stage_free[b], 0)), "cudaStreamWaitEvent");
+    check(static_cast<int>(cudaMemcpyAsync(m.stage[b], l.w, static_cast<size_t>(l.N) * l.K * 2, cudaMemcpyHostToDevice,
+                                           m.stage_stream)),
+          "cudaMemcpyAsync");
+    check(static_cast<int>(cudaEventRecord(m.stage_copied[b], m.stage_stream)), "cudaEventRecord");
+    check(static_cast<int>(cudaStreamWaitEvent(s, m.stage_copied[b], 0)), "cudaStreamWaitEvent");
+    LX_CHECK(lx_gemm_bf16(x, ld_x, m.stage[b], l.bias, y, y_dtype, ld_y, M, l.N, l.K, alpha, beta, s));
+    check(static_cast<int>(cudaEventRecord(m.stage_free[b], s)), "cudaEventRecord");
+    return;
   }
   LX_CHECK(lx_gemm_bf16(x, ld_x, l.w, l.bias, y, y_dtype, ld_y, M, l.N, l.K, alpha, beta, s));
 }
