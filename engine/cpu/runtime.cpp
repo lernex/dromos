@@ -6,12 +6,19 @@
 // stream is an in-order queue whose work is always already done: syncs and events have nothing to wait
 // for, and the order of calls is the order of execution. Graph capture has no meaning here and returns
 // LX_ERR_NOT_SUPPORTED, so the model runs eagerly.
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #include <mutex>
 #include <unordered_map>
+
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <sys/sysctl.h>
+#endif
 
 #include "cpu/cpu.h"
 
@@ -105,6 +112,27 @@ int lx_rt_free(void* ptr) { return release(ptr); }
 int lx_rt_host_alloc(void** ptr, int64_t bytes) { return alloc(ptr, bytes); }
 int lx_rt_host_free(void* ptr) { return release(ptr); }
 
+// Host memory is device memory here, so a mapped block is one ordinary allocation whose address serves
+// as both the host and the device pointer.
+int lx_rt_host_alloc_mapped(void** host, void** device, int64_t bytes) {
+  if (!device) return fail(kInvalid);
+  *device = nullptr;
+  if (const int status = alloc(host, bytes); status != kOk) return status;
+  *device = *host;
+  return kOk;
+}
+
+// Nothing to pin: the range is already where the kernels read it, so registering cannot fail.
+int lx_rt_host_register(void* host, int64_t bytes, void** device) {
+  if (!device || (!host && bytes > 0)) return fail(kInvalid);
+  *device = host;
+  return kOk;
+}
+int lx_rt_host_unregister(void* host) {
+  (void)host;
+  return kOk;
+}
+
 int lx_rt_memset(void* ptr, int value, int64_t bytes, void* stream) {
   (void)stream;
   if (bytes <= 0) return kOk;
@@ -170,6 +198,12 @@ int lx_rt_event_sync(void* event) {
   (void)event;
   return kOk;
 }
+// Streams are synchronous, so the event has already happened by the time anything waits on it.
+int lx_rt_stream_wait(void* stream, void* event) {
+  (void)stream;
+  (void)event;
+  return kOk;
+}
 
 // Declining a capture is the answer to a question the model asks, not a failure, so it does not set
 // lx_rt_last_error (the model checks that after a run).
@@ -190,6 +224,42 @@ int lx_rt_graph_launch(void* graph, void* stream) {
 int lx_rt_graph_destroy(void* graph) {
   (void)graph;
   return kOk;
+}
+
+// Free and total memory of the machine, in bytes: what the offload planner sizes RAM tiers from. Free is
+// the memory the kernel can hand out without reclaiming (MemAvailable on Linux, free pages on macOS).
+int lx_rt_mem_info(int64_t* free_bytes, int64_t* total_bytes) {
+  if (!free_bytes || !total_bytes) return fail(kInvalid);
+#if defined(__APPLE__)
+  uint64_t total = 0;
+  size_t len = sizeof total;
+  if (sysctlbyname("hw.memsize", &total, &len, nullptr, 0) != 0) return fail(kNotSupported);
+  vm_statistics64_data_t vm{};
+  mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+  if (host_statistics64(mach_host_self(), HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&vm), &count) !=
+      KERN_SUCCESS)
+    return fail(kNotSupported);
+  *free_bytes = static_cast<int64_t>(vm.free_count) * static_cast<int64_t>(sysconf(_SC_PAGESIZE));
+  *total_bytes = static_cast<int64_t>(total);
+  return kOk;
+#elif defined(__linux__)
+  FILE* f = fopen("/proc/meminfo", "r");
+  if (!f) return fail(kNotSupported);
+  unsigned long long total_kb = 0, avail_kb = 0;
+  int found = 0;
+  char line[256];
+  while (found < 2 && fgets(line, sizeof line, f)) {
+    if (sscanf(line, "MemTotal: %llu kB", &total_kb) == 1) ++found;
+    else if (sscanf(line, "MemAvailable: %llu kB", &avail_kb) == 1) ++found;
+  }
+  fclose(f);
+  if (found < 2) return fail(kNotSupported);
+  *free_bytes = static_cast<int64_t>(avail_kb) * 1024;
+  *total_bytes = static_cast<int64_t>(total_kb) * 1024;
+  return kOk;
+#else
+  return fail(kNotSupported);
+#endif
 }
 
 int lx_rt_last_error(void) {
