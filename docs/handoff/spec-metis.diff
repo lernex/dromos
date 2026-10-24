@@ -1,0 +1,562 @@
+diff --git a/cli/main.cpp b/cli/main.cpp
+index aad6b7f..93462b1 100644
+--- a/cli/main.cpp
++++ b/cli/main.cpp
+@@ -4,16 +4,31 @@
+ 
+ int cmd_inspect(int argc, char** argv);
+ int cmd_eval(int argc, char** argv);
++int cmd_spec(int argc, char** argv);
++int cmd_spec_check(int argc, char** argv);
++int cmd_spec_cost(int argc, char** argv);
++int cmd_features(int argc, char** argv);
++int cmd_block_check(int argc, char** argv);
+ 
+ int main(int argc, char** argv) {
+   if (argc >= 2) {
+     if (!std::strcmp(argv[1], "inspect")) return cmd_inspect(argc - 1, argv + 1);
+     if (!std::strcmp(argv[1], "eval")) return cmd_eval(argc - 1, argv + 1);
++    if (!std::strcmp(argv[1], "spec")) return cmd_spec(argc - 1, argv + 1);
++    if (!std::strcmp(argv[1], "spec-check")) return cmd_spec_check(argc - 1, argv + 1);
++    if (!std::strcmp(argv[1], "spec-cost")) return cmd_spec_cost(argc - 1, argv + 1);
++    if (!std::strcmp(argv[1], "features")) return cmd_features(argc - 1, argv + 1);
++    if (!std::strcmp(argv[1], "block-check")) return cmd_block_check(argc - 1, argv + 1);
+   }
+   std::fprintf(stderr,
+                "usage: lernex <command>\n"
+                "  inspect MODEL_DIR                         load a model and describe it\n"
+                "  eval MODEL_DIR PROMPTS_JSON OUT_DIR [N]   logits for reference prompts; with N, the\n"
+-               "                                            first N tokens at once and the rest one by one\n");
++               "                                            first N tokens at once and the rest one by one\n"
++               "  spec MODEL_DIR PROMPTS_JSON [options]     speculative decoding against plain decoding\n"
++               "  spec-check MODEL_DIR PROMPTS_JSON [N]     verify steps bit-identical to one-token steps\n"
++               "  spec-cost MODEL_DIR [CONTEXT]             milliseconds per plain and per verify step\n"
++               "  features MODEL_DIR DATA_JSONL OUT_DIR     hidden-state shards for training draft models\n"
++               "  block-check MODEL_DIR HEAD PROMPTS OUT    a block drafter's proposal, for check_block.py\n");
+   return 2;
+ }
+diff --git a/engine/model/metis.cpp b/engine/model/metis.cpp
+index b608a65..0028a24 100644
+--- a/engine/model/metis.cpp
++++ b/engine/model/metis.cpp
+@@ -104,6 +104,16 @@ struct MetisModel::Impl {
+   // ---- persistent state, per (pass, layer) ---------------------------------------------------
+   std::vector<float*> conv_state, ssm_state;
+   std::vector<void*> k_cache, v_cache;
++  // speculative mode: each Mamba layer's pending positions (kernels.h, "Speculative decoding")
++  bool speculative = false;
++  std::vector<float*> conv_hist, ssm_hist;
++  // feature taps: tap_col[pass * (L_layers + 1) + layer + 1] is the tap's first column in tap_out,
++  // or -1 (layer -1, slot 0, is the end of the pass)
++  std::vector<FeatureTap> taps;
++  std::vector<int> tap_col;
++  float* tap_out = nullptr;   // f32 [max_tokens, tap_dim]
++  float* tap_mean = nullptr;  // scratch [max_tokens, D]
++  int tap_dim = 0;
+ 
+   // ---- per-step scratch --------------------------------------------------------------------
+   std::vector<void*> allocations;
+@@ -111,14 +121,15 @@ struct MetisModel::Impl {
+       *cont_in, *cont_hidden, *cont_logit, *continuation, *update, *zxbcdt, *xbc, *ssm_y, *qkv_buf, *latent,
+       *router_in, *router_logits, *route_w, *entropy, *confidence, *routed, *shared_gu, *summary, *bank_k,
+       *bank_v, *entry;
+-  int32_t *route_ids, *d_meta, *d_tokens, *d_cu, *d_slots, *d_has_state, *d_start_pos;
++  int32_t *route_ids, *d_meta, *d_tokens, *d_cu, *d_slots, *d_has_state, *d_start_pos, *d_fold, *d_keep;
+   int32_t* h_meta = nullptr;  // pinned staging for d_meta, so the upload is one async copy
+   size_t meta_count = 0;
+   cudaEvent_t meta_copied = nullptr;
+   float* last_rows = nullptr;
+-  // Decode steps (one token per sequence) replay a captured graph: the first step of a shape runs
+-  // eagerly (which also warms cuBLASLt up), the second captures, every later one replays.
+-  using GraphKey = std::tuple<int, int, bool, float*>;
++  // Decode steps (one token per sequence) and verify steps of up to kGemvRows tokens replay a captured
++  // graph: the first step of a shape runs eagerly (which also warms cuBLASLt up), the second
++  // captures, every later one replays.
++  using GraphKey = std::tuple<int, int, bool, float*, bool>;
+   std::set<GraphKey> seen;
+   std::map<GraphKey, cudaGraphExec_t> graphs;
+   bool use_graphs = true;
+@@ -251,8 +262,8 @@ float* connection_params(Impl& m, const WeightLookup& lookup, const std::string&
+ }  // namespace
+ 
+ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slots, int kv_capacity,
+-                       int max_tokens)
+-    : cfg_(c), slot_len_(max_slots, 0), impl_(new Impl) {
++                       int max_tokens, bool speculative)
++    : cfg_(c), slot_len_(max_slots, 0), folded_(max_slots, 0), pending_(max_slots, 0), impl_(new Impl) {
+   Impl& m = *impl_;
+   m.S = c.n_streams;
+   m.D = c.hidden_size;
+@@ -380,8 +391,15 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
+         m.k_cache.push_back(nullptr);
+         m.v_cache.push_back(nullptr);
+       }
++      const bool hist = speculative && !m.layers[i].attention;
++      m.conv_hist.push_back(hist ? m.alloc<float>(static_cast<size_t>(max_slots) * LX_SPEC_MAX_PENDING * m.conv_dim)
++                                 : nullptr);
++      m.ssm_hist.push_back(
++          hist ? m.alloc<float>(static_cast<size_t>(max_slots) * lx_spec_ssm_hist_floats(m.H, m.Pd, m.N)) : nullptr);
+     }
+   }
++  m.speculative = speculative;
++  m.tap_col.assign(static_cast<size_t>(m.P_passes) * (m.L_layers + 1), -1);
+ 
+   // per-step scratch, for up to max_tokens tokens
+   const size_t T = max_tokens, TS = T * S;
+@@ -434,13 +452,15 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
+   m.cast_capacity = TS * static_cast<size_t>(std::max({3 * D + R, m.I, m.proj, D}));
+   m.cast_bf = m.alloc<uint16_t>(m.cast_capacity);
+   m.moe_workspace = m.alloc<char>(static_cast<size_t>(lx_moe_workspace_bytes(Impl::kGemvRows, m.Iexp, m.K)));
+-  m.meta_count = T + (max_slots + 1) + 3 * static_cast<size_t>(max_slots);
++  m.meta_count = T + (max_slots + 1) + 5 * static_cast<size_t>(max_slots);
+   m.d_meta = m.alloc<int32_t>(m.meta_count);
+   m.d_tokens = m.d_meta;
+   m.d_cu = m.d_tokens + T;
+   m.d_slots = m.d_cu + max_slots + 1;
+   m.d_has_state = m.d_slots + max_slots;
+   m.d_start_pos = m.d_has_state + max_slots;
++  m.d_fold = m.d_start_pos + max_slots;
++  m.d_keep = m.d_fold + max_slots;
+   check(static_cast<int>(cudaMallocHost(&m.h_meta, m.meta_count * 4)), "cudaMallocHost");
+   check(static_cast<int>(cudaEventCreateWithFlags(&m.meta_copied, cudaEventDisableTiming)), "cudaEventCreate");
+   m.use_graphs = std::getenv("LX_NO_GRAPHS") == nullptr;
+@@ -448,18 +468,78 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
+ 
+ MetisModel::~MetisModel() { delete impl_; }
+ 
+-void MetisModel::reset_slot(int slot) { slot_len_.at(slot) = 0; }
++void MetisModel::reset_slot(int slot) {
++  slot_len_.at(slot) = 0;
++  folded_.at(slot) = 0;
++  pending_.at(slot) = 0;
++}
++
++int MetisModel::max_verify_tokens() const {
++  return std::min({LX_SPEC_MAX_PENDING, Impl::kGemvRows, 63 / impl_->KVH});
++}
++
++void MetisModel::set_feature_taps(const std::vector<FeatureTap>& taps) {
++  Impl& m = *impl_;
++  auto same = [](const FeatureTap& a, const FeatureTap& b) { return a.pass == b.pass && a.layer == b.layer; };
++  if (taps.size() == m.taps.size() && std::equal(taps.begin(), taps.end(), m.taps.begin(), same)) return;
++  std::fill(m.tap_col.begin(), m.tap_col.end(), -1);
++  int col = 0;
++  for (const FeatureTap& t : taps) {
++    if (t.pass < 0 || t.pass >= m.P_passes || t.layer < -1 || t.layer >= m.L_layers)
++      throw std::runtime_error("feature tap out of range");
++    int& slot = m.tap_col[static_cast<size_t>(t.pass) * (m.L_layers + 1) + t.layer + 1];
++    if (slot >= 0) throw std::runtime_error("feature tap given twice");
++    slot = col;
++    col += m.D;
++  }
++  m.taps = taps;
++  if (col != m.tap_dim) {
++    if (m.tap_out) {
++      cudaFree(m.tap_out);
++      cudaFree(m.tap_mean);
++      m.allocations.erase(std::remove(m.allocations.begin(), m.allocations.end(), static_cast<void*>(m.tap_out)),
++                          m.allocations.end());
++      m.allocations.erase(std::remove(m.allocations.begin(), m.allocations.end(), static_cast<void*>(m.tap_mean)),
++                          m.allocations.end());
++      m.tap_out = m.tap_mean = nullptr;
++    }
++    m.tap_dim = col;
++    if (col > 0) {
++      m.tap_out = m.alloc<float>(static_cast<size_t>(m.max_tokens) * col);
++      m.tap_mean = m.alloc<float>(static_cast<size_t>(m.max_tokens) * m.D);
++    }
++  }
++  // captured steps have the old taps baked in
++  for (auto& [key, exec] : m.graphs) cudaGraphExecDestroy(exec);
++  m.graphs.clear();
++  m.seen.clear();
++}
++
++int MetisModel::feature_dim() const { return impl_->tap_dim; }
++const float* MetisModel::features() const { return impl_->tap_out; }
++
++MetisModel::HeadWeights MetisModel::head_weights() const {
++  return {impl_->head.w, impl_->head.q, impl_->head.scale};
++}
+ 
+ namespace {
+ 
+ // y = alpha * (x @ W^T + bias) + beta * y for M rows of x (f32 or bf16). Decode-sized products run
+ // as GEMVs on the int8 copy when there is one, reading x as it is; larger ones go to cuBLASLt on
+-// the bf16 weight, through a bf16 copy of x when x is f32.
++// the bf16 weight, through a bf16 copy of x when x is f32. `rows_per_token` > 1 marks a product
++// with that many rows per token (the depth memory's per-stream rows): in a decode-sized step those
++// stay GEMVs, 8 rows at a time, so that a token's rows get the same bits whatever the step's size.
+ void linear(Impl& m, const Linear& l, const void* x, lx_dtype x_dtype, int ld_x, void* y, lx_dtype y_dtype, int ld_y,
+-            int M, cudaStream_t s, float alpha = 1.0f, float beta = 0.0f) {
+-  if (M <= Impl::kGemvRows) {
+-    LX_CHECK(lx_gemv(x, x_dtype, ld_x, l.q ? static_cast<const void*>(l.q) : l.w, l.q ? LX_W_INT8 : LX_W_BF16, l.scale,
+-                     l.bias, LX_BF16, y, y_dtype, ld_y, M, l.N, l.K, alpha, beta, s));
++            int M, cudaStream_t s, float alpha = 1.0f, float beta = 0.0f, int rows_per_token = 1) {
++  const bool decode_step = M / rows_per_token <= Impl::kGemvRows;
++  if (M <= Impl::kGemvRows || decode_step) {
++    const size_t xs = x_dtype == LX_F32 ? 4 : 2, ys = y_dtype == LX_F32 ? 4 : 2;
++    for (int r0 = 0; r0 < M; r0 += Impl::kGemvRows) {
++      const int rows = std::min(Impl::kGemvRows, M - r0);
++      LX_CHECK(lx_gemv(static_cast<const char*>(x) + xs * r0 * ld_x, x_dtype, ld_x,
++                       l.q ? static_cast<const void*>(l.q) : l.w, l.q ? LX_W_INT8 : LX_W_BF16, l.scale, l.bias,
++                       LX_BF16, static_cast<char*>(y) + ys * r0 * ld_y, y_dtype, ld_y, rows, l.N, l.K, alpha, beta, s));
++    }
+     return;
+   }
+   if (x_dtype == LX_F32) {
+@@ -471,6 +551,16 @@ void linear(Impl& m, const Linear& l, const void* x, lx_dtype x_dtype, int ld_x,
+   LX_CHECK(lx_gemm_bf16(x, ld_x, l.w, l.bias, y, y_dtype, ld_y, M, l.N, l.K, alpha, beta, s));
+ }
+ 
++// The f32 products (routers, the depth head): batch invariant in decode-sized steps (kernels.h,
++// lx_spec_gemv_f32), cuBLASLt otherwise.
++void gemm_f32(const float* x, int ld_x, const float* w, const float* bias, float* y, int ld_y, int M, int N, int K,
++              cudaStream_t s) {
++  if (M <= Impl::kGemvRows)
++    LX_CHECK(lx_spec_gemv_f32(x, ld_x, w, bias, y, ld_y, M, N, K, s));
++  else
++    LX_CHECK(lx_gemm_f32(x, ld_x, w, bias, y, ld_y, M, N, K, s));
++}
++
+ void to_bf16(const float* src, int ld_src, void* dst, int ld_dst, int rows, int cols, cudaStream_t s) {
+   LX_CHECK(lx_copy2d(src, LX_F32, ld_src, dst, LX_BF16, ld_dst, rows, cols, s));
+ }
+@@ -487,9 +577,9 @@ void memory_retrieve(Impl& m, int T, int n_entries, cudaStream_t s) {
+     cudaMemsetAsync(m.mem_summary, 0, sizeof(float) * T * D, s);
+     return;
+   }
+-  linear(m, m.m_query, m.streams, LX_F32, D, m.q, LX_F32, Mm, T * S, s);
++  linear(m, m.m_query, m.streams, LX_F32, D, m.q, LX_F32, Mm, T * S, s, 1.0f, 0.0f, S);
+   LX_CHECK(lx_memory_attend(m.q, m.bank_k, m.bank_v, n_entries, m.Emax, m.retrieved_bf, T, S, Mm, s));
+-  linear(m, m.m_out, m.retrieved_bf, LX_BF16, Mm, m.projected, LX_F32, D, T * S, s);
++  linear(m, m.m_out, m.retrieved_bf, LX_BF16, Mm, m.projected, LX_F32, D, T * S, s, 1.0f, 0.0f, S);
+   LX_CHECK(lx_memory_fuse(m.streams, m.projected, m.m_gate, m.m_gate_b, m.mem_summary, T, S, D, s));
+ }
+ 
+@@ -530,6 +620,14 @@ void memory_write(Impl& m, const MetisConfig& c, int T, int pass, int anchor, in
+   ++n_entries;
+ }
+ 
++// A feature tap after block `layer` of `pass`: the stream mean, into its columns of tap_out.
++void write_tap(Impl& m, int pass, int layer, int T, cudaStream_t s) {
++  const int col = m.tap_col[static_cast<size_t>(pass) * (m.L_layers + 1) + layer + 1];
++  if (col < 0) return;
++  LX_CHECK(lx_stream_mean(m.streams, m.tap_mean, T, m.S, m.D, s));
++  copy_f32(m.tap_mean, m.D, m.tap_out + col, m.tap_dim, T, m.D, s);
++}
++
+ }  // namespace
+ 
+ void MetisModel::forward(const StepBatch& b, float* logits, bool all_rows, cudaStream_t s) {
+@@ -540,35 +638,93 @@ void MetisModel::forward(const StepBatch& b, float* logits, bool all_rows, cudaS
+   if (T > m.max_tokens) throw std::runtime_error("step has more tokens than max_tokens");
+   if (n_seq > m.max_slots || static_cast<int>(b.cu_seqlens.size()) != n_seq + 1)
+     throw std::runtime_error("bad step batch");
++  fold_pending(b, s);
++  stage(b, false, s);
++  launch(T, n_seq, all_rows, logits, false, s);
++  for (int i = 0; i < n_seq; ++i) {
++    slot_len_[b.slots[i]] += b.cu_seqlens[i + 1] - b.cu_seqlens[i];
++    folded_[b.slots[i]] = slot_len_[b.slots[i]];
++  }
++}
+ 
+-  // stage the step's metadata (wait until the previous step's copy has left the staging buffer)
++void MetisModel::forward_spec(const StepBatch& b, float* logits, cudaStream_t s) {
++  Impl& m = *impl_;
++  if (!m.speculative) throw std::runtime_error("forward_spec needs a model built with speculative = true");
++  const int T = static_cast<int>(b.tokens.size());
++  const int n_seq = static_cast<int>(b.slots.size());
++  if (T == 0) return;
++  if (T > m.max_tokens) throw std::runtime_error("step has more tokens than max_tokens");
++  if (n_seq > m.max_slots || static_cast<int>(b.cu_seqlens.size()) != n_seq + 1)
++    throw std::runtime_error("bad step batch");
++  for (int i = 0; i < n_seq; ++i)
++    if (b.cu_seqlens[i + 1] - b.cu_seqlens[i] > LX_SPEC_MAX_PENDING)
++      throw std::runtime_error("a verify step takes at most LX_SPEC_MAX_PENDING tokens per sequence");
++  stage(b, true, s);
++  launch(T, n_seq, true, logits, true, s);
++  for (int i = 0; i < n_seq; ++i) {
++    const int slot = b.slots[i], n = b.cu_seqlens[i + 1] - b.cu_seqlens[i];
++    // as stage() decided: fold only what makes room for the new tokens
++    const int fold = std::max(0, pending_[slot] + n - LX_SPEC_MAX_PENDING);
++    folded_[slot] += fold;
++    pending_[slot] += n - fold;
++    slot_len_[slot] += n;
++  }
++}
++
++void MetisModel::truncate(int slot, int length) {
++  if (length < folded_.at(slot) || length > slot_len_[slot])
++    throw std::runtime_error("truncate past the slot's pending positions");
++  pending_[slot] -= slot_len_[slot] - length;
++  slot_len_[slot] = length;
++}
++
++// Stages a step's metadata for the device (waiting until the previous step's copy has left the
++// staging buffer). A verify step folds a slot's oldest pending positions only when the new tokens
++// would not fit after them, so each position is folded once and the base state is written on few
++// steps; its has_state says whether the base state holds anything.
++void MetisModel::stage(const StepBatch& b, bool spec, cudaStream_t s) {
++  Impl& m = *impl_;
++  const int T = static_cast<int>(b.tokens.size());
++  const int n_seq = static_cast<int>(b.slots.size());
+   cudaEventSynchronize(m.meta_copied);
+   int32_t* tokens = m.h_meta;
+   int32_t* cu = tokens + (m.d_cu - m.d_tokens);
+   int32_t* slots = tokens + (m.d_slots - m.d_tokens);
+   int32_t* has_state = tokens + (m.d_has_state - m.d_tokens);
+   int32_t* start_pos = tokens + (m.d_start_pos - m.d_tokens);
++  int32_t* fold = tokens + (m.d_fold - m.d_tokens);
++  int32_t* keep = tokens + (m.d_keep - m.d_tokens);
+   std::memcpy(tokens, b.tokens.data(), 4 * T);
+   std::memcpy(cu, b.cu_seqlens.data(), 4 * (n_seq + 1));
+   std::memcpy(slots, b.slots.data(), 4 * n_seq);
+   for (int i = 0; i < n_seq; ++i) {
+-    const int slot = b.slots[i];
+-    has_state[i] = slot_len_[slot] > 0;
++    const int slot = b.slots[i], n = b.cu_seqlens[i + 1] - b.cu_seqlens[i];
+     start_pos[i] = slot_len_[slot];
+-    if (start_pos[i] + b.cu_seqlens[i + 1] - b.cu_seqlens[i] > m.kv_capacity)
+-      throw std::runtime_error("sequence longer than the KV capacity");
++    if (start_pos[i] + n > m.kv_capacity) throw std::runtime_error("sequence longer than the KV capacity");
++    if (spec) {
++      has_state[i] = folded_[slot] > 0;
++      fold[i] = std::max(0, pending_[slot] + n - LX_SPEC_MAX_PENDING);
++      keep[i] = pending_[slot] - fold[i];
++    } else {
++      has_state[i] = slot_len_[slot] > 0;
++      fold[i] = keep[i] = 0;
++    }
+   }
+   cudaMemcpyAsync(m.d_meta, m.h_meta, m.meta_count * 4, cudaMemcpyHostToDevice, s);
+   cudaEventRecord(m.meta_copied, s);
++}
+ 
+-  const bool decode = T == n_seq;
+-  const Impl::GraphKey key{T, n_seq, all_rows, logits};
+-  if (m.use_graphs && decode) {
++// Runs the staged step, replaying a captured graph for decode and verify shapes.
++void MetisModel::launch(int T, int n_seq, bool all_rows, float* logits, bool spec, cudaStream_t s) {
++  Impl& m = *impl_;
++  const bool capturable = spec ? T <= Impl::kGemvRows : T == n_seq;
++  const Impl::GraphKey key{T, n_seq, all_rows, logits, spec};
++  if (m.use_graphs && capturable) {
+     auto it = m.graphs.find(key);
+     if (it == m.graphs.end() && m.seen.count(key)) {
+       cudaGraph_t graph;
+       check(static_cast<int>(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal)), "cudaStreamBeginCapture");
+-      run(T, n_seq, all_rows, logits, s);
++      run(T, n_seq, all_rows, logits, spec, s);
+       check(static_cast<int>(cudaStreamEndCapture(s, &graph)), "cudaStreamEndCapture");
+       cudaGraphExec_t exec;
+       check(static_cast<int>(cudaGraphInstantiate(&exec, graph, 0)), "cudaGraphInstantiate");
+@@ -578,18 +734,55 @@ void MetisModel::forward(const StepBatch& b, float* logits, bool all_rows, cudaS
+     if (it != m.graphs.end()) {
+       check(static_cast<int>(cudaGraphLaunch(it->second, s)), "cudaGraphLaunch");
+     } else {
+-      run(T, n_seq, all_rows, logits, s);
++      run(T, n_seq, all_rows, logits, spec, s);
+       m.seen.insert(key);
+     }
+   } else {
+-    run(T, n_seq, all_rows, logits, s);
++    run(T, n_seq, all_rows, logits, spec, s);
++  }
++}
++
++// Folds every pending position of the step's slots into their base state, so that a normal step
++// (which has no history) can continue them: the Mamba layers' spec kernels with no new tokens.
++void MetisModel::fold_pending(const StepBatch& b, cudaStream_t s) {
++  Impl& m = *impl_;
++  std::vector<int32_t> slots, has, fold;
++  for (int slot : b.slots)
++    if (pending_[slot] > 0) {
++      slots.push_back(slot);
++      has.push_back(folded_[slot] > 0);
++      fold.push_back(pending_[slot]);
++    }
++  if (slots.empty()) return;
++  const int n = static_cast<int>(slots.size());
++  // [slots | has | fold | keep | cu], uploaded after the previous step's metadata copy is done
++  cudaEventSynchronize(m.meta_copied);
++  int32_t* h = m.h_meta;
++  int32_t* d = m.d_meta;
++  std::memcpy(h, slots.data(), 4 * n);
++  std::memcpy(h + n, has.data(), 4 * n);
++  std::memcpy(h + 2 * n, fold.data(), 4 * n);
++  std::memset(h + 3 * n, 0, 4 * (2 * n + 1));
++  cudaMemcpyAsync(d, h, 4 * (5 * n + 1), cudaMemcpyHostToDevice, s);
++  cudaEventRecord(m.meta_copied, s);
++  for (size_t li = 0; li < m.conv_hist.size(); ++li) {
++    if (!m.conv_hist[li]) continue;
++    const Impl::Layer& layer = m.layers[li % m.L_layers];
++    LX_CHECK(lx_spec_conv1d(m.xbc, m.proj, layer.conv_w, layer.conv_b, m.conv_state[li], m.conv_hist[li], d, d + n,
++                            d + 2 * n, d + 3 * n, d + 4 * n, n, m.xbc, m.conv_dim, m.W, s));
++    LX_CHECK(lx_spec_ssm_scan(m.xbc, m.conv_dim, m.xbc, m.proj, m.xbc, m.xbc, m.conv_dim, layer.A_log, layer.D,
++                              layer.dt_bias, m.ssm_state[li], m.ssm_hist[li], d, d + n, d + 2 * n, d + 3 * n, d + 4 * n,
++                              n, m.ssm_y, m.H, m.Pd, m.G, m.N, s));
++  }
++  for (int slot : slots) {
++    folded_[slot] = slot_len_[slot];
++    pending_[slot] = 0;
+   }
+-  for (int i = 0; i < n_seq; ++i) slot_len_[b.slots[i]] += b.cu_seqlens[i + 1] - b.cu_seqlens[i];
+ }
+ 
+ // The step's device work, from the token ids in d_meta to the logits. Everything it decides on the
+ // host depends only on (T, n_seq, all_rows), which is what makes it capturable.
+-void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, cudaStream_t s) {
++void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, cudaStream_t s) {
+   Impl& m = *impl_;
+   const MetisConfig& c = cfg_;
+   const int S = m.S, D = m.D, R = m.R, Lat = m.Lat, E = m.E;
+@@ -629,12 +822,23 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, cudaStream_
+       } else {
+         const int gn = m.G * m.N;
+         linear(m, layer.in_proj, m.h_bf, LX_BF16, D, m.zxbcdt, LX_F32, m.proj, T, s);
+-        LX_CHECK(lx_conv1d_varlen(m.zxbcdt + m.I, m.proj, layer.conv_w, layer.conv_b, m.conv_state[slot_index],
+-                                  m.d_slots, m.d_has_state, m.d_cu, n_seq, m.xbc, m.conv_dim, m.W, s));
+-        LX_CHECK(lx_ssm_scan_varlen(m.xbc, m.conv_dim, m.zxbcdt + m.I + m.conv_dim, m.proj, m.xbc + m.I,
++        if (spec) {
++          // the step's tokens become pending positions (kernels.h, "Speculative decoding")
++          LX_CHECK(lx_spec_conv1d(m.zxbcdt + m.I, m.proj, layer.conv_w, layer.conv_b, m.conv_state[slot_index],
++                                  m.conv_hist[slot_index], m.d_slots, m.d_has_state, m.d_fold, m.d_keep, m.d_cu, n_seq,
++                                  m.xbc, m.conv_dim, m.W, s));
++          LX_CHECK(lx_spec_ssm_scan(m.xbc, m.conv_dim, m.zxbcdt + m.I + m.conv_dim, m.proj, m.xbc + m.I,
+                                     m.xbc + m.I + gn, m.conv_dim, layer.A_log, layer.D, layer.dt_bias,
+-                                    m.ssm_state[slot_index], m.d_slots, m.d_has_state, m.d_cu, n_seq, m.ssm_y, m.H,
+-                                    m.Pd, m.G, m.N, s));
++                                    m.ssm_state[slot_index], m.ssm_hist[slot_index], m.d_slots, m.d_has_state,
++                                    m.d_fold, m.d_keep, m.d_cu, n_seq, m.ssm_y, m.H, m.Pd, m.G, m.N, s));
++        } else {
++          LX_CHECK(lx_conv1d_varlen(m.zxbcdt + m.I, m.proj, layer.conv_w, layer.conv_b, m.conv_state[slot_index],
++                                    m.d_slots, m.d_has_state, m.d_cu, n_seq, m.xbc, m.conv_dim, m.W, s));
++          LX_CHECK(lx_ssm_scan_varlen(m.xbc, m.conv_dim, m.zxbcdt + m.I + m.conv_dim, m.proj, m.xbc + m.I,
++                                      m.xbc + m.I + gn, m.conv_dim, layer.A_log, layer.D, layer.dt_bias,
++                                      m.ssm_state[slot_index], m.d_slots, m.d_has_state, m.d_cu, n_seq, m.ssm_y, m.H,
++                                      m.Pd, m.G, m.N, s));
++        }
+         LX_CHECK(lx_gated_rmsnorm(m.ssm_y, m.zxbcdt, m.proj, layer.norm_w, m.normed_bf, T, m.I, m.G,
+                                   c.mamba_norm_eps, s));
+         linear(m, layer.out_proj, m.normed_bf, LX_BF16, m.I, m.update, LX_F32, D, T, s);
+@@ -648,7 +852,7 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, cudaStream_
+       to_bf16(m.latent, Lat, m.latent_bf, Lat, T, Lat, s);
+       copy_f32(m.latent, Lat, m.router_in, Lat + R, T, Lat, s);
+       copy_f32(m.features, R, m.router_in + Lat, Lat + R, T, R, s);
+-      LX_CHECK(lx_gemm_f32(m.router_in, Lat + R, layer.router_w, layer.router_b, m.router_logits, E, T, E, Lat + R, s));
++      gemm_f32(m.router_in, Lat + R, layer.router_w, layer.router_b, m.router_logits, E, T, E, Lat + R, s);
+       LX_CHECK(lx_moe_route(m.router_logits, layer.selection_bias, m.route_ids, m.route_w, m.entropy, m.confidence, T,
+                             E, m.K, s));
+       if (T <= Impl::kGemvRows && layer.gate_up_q)
+@@ -666,17 +870,20 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, cudaStream_
+ 
+       LX_CHECK(glue::axpby(m.history, m.summary, 0.5f, 0.5f, static_cast<int64_t>(T) * R, s));
+       if (layer.attention) memory_write(m, c, T, pass, anchor++, n_entries, s);
++      write_tap(m, pass, i, T, s);
+     }
+ 
+     // the end of a pass: one more read, the depth head, and an entry for where the pass left the token
+     memory_retrieve(m, T, n_entries, s);
+     LX_CHECK(lx_stream_mean(m.streams, m.state, T, S, D, s));
++    if (const int col = m.tap_col[static_cast<size_t>(pass) * (m.L_layers + 1)]; col >= 0)
++      copy_f32(m.state, D, m.tap_out + col, m.tap_dim, T, D, s);
+     LX_CHECK(glue::sub(m.state, m.previous, m.difference, static_cast<int64_t>(T) * D, s));
+     routing_features(m, T, s);
+     concat4(m, m.state, m.mem_summary, m.difference, m.features, m.cont_in, LX_F32, T, s);
+-    LX_CHECK(lx_gemm_f32(m.cont_in, 3 * D + R, m.c_hidden_w, m.c_hidden_b, m.cont_hidden, R, T, R, 3 * D + R, s));
++    gemm_f32(m.cont_in, 3 * D + R, m.c_hidden_w, m.c_hidden_b, m.cont_hidden, R, T, R, 3 * D + R, s);
+     LX_CHECK(lx_activate_f32(m.cont_hidden, static_cast<int64_t>(T) * R, 1, s));
+-    LX_CHECK(lx_gemm_f32(m.cont_hidden, R, m.c_out_w, m.c_out_b, m.cont_logit, 1, T, 1, R, s));
++    gemm_f32(m.cont_hidden, R, m.c_out_w, m.c_out_b, m.cont_logit, 1, T, 1, R, s);
+     LX_CHECK(lx_continuation_finish(m.cont_logit, m.state, m.difference, c.continuation_logit_limit, m.continuation, T,
+                                     D, s));
+     memory_write(m, c, T, pass, anchor, n_entries, s);
+diff --git a/engine/model/metis.h b/engine/model/metis.h
+index 18f6f95..b256a74 100644
+--- a/engine/model/metis.h
++++ b/engine/model/metis.h
+@@ -27,10 +27,19 @@ struct StepBatch {
+   std::vector<int32_t> slots;       // [n_seq]
+ };
+ 
++// A point in the forward pass whose hidden state a drafter reads: the mean over the residual
++// streams after block `layer` of pass `pass`, or with layer == -1 after the whole pass.
++struct FeatureTap {
++  int pass = 0;
++  int layer = -1;
++};
++
+ class MetisModel {
+  public:
++  // `speculative` allocates the pending-position history of every Mamba layer (kernels.h,
++  // "Speculative decoding"), which forward_spec and truncate need.
+   MetisModel(const MetisConfig& config, const WeightLookup& weights, int max_slots, int kv_capacity,
+-             int max_tokens);
++             int max_tokens, bool speculative = false);
+   ~MetisModel();
+   MetisModel(const MetisModel&) = delete;
+   MetisModel& operator=(const MetisModel&) = delete;
+@@ -40,9 +49,43 @@ class MetisModel {
+   int slot_length(int slot) const { return slot_len_[slot]; }
+ 
+   // Runs one step. Writes f32 logits to `logits` (device): every token's row [T, V] when
+-  // all_rows, otherwise each sequence's last row [n_seq, V].
++  // all_rows, otherwise each sequence's last row [n_seq, V]. A slot with pending positions folds
++  // them into its state first (it can no longer be truncated before this step).
+   void forward(const StepBatch& batch, float* logits, bool all_rows, cudaStream_t stream);
+ 
++  // ---- Speculative decoding ----------------------------------------------------------------
++  // A verify step: like forward with all_rows, but each sequence's new tokens (at most
++  // max_verify_tokens()) stay pending, so truncate can drop any suffix of them afterwards.
++  // Steps of up to 8 tokens give every row the bits a one-token step gives it (the decode
++  // numerics are batch invariant), so row j's logits are exactly what plain decoding computes
++  // after the same tokens.
++  void forward_spec(const StepBatch& batch, float* logits, cudaStream_t stream);
++  // Drops the slot's positions from `length` on. length can go back as far as the slot's folded
++  // length (pending positions only: at most the last LX_SPEC_MAX_PENDING).
++  void truncate(int slot, int length);
++  int folded_length(int slot) const { return folded_[slot]; }
++  // The largest verify step that is still batch invariant. Attention splits a token's cache over a
++  // cluster only while T * KVH < 64 (attention.cu kSplitBelow), and the split changes the order of
++  // its sums: Praxis (8 kv heads) 7 tokens, Logos (10) 6.
++  int max_verify_tokens() const;
++
++  // Hidden states for drafters: after set_feature_taps, every step writes, for each of its tokens,
++  // the taps' stream means side by side: features() is f32 [T, feature_dim()] on the device, valid
++  // until the next step.
++  void set_feature_taps(const std::vector<FeatureTap>& taps);
++  int feature_dim() const;
++  const float* features() const;
++
++  // The tied embedding / LM head, for drafters that share it (a block drafter embeds its anchor
++  // with it and reads its logits through it): bf16 [V, D], and the int8 decode copy with per-row
++  // scales when the model made one (else null).
++  struct HeadWeights {
++    const void* bf16 = nullptr;
++    const int8_t* int8 = nullptr;
++    const float* scale = nullptr;
++  };
++  HeadWeights head_weights() const;
++
+   int vocab_size() const { return cfg_.vocab_size; }
+   const MetisConfig& config() const { return cfg_; }
+ 
+@@ -50,10 +93,15 @@ class MetisModel {
+   struct Impl;
+ 
+  private:
+-  void run(int T, int n_seq, bool all_rows, float* logits, cudaStream_t stream);
++  void run(int T, int n_seq, bool all_rows, float* logits, bool spec, cudaStream_t stream);
++  void stage(const StepBatch& b, bool spec, cudaStream_t stream);
++  void launch(int T, int n_seq, bool all_rows, float* logits, bool spec, cudaStream_t stream);
++  void fold_pending(const StepBatch& b, cudaStream_t stream);
+ 
+   MetisConfig cfg_;
+   std::vector<int> slot_len_;
++  std::vector<int> folded_;   // positions in the base state
++  std::vector<int> pending_;  // positions after it, held as inputs (speculative mode)
+   Impl* impl_;
+ };
+ 
