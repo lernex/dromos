@@ -36,6 +36,11 @@ std::map<std::string, lx::TuneRunner>& runners() {
   return r;
 }
 
+std::map<std::string, lx::TuneAdmit>& admitters() {
+  static std::map<std::string, lx::TuneAdmit> a;
+  return a;
+}
+
 using Key = std::tuple<std::string, int, int, int>;
 std::map<Key, int>& table() {
   static std::map<Key, int> t;
@@ -86,9 +91,25 @@ int lx_tune_get(const char* kernel, int M, int N, int K) {
   return it == table().end() ? -1 : it->second;
 }
 
-void lx_tune_set(const char* kernel, int M, int N, int K, int variant) {
+int lx_tune_set(const char* kernel, int M, int N, int K, int variant) {
   std::lock_guard<std::mutex> g(lock());
+  auto reg = registry().find(kernel);
+  if (reg != registry().end()) {
+    if (variant < 0 || variant >= static_cast<int>(reg->second.size())) return LX_ERR_TUNE_VARIANT;
+    auto adm = admitters().find(kernel);
+    if (adm != admitters().end() && !adm->second(variant, M, N, K)) return LX_ERR_TUNE_REJECTED;
+  }
   table()[Key{kernel, bucket(M), N, K}] = variant;
+  return 0;
+}
+
+int lx_tune_force(const char* kernel, int M, int N, int K, int variant) {
+  std::lock_guard<std::mutex> g(lock());
+  auto reg = registry().find(kernel);
+  if (reg != registry().end() && (variant < 0 || variant >= static_cast<int>(reg->second.size())))
+    return LX_ERR_TUNE_VARIANT;
+  table()[Key{kernel, bucket(M), N, K}] = variant;
+  return 0;
 }
 
 void lx_tune_clear(void) {
@@ -148,6 +169,13 @@ TunableRegistration::TunableRegistration(const char* kernel, std::initializer_li
     : TunableRegistration(kernel, variants) {
   std::lock_guard<std::mutex> g(lock());
   runners()[kernel] = runner;
+}
+
+TunableRegistration::TunableRegistration(const char* kernel, std::initializer_list<const char*> variants,
+                                         TuneAdmit admit)
+    : TunableRegistration(kernel, variants) {
+  std::lock_guard<std::mutex> g(lock());
+  admitters()[kernel] = admit;
 }
 
 }  // namespace lx

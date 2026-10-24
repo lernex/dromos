@@ -10,10 +10,11 @@
 //   3. down     the intermediate quantized per pair row (for the low-precision maths), then a grouped GEMM
 //               whose epilogue multiplies by the routing weight and adds into the token's output row
 //
-// The routing is deterministic. The down epilogue's sum over a token's top_k experts is not, by default:
-// the experts' tiles run concurrently, so their float adds land in any order (results differ in the last
-// bits from run to run). LX_MOE_ORDERED=1 makes it deterministic instead: each pair writes its own f32 row
-// and a final pass sums the slots in order, at the cost of a [T * top_k, L] buffer and its traffic.
+// The routing is deterministic, and so is the down epilogue's sum over a token's top_k experts: each pair
+// writes its own f32 row and a final pass sums the slots in order, so a token's bits do not depend on the batch
+// it runs in, nor on the run (a speculative verify step must match the one-token steps bit for bit, and the
+// prefill of the same prompt must give the same cache each time). LX_MOE_ORDERED=0 sums with concurrent float
+// adds instead, which land in any order and cost less at large T.
 //
 // Tile variants per kind are registered with the tuner as "moe_grouped.<kind>.sm<arch>"; each stage looks
 // up its own (pairs, N, K).
@@ -54,10 +55,11 @@ constexpr int kTileBM[kTileBMs] = {32, 64, 128, 256};
 // Pairs per routing chunk: 1024, or more when that keeps the chunk count at kMaxChunks.
 int chunk_pairs(int P) { return std::max(1, (P + kMaxChunks * 1024 - 1) / (kMaxChunks * 1024)) * 1024; }
 
-bool ordered_sum() {
+// LX_MOE_ORDERED=0 turns the ordered sum off (concurrent float adds). Read once.
+bool ordered_for(int) {
   static const bool on = [] {
     const char* v = std::getenv("LX_MOE_ORDERED");
-    return v && v[0] == '1';
+    return !(v && v[0] == '0');
   }();
   return on;
 }
@@ -362,7 +364,9 @@ void set_weight(GroupedParams& pp, const lx_weight& w, int rows, int K) {
 
 extern "C" int64_t lx_moe_grouped_workspace_bytes(int T, int L, int I, int E, int top_k, lx_math math) {
   if (T <= 0 || L <= 0 || I <= 0 || E <= 0 || top_k <= 0) return 0;
-  return layout(T, L, I, E, top_k, math, ordered_sum()).total;
+  // Sized for the ordered sum, which a call with few rows always uses; the sums are the last region, so the
+  // others sit where they do without it.
+  return layout(T, L, I, E, top_k, math, true).total;
 }
 
 extern "C" int lx_moe_experts_grouped(const void* latent, const int32_t* ids, const float* weights,
@@ -387,7 +391,7 @@ extern "C" int lx_moe_experts_grouped(const void* latent, const int32_t* ids, co
     return static_cast<int>(cudaErrorNotSupported);
 
   auto s = static_cast<cudaStream_t>(stream);
-  const bool ordered = ordered_sum();
+  const bool ordered = ordered_for(T);
   const Layout l = layout(T, L, I, E, top_k, math, ordered);
   uint8_t* ws = static_cast<uint8_t*>(workspace);
   const int P = l.P;

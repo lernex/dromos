@@ -104,9 +104,14 @@ int lx_tune_get(const char* kernel, int M, int N, int K) {
   return it == table().end() ? -1 : it->second;
 }
 
-void lx_tune_set(const char* kernel, int M, int N, int K, int variant) {
+int lx_tune_set(const char* kernel, int M, int N, int K, int variant) {
   std::lock_guard<std::mutex> g(lock());
   table()[Key{kernel, bucket(M), N, K}] = variant;
+  return 0;
+}
+
+int lx_tune_force(const char* kernel, int M, int N, int K, int variant) {
+  return lx_tune_set(kernel, M, N, K, variant);
 }
 
 void lx_tune_clear(void) {

@@ -6,7 +6,7 @@ TFLOPS counted as 6 * T * top_k * L * I (the two GEMMs); the bf16 lx_moe_experts
 
 Timing: CUDA events around back-to-back calls (enough for ~20 ms), best of 3.
 Environment: LX_KERNELS; PAIRS (default all); TS (comma list); MODEL (praxis | logos);
-LX_MOE_ORDERED=1 to time the deterministic sum.
+LX_MOE_ORDERED=0 to time the atomic sum (the ordered one is the default).
 Run on the GPU server: scripts/remote.sh SLOT x '$PY bench/bench_moe_grouped.py'
 """
 
@@ -53,7 +53,7 @@ def main():
     dn_src = torch.randn(E, L, I, device="cuda") / I**0.5
     gu_bf = gu_src.to(torch.bfloat16)
     dn_bf = dn_src.to(torch.bfloat16)
-    print(f"L={L} I={I} E={E} top_k={top_k} ordered={os.environ.get('LX_MOE_ORDERED', '0')}")
+    print(f"L={L} I={I} E={E} top_k={top_k} ordered={'0' if os.environ.get('LX_MOE_ORDERED') == '0' else '1'}")
     print(f"{'T':>5s} " + " ".join(f"{q:>14s}" for q in ["lx_moe_experts"] + pairs) + "   (us | TFLOPS)")
     for T in ts:
         latent = torch.randn(T, L, device="cuda").to(torch.bfloat16)
