@@ -1,9 +1,10 @@
 cmake_minimum_required(VERSION 3.28)
-# Blackwell consumer (RTX 50) first; more architectures join as they are measured. Set before
-# project(), which otherwise fills in an old default. Real code only: PTX from a toolkit newer
-# than the driver would not load.
+# Blackwell consumer (RTX 50) for development; release builds list every architecture. 120a, not
+# 120: the block-scaled FP4 / FP8 tensor-core instructions exist only in the arch-specific target.
+# Set before project(), which otherwise fills in an old default. Real code only: PTX from a
+# toolkit newer than the driver would not load.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 120-real)
+  set(CMAKE_CUDA_ARCHITECTURES 120a-real)
 endif()
 project(lernex_engine LANGUAGES CXX CUDA)
 

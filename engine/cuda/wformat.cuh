@@ -1,0 +1,55 @@
+// Device-side decoding of the weight formats (kernels.h, "Weight formats"), shared by every kernel
+// that reads a quantized weight: the decode GEMV, the fused decode kernels and the expert kernels.
+//
+// The unit is one 8-byte word of a row, the width a GEMV lane loads per step:
+//   BF16   4 values        INT8 / FP8   8 values        NVFP4   16 values (exactly one scale block)
+// decode() writes the word's values as f32 with any per-block scale applied; the per-row factor
+// (the INT8 / FP8 row scale, the NVFP4 global) is left out, so a dot product applies it once per
+// row: sum_k x * (v * s) = s * sum_k x * v.
+#pragma once
+
+#include <cuda_runtime.h>
+#include <stdint.h>
+
+#include "cuda/kernels.h"
+
+namespace lx {
+
+template <int kType>
+struct WordFormat;
+
+template <>
+struct WordFormat<LX_W_BF16> {
+  static constexpr int kValues = 4;
+  // A bf16 is the top half of an f32.
+  __device__ __forceinline__ static void decode(uint2 v, float block_scale, float* f) {
+    (void)block_scale;
+    f[0] = __uint_as_float(v.x << 16);
+    f[1] = __uint_as_float(v.x & 0xffff0000u);
+    f[2] = __uint_as_float(v.y << 16);
+    f[3] = __uint_as_float(v.y & 0xffff0000u);
+  }
+  __device__ __forceinline__ static float row_factor(const lx_weight&, int64_t) { return 1.0f; }
+};
+
+template <>
+struct WordFormat<LX_W_INT8> {
+  static constexpr int kValues = 8;
+  __device__ __forceinline__ static void decode(uint2 v, float block_scale, float* f) {
+    (void)block_scale;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      f[i] = static_cast<float>(static_cast<int8_t>(v.x >> (8 * i)));
+      f[4 + i] = static_cast<float>(static_cast<int8_t>(v.y >> (8 * i)));
+    }
+  }
+  __device__ __forceinline__ static float row_factor(const lx_weight& w, int64_t n) {
+    return static_cast<const float*>(w.scale)[n];
+  }
+};
+
+// LX_W_FP8 and LX_W_NVFP4 follow the same contract (the Formats workstream). For NVFP4 the caller
+// reads the word's e4m3 block scale (scale[n, k / 16]) and passes it as block_scale; row_factor is
+// the global.
+
+}  // namespace lx
