@@ -579,6 +579,118 @@ LX_API int lx_offload_read_probe(const void* src, int64_t bytes, unsigned long l
 // mask bits[j * ((V + 31) / 32) ...] (one bit per token) to logits row rows[j] ([rows, V] f32).
 LX_API int lx_mask_logits(float* logits, int V, const int32_t* rows, const uint32_t* bits, int n, void* stream);
 
+// ---- Speculative decoding (spec.cu) ---------------------------------------------------------
+// A verify step feeds a sequence its pending token and k drafted tokens in one step and keeps the
+// logits of every position; afterwards only the prefix the target accepted stays. Attention just
+// truncates: later steps overwrite the cache rows past the kept length. The Mamba-2 state cannot
+// be truncated, so in speculative mode each Mamba layer holds, per slot:
+//   the base state (conv_state and ssm_state, as lx_conv1d_varlen and lx_ssm_scan_varlen keep
+//   them), covering every position up to the slot's folded length, and
+//   up to LX_SPEC_MAX_PENDING pending positions after it, as the inputs their state update needs:
+//   conv_hist f32 [slots, LX_SPEC_MAX_PENDING, C] (the conv inputs) and ssm_hist f32
+//   [slots, lx_spec_ssm_hist_floats(H, P, N)] (each head's x, B and dt_raw).
+// Each step a sequence names fold[s] (its first pending positions, folded into the base state for
+// good) and keep[s] (the pending positions after those, which stay pending); pending positions past
+// fold + keep are dropped (rejected drafts). The step's new tokens run from the state after all
+// fold + keep positions and become pending positions after the kept ones. Requires
+// fold + keep <= pending positions held and keep + new tokens <= LX_SPEC_MAX_PENDING. has_state[s]
+// says whether the base state holds anything (0: it reads as zeros). The base state is written only
+// when fold > 0. A fold replays each position with the float operations of the step that first ran
+// it, so the state after folding j positions is bit-identical to feeding those j tokens normally,
+// and so is every output of the new tokens.
+#define LX_SPEC_MAX_PENDING 8
+
+// Floats of ssm_hist per slot.
+LX_API int64_t lx_spec_ssm_hist_floats(int H, int P, int N);
+
+// lx_conv1d_varlen with pending positions (contract above): out for the new tokens; conv_state
+// changes only when fold > 0; conv_hist ends as [kept rows, new rows].
+LX_API int lx_spec_conv1d(const float* x, int ld_x, const void* w, const void* bias, float* conv_state,
+                          float* conv_hist, const int32_t* slot_ids, const int32_t* has_state, const int32_t* fold,
+                          const int32_t* keep, const int32_t* cu_seqlens, int n_seq, float* out, int C, int W,
+                          void* stream);
+
+// lx_ssm_scan_varlen with pending positions (contract above): y for the new tokens; ssm_state
+// changes only when fold > 0; ssm_hist ends as [kept rows, new rows] for every head.
+LX_API int lx_spec_ssm_scan(const float* x, int ld_x, const float* dt_raw, int ld_dt, const float* B, const float* C,
+                            int ld_bc, const float* A_log, const float* D, const float* dt_bias, float* ssm_state,
+                            float* ssm_hist, const int32_t* slot_ids, const int32_t* has_state, const int32_t* fold,
+                            const int32_t* keep, const int32_t* cu_seqlens, int n_seq, float* y, int H, int P, int G,
+                            int N, void* stream);
+
+// lx_gemm_f32 for decode-sized steps (M <= 8): y[M, N] = x[M, K] @ w[N, K]^T + bias[N], every row
+// summed in an order that does not depend on M, so a row's bits never depend on the other rows.
+// The routers and the depth head of a step of up to 8 tokens go through this, plain decode and
+// verify steps alike: with it a verify step's logits equal single-token steps' bit for bit.
+LX_API int lx_spec_gemv_f32(const float* x, int ld_x, const float* w, const float* bias, float* y, int ld_y, int M,
+                            int N, int K, void* stream);
+
+// Sampling parameters of one row: lx_sampling's filters (sampler.cu), without the penalties.
+typedef struct {
+  float temperature;  // <= 0 is greedy
+  float top_p;        // in (0, 1]; 1 disables
+  int32_t top_k;      // keeps that many (1 .. V - 1); 0, or V or more, disables
+  float min_p;        // in [0, 1]; 0 disables
+} lx_spec_filter;
+
+// The draw's key: seed and the index of the output token being drawn, as in lx_sampling.
+typedef struct {
+  uint64_t seed;
+  uint64_t position;
+} lx_spec_rng;
+
+// probs[r, :] = the distribution lx_sample draws row r from: greedy rows are a point mass on the
+// argmax (ties to the lower index); otherwise softmax(logits / temperature) over the tokens that
+// survive top-k, top-p and min-p, renormalized, zeros elsewhere. The kept set is computed exactly
+// as sampler.cu computes it. logits, probs f32 [rows, V]; filters [rows].
+LX_API int lx_spec_probs(const float* logits, int V, const lx_spec_filter* filters, int rows, float* probs,
+                         void* stream);
+
+// Speculative sampling over a verify step. Sequence s fed tokens[cu[s] .. cu[s + 1] - 1]: its pending
+// token, then k_s drafts. Row cu[s] + j of p (from lx_spec_probs on the target's logits) is the
+// target's distribution after the step's first j + 1 tokens; row cu[s] + j of q is the drafter's
+// distribution that draft j + 1 (tokens[cu[s] + j + 1]) was drawn from, or q is null for drafters
+// that propose a token outright (a point mass). Draft j + 1 holds with probability
+// min(1, p(d) / q(d)); at the first that fails the step ends with a token drawn from
+// max(0, p - q) renormalized, and when all k_s hold, with a token drawn from the last row. Then the
+// emitted tokens (accepted drafts and the final one) are distributed exactly as plain sampling from
+// p. accepted[s] = drafts that held (0 .. k_s), next[s] = the final token. Draws are Philox keyed by
+// (rng[s].seed, rng[s].position + j), so they are reproducible and independent of the batch.
+LX_API int lx_spec_verify(const float* p, const float* q, int V, const int32_t* tokens, const int32_t* cu_seqlens,
+                          const lx_spec_rng* rng, int n_seq, int32_t* accepted, int32_t* next, void* stream);
+
+// Greedy verification over the same layout, on the target's logits: argmax[r] = the argmax of row r
+// (ties to the lower index, rows = cu[n_seq]); drafts hold while each equals the argmax of the row
+// before it. accepted[s] = drafts that held, next[s] = the argmax of the row after the last one.
+LX_API int lx_spec_verify_greedy(const float* logits, int V, const int32_t* tokens, const int32_t* cu_seqlens,
+                                 int n_seq, int rows, int32_t* argmax, int32_t* accepted, int32_t* next, void* stream);
+
+// tokens[i] = a draw from probs[rows[i], :] (rows may be null: row i), Philox keyed by
+// (rng[i].seed, rng[i].position, domain). For drafters that sample their proposals.
+LX_API int lx_spec_sample(const float* probs, int V, const int32_t* rows, const lx_spec_rng* rng, uint32_t domain,
+                          int n, int32_t* tokens, void* stream);
+
+// ---- Block drafter (spec.cu) ----------------------------------------------------------------
+// A one-pass block drafter (runtime/block_drafter.h, format lernex.block/1) is dense layers over a
+// block of up to 8 rows; these are its parts the dense kernels don't cover.
+
+// In place on f32 rows: for each row r and head h of x[r, h * head_dim ..], with norm_w (bf16
+// [head_dim]) v = v * rsqrt(mean(v^2) + eps) * norm_w (no norm when null), then RoPE in the
+// rotate-halves layout: (v[i], v[i + head_dim / 2]) rotate by (pos0 + r) * theta^(-2i / head_dim),
+// the angle taken in double.
+LX_API int lx_spec_head_norm_rope(float* x, int ld_x, int rows, int heads, int head_dim, const void* norm_w,
+                                  float eps, int64_t pos0, double theta, void* stream);
+
+// out[b, h, :] = softmax_j(q[b, h, :] . key_j * scale) @ value_j over the n_ctx context rows
+// (k_ctx, v_ctx f32 [n_ctx, KVH, head_dim], any order) and the B block rows (k_blk, v_blk f32 rows of
+// KVH * head_dim at stride ld_blk), every query seeing all of them; head h reads kv head
+// h / (H / KVH). q f32 [B, H * head_dim] (stride ld_q), out f32 (stride ld_out). Keys are read as
+// float4: head_dim a multiple of 4 dividing 256, ld_blk a multiple of 4, k_ctx and k_blk 16-byte
+// aligned. n_ctx + B + head_dim + 256 floats must fit 48 KB of shared memory (n_ctx to about 11900).
+LX_API int lx_spec_block_attention(const float* q, int ld_q, const float* k_ctx, const float* v_ctx, int n_ctx,
+                                   const float* k_blk, const float* v_blk, int ld_blk, float* out, int ld_out, int B,
+                                   int H, int KVH, int head_dim, float scale, void* stream);
+
 #ifdef __cplusplus
 }
 #endif
