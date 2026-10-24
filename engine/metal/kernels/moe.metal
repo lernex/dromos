@@ -91,7 +91,7 @@ kernel void moe_summary(constant SummaryArgs& a [[buffer(0)]], uint2 gid [[threa
 
 // ---- few-token experts --------------------------------------------------------------------------
 constant constexpr int kBatch = 8;       // pairs per stage-1 batch
-constant constexpr int kExpertRows = 4;  // intermediate columns (stage 1) or output rows (stage 2) per simdgroup
+constant constexpr int kExpertRows = 2;  // intermediate columns (stage 1) or output rows (stage 2) per simdgroup
 constant constexpr int kExpertGroups = 4;
 
 kernel void expert_links(constant LinkArgs& a [[buffer(0)]], uint p [[thread_position_in_grid]]) {

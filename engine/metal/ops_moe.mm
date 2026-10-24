@@ -13,7 +13,7 @@ namespace {
 
 constexpr int kMaxTopK = 32;
 constexpr int kRouteGroups = 4;
-constexpr int kExpertRows = 4;
+constexpr int kExpertRows = 2;
 constexpr int kExpertGroups = 4;
 constexpr int kDecodeTokens = 8;
 
