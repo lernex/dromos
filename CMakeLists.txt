@@ -40,3 +40,10 @@ if(LX_CLI_SOURCES AND TARGET lernex_core)
   add_executable(lernex ${LX_CLI_SOURCES})
   target_link_libraries(lernex PRIVATE lernex_core)
 endif()
+
+# The text stack's tests: tokenizer, chat template and output parser. No CUDA; the goldens come from
+# tools/text/*.py and are read through LX_TEXT_GOLDEN (see tests/text).
+file(GLOB LX_TEXT_TEST_SOURCES CONFIGURE_DEPENDS tests/text/*.cpp)
+file(GLOB LX_TEXT_SOURCES CONFIGURE_DEPENDS engine/text/*.cpp)
+add_executable(lx_text_tests ${LX_TEXT_TEST_SOURCES} ${LX_TEXT_SOURCES})
+target_include_directories(lx_text_tests PRIVATE engine third_party)
