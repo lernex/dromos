@@ -1,0 +1,269 @@
+{
+ "cc": 120,
+ "driver": "13.2",
+ "engine": "0.2",
+ "entries": [
+  {
+   "K": 4,
+   "M": 1,
+   "N": 2048,
+   "key": "memory_fuse",
+   "name": "cluster8",
+   "us": 2.6449406317650417,
+   "us_reference": 11.536914110183716,
+   "variant": 1
+  },
+  {
+   "K": 4,
+   "M": 2,
+   "N": 2048,
+   "key": "memory_fuse",
+   "name": "cluster8",
+   "us": 2.649783113007653,
+   "us_reference": 11.596571547644478,
+   "variant": 1
+  },
+  {
+   "K": 4,
+   "M": 4,
+   "N": 2048,
+   "key": "memory_fuse",
+   "name": "cluster8",
+   "us": 2.6374150882713145,
+   "us_reference": 11.662171568189349,
+   "variant": 1
+  },
+  {
+   "K": 4,
+   "M": 8,
+   "N": 2048,
+   "key": "memory_fuse",
+   "name": "cluster8",
+   "us": 2.9666749246281348,
+   "us_reference": 11.691199881689888,
+   "variant": 1
+  },
+  {
+   "K": 4,
+   "M": 16,
+   "N": 2048,
+   "key": "memory_fuse",
+   "name": "block",
+   "us": 12.056914397648402,
+   "us_reference": 12.056914397648402,
+   "variant": 0
+  },
+  {
+   "K": 4,
+   "M": 32,
+   "N": 2048,
+   "key": "memory_fuse",
+   "name": "block",
+   "us": 12.085942711148943,
+   "us_reference": 12.085942711148943,
+   "variant": 0
+  },
+  {
+   "K": 4,
+   "M": 64,
+   "N": 2048,
+   "key": "memory_fuse",
+   "name": "block",
+   "us": 12.188799892153058,
+   "us_reference": 12.188799892153058,
+   "variant": 0
+  },
+  {
+   "K": 4,
+   "M": 128,
+   "N": 2048,
+   "key": "memory_fuse",
+   "name": "block",
+   "us": 13.506081046127692,
+   "us_reference": 13.506081046127692,
+   "variant": 0
+  },
+  {
+   "K": 4,
+   "M": 256,
+   "N": 2048,
+   "key": "memory_fuse",
+   "name": "block",
+   "us": 15.475963233807764,
+   "us_reference": 15.475963233807764,
+   "variant": 0
+  },
+  {
+   "K": 4,
+   "M": 512,
+   "N": 2048,
+   "key": "memory_fuse",
+   "name": "block",
+   "us": 33.54007330807772,
+   "us_reference": 33.54007330807772,
+   "variant": 0
+  },
+  {
+   "K": 4,
+   "M": 1024,
+   "N": 2048,
+   "key": "memory_fuse",
+   "name": "block",
+   "us": 146.19200570242745,
+   "us_reference": 146.19200570242745,
+   "variant": 0
+  },
+  {
+   "K": 4,
+   "M": 2048,
+   "N": 2048,
+   "key": "memory_fuse",
+   "name": "block",
+   "us": 283.35542338235035,
+   "us_reference": 283.35542338235035,
+   "variant": 0
+  },
+  {
+   "K": 4,
+   "M": 4096,
+   "N": 2048,
+   "key": "memory_fuse",
+   "name": "block",
+   "us": 568.2880282402039,
+   "us_reference": 568.2880282402039,
+   "variant": 0
+  },
+  {
+   "K": 4,
+   "M": 1,
+   "N": 2048,
+   "key": "mhc_read",
+   "name": "cluster8",
+   "us": 2.758740403657067,
+   "us_reference": 6.767836760501472,
+   "variant": 1
+  },
+  {
+   "K": 4,
+   "M": 2,
+   "N": 2048,
+   "key": "mhc_read",
+   "name": "cluster8",
+   "us": 2.7779140842960413,
+   "us_reference": 6.810775581671267,
+   "variant": 1
+  },
+  {
+   "K": 4,
+   "M": 4,
+   "N": 2048,
+   "key": "mhc_read",
+   "name": "cluster8",
+   "us": 2.8070347928318267,
+   "us_reference": 6.852310044424875,
+   "variant": 1
+  },
+  {
+   "K": 4,
+   "M": 8,
+   "N": 2048,
+   "key": "mhc_read",
+   "name": "cluster8",
+   "us": 2.9728588151054147,
+   "us_reference": 6.827363189385862,
+   "variant": 1
+  },
+  {
+   "K": 4,
+   "M": 16,
+   "N": 2048,
+   "key": "mhc_read",
+   "name": "block",
+   "us": 7.029388023882496,
+   "us_reference": 7.029388023882496,
+   "variant": 0
+  },
+  {
+   "K": 4,
+   "M": 32,
+   "N": 2048,
+   "key": "mhc_read",
+   "name": "block",
+   "us": 7.091428552355085,
+   "us_reference": 7.091428552355085,
+   "variant": 0
+  },
+  {
+   "K": 4,
+   "M": 64,
+   "N": 2048,
+   "key": "mhc_read",
+   "name": "block",
+   "us": 7.374040934504295,
+   "us_reference": 7.374040934504295,
+   "variant": 0
+  },
+  {
+   "K": 4,
+   "M": 128,
+   "N": 2048,
+   "key": "mhc_read",
+   "name": "block",
+   "us": 8.596408123872719,
+   "us_reference": 8.596408123872719,
+   "variant": 0
+  },
+  {
+   "K": 4,
+   "M": 256,
+   "N": 2048,
+   "key": "mhc_read",
+   "name": "block",
+   "us": 14.531121990545008,
+   "us_reference": 14.531121990545008,
+   "variant": 0
+  },
+  {
+   "K": 4,
+   "M": 512,
+   "N": 2048,
+   "key": "mhc_read",
+   "name": "block",
+   "us": 25.734857150486537,
+   "us_reference": 25.734857150486537,
+   "variant": 0
+  },
+  {
+   "K": 4,
+   "M": 1024,
+   "N": 2048,
+   "key": "mhc_read",
+   "name": "block",
+   "us": 106.11368480481599,
+   "us_reference": 106.11368480481599,
+   "variant": 0
+  },
+  {
+   "K": 4,
+   "M": 2048,
+   "N": 2048,
+   "key": "mhc_read",
+   "name": "block",
+   "us": 219.69280242919922,
+   "us_reference": 219.69280242919922,
+   "variant": 0
+  },
+  {
+   "K": 4,
+   "M": 4096,
+   "N": 2048,
+   "key": "mhc_read",
+   "name": "block",
+   "us": 444.8448181152344,
+   "us_reference": 444.8448181152344,
+   "variant": 0
+  }
+ ],
+ "gpu": "NVIDIA_GeForce_RTX_5070_Ti_sm120",
+ "name": "NVIDIA GeForce RTX 5070 Ti"
+}
