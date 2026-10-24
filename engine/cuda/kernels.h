@@ -276,6 +276,175 @@ LX_API int64_t lx_moe_grouped_workspace_bytes(int T, int L, int I, int E, int to
 // for a format the file is not stored in; checkpoints made with GPTQ are loaded as they are.
 LX_API int lx_quantize_weight(const void* w, lx_weight* out, int64_t rows, int cols, void* stream);
 
+// =============================================================================================
+// ---- Decode programs (decode_*.cu; the Decode Overhead workstream) ---------------------------
+// =============================================================================================
+// A decode step (M <= 8 tokens, one per sequence) runs as one persistent kernel. The step is built
+// once per shape as a program of ops (products, the depth-memory read, the Mamba step, routing,
+// experts, attention, the memory write, the depth head), each op is split into tasks, and every SM
+// runs its share of the tasks in program order. A loader warp per SM streams each task's weights
+// (and the Mamba state) into a ring of shared-memory pages ahead of time, independent of the data
+// dependencies, so DRAM stays busy across op boundaries; tasks wait on the ops they read from
+// through counters in global memory. Dependencies are inferred from the buffers each op reads and
+// writes, so ops are added in step order and nothing else.
+//
+//   lx_program_create, the lx_program_* ops in step order, lx_program_build, then lx_program_run
+//   once per step. Every pointer is fixed at build time; what changes per step (token ids, slots,
+//   start positions) is read on the device from the buffers named at create.
+//
+// Runs on sm_80 and newer (cp.async and mbarrier only). Products read their weight in its stored
+// format (BF16, INT8, LX_W_F32; FP8 and NVFP4 once wformat.cuh decodes them).
+
+typedef struct lx_program lx_program;
+
+// f32 weights [N, K] (the routers and the depth head), for program products only.
+#define LX_W_F32 ((lx_wtype)16)
+
+// tokens [M] (ids), slots [M] (state slots), has_state [M] (0 on a sequence's first step) and
+// start_pos [M] (tokens already in the KV cache) are int32 device buffers, read when the step runs.
+LX_API lx_program* lx_program_create(int M, const int32_t* tokens, const int32_t* slots, const int32_t* has_state,
+                                     const int32_t* start_pos);
+LX_API void lx_program_destroy(lx_program* p);
+// Lays the tasks out over the SMs and uploads the program; no ops can be added afterwards.
+LX_API int lx_program_build(lx_program* p);
+LX_API int lx_program_run(const lx_program* p, void* stream);
+// Tasks of an op. For a product: its row tiles, which is also how many partial sums of squares a
+// LX_FY_WRITE with next_read leaves per token (the n_parts of the LX_FX_RMS that reads them).
+LX_API int lx_program_tasks(const lx_program* p, int op);
+// With LX_PROGRAM_TRACE set at build, timestamps (ns, globaltimer) of the last run, two tables of
+// [tasks][4] int64 in list order (block by block): per task (op << 32 | task << 16 | block, wait start, start,
+// end), then per run of an op's tasks, at the run's first task (run start, dependencies met,
+// inputs staged, 0). Returns the number of records written (up to 2 * tasks).
+LX_API int lx_program_trace(const lx_program* p, int64_t* out, int capacity);
+
+// ---- Products: out = epilogue(W x) for a weight [N, K] ----------------------------------------
+typedef enum {
+  LX_FX_PLAIN = 0,   // x [M, K] (dtype f32 or bf16, row stride ld)
+  LX_FX_RMS = 1,     // bf16(x[m, k] * rsqrt(sum_j parts[m, j] / K + eps) * norm_w[k]); x f32 [M, ld]
+  LX_FX_GATED = 2,   // bf16(x[m, k] * rsqrt(sum_{j of g} parts[m, j] / group + eps) * norm_w[k]) with g = k / group;
+                     //   x f32 [M, ld]; parts [M, n_parts] are sums of squares over equal consecutive slices of K,
+                     //   n_parts / (K / group) of them per group
+  LX_FX_CONCAT = 3,  // the f32 rows seg[0] | seg[1] | ... (seg[i] [M, width[i]] contiguous; a 0 width ends the
+                     //   list; widths sum to K), rounded to bf16 when round_bf16
+  LX_FX_SWIGLU = 4,  // bf16(silu(x[m, k]) * x[m, K + k]); x f32 [M, ld] holding gate | up (a gated MLP's middle)
+} lx_fx_kind;
+
+typedef struct {
+  int kind;
+  const void* x; int dtype; int ld;
+  const float* parts; int n_parts;
+  const void* norm_w; float eps; int group;
+  const float* seg[4]; int width[4]; int round_bf16;
+} lx_fx;
+
+typedef enum {
+  // v = alpha * (y + bias[n]) + beta * out[m, n], then + lora_gate * (lora_up[n, :] . lora[m, :]) when lora_up
+  // is set (lora_up bf16 [N, rank]); out[m, n] = act(v) with act 0 none, 1 tanh, 2 silu; out_bf, when set,
+  // gets bf16(act(v)). out f32 or bf16 (row stride ld), bias bf16 or f32 or null.
+  LX_FY_STORE = 0,
+  // The hyper-connection write of the update y into streams f32 [M, S, N] (S <= 4), with the mix of the
+  // read it belongs to applied here: new[s] = sum_i matrix[s, i] * streams[m, i, n] + write[s] * y.
+  // Optional: state[m, n] = mean_s new[s]; next_src[m, n] = sum_s next_read[s] * new[s], and
+  // next_parts[m, task] = sum of next_src^2 over the task's rows (lx_program_tasks per token).
+  LX_FY_WRITE = 1,
+} lx_fy_kind;
+
+typedef struct {
+  int kind;
+  void* out; int dtype; int ld; const void* bias; int bias_dtype; float alpha, beta; int act;
+  void* out_bf; int ld_bf;
+  const void* lora_up; const float* lora; int rank; float lora_gate;
+  float* streams; const float* matrix; const float* write; int S;
+  float* state; const float* next_read; float* next_src; float* next_parts;
+} lx_fy;
+
+// y[m, n] = sum_k W[n, k] x[m, k] with the format's scales, then the epilogue. Returns the op id.
+LX_API int lx_program_gemv(lx_program* p, const lx_fx* x, const lx_weight* w, const lx_fy* y, int N, int K);
+
+// ---- The rest of a Metis step ----------------------------------------------------------------
+
+// streams[m, s, :] = table[tokens[m], :] + stream_emb[s, :] (f32 sums of the bf16 rows),
+// previous[m, :] = mean_s streams[m, s, :], history[m, :R] = 0, continuation[m] = 0.
+LX_API int lx_program_embed(lx_program* p, const void* table, const void* stream_emb, float* streams, float* previous,
+                            float* history, float* continuation, int S, int D, int R);
+
+// The depth-memory read, per token, over the first n_entries entries of the token's bank. Entry e
+// holds U | P | c (bank + m * token_stride + e * entry_stride, f32): U = Wq^T k_e (D), P = Wout v_e +
+// out bias (D), c = bq . k_e, so that with x[s] = streams[m, s, :] it computes exactly the read of
+// lx_memory_attend + the output projection + lx_memory_fuse, without the per-read projections:
+//   p[s, :] = softmax_e((x[s] . U_e + c_e) / sqrt(mem_dim)), g[s] = sigmoid(x[s] . gate[s] / sqrt(D) + gate_bias[s])
+//   projected[s] = sum_e p[s, e] P_e; streams[m, s] += g[s] * projected[s]; summary[m] = mean_s projected[s]
+// (summary = 0 and streams unchanged when n_entries == 0). Then, from the new streams:
+//   state[m] = mean_s streams[m, s];
+//   with rms (f32 [2, M]): rms[m] = sum state^2 (the final norm's LX_FX_RMS parts, n_parts 1);
+//   with previous: difference[m] = state - previous, previous = state, and rms[M + m] = sum difference^2;
+//   with h: src = sum_s read[s] streams[m, s], h[m] = bf16(src * rsqrt(mean(src^2) + eps) * norm_w);
+//   with lora_down (bf16 [rank, D]): lora[m, j] = bf16(lora_down[j] . h[m]).
+typedef struct {
+  float* streams; const float* bank; int n_entries; int entry_stride; int token_stride; int mem_dim;
+  const void* gate; const void* gate_bias;
+  float* state; float* summary;
+  const float* read; const void* norm_w; float eps; void* h;
+  const void* lora_down; int rank; float* lora;
+  float* previous; float* difference; float* rms;
+  int S, D;
+} lx_memread_args;
+LX_API int lx_program_memory_read(lx_program* p, const lx_memread_args* a);
+
+// The Mamba-2 step for one token per sequence, from the in_proj output zxbcdt [M, ld] (z | x | B | C | dt):
+// the causal conv (continuing conv_state, lx_conv1d_varlen's layout), the selective scan (continuing
+// ssm_state) and v = y * silu(z) [M, I] f32, with each head's sum of squares of v in head_ss [M, H] for the
+// out_proj's LX_FX_GATED. Adds the step and the conv-state update of the B and C channels (shared by a
+// group's heads); returns the step's op id.
+typedef struct {
+  const float* zxbcdt; int ld; const void* conv_w; const void* conv_b; float* conv_state; float* ssm_state;
+  const float* A_log; const float* D; const float* dt_bias; float* v; float* head_ss;
+  int I, H, P, G, N, W;
+} lx_ssm_args;
+LX_API int lx_program_ssm(lx_program* p, const lx_ssm_args* a);
+
+// Routing on logits [M, E] as lx_moe_route, the expert summary as lx_moe_summary, and the routing
+// history: history = 0.5 * history + 0.5 * summary.
+typedef struct {
+  const float* logits; const float* selection_bias; int32_t* ids; float* weights; float* entropy; float* confidence;
+  const void* expert_emb; float* summary; float* history; int E, top_k, R;
+} lx_select_args;
+LX_API int lx_program_select(lx_program* p, const lx_select_args* a);
+
+// out[m] = sum_k weights[m, k] expert(ids[m, k], latent[m]) + shared(latent[m]), each expert as in
+// lx_moe_experts (intermediates rounded to bf16); the shared expert's product is added to the routed sum.
+// latent bf16 [M, L]; gate_up [E, 2I, L], down [E, L, I], shared_gate_up [2Is, L], shared_down [L, Is].
+// The shared expert's ops wait only for the latent. Returns the last op (the routed down product).
+typedef struct {
+  const void* latent; const int32_t* ids; const float* weights;
+  lx_weight gate_up; lx_weight down; lx_weight shared_gate_up; lx_weight shared_down;
+  float* out; int L, I, Is, top_k;
+} lx_experts_args;
+LX_API int lx_program_experts(lx_program* p, const lx_experts_args* a);
+
+// Decode attention: lx_attention_varlen for one new token per sequence (k, v rounded to bf16 into the
+// caches at start_pos, then attention over positions 0 .. start_pos). qkv f32 [M, ld_qkv]; out bf16 [M, H * Dh].
+typedef struct {
+  const float* qkv; int ld_qkv; void* k_cache; void* v_cache; int capacity; void* out; int H, KVH, Dh; float scale;
+} lx_attention_args;
+LX_API int lx_program_attention(lx_program* p, const lx_attention_args* a);
+
+// A depth-memory entry: meta = bf16([summary (R), mean_k, entropy * inv_log_e, confidence, continuation]),
+// entry[m] = (W_state state[m] + b_state) + (W_meta meta + b_meta) + pass_emb + anchor_emb.
+// w_state [mem_dim, D] in any program format; w_meta bf16 [mem_dim, R + 4]; biases and embeddings bf16.
+typedef struct {
+  const float* state; lx_weight w_state; const void* b_state;
+  const float* summary; const float* entropy; const float* confidence; const float* continuation;
+  float mean_k, inv_log_e; const void* w_meta; const void* b_meta; const void* pass_emb; const void* anchor_emb;
+  float* entry; int D, R, mem_dim;
+} lx_entry_args;
+LX_API int lx_program_memory_entry(lx_program* p, const lx_entry_args* a);
+
+// The depth head's last step from its hidden layer: logit[m] = w_out . hidden[m] + b_out (f32, R), then
+// lx_continuation_finish with rms [2, M] = (sum state^2, sum difference^2) over D from the memory read.
+LX_API int lx_program_continuation(lx_program* p, const float* hidden, const float* w_out, const float* b_out,
+                                   const float* rms, float limit, float* out, int R, int D);
+
 #ifdef __cplusplus
 }
 #endif
