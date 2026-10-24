@@ -10,11 +10,13 @@
 #define LX_PTR(T) device T*
 #define LX_CPTR(T) device const T*
 typedef long lx_i64;
+typedef ulong lx_u64;
 #else
 #include <stdint.h>
 #define LX_PTR(T) uint64_t
 #define LX_CPTR(T) uint64_t
 typedef int64_t lx_i64;
+typedef uint64_t lx_u64;
 typedef uint32_t uint;
 #endif
 
@@ -322,4 +324,38 @@ struct SpecGemvArgs {
   LX_CPTR(float) bias;  // 0 for none
   LX_PTR(float) y;
   int ld_x, ld_y, M, N, K;
+};
+
+// ---- sampling -------------------------------------------------------------------------------
+// One row's parameters: lx_sampling, field for field (56 bytes on both sides).
+struct SamplingRow {
+  lx_u64 seed;
+  lx_u64 position;
+  int slot, row;
+  float temperature, top_p;
+  int top_k;
+  float min_p, repetition_penalty, presence_penalty, frequency_penalty;
+};
+struct SampleArgs {
+  LX_CPTR(float) logits;
+  LX_CPTR(SamplingRow) params;
+  LX_PTR(int) seen;
+  LX_PTR(int) out_counts;
+  LX_PTR(float) work;
+  LX_PTR(int) tokens;
+  LX_PTR(float) token_logprob;  // 0 for none
+  LX_PTR(int) top_tokens;
+  LX_PTR(float) top_logprobs;
+  int V, top_n;
+};
+struct ObserveArgs {
+  LX_PTR(int) counts;
+  LX_CPTR(int) tokens;
+  int n;
+};
+struct MaskLogitsArgs {
+  LX_PTR(float) logits;
+  LX_CPTR(int) rows;
+  LX_CPTR(uint) bits;
+  int V, words;
 };
