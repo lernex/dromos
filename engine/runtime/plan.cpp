@@ -386,11 +386,19 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
   p.prefill_chunk = std::max(1, tokens - p.max_slots);
   p.budget_bytes = budget;
 
-  // The decode ceiling: one stream reads the dense weights and the routed experts it uses per token,
-  // and the bandwidth bounds how fast that can go.
+  // The decode ceiling: one stream reads the layers' weights and the routed experts it uses once per
+  // pass (the stack runs num_passes times over the same weights), the LM head once, one embedding row
+  // (nothing, next to the rest), and reads and writes its Mamba state. Bandwidth bounds how fast that
+  // can go.
   const WeightBytes& wb = chosen->wb;
+  const double head = static_cast<double>(projection_bytes(recipe_for(chosen->format).dense, c.vocab_size, c.hidden_size));
+  const double embedding = static_cast<double>(projection_bytes(LX_W_BF16, c.vocab_size, c.hidden_size));
   const double experts_read = static_cast<double>(wb.experts) * c.num_experts_per_tok / c.n_routed_experts;
-  const double active = static_cast<double>(wb.plain + wb.dense + wb.latent_up + wb.out_proj) + experts_read;
+  // weight_bytes counts a quantized head among the dense projections; a BF16 head is the embedding itself.
+  const bool head_in_dense = recipe_for(chosen->format).dense != LX_W_BF16;
+  const double per_pass = static_cast<double>(wb.plain + wb.dense + wb.latent_up + wb.out_proj) - embedding -
+                          (head_in_dense ? head : 0.0) + experts_read;
+  const double active = per_pass * c.num_passes + head + 2.0 * static_cast<double>(state_bytes_per_slot(c));
   if (d.bandwidth_gbs > 0 && active > 0) p.decode_ceiling_tps = d.bandwidth_gbs * 1e9 / active;
 
   // Notes, in the order a person reads them.
