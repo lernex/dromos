@@ -1,0 +1,127 @@
+CPU backend: the other workstreams' kernel tests on the CPU (patch -p1 from the repo root, against the
+native clone's tests/kernels/{test_gemm_w,test_moe_grouped,wformats}.py and the offload clone's
+test_cpu_experts.py as of 2026-10-24).
+
+With tests/kernels/conftest.py's LX_BACKEND=cpu (committed in the CPU clone), these tests run against
+liblernex_cpu.so. Three things in them are CUDA-specific and are gated on BACKEND == "cuda" here:
+the sm_89/sm_80 arch-override families (the CPU's lx_arch is an ISA level, not an SM), the tile-variant
+tuner tests (the CPU registers no variants), and the grouped kernel's NOT_SUPPORTED cases for tile shapes
+the CUDA kernels cannot take (the CPU takes them). The ctypes lx_weight in wformats.py and
+test_cpu_experts.py also gains expert_global, the field Formats added to kernels.h, without which a
+backend that reads it gets garbage for NVFP4 stacks.
+
+diff -ru a/tests/kernels/test_cpu_experts.py b/tests/kernels/test_cpu_experts.py
+--- a/tests/kernels/test_cpu_experts.py	2026-10-24 15:22:36
++++ b/tests/kernels/test_cpu_experts.py	2026-10-24 15:22:36
+@@ -20,7 +20,8 @@
+ 
+ 
+ class Weight(ctypes.Structure):
+-    _fields_ = [("type", ctypes.c_int), ("data", ctypes.c_void_p), ("scale", ctypes.c_void_p), ("glob", ctypes.c_float)]
++    _fields_ = [("type", ctypes.c_int), ("data", ctypes.c_void_p), ("scale", ctypes.c_void_p), ("glob", ctypes.c_float),
++                ("expert_global", ctypes.c_void_p)]
+ 
+ 
+ @pytest.fixture(scope="module")
+diff -ru a/tests/kernels/test_gemm_w.py b/tests/kernels/test_gemm_w.py
+--- a/tests/kernels/test_gemm_w.py	2026-10-24 15:22:36
++++ b/tests/kernels/test_gemm_w.py	2026-10-24 15:22:36
+@@ -13,7 +13,7 @@
+ import pytest
+ import torch
+ 
+-from conftest import DTYPE, close
++from conftest import BACKEND, DTYPE, close
+ from wformats import (
+     MATH_BF16,
+     MATH_FP4,
+@@ -40,7 +40,7 @@
+     ("w4a8", W_NVFP4, MATH_FP8, 120),
+     ("fp4", W_NVFP4, MATH_FP4, 120),
+ ]
+-ARCHS = [0, 89, 80]  # 0: the card's own
++ARCHS = [0, 89, 80] if BACKEND == "cuda" else [0]  # 0: the card's own
+ SHAPES = [
+     (1, 64, 256),
+     (7, 136, 512),  # N not a multiple of the 128-wide tile
+@@ -65,7 +65,8 @@
+ 
+ def native_arch(lx):
+     set_arch(lx, 0)
+-    return lx.lib.lx_arch()
++    # The GPU families gate the pairs; every other backend runs every pair.
++    return lx.lib.lx_arch() if BACKEND == "cuda" else 1000
+ 
+ 
+ def call_gemm_w(lx, x, ld_x, w, math, bias, y, ld_y, M, N, K, alpha, beta, ws):
+@@ -148,6 +149,8 @@
+ 
+ 
+ def test_gemm_w_tuned_variants(lx):
++    if BACKEND != "cuda":
++        pytest.skip("the tile variants are the CUDA kernels'")
+     # Every registered tile variant of every family gives the same answer when the tuner picks it. The
+     # bf16 family runs with an f32 bias (a bf16 bias goes to cuBLASLt).
+     names = (ctypes.c_char_p * 256)()
+diff -ru a/tests/kernels/test_moe_grouped.py b/tests/kernels/test_moe_grouped.py
+--- a/tests/kernels/test_moe_grouped.py	2026-10-24 15:22:36
++++ b/tests/kernels/test_moe_grouped.py	2026-10-24 15:22:36
+@@ -16,7 +16,7 @@
+ import torch
+ import torch.nn.functional as F
+ 
+-from conftest import close
++from conftest import BACKEND, close
+ from wformats import (
+     MATH_BF16,
+     MATH_FP4,
+@@ -45,7 +45,7 @@
+     ("w4a8", W_NVFP4, MATH_FP8, 120),
+     ("fp4", W_NVFP4, MATH_FP4, 120),
+ ]
+-ARCHS = [0, 89, 80]
++ARCHS = [0, 89, 80] if BACKEND == "cuda" else [0]
+ # (T, L, I, E, top_k)
+ SHAPES = [
+     (5, 256, 256, 8, 2),
+@@ -62,7 +62,8 @@
+ 
+ def native_arch(lx):
+     set_arch(lx, 0)
+-    return lx.lib.lx_arch()
++    # The GPU families gate the pairs; every other backend runs every pair.
++    return lx.lib.lx_arch() if BACKEND == "cuda" else 1000
+ 
+ 
+ def workspace_bytes(lx, T, L, I, E, top_k, math):
+@@ -191,6 +192,8 @@
+     assert call_grouped(lx, latent, ids, weights, gu, dn, MATH_BF16, out, ws, 0, 256, 256, 8, 2) == 0
+     assert workspace_bytes(lx, 0, 256, 256, 8, 2, MATH_BF16) == 0
+     # I not a multiple of 8, and FP4 math with K not a whole number of its 256-wide K tiles
++    if BACKEND != "cuda":
++        return  # the tile-shape limits below are the CUDA kernels'
+     assert call_grouped(lx, latent, ids, weights, gu, dn, MATH_BF16, out, ws, 4, 256, 252, 8, 2) == NOT_SUPPORTED
+     if native_arch(lx) >= 120:
+         g4 = quantize_weight(torch.randn(8, 2 * 128, 256, device="cuda"), W_NVFP4)
+@@ -200,6 +203,8 @@
+ 
+ 
+ def test_moe_grouped_tuned_variants(lx):
++    if BACKEND != "cuda":
++        pytest.skip("the tile variants are the CUDA kernels'")
+     # Every registered tile variant of every family, picked through the tuner for both stages.
+     names = (ctypes.c_char_p * 256)()
+     lx.lib.lx_tune_kernels.restype = ctypes.c_int
+diff -ru a/tests/kernels/wformats.py b/tests/kernels/wformats.py
+--- a/tests/kernels/wformats.py	2026-10-24 15:22:36
++++ b/tests/kernels/wformats.py	2026-10-24 15:22:36
+@@ -13,7 +13,8 @@
+ 
+ 
+ class LxWeight(ctypes.Structure):
+-    _fields_ = [("type", ctypes.c_int), ("data", ctypes.c_void_p), ("scale", ctypes.c_void_p), ("glob", ctypes.c_float)]
++    _fields_ = [("type", ctypes.c_int), ("data", ctypes.c_void_p), ("scale", ctypes.c_void_p), ("glob", ctypes.c_float),
++                ("expert_global", ctypes.c_void_p)]
+ 
+ 
+ class Weight:

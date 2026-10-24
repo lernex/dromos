@@ -2,6 +2,11 @@
 on PyTorch CUDA tensors, and compare against a PyTorch reference written beside the test.
 
 LX_KERNELS points at build/liblernex_kernels.so (scripts/remote.sh sets it).
+
+The same tests run against any backend library. LX_BACKEND=cpu (with LX_KERNELS pointing at
+liblernex_cpu.so) runs them on CPU tensors: every tensor the tests create on "cuda" is created on the
+CPU instead, torch.cuda's stream and synchronize calls become the backend's (the CPU's streams are
+synchronous), and the kernels get host pointers. The tests themselves are unchanged.
 """
 
 import ctypes
@@ -9,6 +14,38 @@ import os
 
 import pytest
 import torch
+
+BACKEND = os.environ.get("LX_BACKEND", "cuda")
+DEVICE = "cpu" if BACKEND == "cpu" else "cuda"
+
+if DEVICE == "cpu":
+    from torch.overrides import TorchFunctionMode
+
+    def _host(device):
+        return "cpu" if device is not None and str(device).startswith("cuda") else device
+
+    class _CudaOnHost(TorchFunctionMode):
+        """Creates on the CPU every tensor a test asks for on "cuda"."""
+
+        def __torch_function__(self, func, types, args=(), kwargs=None):
+            kwargs = dict(kwargs or {})
+            if "device" in kwargs:
+                kwargs["device"] = _host(kwargs["device"])
+            if func in (torch.Tensor.to, torch.Tensor.new_empty, torch.Tensor.new_zeros, torch.Tensor.new_full,
+                        torch.Tensor.new_ones, torch.Tensor.new_tensor):
+                args = tuple(_host(a) if isinstance(a, (str, torch.device)) else a for a in args)
+            return func(*args, **kwargs)
+
+    class _HostStream:
+        cuda_stream = 0
+
+        def synchronize(self):
+            pass
+
+    _CudaOnHost().__enter__()
+    torch.cuda.current_stream = lambda *a, **k: _HostStream()
+    torch.cuda.synchronize = lambda *a, **k: None
+    torch.Tensor.cuda = lambda self, *a, **k: self
 
 F32, BF16 = 0, 1
 DTYPE = {torch.float32: F32, torch.bfloat16: BF16}
@@ -25,7 +62,7 @@ class Kernels:
         conv = []
         for a in args:
             if isinstance(a, torch.Tensor):
-                assert a.is_cuda and a.is_contiguous(), "kernels take contiguous CUDA tensors"
+                assert a.device.type == DEVICE and a.is_contiguous(), f"kernels take contiguous {DEVICE} tensors"
                 conv.append(ctypes.c_void_p(a.data_ptr()))
             elif isinstance(a, bool):
                 conv.append(ctypes.c_int(int(a)))
@@ -40,7 +77,10 @@ class Kernels:
         conv.append(ctypes.c_void_p(torch.cuda.current_stream().cuda_stream))
         status = fn(*conv)
         assert status == 0, f"lx_{name} returned CUDA error {status}"
-        torch.cuda.synchronize()
+        if DEVICE == "cpu":
+            assert self.lib.lx_rt_stream_sync(None) == 0
+        else:
+            torch.cuda.synchronize()
 
 
 def pytest_addoption(parser):
@@ -57,7 +97,7 @@ def pytest_addoption(parser):
 def lx(request):
     path = os.environ.get("LX_KERNELS")
     if not path or not os.path.exists(path):
-        pytest.skip("LX_KERNELS is not set to a built liblernex_kernels.so")
+        pytest.skip("LX_KERNELS is not set to a built kernel library")
     kernels = Kernels(path)
     arch = request.config.getoption("--lx-arch")
     if arch:

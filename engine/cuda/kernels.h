@@ -691,6 +691,11 @@ LX_API int lx_spec_block_attention(const float* q, int ld_q, const float* k_ctx,
                                    const float* k_blk, const float* v_blk, int ld_blk, float* out, int ld_out, int B,
                                    int H, int KVH, int head_dim, float scale, void* stream);
 
+// The reverse: out[r, c] = w[r, c] as bf16 for an [rows, cols] matrix in any format, with its row
+// factor applied (the row scale, or the NVFP4 global). The loader uses it to hold a quantized
+// embedding's bf16 gather table, and the acceptance checks compare dequantized weights with BF16.
+LX_API int lx_dequantize_weight(const lx_weight* w, void* out, int64_t rows, int cols, void* stream);
+
 #ifdef __cplusplus
 }
 #endif

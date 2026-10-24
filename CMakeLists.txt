@@ -1,4 +1,12 @@
 cmake_minimum_required(VERSION 3.28)
+# Backends: each is one shared library exporting every lx_* function of engine/cuda/kernels.h.
+#   LX_BACKEND_CUDA  liblernex_kernels.so plus the CUDA runtime, model and CLI (the default)
+#   LX_BACKEND_CPU   liblernex_cpu.so, x86 (AVX2, AVX-VNNI, AVX-512) and ARM (NEON, dot product, I8MM,
+#                    BF16), no CUDA needed: cmake -DLX_BACKEND_CUDA=OFF -DLX_BACKEND_CPU=ON. Built by
+#                    default next to CUDA too: the offload runtime loads it for its CPU lane.
+option(LX_BACKEND_CUDA "Build the CUDA backend, model and CLI" ON)
+option(LX_BACKEND_CPU "Build the CPU backend (liblernex_cpu.so)" ON)
+
 # The CUDA architectures this build compiles for, chosen with -DLX_ARCHS:
 #   120a-real  the development default (RTX 50), so an edit-compile loop stays fast
 #   all        every architecture the engine runs on: RTX 30 / A100 (80, 86), RTX 40 (89), H100 (90a),
@@ -14,8 +22,10 @@ if(LX_ARCHS STREQUAL "all")
 else()
   set(LX_ARCH_LIST "${LX_ARCHS}")
 endif()
-set(CMAKE_CUDA_ARCHITECTURES ${LX_ARCH_LIST})
-project(lernex_engine LANGUAGES CXX CUDA)
+if(LX_BACKEND_CUDA)
+  set(CMAKE_CUDA_ARCHITECTURES ${LX_ARCH_LIST})
+endif()
+project(lernex_engine LANGUAGES CXX)
 
 # The compute capabilities this build has code for (80, 86, 89, 90, 100, 120), for the device report.
 set(LX_BUILT_ARCHS "")
@@ -27,12 +37,22 @@ list(JOIN LX_BUILT_ARCHS "," LX_BUILT_ARCHS_CSV)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_STANDARD 20)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
+
+if(LX_BACKEND_CPU)
+  add_subdirectory(engine/cpu)
+endif()
+
+if(NOT LX_BACKEND_CUDA)
+  return()
+endif()
+
+enable_language(CUDA)
+set(CMAKE_CUDA_STANDARD 20)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr -lineinfo")
 
 find_package(CUDAToolkit REQUIRED)
@@ -42,18 +62,6 @@ file(GLOB LX_CUDA_SOURCES CONFIGURE_DEPENDS engine/cuda/*.cu)
 add_library(lernex_kernels SHARED ${LX_CUDA_SOURCES})
 target_include_directories(lernex_kernels PUBLIC engine)
 target_link_libraries(lernex_kernels PUBLIC CUDA::cudart CUDA::cublasLt)
-
-# The CPU backend's kernels (engine/cpu), a library of their own: they export the same lx_* names as
-# the GPU backends, so the offload runtime loads this one by path (dlopen) for its CPU lane. No
-# -march: the vector paths are compiled per function and chosen at run time.
-file(GLOB LX_CPU_SOURCES CONFIGURE_DEPENDS engine/cpu/*.cpp)
-if(LX_CPU_SOURCES)
-  find_package(Threads REQUIRED)
-  add_library(lernex_cpu SHARED ${LX_CPU_SOURCES})
-  target_include_directories(lernex_cpu PUBLIC engine)
-  target_compile_options(lernex_cpu PRIVATE -O3)
-  target_link_libraries(lernex_cpu PRIVATE Threads::Threads)
-endif()
 
 # The prefix cache snapshots the model's slot state. That needs MetisModel::save_slot and restore_slot,
 # which live in docs/handoff/serving-metis.diff until the lead applies it to engine/model/metis.cpp.
