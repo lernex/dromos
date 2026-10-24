@@ -1,0 +1,579 @@
+// The tensor-core GEMM every low-precision product runs on: C[M, N] = A[M, K] . B[N, K]^T with A the
+// activations and B a weight in its stored format (kernels.h, "Weight formats"), both K-contiguous.
+// One template covers every (weight format, math) pair, the dense GEMM (gemm_w.cu) and the grouped
+// expert GEMMs (moe_grouped.cu); a Prob policy says where a tile's rows live and an Epi policy what
+// happens to the results.
+//
+// Mainloop: a CTA computes a BM x BN tile with WM x WN warps; K advances in tiles of 128 bytes of A per
+// row (64 bf16, 128 int8 / e4m3, 256 e2m1), streamed through ST shared-memory stages by cp.async
+// (zero-filled past M, N and K), so the copy of tile k + ST - 1 overlaps the MMAs on tile k.
+//
+// Operand kinds:
+//   homogeneous (BF16, INT8, FP8, FP4): A and B have the same element type. Fragments come from
+//     ldmatrix on a 128-byte swizzled layout (16-byte chunk ^ row % 8) and feed the MMA directly. FP4
+//     also stages the e4m3 block scales of both sides and passes them to the block-scaled MMA.
+//   bf16 x quantized weight (W8A16 for INT8 / FP8 weights, W4A16 for NVFP4): the bf16 MMA, with B
+//     expanded to bf16 in registers. The expansion yields contiguous K runs, so K is permuted inside
+//     each 32-wide step: thread q owns K 8q..8q+7, the first MMA takes 8q..8q+3 as its logical
+//     columns (2q, 2q+1, 2q+8, 2q+9) and the second 8q+4..8q+7. A is read with the same permutation
+//     (one 16-byte load per row), so the product is unchanged.
+//   W4A8 (NVFP4 weight x e4m3 activation): the weight's per-16 scales are not representable inside an
+//     FP8 operand, so each 32-wide step runs two block-scaled FP8 MMAs, one per 16-block (the other
+//     block's B values zeroed), into fresh registers that are scaled and accumulated in f32. The same
+//     K permutation puts all of a thread's B values in one block.
+// The per-row and per-token scales and the globals are applied once, in the epilogue.
+//
+// Split-K (sm_90+, small problems): a cluster of 2 or 4 CTAs shares one tile, each running the mainloop
+// over its part of K; the partial tiles are summed across the cluster in rank order through distributed
+// shared memory, so the result does not depend on scheduling.
+#pragma once
+
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+#include <stdint.h>
+
+#include <type_traits>
+
+#include "cuda/common.cuh"
+#include "cuda/mma.cuh"
+
+namespace lx::tc {
+
+enum Kind : int {
+  kBF16 = 0,  // bf16 x bf16
+  kI8,        // int8 per token x int8 per row (IMMA)
+  kF8,        // e4m3 per token x e4m3 per row
+  kF4,        // NVFP4 x NVFP4 (block scales in the MMA; per-token and weight globals)
+  kW8I8,      // bf16 x int8 weight expanded to bf16
+  kW8F8,      // bf16 x e4m3 weight expanded to bf16
+  kW4A16,     // bf16 x NVFP4 weight expanded to bf16 with its block scale
+  kW4A8,      // e4m3 per token x NVFP4 weight, per-block products
+};
+
+template <int kKind>
+struct Traits;
+template <>
+struct Traits<kBF16> {
+  static constexpr int kABits = 16, kBBits = 16;
+  static constexpr bool kLdm = true, kASf = false, kBSf = false, kRowScale = false, kColScale = false, kGlobal = false;
+};
+template <>
+struct Traits<kI8> {
+  static constexpr int kABits = 8, kBBits = 8;
+  static constexpr bool kLdm = true, kASf = false, kBSf = false, kRowScale = true, kColScale = true, kGlobal = false;
+};
+template <>
+struct Traits<kF8> : Traits<kI8> {};
+template <>
+struct Traits<kF4> {
+  static constexpr int kABits = 4, kBBits = 4;
+  static constexpr bool kLdm = true, kASf = true, kBSf = true, kRowScale = true, kColScale = false, kGlobal = true;
+};
+template <>
+struct Traits<kW8I8> {
+  static constexpr int kABits = 16, kBBits = 8;
+  static constexpr bool kLdm = false, kASf = false, kBSf = false, kRowScale = false, kColScale = true, kGlobal = false;
+};
+template <>
+struct Traits<kW8F8> : Traits<kW8I8> {};
+template <>
+struct Traits<kW4A16> {
+  static constexpr int kABits = 16, kBBits = 4;
+  static constexpr bool kLdm = false, kASf = false, kBSf = true, kRowScale = false, kColScale = false, kGlobal = true;
+};
+template <>
+struct Traits<kW4A8> {
+  static constexpr int kABits = 8, kBBits = 4;
+  static constexpr bool kLdm = false, kASf = false, kBSf = true, kRowScale = true, kColScale = false, kGlobal = true;
+};
+
+// Everything the mainloop and the epilogue know about one CTA's tile, filled in by the Prob policy.
+struct Tile {
+  int rows, cols;    // valid rows (<= BM) and columns (<= BN) of the tile
+  int m0, n0;        // the tile's first row and column in the problem's numbering
+  int expert;        // grouped problems: the expert; dense: 0
+  const uint8_t* b;  // the weight (the expert's slice), row 0
+  const uint8_t* b_sf;
+  const float* b_scale;
+};
+
+// Swizzled byte offset of 16-byte chunk `c` of row `r` in a tile of RB-byte rows. The 128-byte line
+// holding the chunk is XORed with a per-line pattern chosen for the access pattern that reads it.
+template <int RB, int kPattern>
+__device__ __forceinline__ uint32_t swz(int r, int c) {
+  const int lin = r * RB + c * 16;
+  const int line = lin >> 7;
+  int chunk = (lin >> 4) & 7;
+  if constexpr (kPattern == 0) chunk ^= line & 7;         // ldmatrix: 8 rows of one chunk
+  else if constexpr (kPattern == 1) chunk ^= (line & 1) << 2;  // 16-byte loads, rows in pairs
+  else if constexpr (kPattern == 2) chunk ^= (line & 3) << 1;  // 8-byte loads, rows in fours
+  else if constexpr (kPattern == 3) chunk ^= (line & 1) << 1;  // 8-byte loads of 64-byte rows
+  else if constexpr (kPattern == 4) chunk ^= line & 1;         // 4-byte loads of 32-byte rows
+  else chunk ^= line & 3;                                       // 4-byte loads of 64-byte rows
+  return static_cast<uint32_t>((line << 7) | (chunk << 4));
+}
+
+template <int kKind, int kArch, int BM, int BN, int WM, int WN, int ST, int RB = 128>
+struct Config {
+  using T = Traits<kKind>;
+  static constexpr int kThreads = WM * WN * 32;
+  static constexpr int kWTM = BM / WM, kWTN = BN / WN;
+  static constexpr int kMT = kWTM / 16, kNT = kWTN / 8;
+  static constexpr int kARow = RB;                         // A bytes per row per k-tile (64 or 128)
+  static constexpr int kKTile = kARow * 8 / T::kABits;     // K per k-tile
+  static constexpr int kBRow = kKTile * T::kBBits / 8;     // B bytes per row per k-tile
+  static constexpr int kSfRow = kKTile / 16;               // scale bytes per row per k-tile (FP4 / NVFP4)
+  // Scale tiles. An FP4 scale load reads one 4-byte word from each of 32 rows: with 8-byte rows the tile
+  // is stored word-major ([word][row]) so those rows fall in 32 banks; otherwise rows are padded by one
+  // row every 8, which does the same for 16-byte rows and keeps the 4- and 8-byte NVFP4 rows aligned.
+  static constexpr bool kSfWordMajor = kKind == kF4 && kSfRow == 8;
+  static constexpr int kASfBytes = T::kASf ? (kSfWordMajor ? BM * kSfRow : (BM + BM / 8) * kSfRow) : 0;
+  static constexpr int kBSfBytes = T::kBSf ? (kSfWordMajor ? BN * kSfRow : (BN + BN / 8 + 8) * kSfRow) : 0;
+  template <int R>
+  static __device__ __forceinline__ int sf_off(int r, int w) {
+    if constexpr (kSfWordMajor) return (w * R + r) * 4;
+    else return (r + r / 8) * kSfRow + 4 * w;
+  }
+  static constexpr int kAOff = 0;
+  static constexpr int kBOff = kAOff + BM * kARow;
+  static constexpr int kASfOff = kBOff + BN * kBRow;
+  static constexpr int kBSfOff = kASfOff + kASfBytes;
+  static constexpr int kStage = (kBSfOff + kBSfBytes + 127) / 128 * 128;
+  static constexpr int kSmem = ST * kStage;
+  // Patterns: homogeneous tiles are read by ldmatrix; the others by the loads described above.
+  static constexpr int kAPat = T::kLdm ? 0 : (T::kABits == 16 ? 1 : 2);
+  static constexpr int kBPat = T::kLdm ? 0 : (T::kBBits == 8 ? 3 : (kBRow == 32 ? 4 : 5));
+  static_assert(BM % (16 * WM) == 0 && BN % (8 * WN) == 0, "warp tile");
+  static_assert(T::kLdm == false || kNT % 2 == 0, "ldmatrix loads B in pairs of n8 tiles");
+  static_assert(kSmem <= 101376, "shared memory");
+  // Two CTAs per SM when they fit (sm_80-family SMs hold 100 KB, 1 KB of it reserved per CTA): one CTA's
+  // epilogue then overlaps the other's mainloop. The output write is first order here: at K = 2048 an f32
+  // result carries 1024 FLOPs per byte, so at the FP4 peak the stores alone need most of DRAM's bandwidth.
+  static constexpr int kMinBlocks = 2 * (kSmem + 1024) <= 102400 && kThreads <= 128 ? 2 : 1;
+  static_assert(RB == 128 || (RB == 64 && T::kLdm), "64-byte rows: homogeneous kinds only");
+};
+
+__device__ __forceinline__ float bf16_lo(uint32_t w) { return __uint_as_float(w << 16); }
+
+// Scale of the f32 result before the epilogue, per kind.
+template <int kKind>
+__device__ __forceinline__ float row_col_scale(float row, float col, float global) {
+  using T = Traits<kKind>;
+  float s = 1.0f;
+  if constexpr (T::kRowScale) s *= row;
+  if constexpr (T::kColScale) s *= col;
+  if constexpr (T::kGlobal) s *= global;
+  return s;
+}
+
+// The kernel body. Prob: tile assignment and row addresses; Epi: what to do with the results.
+//
+// kSplit > 1 (sm_90+, launched as clusters of kSplit CTAs along x): the cluster shares one tile and each
+// CTA takes a contiguous part of K, for small problems whose tiles alone would leave SMs idle. The
+// partial accumulators meet in distributed shared memory: every CTA writes its own, then reduces a
+// slice of the tile's rows across the cluster in rank order (deterministic) and runs the epilogue on it.
+template <int kKind, int kArch, int BM, int BN, int WM, int WN, int ST, int RB, class Prob, class Epi, int kSplit = 1>
+__device__ __forceinline__ void gemm_body(const typename Prob::Params& pp, const typename Epi::Params& ep,
+                                          uint8_t* smem) {
+  using C = Config<kKind, kArch, BM, BN, WM, WN, ST, RB>;
+  using T = typename C::T;
+  constexpr int kThreads = C::kThreads, kMT = C::kMT, kNT = C::kNT;
+  using Acc = std::conditional_t<kKind == kI8, int, float>;
+  constexpr int kRedLd = BN + 4;  // split-K: the partial tile's row stride in shared memory
+  static_assert(kSplit == 1 || (!Epi::kGated && BM % kSplit == 0 && BM * kRedLd * 4 <= C::kSmem), "split-K tile");
+
+  Tile t;
+  const int cta = static_cast<int>(blockIdx.x) / kSplit;  // every CTA of a cluster has the same tile
+  if (!Prob::template tile<BM, BN>(pp, t, cta)) return;
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int wm = warp / WN, wn = warp % WN;
+  const int K = pp.K;
+  const int KT_all = (K + C::kKTile - 1) / C::kKTile;
+  const int rank = kSplit > 1 ? static_cast<int>(blockIdx.x) % kSplit : 0;
+  const int kt0 = rank * KT_all / kSplit;                  // this CTA's K tiles: kt0 .. kt0 + KT - 1
+  const int KT = (rank + 1) * KT_all / kSplit - kt0;
+  const uint32_t s0 = mma::smem_addr(smem);
+
+  // ---- loader: each thread copies fixed chunks of every tile, so its source rows are set up once ----
+  constexpr int kAChunks = BM * C::kARow / 16, kBChunks = BN * C::kBRow / 16;
+  constexpr int kAIt = (kAChunks + kThreads - 1) / kThreads, kBIt = (kBChunks + kThreads - 1) / kThreads;
+  const uint8_t* a_src[kAIt];
+  const uint8_t* b_src[kBIt];
+  uint32_t a_dst[kAIt], b_dst[kBIt];
+  int a_col[kAIt], b_col[kBIt];  // byte offset of the chunk within a K tile
+#pragma unroll
+  for (int i = 0; i < kAIt; ++i) {
+    const int c = tid + i * kThreads;
+    const int r = c / (C::kARow / 16), ch = c % (C::kARow / 16);
+    a_src[i] = c < kAChunks && r < t.rows ? Prob::a_row(pp, t, r) : nullptr;
+    a_dst[i] = C::kAOff + swz<C::kARow, C::kAPat>(r, ch);
+    a_col[i] = ch * 16;
+  }
+#pragma unroll
+  for (int i = 0; i < kBIt; ++i) {
+    const int c = tid + i * kThreads;
+    const int r = c / (C::kBRow / 16), ch = c % (C::kBRow / 16);
+    b_src[i] = c < kBChunks && r < t.cols ? t.b + Prob::b_row(pp, t, r) * pp.ldb : nullptr;
+    b_dst[i] = C::kBOff + swz<C::kBRow, C::kBPat>(r, ch);
+    b_col[i] = ch * 16;
+  }
+  // Scale tiles: one copy of kSfRow bytes per row (16, 8 or 4 bytes).
+  constexpr int kASfIt = T::kASf ? (BM + kThreads - 1) / kThreads : 0;
+  constexpr int kBSfIt = T::kBSf ? (BN + kThreads - 1) / kThreads : 0;
+  const uint8_t* asf_src[kASfIt > 0 ? kASfIt : 1];
+  const uint8_t* bsf_src[kBSfIt > 0 ? kBSfIt : 1];
+#pragma unroll
+  for (int i = 0; i < kASfIt; ++i) {
+    const int rr = tid + i * kThreads;
+    asf_src[i] = rr < t.rows ? Prob::a_sf_row(pp, t, rr) : nullptr;
+  }
+#pragma unroll
+  for (int i = 0; i < kBSfIt; ++i) {
+    const int rr = tid + i * kThreads;
+    bsf_src[i] = rr < t.cols ? t.b_sf + Prob::b_row(pp, t, rr) * pp.ld_bsf : nullptr;
+  }
+  const int k_bytes_a = K * T::kABits / 8, k_bytes_b = K * T::kBBits / 8, k_sf = K / 16;
+
+  auto load_tile = [&](int stage, int kt) {
+    kt += kt0;
+    const uint32_t base = s0 + stage * C::kStage;
+    const int ka = kt * C::kARow, kb = kt * C::kBRow;
+#pragma unroll
+    for (int i = 0; i < kAIt; ++i) {
+      if (kAChunks % kThreads == 0 || tid + i * kThreads < kAChunks) {
+        const bool ok = a_src[i] && ka + a_col[i] < k_bytes_a;
+        mma::cp_async16(base + a_dst[i], ok ? a_src[i] + ka + a_col[i] : t.b, ok);
+      }
+    }
+#pragma unroll
+    for (int i = 0; i < kBIt; ++i) {
+      if (kBChunks % kThreads == 0 || tid + i * kThreads < kBChunks) {
+        const bool ok = b_src[i] && kb + b_col[i] < k_bytes_b;
+        mma::cp_async16(base + b_dst[i], ok ? b_src[i] + kb + b_col[i] : t.b, ok);
+      }
+    }
+    const int ks = kt * C::kSfRow;
+    if constexpr (T::kASf) {
+#pragma unroll
+    for (int i = 0; i < kASfIt; ++i) {
+      const int rr = tid + i * kThreads;
+      if (rr < BM) {
+        const bool ok = asf_src[i] != nullptr && ks < k_sf;
+        if constexpr (C::kSfWordMajor) {
+          mma::cp_async_small<4>(base + C::kASfOff + C::template sf_off<BM>(rr, 0), ok ? asf_src[i] + ks : t.b, ok);
+          mma::cp_async_small<4>(base + C::kASfOff + C::template sf_off<BM>(rr, 1), ok ? asf_src[i] + ks + 4 : t.b, ok);
+        } else {
+          const uint32_t dst = base + C::kASfOff + C::template sf_off<BM>(rr, 0);
+          if constexpr (C::kSfRow == 16) mma::cp_async16(dst, ok ? asf_src[i] + ks : t.b, ok);
+          else mma::cp_async_small<C::kSfRow>(dst, ok ? asf_src[i] + ks : t.b, ok);
+        }
+      }
+    }
+    }
+    if constexpr (T::kBSf) {
+#pragma unroll
+    for (int i = 0; i < kBSfIt; ++i) {
+      const int rr = tid + i * kThreads;
+      if (rr < BN) {
+        const bool ok = bsf_src[i] != nullptr && ks < k_sf;
+        if constexpr (C::kSfWordMajor) {
+          mma::cp_async_small<4>(base + C::kBSfOff + C::template sf_off<BN>(rr, 0), ok ? bsf_src[i] + ks : t.b, ok);
+          mma::cp_async_small<4>(base + C::kBSfOff + C::template sf_off<BN>(rr, 1), ok ? bsf_src[i] + ks + 4 : t.b, ok);
+        } else {
+          const uint32_t dst = base + C::kBSfOff + C::template sf_off<BN>(rr, 0);
+          if constexpr (C::kSfRow == 16) mma::cp_async16(dst, ok ? bsf_src[i] + ks : t.b, ok);
+          else mma::cp_async_small<C::kSfRow>(dst, ok ? bsf_src[i] + ks : t.b, ok);
+        }
+      }
+    }
+    }
+  };
+
+  Acc acc[kMT][kNT][4];
+#pragma unroll
+  for (int i = 0; i < kMT; ++i)
+#pragma unroll
+    for (int j = 0; j < kNT; ++j)
+#pragma unroll
+      for (int v = 0; v < 4; ++v) acc[i][j][v] = Acc(0);
+
+  const int row0 = wm * C::kWTM, col0 = wn * C::kWTN;
+
+  // ---- fragments: loaded from shared memory one k-step ahead of the MMAs that use them ----
+  // A k-step is 32 bytes of A per row (ldmatrix kinds, W4A8) or 64 (bf16 x expanded weight).
+  constexpr int KS = T::kLdm || kKind == kW4A8 ? C::kARow / 32 : C::kARow / 64;
+  struct Frag {
+    uint32_t a[kMT][2][4];  // A fragments; [1] is the bf16 kinds' second MMA of the step
+    uint32_t b[kNT][2];     // B registers (ldmatrix kinds), or the raw NVFP4 word and its scale word
+    uint2 bw[kNT];          // raw 8-bit weights (W8A16)
+    uint32_t s1[kNT];       // W4A8: the scale word of the thread's second result column
+    uint32_t sfa[(kMT + 1) / 2], sfb[(kNT + 3) / 4];  // FP4 scale registers
+  };
+  const int a_r = (lane & 7) + ((lane >> 3) & 1) * 8, a_c = lane >> 4;  // ldmatrix lanes, A
+  const int b_r = (lane & 7) + (lane >> 4) * 8, b_c = (lane >> 3) & 1;  // ldmatrix lanes, B (two n8 tiles)
+  const int fr = lane >> 2, fq = lane & 3;
+
+  auto load_frags = [&](Frag& f, uint32_t base, int ks) {
+    const uint32_t sA = base + C::kAOff, sB = base + C::kBOff;
+    if constexpr (T::kLdm) {
+#pragma unroll
+      for (int mt = 0; mt < kMT; ++mt)
+        mma::ldmatrix_x4(f.a[mt][0], sA + swz<C::kARow, 0>(row0 + mt * 16 + a_r, 2 * ks + a_c));
+#pragma unroll
+      for (int p = 0; p < kNT / 2; ++p) {
+        uint32_t r[4];
+        mma::ldmatrix_x4(r, sB + swz<C::kBRow, 0>(col0 + p * 16 + b_r, 2 * ks + b_c));
+        f.b[2 * p][0] = r[0];
+        f.b[2 * p][1] = r[1];
+        f.b[2 * p + 1][0] = r[2];
+        f.b[2 * p + 1][1] = r[3];
+      }
+      if constexpr (kKind == kF4) {
+        // One scale register covers two m16 tiles (A) or four n8 tiles (B); see mma.cuh.
+#pragma unroll
+        for (int g = 0; g < (kMT + 1) / 2; ++g) {
+          int r = row0 + (2 * g + (fq >> 1)) * 16 + fr + 8 * (fq & 1);
+          r = r < BM ? r : BM - 1;
+          f.sfa[g] = mma::lds32(base + C::kASfOff + C::template sf_off<BM>(r, ks));
+        }
+#pragma unroll
+        for (int g = 0; g < (kNT + 3) / 4; ++g) {
+          int r = col0 + (4 * g + fq) * 8 + fr;
+          r = r < BN ? r : BN - 1;
+          f.sfb[g] = mma::lds32(base + C::kBSfOff + C::template sf_off<BN>(r, ks));
+        }
+      }
+    } else if constexpr (T::kABits == 16) {
+#pragma unroll
+      for (int mt = 0; mt < kMT; ++mt) {
+        const uint4 v = mma::lds128(sA + swz<128, 1>(row0 + mt * 16 + fr, 4 * ks + fq));
+        const uint4 u = mma::lds128(sA + swz<128, 1>(row0 + mt * 16 + fr + 8, 4 * ks + fq));
+        f.a[mt][0][0] = v.x; f.a[mt][0][1] = u.x; f.a[mt][0][2] = v.y; f.a[mt][0][3] = u.y;
+        f.a[mt][1][0] = v.z; f.a[mt][1][1] = u.z; f.a[mt][1][2] = v.w; f.a[mt][1][3] = u.w;
+      }
+#pragma unroll
+      for (int nt = 0; nt < kNT; ++nt) {
+        const int row = col0 + nt * 8 + fr;
+        if constexpr (kKind == kW4A16) {
+          f.b[nt][0] = mma::lds32(sB + swz<C::kBRow, C::kBPat>(row, ks) + 4 * fq);
+          f.b[nt][1] = mma::lds32(base + C::kBSfOff + C::template sf_off<BN>(row, 0));
+        } else {
+          f.bw[nt] = mma::lds64(sB + swz<C::kBRow, C::kBPat>(row, 2 * ks + (fq >> 1)) + 8 * (fq & 1));
+        }
+      }
+    } else {  // W4A8
+#pragma unroll
+      for (int mt = 0; mt < kMT; ++mt) {
+        const uint2 v = mma::lds64(sA + swz<128, 2>(row0 + mt * 16 + fr, 2 * ks + (fq >> 1)) + 8 * (fq & 1));
+        const uint2 u = mma::lds64(sA + swz<128, 2>(row0 + mt * 16 + fr + 8, 2 * ks + (fq >> 1)) + 8 * (fq & 1));
+        f.a[mt][0][0] = v.x; f.a[mt][0][1] = u.x; f.a[mt][0][2] = v.y; f.a[mt][0][3] = u.y;
+      }
+#pragma unroll
+      for (int nt = 0; nt < kNT; ++nt) {
+        const int row = col0 + nt * 8 + fr;
+        f.b[nt][0] = mma::lds32(sB + swz<C::kBRow, C::kBPat>(row, ks) + 4 * fq);
+        // the scale words of this thread's two result columns (bytes 2 ks, 2 ks + 1 are this step's blocks)
+        const int c0 = col0 + nt * 8 + 2 * fq;
+        f.b[nt][1] = mma::lds32(base + C::kBSfOff + C::template sf_off<BN>(c0, ks >> 1));
+        f.s1[nt] = mma::lds32(base + C::kBSfOff + C::template sf_off<BN>(c0 + 1, ks >> 1));
+      }
+    }
+  };
+
+  auto do_mma = [&](const Frag& f, int ks) {
+    if constexpr (kKind == kF4) {
+#pragma unroll
+      for (int mt = 0; mt < kMT; ++mt)
+#pragma unroll
+        for (int nt = 0; nt < kNT; ++nt) {
+          const uint32_t sa = f.sfa[mt / 2], sb = f.sfb[nt / 4];
+          const uint32_t(&a)[4] = f.a[mt][0];
+          if ((mt & 1) == 0) {
+            switch (nt & 3) {
+              case 0: mma::mma_nvf4<0, 0>(acc[mt][nt], a, f.b[nt][0], f.b[nt][1], sa, sb); break;
+              case 1: mma::mma_nvf4<0, 1>(acc[mt][nt], a, f.b[nt][0], f.b[nt][1], sa, sb); break;
+              case 2: mma::mma_nvf4<0, 2>(acc[mt][nt], a, f.b[nt][0], f.b[nt][1], sa, sb); break;
+              default: mma::mma_nvf4<0, 3>(acc[mt][nt], a, f.b[nt][0], f.b[nt][1], sa, sb); break;
+            }
+          } else {
+            switch (nt & 3) {
+              case 0: mma::mma_nvf4<1, 0>(acc[mt][nt], a, f.b[nt][0], f.b[nt][1], sa, sb); break;
+              case 1: mma::mma_nvf4<1, 1>(acc[mt][nt], a, f.b[nt][0], f.b[nt][1], sa, sb); break;
+              case 2: mma::mma_nvf4<1, 2>(acc[mt][nt], a, f.b[nt][0], f.b[nt][1], sa, sb); break;
+              default: mma::mma_nvf4<1, 3>(acc[mt][nt], a, f.b[nt][0], f.b[nt][1], sa, sb); break;
+            }
+          }
+        }
+    } else if constexpr (T::kLdm) {
+#pragma unroll
+      for (int mt = 0; mt < kMT; ++mt)
+#pragma unroll
+        for (int nt = 0; nt < kNT; ++nt) {
+          if constexpr (kKind == kBF16) mma::mma_bf16(acc[mt][nt], f.a[mt][0], f.b[nt][0], f.b[nt][1]);
+          else if constexpr (kKind == kI8) mma::mma_s8(acc[mt][nt], f.a[mt][0], f.b[nt][0], f.b[nt][1]);
+          else if constexpr (kArch >= 120) mma::mma_e4m3_mx(acc[mt][nt], f.a[mt][0], f.b[nt][0], f.b[nt][1]);
+          else mma::mma_e4m3(acc[mt][nt], f.a[mt][0], f.b[nt][0], f.b[nt][1]);
+        }
+    } else if constexpr (T::kABits == 16) {
+#pragma unroll
+      for (int nt = 0; nt < kNT; ++nt) {
+        uint32_t b[4];
+        if constexpr (kKind == kW4A16) {
+          const uint32_t s8 = (f.b[nt][1] >> (8 * (2 * ks + (fq >> 1)))) & 0xffu;
+          const float sf = mma::e4m3_to_f32(s8);
+          mma::e2m1x8_to_bf16(f.b[nt][0], mma::pack_bf16(sf, sf), b);
+        } else if constexpr (kKind == kW8I8) {
+          mma::i8x4_to_bf16(f.bw[nt].x, b[0], b[1]);
+          mma::i8x4_to_bf16(f.bw[nt].y, b[2], b[3]);
+        } else {
+          mma::e4m3x4_to_bf16<kArch>(f.bw[nt].x, b[0], b[1]);
+          mma::e4m3x4_to_bf16<kArch>(f.bw[nt].y, b[2], b[3]);
+        }
+#pragma unroll
+        for (int mt = 0; mt < kMT; ++mt) {
+          mma::mma_bf16(acc[mt][nt], f.a[mt][0], b[0], b[1]);
+          mma::mma_bf16(acc[mt][nt], f.a[mt][1], b[2], b[3]);
+        }
+      }
+    } else {  // W4A8: one MMA per 16-block of the step, the other block's B values zeroed
+      const bool lo = fq < 2;
+      const int sh = 16 * (ks & 1);
+#pragma unroll
+      for (int nt = 0; nt < kNT; ++nt) {
+        const uint32_t b0 = mma::e2m1x4_to_e4m3(f.b[nt][0]), b1 = mma::e2m1x4_to_e4m3(f.b[nt][0] >> 16);
+        const uint32_t sw0 = f.b[nt][1], sw1 = f.s1[nt];
+        const float s00 = mma::e4m3_to_f32((sw0 >> sh) & 0xffu), s01 = mma::e4m3_to_f32((sw0 >> (sh + 8)) & 0xffu);
+        const float s10 = mma::e4m3_to_f32((sw1 >> sh) & 0xffu), s11 = mma::e4m3_to_f32((sw1 >> (sh + 8)) & 0xffu);
+#pragma unroll
+        for (int mt = 0; mt < kMT; ++mt) {
+          float d0[4], d1[4];
+          mma::mma_e4m3_mx_zero(d0, f.a[mt][0], lo ? b0 : 0u, lo ? b1 : 0u);
+          mma::mma_e4m3_mx_zero(d1, f.a[mt][0], lo ? 0u : b0, lo ? 0u : b1);
+          acc[mt][nt][0] = fmaf(d1[0], s01, fmaf(d0[0], s00, acc[mt][nt][0]));
+          acc[mt][nt][1] = fmaf(d1[1], s11, fmaf(d0[1], s10, acc[mt][nt][1]));
+          acc[mt][nt][2] = fmaf(d1[2], s01, fmaf(d0[2], s00, acc[mt][nt][2]));
+          acc[mt][nt][3] = fmaf(d1[3], s11, fmaf(d0[3], s10, acc[mt][nt][3]));
+        }
+      }
+    }
+  };
+
+  // ---- the pipeline ----
+  // Tile kt + ST - 1 is issued while tile kt is consumed. The barrier for tile kt + 1 sits before the
+  // last k-step of tile kt, so its first fragments load while that step's MMAs run; the barrier also
+  // retires every read of the stage the next issue overwrites.
+#pragma unroll
+  for (int s = 0; s < ST - 1; ++s) {
+    if (s < KT) load_tile(s, s);
+    mma::cp_async_commit();
+  }
+  mma::cp_async_wait<ST - 2>();
+  __syncthreads();
+  int rs = 0, wst = ST - 1;
+  Frag f[2];
+  load_frags(f[0], s0, 0);
+  for (int kt = 0; kt < KT; ++kt) {
+#pragma unroll
+    for (int ks = 0; ks < KS; ++ks) {
+      if (ks == KS - 1) {
+        mma::cp_async_wait<ST - 2>();
+        __syncthreads();
+        rs = rs + 1 == ST ? 0 : rs + 1;
+      }
+      load_frags(f[(ks + 1) & 1], s0 + rs * C::kStage, (ks + 1) % KS);
+      if (ks == 0) {
+        if (kt + ST - 1 < KT) load_tile(wst, kt + ST - 1);
+        mma::cp_async_commit();
+        wst = wst + 1 == ST ? 0 : wst + 1;
+      }
+      do_mma(f[ks & 1], ks);
+    }
+  }
+  mma::cp_async_wait<0>();
+
+  const int r = fr, q = fq;
+  const float global = pp.b_global;
+  auto col_scale = [&](int tc) -> float {
+    if constexpr (T::kColScale) return tc < t.cols ? t.b_scale[Prob::b_row(pp, t, tc)] : 0.0f;
+    else return 1.0f;
+  };
+
+  if constexpr (kSplit > 1) {
+#if LX_SM90_DEVICE
+    // ---- split-K: partial tiles to shared memory, a rank-ordered sum over the cluster, the epilogue ----
+    __syncthreads();  // every warp is past its last fragment load: the stages can be reused
+    Acc* red = reinterpret_cast<Acc*>(smem);
+#pragma unroll
+    for (int mt = 0; mt < kMT; ++mt)
+#pragma unroll
+      for (int h = 0; h < 2; ++h)
+#pragma unroll
+        for (int nt = 0; nt < kNT; ++nt) {
+          Acc* d = red + (row0 + mt * 16 + r + 8 * h) * kRedLd + col0 + nt * 8 + 2 * q;
+          d[0] = acc[mt][nt][2 * h];
+          d[1] = acc[mt][nt][2 * h + 1];
+        }
+    lx::cluster_sync();
+    constexpr int kRows = BM / kSplit;
+    for (int idx = tid; idx < kRows * (BN / 2); idx += kThreads) {
+      const int tr = rank * kRows + idx / (BN / 2), tc = 2 * (idx % (BN / 2));
+      if (tr >= t.rows || tc >= t.cols) continue;
+      Acc sum0 = 0, sum1 = 0;
+#pragma unroll
+      for (int p = 0; p < kSplit; ++p) {
+        const Acc* peer = lx::cluster_peer(red, p) + tr * kRedLd + tc;
+        sum0 += peer[0];
+        sum1 += peer[1];
+      }
+      float rs = 1.0f;
+      if constexpr (T::kRowScale) rs = Prob::a_scale(pp, t, tr);
+      const float v0 = static_cast<float>(sum0) * row_col_scale<kKind>(rs, col_scale(tc), global);
+      const float v1 = static_cast<float>(sum1) * row_col_scale<kKind>(rs, col_scale(tc + 1), global);
+      Epi::store2(ep, t, Epi::row(ep, t, tr), tc, v0, v1);
+    }
+    lx::cluster_sync();  // no CTA leaves while a peer still reads its partial tile
+#endif
+  } else {
+    // ---- epilogue: per-kind scaling, then the policy ----
+    // Epi::row gives the policy's per-row context once (destination, routing weight); then each pair of
+    // columns goes to Epi::store2, or, for a gated policy, each gate pair with its up pair to
+    // Epi::store_gated: the Prob then interleaves the weight rows so that every even n8 tile holds gate
+    // columns and the odd tile after it the matching up columns (tile widths are multiples of 16).
+#pragma unroll
+    for (int mt = 0; mt < kMT; ++mt) {
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const int tr = row0 + mt * 16 + r + 8 * h;
+        if (tr >= t.rows) continue;
+        float rs = 1.0f;
+        if constexpr (T::kRowScale) rs = Prob::a_scale(pp, t, tr);
+        const typename Epi::Row row = Epi::row(ep, t, tr);
+        if constexpr (Epi::kGated) {
+          static_assert(kNT % 2 == 0, "gated epilogue: n8 tiles in pairs");
+#pragma unroll
+          for (int nt = 0; nt < kNT; nt += 2) {
+            const int tc = col0 + nt * 8 + 2 * q;
+            if (tc >= t.cols) continue;
+            const float g0 = static_cast<float>(acc[mt][nt][2 * h]) * row_col_scale<kKind>(rs, col_scale(tc), global);
+            const float g1 = static_cast<float>(acc[mt][nt][2 * h + 1]) * row_col_scale<kKind>(rs, col_scale(tc + 1), global);
+            const float u0 = static_cast<float>(acc[mt][nt + 1][2 * h]) * row_col_scale<kKind>(rs, col_scale(tc + 8), global);
+            const float u1 =
+                static_cast<float>(acc[mt][nt + 1][2 * h + 1]) * row_col_scale<kKind>(rs, col_scale(tc + 9), global);
+            Epi::store_gated(ep, t, row, tc, g0, g1, u0, u1);
+          }
+        } else {
+#pragma unroll
+          for (int nt = 0; nt < kNT; ++nt) {
+            const int tc = col0 + nt * 8 + 2 * q;
+            if (tc >= t.cols) continue;
+            const float v0 = static_cast<float>(acc[mt][nt][2 * h]) * row_col_scale<kKind>(rs, col_scale(tc), global);
+            const float v1 = static_cast<float>(acc[mt][nt][2 * h + 1]) * row_col_scale<kKind>(rs, col_scale(tc + 1), global);
+            Epi::store2(ep, t, row, tc, v0, v1);
+          }
+        }
+      }
+    }
+  }
+}
+
+}  // namespace lx::tc

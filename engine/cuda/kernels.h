@@ -261,13 +261,17 @@ LX_API int lx_rt_last_error(void);  // and clears it
 //               code). Values further than 15 binades below their block's base are listed in the
 //               row's patch slots as (k << 8 | exponent). Full layout: cuda/bf16x.cuh.
 // Stacked expert weights are [E, N, K] in the same format, every expert laid out as above, one
-// after the other (scales likewise [E, N] or [E, N, K / 16]; global is one value for the stack).
+// after the other (scales likewise [E, N] or [E, N, K / 16]). An NVFP4 stack's experts each have a
+// global scale in the checkpoint (weight_scale_2 is [E]); folding those into the e4m3 block scales
+// would round them twice, so the stack carries them: expert_global is [E] f32 on the device, and
+// null means every expert uses `global`. Consumers of a stack read the expert's own global.
 // For LX_W_BF16X a stack is simply E * N rows.
 typedef struct {
   lx_wtype type;
   const void* data;
-  const void* scale;  // f32 [N] for INT8 / FP8, e4m3 [N, K / 16] for NVFP4, null for BF16
-  float global;       // NVFP4 only (1 otherwise)
+  const void* scale;          // f32 [N] for INT8 / FP8, e4m3 [N, K / 16] for NVFP4, null for BF16
+  float global;               // NVFP4 only (1 otherwise)
+  const float* expert_global;  // NVFP4 stacks only: f32 [E] on the device, or null
 } lx_weight;
 
 // How a tensor-core product does its math. Weights are always read in their stored format; this
@@ -294,10 +298,28 @@ LX_API int lx_gemv_w(const void* x, lx_dtype x_dtype, int ld_x, const lx_weight*
 //   y[M, N] = alpha * (x[M, K] @ W[N, K]^T + bias[N]) + beta * y
 // x bf16 or f32 (quantized on the fly when math needs it, into `workspace`, at least
 // lx_gemm_workspace_bytes(M, K, math) bytes). Same dtype rules for bias and y as lx_gemm_bf16.
+// Deterministic: the same call gives the same bits (small products on sm_90+ may split K across a
+// thread block cluster; the partial sums are added in a fixed order).
 LX_API int lx_gemm_w(const void* x, lx_dtype x_dtype, int ld_x, const lx_weight* w, lx_math math, const void* bias,
                      lx_dtype bias_dtype, void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K, float alpha,
                      float beta, void* workspace, void* stream);
 LX_API int64_t lx_gemm_workspace_bytes(int M, int K, lx_math math);
+
+// Per-token activation quantization: the first step of lx_gemm_w and lx_moe_experts_grouped under the
+// low-precision maths, exposed so one quantization can serve several products of the same x.
+// x: [M, K] (x_dtype, row stride ld_x). Per row, with a = max_k |x[m, k]|:
+//   LX_MATH_INT8  q int8 [M, ld_q]: q = round_half_even(x * (127 / a)) clamped to [-127, 127];
+//                 scale[m] = a / 127
+//   LX_MATH_FP8   q e4m3 [M, ld_q]: q = e4m3(x * (448 / a)); scale[m] = a / 448
+//   LX_MATH_FP4   q [M, ld_q], two e2m1 per byte (low nibble = even k); block_scale e4m3 [M, ld_bs], one
+//                 per 16 k; scale[m] = g = a / (448 * 6). Block b with absmax a_b:
+//                 s_b = e4m3(a_b / (6 * g)), q = e2m1(x * (1 / (s_b * g))), and q = 0 where s_b = 0.
+//                 Requires K % 16 == 0.
+// Every rounding is to nearest, ties to even, saturating at the format's largest value; the products
+// and quotients are float32. A zero row gets scale 1 and q = 0. ld_q and ld_bs are in bytes;
+// block_scale is used for FP4 only.
+LX_API int lx_quantize_act(const void* x, lx_dtype x_dtype, int ld_x, lx_math math, void* q, int ld_q, float* scale,
+                           void* block_scale, int ld_bs, int M, int K, void* stream);
 
 // Routed experts on any weight format (contract of lx_moe_experts; gate_up [E, 2I, L],
 // down [E, L, I] as lx_weight stacks). Two implementations with one contract:
@@ -305,6 +327,9 @@ LX_API int64_t lx_gemm_workspace_bytes(int M, int K, lx_math math);
 //                          weight-only, f32 math. Workspace: lx_moe_decode_workspace_bytes.
 //   lx_moe_experts_grouped any T: tokens grouped by expert, a tensor-core grouped GEMM per
 //                          stage with the given math. Workspace: lx_moe_grouped_workspace_bytes.
+//                          The top_k weighted rows of a token are summed with f32 atomics, so the
+//                          last bits of out can differ between calls; LX_MOE_ORDERED=1 sums them in
+//                          a fixed order instead (3 to 25% slower at T >= 1024 on Praxis).
 LX_API int lx_moe_experts_decode(const void* latent, const int32_t* ids, const float* weights,
                                  const lx_weight* gate_up, const lx_weight* down, float* out, void* workspace, int T,
                                  int L, int I, int top_k, void* stream);

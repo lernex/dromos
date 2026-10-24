@@ -8,12 +8,31 @@
 // row: sum_k x * (v * s) = s * sum_k x * v.
 #pragma once
 
+#include <cuda_fp4.h>
+#include <cuda_fp8.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
 
 #include "cuda/kernels.h"
 
 namespace lx {
+
+// One e4m3 byte as f32, exact. For the scalar paths and the per-block scales, which are one
+// value per 16 weights; the word decoders below use the hardware conversion on pairs instead.
+// Bit trick: the byte's exponent and mantissa land in an f32 with the e4m3 exponent bias (7)
+// rebased to f32's (127), which is a multiply by 2^120; subnormals come out right too.
+__device__ __forceinline__ float e4m3_to_f32(uint8_t b) {
+  const float mag = __uint_as_float((static_cast<uint32_t>(b) & 0x7fu) << 20) * 0x1p120f;
+  return (b & 0x80u) ? -mag : mag;
+}
+
+// One e2m1 code (low 4 bits) as f32, exact. The same trick at f32 scale: the code's exponent and
+// mantissa sit at f32 bits 22..24, and a multiply by 2^126 rebases the bias (1) to f32's (127).
+__device__ __forceinline__ float e2m1_to_f32(uint32_t code) {
+  const float mag = __uint_as_float((code & 7u) << 22) * 0x1p126f;
+  return (code & 8u) ? -mag : mag;
+}
 
 template <int kType>
 struct WordFormat;
@@ -48,8 +67,92 @@ struct WordFormat<LX_W_INT8> {
   }
 };
 
-// LX_W_FP8 and LX_W_NVFP4 follow the same contract (the Formats workstream). For NVFP4 the caller
-// reads the word's e4m3 block scale (scale[n, k / 16]) and passes it as block_scale; row_factor is
-// the global.
+template <>
+struct WordFormat<LX_W_FP8> {
+  static constexpr int kValues = 8;
+  // Two e4m3 bytes per hardware conversion; the lower byte is the lower k, as in memory.
+  __device__ __forceinline__ static void decode(uint2 v, float block_scale, float* f) {
+    (void)block_scale;
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+      const uint32_t word = p < 2 ? v.x : v.y;
+      const uint16_t pair = static_cast<uint16_t>(word >> (16 * (p & 1)));
+      const float2 t = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(pair, __NV_E4M3)));
+      f[2 * p] = t.x;
+      f[2 * p + 1] = t.y;
+    }
+  }
+  __device__ __forceinline__ static float row_factor(const lx_weight& w, int64_t n) {
+    return static_cast<const float*>(w.scale)[n];
+  }
+};
+
+template <>
+struct WordFormat<LX_W_NVFP4> {
+  static constexpr int kValues = 16;
+  // Two e2m1 codes per byte, the low nibble holding the even k. The block scale (one e4m3 per 16
+  // k, which is this word) is passed in as f32; each value is e2m1 * block_scale.
+  __device__ __forceinline__ static void decode(uint2 v, float block_scale, float* f) {
+#pragma unroll
+    for (int p = 0; p < 8; ++p) {
+      const uint32_t word = p < 4 ? v.x : v.y;
+      const uint8_t byte = static_cast<uint8_t>(word >> (8 * (p & 3)));
+      const float2 t = __half22float2(__half2(__nv_cvt_fp4x2_to_halfraw2(byte, __NV_E2M1)));
+      f[2 * p] = t.x * block_scale;
+      f[2 * p + 1] = t.y * block_scale;
+    }
+  }
+  // The NVFP4 global of the matrix (or of the expert, for a stack that has per-expert globals).
+  __device__ __forceinline__ static float row_factor(const lx_weight& w, int64_t) { return w.global; }
+};
+
+// Element (n, k) of a weight as f32, without the row factor: the scalar path for short rows and
+// odd shapes. K is the row length in values (for NVFP4, a multiple of 16).
+template <int kType>
+__device__ __forceinline__ float element(const lx_weight& w, int64_t n, int64_t k, int64_t K);
+
+template <>
+__device__ __forceinline__ float element<LX_W_BF16>(const lx_weight& w, int64_t n, int64_t k, int64_t K) {
+  const uint16_t raw = static_cast<const uint16_t*>(w.data)[n * K + k];
+  return __uint_as_float(static_cast<uint32_t>(raw) << 16);
+}
+template <>
+__device__ __forceinline__ float element<LX_W_INT8>(const lx_weight& w, int64_t n, int64_t k, int64_t K) {
+  return static_cast<float>(static_cast<const int8_t*>(w.data)[n * K + k]);
+}
+template <>
+__device__ __forceinline__ float element<LX_W_FP8>(const lx_weight& w, int64_t n, int64_t k, int64_t K) {
+  return e4m3_to_f32(static_cast<const uint8_t*>(w.data)[n * K + k]);
+}
+template <>
+__device__ __forceinline__ float element<LX_W_NVFP4>(const lx_weight& w, int64_t n, int64_t k, int64_t K) {
+  const uint8_t byte = static_cast<const uint8_t*>(w.data)[n * (K / 2) + k / 2];
+  const uint32_t code = (k & 1) ? (byte >> 4) : (byte & 15u);
+  return e2m1_to_f32(code) * e4m3_to_f32(static_cast<const uint8_t*>(w.scale)[n * (K / 16) + k / 16]);
+}
+
+// The weight of expert `e` of a stack [E, N, K]: the same format, the expert's own slice and global.
+// Device only: an NVFP4 stack's expert_global lives on the device. The expert kernels call it per pair.
+__device__ __forceinline__ lx_weight expert_slice(const lx_weight& stack, int64_t e, int64_t N, int64_t K) {
+  lx_weight w = stack;
+  const int64_t rows = e * N;
+  switch (stack.type) {
+    case LX_W_BF16:
+      w.data = static_cast<const uint16_t*>(stack.data) + rows * K;
+      break;
+    case LX_W_INT8:
+    case LX_W_FP8:
+      w.data = static_cast<const uint8_t*>(stack.data) + rows * K;
+      w.scale = static_cast<const float*>(stack.scale) + rows;
+      break;
+    case LX_W_NVFP4:
+      w.data = static_cast<const uint8_t*>(stack.data) + rows * (K / 2);
+      w.scale = static_cast<const uint8_t*>(stack.scale) + rows * (K / 16);
+      w.global = stack.expert_global ? stack.expert_global[e] : stack.global;
+      w.expert_global = nullptr;
+      break;
+  }
+  return w;
+}
 
 }  // namespace lx
