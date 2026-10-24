@@ -183,3 +183,39 @@ def test_lx_gemv_wrapper_matches_gemv_w(lx):
             lx("gemv", x, DTYPE[x.dtype], K, w.data, 0, None, None, F32, a, F32, N, M, N, K, 1.0, 0.0)
         run_w(lx, x, w, None, b, 1.0, 0.0, M, N, K)
         assert torch.equal(a, b)
+
+
+@pytest.mark.parametrize("x_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("fmt", FMT_NAMES)
+def test_gemv_w_every_variant(lx, fmt, x_dtype):
+    # The autotuner may pin any built variant for a shape, so each one must compute the same product:
+    # row counts that leave partial row groups, a K whose last step is partial (1040 = 4 * 256 + 16,
+    # and 1296 = 5 * 256 + 16 in the M = 8 bucket, where both loop styles are built), splits with more
+    # parts than steps, and M below its bucket.
+    import ctypes
+
+    lib = lx.lib
+    lib.lx_tune_set.restype = None
+    lib.lx_tune_set.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+    lib.lx_tune_clear.restype = None
+    lib.lx_tune_clear.argtypes = []
+    lib.lx_tune_variants.restype = ctypes.c_int
+    lib.lx_tune_variants.argtypes = [ctypes.c_char_p]
+    kernel = f"gemv_w_{fmt}".encode()
+    variants = lib.lx_tune_variants(kernel)
+    assert variants > 0
+    try:
+        for M, N, K in [(1, 300, 1040), (3, 77, 2048), (8, 129, 1024), (5, 50, 1296), (2, 64, 528)]:
+            torch.manual_seed(M * 13 + N + K)
+            x = torch.randn(M, K, device="cuda").to(x_dtype)
+            w = random_weight(FORMATS[fmt], N, K, seed=N + K)
+            bias = torch.randn(N, device="cuda")
+            want = reference(x, w.dense, bias, 1.0, 0.0, None)
+            for v in range(variants):
+                lib.lx_tune_clear()
+                lib.lx_tune_set(kernel, M, N, K, v)
+                y = torch.full((M, N), float("nan"), device="cuda")
+                run_w(lx, x, w, bias, y, 1.0, 0.0, M, N, K)
+                check(y, want)
+    finally:
+        lib.lx_tune_clear()
