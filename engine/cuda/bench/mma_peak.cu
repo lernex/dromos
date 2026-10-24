@@ -2,7 +2,7 @@
 // measured against. Every warp runs independent chains of one instruction on register operands
 // (no memory traffic), enough of them to cover the pipeline latency.
 //
-//   nvcc -O3 -gencode arch=compute_120a,code=sm_120a bench/mma_peak.cu -o build/mma_peak && build/mma_peak
+//   nvcc -O3 -gencode arch=compute_120a,code=sm_120a engine/cuda/bench/mma_peak.cu -o build/mma_peak && build/mma_peak
 #include <cuda_runtime.h>
 
 #include <cstdint>

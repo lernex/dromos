@@ -8,7 +8,7 @@
 // Data is random: only speed is measured. A mode the library cannot run here prints "-".
 //
 // Build and run on the GPU server:
-//   nvcc -O2 -std=c++17 -gencode arch=compute_120a,code=sm_120a bench/cublaslt_lowp.cu -lcublasLt -o /tmp/lowp
+//   nvcc -O2 -std=c++17 -gencode arch=compute_120a,code=sm_120a engine/cuda/bench/cublaslt_lowp.cu -lcublasLt -o /tmp/lowp
 //   /tmp/lowp
 #include <cublasLt.h>
 #include <cuda_runtime.h>
