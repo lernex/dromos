@@ -313,6 +313,147 @@ LX_API int64_t lx_moe_grouped_workspace_bytes(int T, int L, int I, int E, int to
 // for a format the file is not stored in; checkpoints made with GPTQ are loaded as they are.
 LX_API int lx_quantize_weight(const void* w, lx_weight* out, int64_t rows, int cols, void* stream);
 
+// ---- Offload (offload.cu; the runtime half is engine/runtime/offload.h) ---------------------
+// A model larger than VRAM runs from every memory the machine has at once: the dense weights and
+// the experts the routing uses most in VRAM, every expert in pinned host memory (read by the GPU
+// across PCIe, or computed by the CPU straight from RAM), the coldest on NVMe when RAM runs out.
+// Decode steps stay inside one CUDA graph: the cache decisions are made on the GPU (lx_offload_plan),
+// misses are read across PCIe by the expert kernel itself and written into VRAM as they are read,
+// and the CPU's share is handed over through a mailbox in mapped host memory, so no step waits for
+// the host. Correctness never depends on where an expert is: every location holds the same bytes.
+
+// Pinned host memory the GPU reads and writes directly (zero-copy). `*device` is the address
+// kernels use for the block at `*host`.
+LX_API int lx_rt_host_alloc_mapped(void** host, void** device, int64_t bytes);
+// Pins (page-locks) and maps an existing host range; `*device` as above.
+LX_API int lx_rt_host_register(void* host, int64_t bytes, void** device);
+LX_API int lx_rt_host_unregister(void* host);
+// Work issued on `stream` after this call waits for `event` (recorded on another stream). Inside a
+// capture this forks and joins graph branches.
+LX_API int lx_rt_stream_wait(void* stream, void* event);
+// Free and total device memory, in bytes.
+LX_API int lx_rt_mem_info(int64_t* free_bytes, int64_t* total_bytes);
+
+// One expert's weights where they are now (VRAM, or pinned host memory through its mapped address),
+// in the layout of one entry of the expert stacks ("Weight formats"): gate_up [2I, L], down [L, I];
+// scales f32 [2I] / [L] for INT8 and FP8 (null for BF16). A null gate_up means "no expert here":
+// the pair is skipped (another device computes it). Destinations of a fill use the same struct.
+typedef struct {
+  const void* gate_up;
+  const void* gate_up_scale;
+  const void* down;
+  const void* down_scale;
+} lx_expert_ref;
+
+// Routed experts of a decode step, each pair p = t * top_k + k reading its expert through src[p]:
+//   out[t, :] = sum over k with src[p].gate_up != null of weights[p] * expert(src[p], latent[t, :])
+//   expert(x) = down @ bf16(silu(gate @ x) * (up @ x))           (the math of lx_moe_experts)
+// Weight-only, f32 accumulation, each output written once (no atomics). With fill non-null, a pair
+// whose fill[p].gate_up is non-null also writes the bytes it reads (weights and scales) to fill[p]:
+// an expert read across PCIe lands in its VRAM cache slot in the same pass. latent bf16 [T, L];
+// weights f32 [T, top_k]; src, fill [T * top_k] in device memory; out f32 [T, L]. type: LX_W_BF16,
+// LX_W_INT8 or LX_W_FP8. Requires L % 16 == 0 and I % 16 == 0, top_k <= 8.
+// Workspace: lx_offload_workspace_bytes(T, L, I, top_k).
+LX_API int lx_offload_experts(const void* latent, const float* weights, const lx_expert_ref* src,
+                              const lx_expert_ref* fill, lx_wtype type, float* out, void* workspace, int T, int L,
+                              int I, int top_k, void* stream);
+// The same contract for any T, with the pairs grouped by expert so each expert is read once: group g
+// applies groups[g] to the pairs pairs[offsets[g] .. offsets[g + 1]) (pair index t * top_k + k).
+// groups, offsets [G + 1], pairs in device memory. A layer's groups may come in several calls (the
+// experts staged into VRAM in batches): LX_OG_BEGIN on the first clears the per-pair partial sums in
+// the workspace, LX_OG_END on the last writes out; a pair no call covered contributes zero.
+#define LX_OG_BEGIN 1
+#define LX_OG_END 2
+LX_API int lx_offload_experts_grouped(const void* latent, const float* weights, const lx_expert_ref* groups,
+                                      const int32_t* offsets, const int32_t* pairs, int G, lx_wtype type, float* out,
+                                      void* workspace, int T, int L, int I, int top_k, int flags, void* stream);
+LX_API int64_t lx_offload_workspace_bytes(int T, int L, int I, int top_k);
+
+// Copies whole experts, src[i] -> dst[i] for i < *count (weights and scales; count in device memory,
+// at most max_count, so the launch is capturable). Prefetches use it with host sources.
+LX_API int lx_offload_copy(const lx_expert_ref* src, const lx_expert_ref* dst, const int32_t* count, int max_count,
+                           lx_wtype type, int L, int I, void* stream);
+
+// The CPU lane's mailbox, in mapped host memory. The GPU posts a job (its pairs, and the latent rows
+// in latent_rows) and rings the doorbell with the job's sequence number; the CPU writes
+// result[t, :] = sum over the job's pairs of token t of weight * expert(...) for every t < T (zeros
+// where a token has none), then sets done to the same number.
+#define LX_OFFLOAD_MAX_PAIRS 64
+typedef struct {
+  volatile uint32_t doorbell;
+  uint32_t pad0[15];
+  volatile uint32_t done;
+  uint32_t pad1[15];
+  int32_t layer, T, n;
+  int32_t token[LX_OFFLOAD_MAX_PAIRS], expert[LX_OFFLOAD_MAX_PAIRS];
+  float weight[LX_OFFLOAD_MAX_PAIRS];
+} lx_offload_mailbox;
+
+// Per-layer counters, uint64 each, in lx_offload_state.counters[layer * LX_OFFLOAD_COUNTERS + i].
+enum {
+  LX_OC_HITS = 0,        // pairs served from VRAM
+  LX_OC_GPU_MISSES,      // pairs the GPU read across PCIe
+  LX_OC_CPU_MISSES,      // pairs computed by the CPU
+  LX_OC_FILLS,           // misses written into a VRAM slot
+  LX_OC_PREFETCHES,      // experts copied ahead by lx_offload_prefetch
+  LX_OC_PREFETCH_HITS,   // pairs served from a slot a prefetch filled
+  LX_OC_CALLS,           // plan calls
+  LX_OFFLOAD_COUNTERS = 8
+};
+
+// The expert cache of one model, in device memory. The host fills it at load (and may rewrite it
+// between steps when it re-plans); during steps only the kernels below change it.
+typedef struct {
+  int n_layers, n_experts, top_k, L, I;
+  int type;              // lx_wtype of every expert
+  int32_t* vram_slot;    // [n_layers * n_experts]: VRAM pool slot, -1 when not in VRAM
+  int32_t* host_slot;    // [n_layers * n_experts]: host pool slot, -1 when only on disk (CPU lane only)
+  uint8_t* cpu_first;    // [n_layers * n_experts]: 1 for experts whose misses the CPU should take
+  // VRAM slots, grouped by layer: layer l owns [layer_first[l], layer_first[l + 1]); the first
+  // layer_pinned[l] of them hold experts placed at load that are never evicted.
+  int32_t* layer_first;  // [n_layers + 1]
+  int32_t* layer_pinned; // [n_layers]
+  int32_t* slot_expert;  // [slots]: the expert in each slot, -1 when empty
+  uint32_t* slot_stamp;  // [slots]: clock of the slot's last use (least recently used is evicted)
+  uint8_t* slot_prefetched;  // [slots]: 1 while a prefetched expert has not been used yet
+  uint32_t* clock;       // advanced by every plan
+  lx_expert_ref vram_pool, host_pool;  // slot 0 of each; slot s at + s * the strides below
+  int64_t gate_up_stride, gate_up_scale_stride, down_stride, down_scale_stride;  // bytes
+  int max_cpu_pairs;     // CPU pairs per plan call, 0 disables the CPU lane
+  float cpu_fraction;    // share of a step's misses the CPU takes (cold experts first)
+  int fill;              // write the GPU's misses into VRAM slots as they are read
+  lx_offload_mailbox* mailbox;  // mapped host memory
+  void* cpu_latent;      // mapped host memory, bf16 [max T, L]
+  const float* cpu_result;  // mapped host memory, f32 [max T, L]
+  uint32_t* job_seq;     // the last job's sequence number
+  int32_t* job_pending;  // set by plan when it posted a job, cleared by join
+  int32_t* error;        // nonzero after a join timed out (the step's output is wrong)
+  unsigned long long* counters;  // [n_layers * LX_OFFLOAD_COUNTERS]
+} lx_offload_state;
+
+// Decides where every pair of one MoE layer's decode step is computed, from ids [T, top_k] (the
+// routing) and the cache in *state (device memory): a pair whose expert is in VRAM reads it there;
+// a miss is either read across PCIe by lx_offload_experts (written into the layer's least recently
+// used dynamic slot as it is read, when fill is on and a slot is free this step) or posted to the
+// CPU lane (cold experts first, up to the policy's share; experts that are only on disk always).
+// Writes src and fill [T * top_k] for lx_offload_experts. One warp; T * top_k <= LX_OFFLOAD_MAX_PAIRS.
+LX_API int lx_offload_plan(const int32_t* ids, const float* weights, const void* latent, int layer,
+                           lx_offload_state* state, lx_expert_ref* src, lx_expert_ref* fill, int T, void* stream);
+// Adds the CPU lane's result to out [T, L] once it is done (waits on the mailbox; returns at once
+// when the plan posted no job). After a timeout it sets state->error and adds nothing.
+LX_API int lx_offload_join(lx_offload_state* state, float* out, int T, int L, void* stream);
+// Prefetch for a layer about to run: for the first n experts of predicted [n] (any order) that are
+// not in VRAM and can come from host memory, claims the layer's least recently used dynamic slots
+// (never one the layer's pinned set or another prediction holds) and writes copy jobs (src host,
+// dst VRAM, *count) for lx_offload_copy. The cache tables point at the slots at once, so the plan
+// that follows must run after the copy (a graph join), which is how the engine launches it.
+LX_API int lx_offload_prefetch(const int32_t* predicted, int n, int layer, lx_offload_state* state,
+                               lx_expert_ref* src, lx_expert_ref* dst, int32_t* count, void* stream);
+
+// Reads `bytes` of (possibly host-mapped) memory with `blocks` blocks of 16-byte loads, xor-folding
+// them into *sink: the probe for the GPU's zero-copy read bandwidth.
+LX_API int lx_offload_read_probe(const void* src, int64_t bytes, unsigned long long* sink, int blocks, void* stream);
+
 #ifdef __cplusplus
 }
 #endif

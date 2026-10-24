@@ -2,6 +2,8 @@
 
 #include <cmath>
 #include <algorithm>
+#include <cstdio>
+#include <vector>
 #include <cstdlib>
 #include <map>
 #include <set>
@@ -11,6 +13,7 @@
 
 #include "cuda/kernels.h"
 #include "model/glue.h"
+#include "runtime/offload.h"
 
 namespace lx {
 namespace {
@@ -127,6 +130,8 @@ struct MetisModel::Impl {
   void* cast_bf = nullptr;  // bf16 copy of an f32 input for a cuBLASLt product
   size_t cast_capacity = 0;
   void* moe_workspace = nullptr;
+  offload::ExpertOffload* offload = nullptr;  // the routed experts, when they run offloaded
+  FILE* route_trace = nullptr;                // LX_ROUTE_TRACE: every layer's routing, for the placement stats
   std::string w8_keep;  // LX_W8_KEEP: comma-separated name fragments that stay bf16 for decode
   void *streams_bf, *retrieved_bf, *feat_in_bf, *h_bf, *normed_bf, *lora_bf, *att_bf, *latent_bf, *shared_bf,
       *routed_bf, *entry_bf, *meta_bf, *out_bf;
@@ -140,6 +145,7 @@ struct MetisModel::Impl {
     return static_cast<T*>(p);
   }
   ~Impl() {
+    if (route_trace) std::fclose(route_trace);
     for (auto& [key, exec] : graphs) cudaGraphExecDestroy(exec);
     if (meta_copied) cudaEventDestroy(meta_copied);
     if (h_meta) cudaFreeHost(h_meta);
@@ -251,9 +257,14 @@ float* connection_params(Impl& m, const WeightLookup& lookup, const std::string&
 }  // namespace
 
 MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slots, int kv_capacity,
-                       int max_tokens)
+                       int max_tokens, offload::ExpertOffload* experts)
     : cfg_(c), slot_len_(max_slots, 0), impl_(new Impl) {
   Impl& m = *impl_;
+  m.offload = experts;
+  if (const char* trace = std::getenv("LX_ROUTE_TRACE")) {
+    m.route_trace = std::fopen(trace, "wb");
+    if (!m.route_trace) throw std::runtime_error(std::string("cannot open ") + trace);
+  }
   m.S = c.n_streams;
   m.D = c.hidden_size;
   m.L_layers = c.num_hidden_layers;
@@ -342,11 +353,13 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
     layer.latent_down = make_linear(m, lw, e + "latent_down.weight", "", Lat, D, true);
     layer.latent_up = make_linear(m, lw, e + "latent_up.weight", "", D, Lat, true);
     layer.expert_emb = need(lw, e + "expert_embeddings", LX_BF16, {E, R});
-    layer.gate_up = need(lw, e + "local_experts.gate_up.weight", LX_BF16, {E, 2 * m.Iexp, Lat});
-    layer.down = need(lw, e + "local_experts.down.weight", LX_BF16, {E, Lat, m.Iexp});
+    if (!m.offload) {
+      layer.gate_up = need(lw, e + "local_experts.gate_up.weight", LX_BF16, {E, 2 * m.Iexp, Lat});
+      layer.down = need(lw, e + "local_experts.down.weight", LX_BF16, {E, Lat, m.Iexp});
+    }
     layer.shared_gate_up = make_linear(m, lw, e + "shared_expert.gate_up.weight", "", 2 * m.Ishared, Lat, true);
     layer.shared_down = make_linear(m, lw, e + "shared_expert.down.weight", "", Lat, m.Ishared, true);
-    if (!kept_bf16(m, e + "local_experts.gate_up.weight")) {
+    if (!m.offload && !kept_bf16(m, e + "local_experts.gate_up.weight")) {
       const int64_t gu_rows = static_cast<int64_t>(E) * 2 * m.Iexp, dn_rows = static_cast<int64_t>(E) * Lat;
       layer.gate_up_q = m.alloc<int8_t>(gu_rows * Lat);
       layer.gate_up_scale = m.alloc<float>(gu_rows);
@@ -443,7 +456,7 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
   m.d_start_pos = m.d_has_state + max_slots;
   check(static_cast<int>(cudaMallocHost(&m.h_meta, m.meta_count * 4)), "cudaMallocHost");
   check(static_cast<int>(cudaEventCreateWithFlags(&m.meta_copied, cudaEventDisableTiming)), "cudaEventCreate");
-  m.use_graphs = std::getenv("LX_NO_GRAPHS") == nullptr;
+  m.use_graphs = std::getenv("LX_NO_GRAPHS") == nullptr && !m.route_trace;
 }
 
 MetisModel::~MetisModel() { delete impl_; }
@@ -561,7 +574,8 @@ void MetisModel::forward(const StepBatch& b, float* logits, bool all_rows, cudaS
   cudaMemcpyAsync(m.d_meta, m.h_meta, m.meta_count * 4, cudaMemcpyHostToDevice, s);
   cudaEventRecord(m.meta_copied, s);
 
-  const bool decode = T == n_seq;
+  // Offloaded steps larger than a decode stage their experts from the host, which is not capturable.
+  const bool decode = T == n_seq && !(m.offload && T > Impl::kGemvRows);
   const Impl::GraphKey key{T, n_seq, all_rows, logits};
   if (m.use_graphs && decode) {
     auto it = m.graphs.find(key);
@@ -651,7 +665,21 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, cudaStream_
       LX_CHECK(lx_gemm_f32(m.router_in, Lat + R, layer.router_w, layer.router_b, m.router_logits, E, T, E, Lat + R, s));
       LX_CHECK(lx_moe_route(m.router_logits, layer.selection_bias, m.route_ids, m.route_w, m.entropy, m.confidence, T,
                             E, m.K, s));
-      if (T <= Impl::kGemvRows && layer.gate_up_q)
+      if (m.route_trace) {  // pass, layer, T, then T * K expert ids (int32)
+        std::vector<int32_t> ids(static_cast<size_t>(T) * m.K);
+        check(static_cast<int>(cudaMemcpyAsync(ids.data(), m.route_ids, ids.size() * 4, cudaMemcpyDeviceToHost, s)),
+              "cudaMemcpyAsync");
+        check(static_cast<int>(cudaStreamSynchronize(s)), "cudaStreamSynchronize");
+        const int32_t head[3] = {pass, i, T};
+        std::fwrite(head, 4, 3, m.route_trace);
+        std::fwrite(ids.data(), 4, ids.size(), m.route_trace);
+      }
+      if (m.offload) {
+        if (T <= Impl::kGemvRows)
+          m.offload->decode(i, m.route_ids, m.route_w, m.latent_bf, m.routed, T, s);
+        else
+          m.offload->prefill(i, m.route_ids, m.route_w, m.latent_bf, m.routed, T, s);
+      } else if (T <= Impl::kGemvRows && layer.gate_up_q)
         LX_CHECK(lx_moe_experts_w8(m.latent_bf, m.route_ids, m.route_w, layer.gate_up_q, layer.gate_up_scale,
                                    layer.down_q, layer.down_scale, m.routed, m.moe_workspace, T, Lat, m.Iexp, m.K, s));
       else
