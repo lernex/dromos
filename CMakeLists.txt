@@ -31,12 +31,28 @@ file(GLOB LX_CORE_SOURCES CONFIGURE_DEPENDS engine/core/*.cpp engine/model/*.cpp
      engine/runtime/*.cu engine/text/*.cpp engine/server/*.cpp)
 if(LX_CORE_SOURCES)
   add_library(lernex_core STATIC ${LX_CORE_SOURCES})
-  target_include_directories(lernex_core PUBLIC engine third_party)
+  target_include_directories(lernex_core PUBLIC engine third_party third_party/httplib)
   target_link_libraries(lernex_core PUBLIC lernex_kernels)
 endif()
 
 file(GLOB LX_CLI_SOURCES CONFIGURE_DEPENDS cli/*.cpp)
 if(LX_CLI_SOURCES AND TARGET lernex_core)
   add_executable(lernex ${LX_CLI_SOURCES})
+  target_include_directories(lernex PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(lernex PRIVATE lernex_core)
+endif()
+
+# The C++ unit tests (doctest): host-side policy, parsing and protocol code, run on the server.
+file(GLOB LX_TEST_SOURCES CONFIGURE_DEPENDS tests/cpp/*.cpp)
+if(LX_TEST_SOURCES AND TARGET lernex_core)
+  add_executable(lernex_tests ${LX_TEST_SOURCES})
+  target_include_directories(lernex_tests PRIVATE engine third_party)
+  target_link_libraries(lernex_tests PRIVATE lernex_core)
+endif()
+
+# GPU checks: the engine end to end on a real model (run by hand on the server, see tests/gpu).
+file(GLOB LX_GPU_CHECK_SOURCES CONFIGURE_DEPENDS tests/gpu/*.cpp)
+if(LX_GPU_CHECK_SOURCES AND TARGET lernex_core)
+  add_executable(lernex_gpu_check ${LX_GPU_CHECK_SOURCES})
+  target_link_libraries(lernex_gpu_check PRIVATE lernex_core)
 endif()
