@@ -1,0 +1,122 @@
+diff --git a/engine/model/metis.cpp b/engine/model/metis.cpp
+index b608a65..6725fb7 100644
+--- a/engine/model/metis.cpp
++++ b/engine/model/metis.cpp
+@@ -252,7 +252,8 @@ float* connection_params(Impl& m, const WeightLookup& lookup, const std::string&
+ 
+ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slots, int kv_capacity,
+                        int max_tokens)
+-    : cfg_(c), slot_len_(max_slots, 0), impl_(new Impl) {
++try
++    : cfg_(c), impl_(new Impl), slot_len_(max_slots, 0) {
+   Impl& m = *impl_;
+   m.S = c.n_streams;
+   m.D = c.hidden_size;
+@@ -444,6 +445,11 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
+   check(static_cast<int>(cudaMallocHost(&m.h_meta, m.meta_count * 4)), "cudaMallocHost");
+   check(static_cast<int>(cudaEventCreateWithFlags(&m.meta_copied, cudaEventDisableTiming)), "cudaEventCreate");
+   m.use_graphs = std::getenv("LX_NO_GRAPHS") == nullptr;
++} catch (...) {
++  // A constructor that throws (a cudaMalloc that fails, say) never reaches the destructor, so the device
++  // memory this build took would stay allocated for the life of the process. Free it, then rethrow.
++  delete impl_;
++  throw;
+ }
+ 
+ MetisModel::~MetisModel() { delete impl_; }
+@@ -452,6 +458,65 @@ void MetisModel::reset_slot(int slot) { slot_len_.at(slot) = 0; }
+ 
+ namespace {
+ 
++// The snapshot's pieces for one slot, in layout order: `piece(device_ptr, bytes, is_kv)`.
++template <typename Fn>
++void each_piece(const Impl& m, int slot, int length, Fn&& piece) {
++  const size_t kv_row = static_cast<size_t>(m.KVH) * m.Dh;  // elements per position
++  for (int pass = 0; pass < m.P_passes; ++pass) {
++    for (int i = 0; i < m.L_layers; ++i) {
++      const int idx = pass * m.L_layers + i;
++      if (m.layers[i].attention) {
++        const size_t base = static_cast<size_t>(slot) * m.kv_capacity * kv_row;  // elements
++        const size_t bytes = sizeof(uint16_t) * static_cast<size_t>(length) * kv_row;
++        piece(static_cast<char*>(m.k_cache[idx]) + sizeof(uint16_t) * base, bytes, true);
++        piece(static_cast<char*>(m.v_cache[idx]) + sizeof(uint16_t) * base, bytes, true);
++      } else {
++        const size_t conv = static_cast<size_t>(m.W - 1) * m.conv_dim;
++        const size_t ssm = static_cast<size_t>(m.H) * m.Pd * m.N;
++        piece(m.conv_state[idx] + static_cast<size_t>(slot) * conv, sizeof(float) * conv, false);
++        piece(m.ssm_state[idx] + static_cast<size_t>(slot) * ssm, sizeof(float) * ssm, false);
++      }
++    }
++  }
++}
++
++}  // namespace
++
++size_t MetisModel::slot_state_bytes(int length) const {
++  const Impl& m = *impl_;
++  size_t total = 0;
++  each_piece(m, 0, length, [&total](const void*, size_t bytes, bool) { total += bytes; });
++  return total;
++}
++
++void MetisModel::save_slot(int slot, void* dst, int length, cudaStream_t stream) {
++  Impl& m = *impl_;
++  if (slot < 0 || slot >= m.max_slots || length < 0 || length > m.kv_capacity)
++    throw std::runtime_error("save_slot: slot or length out of range");
++  char* out = static_cast<char*>(dst);
++  size_t off = 0;
++  each_piece(m, slot, length, [&](const void* src, size_t bytes, bool) {
++    check(static_cast<int>(cudaMemcpyAsync(out + off, src, bytes, cudaMemcpyDefault, stream)), "cudaMemcpyAsync");
++    off += bytes;
++  });
++}
++
++void MetisModel::restore_slot(int slot, const void* src, int length, cudaStream_t stream) {
++  Impl& m = *impl_;
++  if (slot < 0 || slot >= m.max_slots || length < 0 || length > m.kv_capacity)
++    throw std::runtime_error("restore_slot: slot or length out of range");
++  const char* in = static_cast<const char*>(src);
++  size_t off = 0;
++  each_piece(m, slot, length, [&](const void* dst, size_t bytes, bool) {
++    check(static_cast<int>(cudaMemcpyAsync(const_cast<void*>(dst), in + off, bytes, cudaMemcpyDefault, stream)),
++          "cudaMemcpyAsync");
++    off += bytes;
++  });
++  slot_len_.at(slot) = length;
++}
++
++namespace {
++
+ // y = alpha * (x @ W^T + bias) + beta * y for M rows of x (f32 or bf16). Decode-sized products run
+ // as GEMVs on the int8 copy when there is one, reading x as it is; larger ones go to cuBLASLt on
+ // the bf16 weight, through a bf16 copy of x when x is f32.
+diff --git a/engine/model/metis.h b/engine/model/metis.h
+index 18f6f95..1b1cf42 100644
+--- a/engine/model/metis.h
++++ b/engine/model/metis.h
+@@ -39,6 +39,15 @@ class MetisModel {
+   void reset_slot(int slot);
+   int slot_length(int slot) const { return slot_len_[slot]; }
+ 
++  // A slot's complete state after its first `length` tokens, so a prefix can be restored without
++  // re-running it. The Mamba state is a recurrence and cannot be cut back, so a snapshot is only
++  // valid at the length it was taken. Layout, per (pass, layer): a Mamba layer's conv state then its
++  // SSM state; an attention layer's K then V for the first `length` positions. `dst` and `src` are
++  // device or pinned host memory; the copies run on `stream` in order with the model's steps.
++  size_t slot_state_bytes(int length) const;
++  void save_slot(int slot, void* dst, int length, cudaStream_t stream);
++  void restore_slot(int slot, const void* src, int length, cudaStream_t stream);  // the slot now holds `length`
++
+   // Runs one step. Writes f32 logits to `logits` (device): every token's row [T, V] when
+   // all_rows, otherwise each sequence's last row [n_seq, V].
+   void forward(const StepBatch& batch, float* logits, bool all_rows, cudaStream_t stream);
+@@ -53,8 +62,8 @@ class MetisModel {
+   void run(int T, int n_seq, bool all_rows, float* logits, cudaStream_t stream);
+ 
+   MetisConfig cfg_;
+-  std::vector<int> slot_len_;
+   Impl* impl_;
++  std::vector<int> slot_len_;
+ };
+ 
+ }  // namespace lx

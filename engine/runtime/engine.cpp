@@ -7,6 +7,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include <set>
@@ -17,7 +18,9 @@
 #include "core/safetensors.h"
 #include "cuda/kernels.h"
 #include "model/metis.h"
+#include "runtime/prefix_cache.h"
 #include "runtime/scheduler.h"
+#include "runtime/tool_grammar.h"
 
 namespace lx::runtime {
 namespace {
@@ -86,6 +89,7 @@ size_t held_suffix(const std::string& text, const std::vector<std::string>& stri
 struct Sequence {
   uint64_t id = 0;
   GenerateRequest request;
+  std::unique_ptr<ToolGrammar> grammar;               // when the request must call a tool
   RequestCallbacks callbacks;
   std::vector<int32_t> stop_ids;                       // the request's, plus the tokenizer's end ids
   std::unique_ptr<lx::text::Tokenizer::Stream> detok;  // null without a tokenizer
@@ -93,6 +97,7 @@ struct Sequence {
   std::string held;                                    // text that may begin a stop string
   int slot = -1;
   int prompt_fed = 0;
+  int cached = 0;                       // prompt tokens restored from the cache, not fed
   int generated = 0;
   bool has_pending = false;  // a sampled token waits to be fed
   int32_t pending = 0;
@@ -109,6 +114,7 @@ struct Engine::Impl {
         kv_capacity(plan.kv_capacity),
         max_step_tokens(plan.max_step_tokens),
         prefill_chunk(plan.prefill_chunk > 0 ? plan.prefill_chunk : plan.max_step_tokens),
+        grid(options.prefill_grid > 0 ? std::min(options.prefill_grid, plan.prefill_chunk > 0 ? plan.prefill_chunk : plan.max_step_tokens) : 0),
         max_queue(options.max_queue) {
     if (max_slots < 1 || kv_capacity < 2 || max_step_tokens < 1)
       throw std::invalid_argument("the plan leaves no room for a sequence");
@@ -120,6 +126,12 @@ struct Engine::Impl {
     const lx::SafetensorsSet set = lx::SafetensorsSet::open(dir);
     weights = std::make_unique<lx::Weights>(lx::Weights::upload(set));
     model = std::make_unique<lx::MetisModel>(config, lookup_for(*weights), max_slots, kv_capacity, max_step_tokens);
+#ifdef LX_SLOT_STATE
+    if (options.prefix_cache && plan.prefix_device_bytes + plan.prefix_host_bytes > 0)
+      cache = std::make_unique<PrefixCache>(plan.prefix_device_bytes, plan.prefix_host_bytes, stream);
+#else
+    (void)options.prefix_cache;
+#endif
 
     const size_t slots = static_cast<size_t>(max_slots);
     logits = DeviceBuffer(sizeof(float) * slots * V);
@@ -134,6 +146,16 @@ struct Engine::Impl {
     prompt_scratch = DeviceBuffer(sizeof(int32_t) * static_cast<size_t>(kv_capacity));
     check_cuda(cudaMemset(seen.data(), 0, seen.size()), "cudaMemset");
     check_cuda(cudaMemset(out_counts.data(), 0, out_counts.size()), "cudaMemset");
+
+    if (tokenizer) {
+      token_texts.resize(static_cast<size_t>(V));
+      for (int i = 0; i < V; ++i) token_texts[static_cast<size_t>(i)] = tokenizer->decode({i}, false);
+    }
+    mask_words = (static_cast<size_t>(V) + 31) / 32;
+    mask_rows = DeviceBuffer(sizeof(int32_t) * slots);
+    mask_bits = DeviceBuffer(sizeof(uint32_t) * slots * mask_words);
+    host_mask_rows = std::make_unique<PinnedArray<int32_t>>(slots);
+    host_mask_bits = std::make_unique<PinnedArray<uint32_t>>(slots * mask_words);
 
     host_params = std::make_unique<PinnedArray<lx_sampling>>(slots);
     host_tokens = std::make_unique<PinnedArray<int32_t>>(slots);
@@ -164,14 +186,23 @@ struct Engine::Impl {
   void retire(const std::shared_ptr<Sequence>& s);
   void fail_all(const std::string& reason);
   void publish_stats();
+  void restore_prefix(const std::shared_ptr<Sequence>& s);
+  void snapshot(const std::shared_ptr<Sequence>& s, int length, const std::vector<int32_t>& tokens);
 
   lx::MetisConfig config;
   std::unique_ptr<lx::Weights> weights;
   std::unique_ptr<lx::MetisModel> model;
+  std::unique_ptr<PrefixCache> cache;  // null when prefix reuse is off or the model lacks slot state
+  std::vector<std::string> token_texts;  // every token's text, for the tool grammar's masks
+  size_t mask_words = 0;                 // 32-bit words per token mask
+  DeviceBuffer mask_rows, mask_bits;     // device staging for the masks of one step
+  std::unique_ptr<PinnedArray<int32_t>> host_mask_rows;
+  std::unique_ptr<PinnedArray<uint32_t>> host_mask_bits;
   std::unique_ptr<lx::text::Tokenizer> tokenizer;
   cudaStream_t stream = nullptr;
   int V;
   int max_slots, kv_capacity, max_step_tokens, prefill_chunk;
+  int grid;  // the prefill grid, or 0
   size_t max_queue;
 
   DeviceBuffer logits, seen, out_counts, work, params, tokens, token_lp, top_ids, top_lp, prompt_scratch;
@@ -246,12 +277,16 @@ uint64_t Engine::submit(GenerateRequest request, RequestCallbacks callbacks) {
   request.max_tokens = std::min(request.max_tokens, m.kv_capacity - static_cast<int>(request.prompt.size()));
 
   auto seq = std::make_shared<Sequence>();
+  if (request.tool_grammar) {
+    if (!m.tokenizer) throw std::invalid_argument("a tool grammar needs a tokenizer, and this engine has none");
+    seq->grammar = std::make_unique<ToolGrammar>(*request.tool_grammar, request.thinking);
+  }
   seq->stop_ids = request.stop_ids;
   if (!request.ignore_eos && m.tokenizer)
     for (int32_t id : m.tokenizer->stop_ids()) seq->stop_ids.push_back(id);
   if (m.tokenizer) {
     seq->detok = m.tokenizer->stream(false);
-    seq->parser = std::make_unique<lx::text::OutputParser>(request.thinking);
+    seq->parser = std::make_unique<lx::text::OutputParser>(request.thinking, request.tools_json);
   }
   seq->request = std::move(request);
   seq->callbacks = std::move(callbacks);
@@ -336,6 +371,10 @@ void Engine::Impl::publish_stats() {
   std::lock_guard<std::mutex> lock(mu);
   stats.running = static_cast<int>(running.size());
   stats.waiting = static_cast<int>(waiting.size() + incoming.size());
+  if (cache) {
+    stats.prefix_device_bytes = cache->device_used();
+    stats.prefix_host_bytes = cache->host_used();
+  }
 }
 
 void Engine::Impl::admit() {
@@ -349,6 +388,7 @@ void Engine::Impl::admit() {
     s->slot = free_slots.back();
     free_slots.pop_back();
     model->reset_slot(s->slot);
+    restore_prefix(s);
     check_lx(lx_sampler_reset(static_cast<int32_t*>(seen.data()), static_cast<int32_t*>(out_counts.data()), s->slot,
                               V, stream),
              "lx_sampler_reset");
@@ -368,8 +408,9 @@ void Engine::Impl::step() {
   std::vector<SchedSeq> view;
   view.reserve(running.size());
   for (const auto& s : running)
-    view.push_back(SchedSeq{static_cast<int>(s->request.prompt.size()) - s->prompt_fed, s->has_pending});
-  const SchedPlan plan = plan_step(view, max_step_tokens, prefill_chunk, cursor);
+    view.push_back(SchedSeq{static_cast<int>(s->request.prompt.size()) - s->prompt_fed, s->has_pending,
+                            s->prompt_fed});
+  const SchedPlan plan = plan_step(view, max_step_tokens, prefill_chunk, cursor, grid);
   if (plan.entries.empty()) return;
 
   // Entry e is one sequence's tokens; its logits are row e of the model's output.
@@ -379,6 +420,7 @@ void Engine::Impl::step() {
   std::vector<std::shared_ptr<Sequence>> sampled;
   uint64_t prompt_tokens = 0;
   bool all_decode = true;
+  std::vector<std::shared_ptr<Sequence>> prompt_moved;  // sequences whose prompt advanced this step
   for (size_t e = 0; e < plan.entries.size(); ++e) {
     const std::shared_ptr<Sequence> s = running[plan.entries[e].seq];
     if (s->has_pending) {
@@ -393,6 +435,7 @@ void Engine::Impl::step() {
       for (int k = 0; k < n; ++k) batch.tokens.push_back(prompt[s->prompt_fed + k]);
       s->prompt_fed += n;
       prompt_tokens += static_cast<uint64_t>(n);
+      prompt_moved.push_back(s);
       if (s->prompt_fed == static_cast<int>(prompt.size())) {
         rows.push_back(static_cast<int>(e));
         sampled.push_back(s);
@@ -403,6 +446,9 @@ void Engine::Impl::step() {
   }
 
   model->forward(batch, static_cast<float*>(logits.data()), false, stream);
+  if (cache && grid > 0)
+    for (const auto& s : prompt_moved)
+      if (s->prompt_fed % grid == 0) snapshot(s, s->prompt_fed, s->request.prompt);  // queued before the next step
   {
     std::lock_guard<std::mutex> lock(mu);
     stats.steps += 1;
@@ -436,6 +482,31 @@ void Engine::Impl::sample(const std::vector<int>& rows, const std::vector<std::s
       want_lp = true;
       top_n = std::max(top_n, sp.top_logprobs);
     }
+  }
+  // constrained rows: the logits of the tokens their grammar rules out become -inf before sampling
+  int constrained = 0;
+  for (int j = 0; j < n; ++j) {
+    Sequence& s = *seqs[j];
+    if (!s.grammar) continue;
+    const std::vector<uint32_t>& bits = s.grammar->mask(token_texts, s.stop_ids);
+    bool any = false;
+    for (uint32_t w : bits) any = any || w != 0;
+    if (!any) throw std::runtime_error("the tool grammar allows no token in a reply");
+    host_mask_rows->data()[constrained] = rows[j];
+    std::memcpy(host_mask_bits->data() + static_cast<size_t>(constrained) * mask_words, bits.data(),
+                sizeof(uint32_t) * mask_words);
+    constrained += 1;
+  }
+  if (constrained > 0) {
+    check_cuda(cudaMemcpyAsync(mask_rows.data(), host_mask_rows->data(), sizeof(int32_t) * constrained,
+                               cudaMemcpyHostToDevice, stream),
+               "cudaMemcpyAsync");
+    check_cuda(cudaMemcpyAsync(mask_bits.data(), host_mask_bits->data(),
+                               sizeof(uint32_t) * constrained * mask_words, cudaMemcpyHostToDevice, stream),
+               "cudaMemcpyAsync");
+    check_lx(lx_mask_logits(static_cast<float*>(logits.data()), V, static_cast<const int32_t*>(mask_rows.data()),
+                            static_cast<const uint32_t*>(mask_bits.data()), constrained, stream),
+             "lx_mask_logits");
   }
   check_cuda(cudaMemcpyAsync(params.data(), host_params->data(), sizeof(lx_sampling) * n, cudaMemcpyHostToDevice, stream),
              "cudaMemcpyAsync");
@@ -479,6 +550,10 @@ bool Engine::Impl::accept(const std::shared_ptr<Sequence>& s, int32_t token, flo
   Sequence& q = *s;
   if (std::find(q.stop_ids.begin(), q.stop_ids.end(), token) != q.stop_ids.end()) {
     end(s, FinishReason::Stop, "", true);
+    return true;
+  }
+  if (q.grammar && !q.grammar->accept(token_texts[static_cast<size_t>(token)])) {
+    end(s, FinishReason::Error, "the tool grammar rejected a sampled token", false);
     return true;
   }
   q.generated += 1;
@@ -581,6 +656,44 @@ void Engine::Impl::end(const std::shared_ptr<Sequence>& s, FinishReason reason, 
     } catch (...) {
     }
   }
+}
+
+// A new sequence starts from the longest cached prefix of its prompt that leaves at least one prompt
+// token to feed (that step produces the logits the first token is sampled from).
+void Engine::Impl::restore_prefix(const std::shared_ptr<Sequence>& s) {
+  s->cached = 0;
+  s->prompt_fed = 0;
+#ifdef LX_SLOT_STATE
+  if (!cache) return;
+  PrefixCache::Hit hit;
+  const int limit = static_cast<int>(s->request.prompt.size()) - 1;
+  if (cache->find(s->request.prompt, limit, grid, hit)) {
+    model->restore_slot(s->slot, hit.data, hit.length, stream);
+    check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize");  // the snapshot may be evicted next
+    s->cached = hit.length;
+    s->prompt_fed = hit.length;
+    std::lock_guard<std::mutex> lock(mu);
+    stats.prefix_hits += 1;
+    stats.prefix_tokens_reused += static_cast<uint64_t>(hit.length);
+  }
+#endif
+}
+
+void Engine::Impl::snapshot(const std::shared_ptr<Sequence>& s, int length, const std::vector<int32_t>& tokens) {
+#ifdef LX_SLOT_STATE
+  const size_t bytes = model->slot_state_bytes(length);
+  const bool kept = cache->store(tokens, length, bytes, [&](void* dst) {
+    model->save_slot(s->slot, dst, length, stream);
+  });
+  if (kept) {
+    std::lock_guard<std::mutex> lock(mu);
+    stats.prefix_snapshots += 1;
+  }
+#else
+  (void)s;
+  (void)length;
+  (void)tokens;
+#endif
 }
 
 void Engine::Impl::retire(const std::shared_ptr<Sequence>& s) {

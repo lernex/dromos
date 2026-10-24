@@ -295,6 +295,8 @@ int cmd_run(int argc, char** argv) {
   std::string name;
   int context = 0;
   bool thinking = true;
+  bool prefix_cache = true;
+  double memory_fraction = 0.92;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto value = [&]() -> std::string {
@@ -306,6 +308,8 @@ int cmd_run(int argc, char** argv) {
       if (v != "on" && v != "off") throw std::runtime_error("--think takes on or off");
       thinking = v == "on";
     } else if (a == "--context") context = std::stoi(value());
+    else if (a == "--no-prefix-cache") prefix_cache = false;
+    else if (a == "--memory-fraction") memory_fraction = std::stod(value());
     else if (name.empty() && a[0] != '-') name = a;
     else throw std::runtime_error("unknown option " + a);
   }
@@ -315,9 +319,12 @@ int cmd_run(int argc, char** argv) {
   }
 
   const cli::Model model = cli::find_model(name, true);
-  const runtime::Plan plan = cli::plan_for(model, 1, context);
+  runtime::EngineOptions engine_options;
+  engine_options.prefix_cache = prefix_cache;
+  cli::StartedEngine started = cli::start_engine(model, 1, context, -1, engine_options, memory_fraction);
+  const runtime::Plan& plan = started.plan;
   for (const std::string& note : plan.notes) std::fprintf(stderr, "%s\n", note.c_str());
-  runtime::Engine engine(model.dir.string(), plan);
+  runtime::Engine& engine = *started.engine;
   if (!engine.tokenizer()) throw std::runtime_error("the model folder has no tokenizer");
 
   std::signal(SIGINT, on_interrupt);

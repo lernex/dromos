@@ -29,6 +29,7 @@ struct BenchArgs {
   int prompt_tokens = 512;
   int gen_tokens = 256;
   bool sample = false;
+  bool prefix_cache = true;  // --no-prefix-cache measures the cold path
 };
 
 std::vector<int> parse_list(const std::string& text) {
@@ -144,6 +145,7 @@ int cmd_bench(int argc, char** argv) {
     else if (a == "--prompt-tokens") args.prompt_tokens = std::stoi(value());
     else if (a == "--gen-tokens") args.gen_tokens = std::stoi(value());
     else if (a == "--sample") args.sample = true;
+    else if (a == "--no-prefix-cache") args.prefix_cache = false;
     else if (args.model.empty() && a[0] != '-') args.model = a;
     else throw std::runtime_error("unknown option " + a);
   }
@@ -156,10 +158,13 @@ int cmd_bench(int argc, char** argv) {
   const int max_streams = *std::max_element(args.streams.begin(), args.streams.end());
 
   const Model model = find_model(args.model, false);
-  const Plan plan = plan_for(model, max_streams, args.prompt_tokens + args.gen_tokens + 16);
   EngineOptions options;
   options.load_tokenizer = false;
-  Engine engine(model.dir.string(), plan, options);
+  options.prefix_cache = args.prefix_cache;
+  lx::cli::StartedEngine started =
+      lx::cli::start_engine(model, max_streams, args.prompt_tokens + args.gen_tokens + 16, -1, options);
+  const Plan& plan = started.plan;
+  Engine& engine = *started.engine;
 
   std::printf("%s  (%s)\n", args.model.c_str(), model.dir.c_str());
   for (const std::string& note : plan.notes) std::printf("  %s\n", note.c_str());

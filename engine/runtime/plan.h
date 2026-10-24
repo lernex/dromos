@@ -56,7 +56,7 @@ struct PlanRequest {
   int weights = -1;   // an lx_wtype, or -1 for automatic (the widest format that fits usefully)
   int context = 0;    // context each sequence is sized for, 0 for automatic
   int sequences = 0;  // concurrent sequences wanted, 0 for automatic
-  double memory_fraction = 0.92;
+  double memory_fraction = 0.92;  // of the free memory at startup; the rest is left for others
   // Offload (runtime/offload_plan.h): the GPU memory this process may use, 0 for the card
   // (LX_VRAM_BUDGET_GB), and the pinned RAM the offloaded experts may take, 0 for all of them
   // (LX_RAM_BUDGET_GB; the rest are read from the checkpoint on NVMe).
@@ -86,6 +86,8 @@ struct Plan {
   int max_step_tokens = 0;    // tokens in one step (decode rows and prefill rows together)
   int prefill_chunk = 0;      // prompt tokens a sequence takes per step while it is being prefilled
   size_t weight_bytes = 0, state_bytes = 0, kv_bytes = 0, scratch_bytes = 0, budget_bytes = 0;
+  size_t prefix_device_bytes = 0;  // prefix snapshots kept in device memory (what the model leaves over)
+  size_t prefix_host_bytes = 0;    // and in pinned host memory, when the device share is full
   double decode_ceiling_tps = 0;  // bandwidth / weight bytes: the most tokens per second one stream can make
   std::vector<std::string> notes;  // plain-language lines `lernex` prints (why this format, etc.)
 

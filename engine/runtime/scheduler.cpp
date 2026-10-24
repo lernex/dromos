@@ -4,7 +4,7 @@
 
 namespace lx::runtime {
 
-SchedPlan plan_step(const std::vector<SchedSeq>& seqs, int budget, int prefill_chunk, unsigned& cursor) {
+SchedPlan plan_step(const std::vector<SchedSeq>& seqs, int budget, int prefill_chunk, unsigned& cursor, int grid) {
   SchedPlan plan;
   const int n = static_cast<int>(seqs.size());
   if (n == 0 || budget <= 0) {
@@ -27,7 +27,14 @@ SchedPlan plan_step(const std::vector<SchedSeq>& seqs, int budget, int prefill_c
   const int chunk = std::max(1, prefill_chunk);
   for (int i = 0; i < n && left > 0; ++i) {
     if (seqs[i].decode_ready || seqs[i].prompt_left <= 0) continue;
-    const int take = std::min({chunk, seqs[i].prompt_left, left});
+    int take = std::min(chunk, seqs[i].prompt_left);
+    if (grid > 0) {
+      take = std::min(take, grid - seqs[i].prompt_pos % grid);  // stop at the next grid line
+      if (take > left) continue;                                 // the whole piece must fit
+    } else {
+      take = std::min(take, left);
+    }
+    if (take <= 0) continue;
     plan.entries.push_back({i, take});
     left -= take;
   }

@@ -221,6 +221,93 @@ def test_tool_round_trip(client):
     assert "18" in (second.choices[0].message.content or "")
 
 
+SHAPES = [
+    (
+        "get_weather",
+        {"type": "object", "properties": {"city": {"type": "string"}, "days": {"type": "integer"}}, "required": ["city"]},
+        {"city": str, "days": int},
+    ),
+    (
+        "set_mix",
+        {
+            "type": "object",
+            "properties": {
+                "ratio": {"type": "number"},
+                "ok": {"type": "boolean"},
+                "mode": {"type": "string", "enum": ["fast", "slow"]},
+            },
+            "required": ["ratio", "mode"],
+        },
+        {"ratio": (int, float), "ok": bool, "mode": str},
+    ),
+    (
+        "search",
+        {
+            "type": "object",
+            "properties": {"filters": {"type": "object"}, "tags": {"type": "array"}, "note": {"type": "null"}},
+            "required": ["filters"],
+        },
+        {"filters": dict, "tags": list, "note": type(None)},
+    ),
+]
+
+
+def check_args(name, args, shapes):
+    schema, types = next((s, t) for n, s, t in shapes if n == name)
+    for key in schema.get("required", []):
+        assert key in args, (name, key, args)
+    for key, value in args.items():
+        assert key in schema["properties"], (name, key)
+        assert isinstance(value, types[key]), (name, key, value)
+        if "enum" in schema["properties"][key]:
+            assert value in schema["properties"][key]["enum"]
+
+
+def test_tool_choice_required_always_parses_into_the_schema(client):
+    tools = [
+        {"type": "function", "function": {"name": n, "parameters": s}} for n, s, _ in SHAPES
+    ]
+    prompts = [
+        "Look up the weather in Oslo for three days.",
+        "Set the mix to a ratio of 0.25, enabled, in fast mode.",
+        "Search with a filter on price and tag the results.",
+    ]
+    for prompt in prompts:
+        for _ in range(2):
+            resp = client.chat.completions.create(
+                model="praxis",
+                messages=[{"role": "user", "content": prompt}],
+                tools=tools,
+                tool_choice="required",
+                max_tokens=600,
+                temperature=0.8,
+            )
+            assert resp.choices[0].finish_reason == "tool_calls"
+            calls = resp.choices[0].message.tool_calls
+            assert calls, resp
+            for call in calls:
+                check_args(call.function.name, json.loads(call.function.arguments), SHAPES)
+
+
+def test_tool_choice_named_calls_only_that_function(client):
+    tools = [
+        {"type": "function", "function": {"name": n, "parameters": s}} for n, s, _ in SHAPES
+    ]
+    chosen = "get_weather"
+    resp = client.chat.completions.create(
+        model="praxis",
+        messages=[{"role": "user", "content": "Set the mix to a ratio of 0.25, enabled, in fast mode."}],
+        tools=tools,
+        tool_choice={"type": "function", "function": {"name": chosen}},
+        max_tokens=600,
+        temperature=0.8,
+    )
+    calls = resp.choices[0].message.tool_calls
+    assert calls and all(c.function.name == chosen for c in calls)
+    for c in calls:
+        check_args(c.function.name, json.loads(c.function.arguments), SHAPES)
+
+
 def test_errors_are_clear(server):
     base, _ = server
     url = base + "/v1/chat/completions"

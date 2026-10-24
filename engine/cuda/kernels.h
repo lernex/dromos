@@ -575,6 +575,10 @@ LX_API int lx_offload_prefetch(const int32_t* predicted, int n, int layer, lx_of
 // them into *sink: the probe for the GPU's zero-copy read bandwidth.
 LX_API int lx_offload_read_probe(const void* src, int64_t bytes, unsigned long long* sink, int blocks, void* stream);
 
+// Constrained decoding: sets to -inf the logits that a token mask rules out. Entry j applies its
+// mask bits[j * ((V + 31) / 32) ...] (one bit per token) to logits row rows[j] ([rows, V] f32).
+LX_API int lx_mask_logits(float* logits, int V, const int32_t* rows, const uint32_t* bits, int n, void* stream);
+
 #ifdef __cplusplus
 }
 #endif
