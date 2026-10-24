@@ -476,8 +476,16 @@ __device__ __forceinline__ void gemm_body(const typename Prob::Params& pp, const
   mma::cp_async_wait<0>();
 
   // ---- epilogue: per-kind scaling, then the policy ----
+  // Epi::row gives the policy's per-row context once (destination, routing weight); then each pair of
+  // columns goes to Epi::store2, or, for a gated policy, each gate pair with its up pair to
+  // Epi::store_gated: the Prob then interleaves the weight rows so that every even n8 tile holds gate
+  // columns and the odd tile after it the matching up columns (tile widths are multiples of 16).
   const int r = fr, q = fq;
   const float global = pp.b_global;
+  auto col_scale = [&](int tc) -> float {
+    if constexpr (T::kColScale) return tc < t.cols ? t.b_scale[Prob::b_row(pp, t, tc)] : 0.0f;
+    else return 1.0f;
+  };
 #pragma unroll
   for (int mt = 0; mt < kMT; ++mt) {
 #pragma unroll
@@ -486,18 +494,29 @@ __device__ __forceinline__ void gemm_body(const typename Prob::Params& pp, const
       if (tr >= t.rows) continue;
       float rs = 1.0f;
       if constexpr (T::kRowScale) rs = Prob::a_scale(pp, t, tr);
+      const typename Epi::Row row = Epi::row(ep, t, tr);
+      if constexpr (Epi::kGated) {
+        static_assert(kNT % 2 == 0, "gated epilogue: n8 tiles in pairs");
 #pragma unroll
-      for (int nt = 0; nt < kNT; ++nt) {
-        const int tc = col0 + nt * 8 + 2 * q;
-        if (tc >= t.cols) continue;
-        float cs0 = 1.0f, cs1 = 1.0f;
-        if constexpr (T::kColScale) {
-          cs0 = t.b_scale[Prob::b_row(pp, t, tc)];
-          cs1 = tc + 1 < t.cols ? t.b_scale[Prob::b_row(pp, t, tc + 1)] : 0.0f;
+        for (int nt = 0; nt < kNT; nt += 2) {
+          const int tc = col0 + nt * 8 + 2 * q;
+          if (tc >= t.cols) continue;
+          const float g0 = static_cast<float>(acc[mt][nt][2 * h]) * row_col_scale<kKind>(rs, col_scale(tc), global);
+          const float g1 = static_cast<float>(acc[mt][nt][2 * h + 1]) * row_col_scale<kKind>(rs, col_scale(tc + 1), global);
+          const float u0 = static_cast<float>(acc[mt][nt + 1][2 * h]) * row_col_scale<kKind>(rs, col_scale(tc + 8), global);
+          const float u1 =
+              static_cast<float>(acc[mt][nt + 1][2 * h + 1]) * row_col_scale<kKind>(rs, col_scale(tc + 9), global);
+          Epi::store_gated(ep, t, row, tc, g0, g1, u0, u1);
         }
-        const float v0 = static_cast<float>(acc[mt][nt][2 * h]) * row_col_scale<kKind>(rs, cs0, global);
-        const float v1 = static_cast<float>(acc[mt][nt][2 * h + 1]) * row_col_scale<kKind>(rs, cs1, global);
-        Epi::store2(ep, t, tr, tc, v0, v1);
+      } else {
+#pragma unroll
+        for (int nt = 0; nt < kNT; ++nt) {
+          const int tc = col0 + nt * 8 + 2 * q;
+          if (tc >= t.cols) continue;
+          const float v0 = static_cast<float>(acc[mt][nt][2 * h]) * row_col_scale<kKind>(rs, col_scale(tc), global);
+          const float v1 = static_cast<float>(acc[mt][nt][2 * h + 1]) * row_col_scale<kKind>(rs, col_scale(tc + 1), global);
+          Epi::store2(ep, t, row, tc, v0, v1);
+        }
       }
     }
   }

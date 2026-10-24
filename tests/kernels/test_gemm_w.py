@@ -150,11 +150,11 @@ def test_gemm_w_epilogue(lx, name, wtype, math, oldest, x_dtype, y_dtype, alpha,
 def test_gemm_w_tuned_variants(lx):
     # Every registered tile variant of every family gives the same answer when the tuner picks it. The
     # bf16 family runs with an f32 bias (a bf16 bias goes to cuBLASLt).
-    names = (ctypes.c_char_p * 64)()
+    names = (ctypes.c_char_p * 256)()
     lx.lib.lx_tune_kernels.restype = ctypes.c_int
-    count = lx.lib.lx_tune_kernels(names, 64)
+    count = lx.lib.lx_tune_kernels(names, 256)
     lx.lib.lx_tune_variant_name.restype = ctypes.c_char_p
-    families = [names[i].decode() for i in range(min(count, 64)) if names[i].decode().startswith("gemm_w.")]
+    families = [names[i].decode() for i in range(min(count, 256)) if names[i].decode().startswith("gemm_w.")]
     assert families, "gemm_w registered no variants"
     by_kind = {"bf16": PAIRS[0], "w8i8": PAIRS[1], "w8f8": PAIRS[2], "w4a16": PAIRS[3], "i8": PAIRS[4], "f8": PAIRS[5],
                "w4a8": PAIRS[6], "f4": PAIRS[7]}

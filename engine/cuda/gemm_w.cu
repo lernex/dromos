@@ -31,10 +31,16 @@
 namespace {
 
 using namespace lx::tc;
+using lx::gemmw::act_layout;
+using lx::gemmw::act_math;
+using lx::gemmw::ActLayout;
 using lx::gemmw::DenseEpi;
 using lx::gemmw::DenseProb;
 using lx::gemmw::Family;
+using lx::gemmw::k_ok;
+using lx::gemmw::kind_for;
 using lx::gemmw::Variant;
+using lx::gemmw::weight_bits;
 
 template <int kKind, int kArch>
 struct Registered {
@@ -87,37 +93,6 @@ int run_family(const DenseProb::Params& pp, const DenseEpi::Params& ep, cudaStre
   return v[pick].fn(pp, ep, s);
 }
 
-// ---- workspace layout -----------------------------------------------------------------------------
-
-constexpr int64_t round_up(int64_t v, int64_t a) { return (v + a - 1) / a * a; }
-
-struct ActLayout {
-  int64_t ld_q = 0, ld_bs = 0;            // bytes per row of the quantized values / block scales
-  int64_t q_off = 0, scale_off = 0, bs_off = 0, total = 0;
-};
-
-ActLayout act_layout(int M, int K, lx_math math) {
-  ActLayout l;
-  switch (math) {
-    case LX_MATH_BF16:
-      l.ld_q = round_up(static_cast<int64_t>(K) * 2, 16);
-      break;
-    case LX_MATH_INT8:
-    case LX_MATH_FP8:
-      l.ld_q = round_up(K, 16);
-      break;
-    case LX_MATH_FP4:
-      l.ld_q = round_up((K + 1) / 2, 16);
-      l.ld_bs = round_up((K + 15) / 16, 16);
-      break;
-  }
-  l.q_off = 0;
-  l.scale_off = round_up(l.q_off + l.ld_q * M, 256);
-  l.bs_off = round_up(l.scale_off + 4 * static_cast<int64_t>(M), 256);
-  l.total = round_up(l.bs_off + l.ld_bs * M, 256);
-  return l;
-}
-
 bool aligned16(const void* p) { return (reinterpret_cast<uintptr_t>(p) & 15) == 0; }
 
 }  // namespace
@@ -138,28 +113,10 @@ extern "C" int lx_gemm_w(const void* x, lx_dtype x_dtype, int ld_x, const lx_wei
     return static_cast<int>(cudaErrorInvalidValue);
   auto s = static_cast<cudaStream_t>(stream);
   const int arch = lx_arch();
-  const bool sm89 = arch >= 89, sm120 = arch >= 120 && arch < 130;
-
-  // Which kernel, or not supported here.
-  int kind = -1;
-  switch (math) {
-    case LX_MATH_BF16:
-      kind = w->type == LX_W_BF16 ? kBF16 : w->type == LX_W_INT8 ? kW8I8 : w->type == LX_W_FP8 ? kW8F8 : kW4A16;
-      break;
-    case LX_MATH_INT8:
-      if (w->type == LX_W_INT8) kind = kI8;
-      break;
-    case LX_MATH_FP8:
-      if (w->type == LX_W_FP8 && sm89) kind = kF8;
-      else if (w->type == LX_W_NVFP4 && sm120) kind = kW4A8;
-      break;
-    case LX_MATH_FP4:
-      if (w->type == LX_W_NVFP4 && sm120) kind = kF4;
-      break;
-    default:
-      return static_cast<int>(cudaErrorInvalidValue);
-  }
-  if (kind < 0 || arch < 80) return static_cast<int>(cudaErrorNotSupported);
+  const bool sm120 = arch >= 120 && arch < 130;
+  if (math < LX_MATH_BF16 || math > LX_MATH_FP4) return static_cast<int>(cudaErrorInvalidValue);
+  const int kind = kind_for(math, w->type, arch);
+  if (kind < 0) return static_cast<int>(cudaErrorNotSupported);
   if (w->type != LX_W_BF16 && !w->scale) return static_cast<int>(cudaErrorInvalidValue);
 
   // Plain BF16: cuBLASLt, at the bf16 peak, when its bias rules fit (bf16 bias); x converted if f32.
@@ -175,15 +132,9 @@ extern "C" int lx_gemm_w(const void* x, lx_dtype x_dtype, int ld_x, const lx_wei
     return lx_gemm_bf16(x, ld_x, w->data, bias, y, y_dtype, ld_y, M, N, K, alpha, beta, stream);
   }
 
-  // The tensor-core kernels read 16-byte chunks: weight rows must be a multiple of 16 bytes, and NVFP4
-  // scale rows a whole number of the kernel's K tiles.
-  const int wbits = w->type == LX_W_BF16 ? 16 : w->type == LX_W_NVFP4 ? 4 : 8;
-  if ((static_cast<int64_t>(K) * wbits / 8) % 16 != 0 || !aligned16(w->data))
-    return static_cast<int>(cudaErrorNotSupported);
-  if (w->type == LX_W_NVFP4) {
-    const int ktile = kind == kF4 ? 256 : kind == kW4A8 ? 128 : 64;
-    if (K % ktile != 0) return static_cast<int>(cudaErrorNotSupported);
-  }
+  // The tensor-core kernels read 16-byte chunks of rows: see k_ok.
+  const int wbits = weight_bits(w->type);
+  if (!k_ok(kind, w->type, K) || !aligned16(w->data)) return static_cast<int>(cudaErrorNotSupported);
 
   DenseProb::Params pp{};
   pp.M = M;
@@ -212,7 +163,7 @@ extern "C" int lx_gemm_w(const void* x, lx_dtype x_dtype, int ld_x, const lx_wei
     }
   } else {
     if (!ws) return static_cast<int>(cudaErrorInvalidValue);
-    const lx_math qmath = kind == kI8 ? LX_MATH_INT8 : kind == kF4 ? LX_MATH_FP4 : LX_MATH_FP8;
+    const lx_math qmath = act_math(kind);
     const ActLayout ql = act_layout(M, K, qmath);
     if (int e = lx_quantize_act(x, x_dtype, ld_x, qmath, ws + ql.q_off, static_cast<int>(ql.ld_q),
                                 reinterpret_cast<float*>(ws + ql.scale_off), ws + ql.bs_off, static_cast<int>(ql.ld_bs),

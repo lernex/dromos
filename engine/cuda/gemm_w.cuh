@@ -62,6 +62,8 @@ struct DenseProb {
 
 // y = alpha * (v + bias) + beta * y, v already scaled. Pairs of columns, stored together when aligned.
 struct DenseEpi {
+  static constexpr bool kGated = false;
+  using Row = int;  // the tile row
   struct Params {
     void* y;
     int64_t ld_y;
@@ -73,7 +75,8 @@ struct DenseEpi {
   static __device__ __forceinline__ float bias_at(const Params& e, int n) {
     return e.bias_bf16 ? __bfloat162float(static_cast<const __nv_bfloat16*>(e.bias)[n]) : static_cast<const float*>(e.bias)[n];
   }
-  static __device__ __forceinline__ void store2(const Params& e, const Tile& t, int r, int c, float v0, float v1) {
+  static __device__ __forceinline__ Row row(const Params&, const Tile&, int r) { return r; }
+  static __device__ __forceinline__ void store2(const Params& e, const Tile& t, Row r, int c, float v0, float v1) {
     const int64_t m = t.m0 + r;
     const int n = t.n0 + c;
     const bool two = c + 1 < t.cols;
@@ -182,5 +185,72 @@ LX_GEMMW_FAMILY(kW4A8, 120)
     n = static_cast<int>(sizeof(v) / sizeof(v[0]));                 \
     return v;                                                       \
   }
+
+// Where lx_quantize_act puts M rows of K activations for a math, inside a workspace: values, per-row
+// scales, FP4 block scales, each 256-byte aligned. lx_gemm_w and lx_moe_experts_grouped share it.
+constexpr int64_t round_up(int64_t v, int64_t a) { return (v + a - 1) / a * a; }
+
+struct ActLayout {
+  int64_t ld_q = 0, ld_bs = 0;            // bytes per row of the quantized values / block scales
+  int64_t q_off = 0, scale_off = 0, bs_off = 0, total = 0;
+};
+
+inline ActLayout act_layout(int M, int K, lx_math math) {
+  ActLayout l;
+  switch (math) {
+    case LX_MATH_BF16:
+      l.ld_q = round_up(static_cast<int64_t>(K) * 2, 16);
+      break;
+    case LX_MATH_INT8:
+    case LX_MATH_FP8:
+      l.ld_q = round_up(K, 16);
+      break;
+    case LX_MATH_FP4:
+      l.ld_q = round_up((K + 1) / 2, 16);
+      l.ld_bs = round_up((K + 15) / 16, 16);
+      break;
+  }
+  l.q_off = 0;
+  l.scale_off = round_up(l.q_off + l.ld_q * M, 256);
+  l.bs_off = round_up(l.scale_off + 4 * static_cast<int64_t>(M), 256);
+  l.total = round_up(l.bs_off + l.ld_bs * M, 256);
+  return l;
+}
+
+
+// The kernel kind for a weight format under a math on an architecture, or -1 when the GPU cannot run
+// that pair (the caller answers cudaErrorNotSupported). See the table in gemm_w.cu.
+inline int kind_for(lx_math math, lx_wtype w, int arch) {
+  using namespace lx::tc;
+  if (arch < 80) return -1;
+  const bool sm89 = arch >= 89, sm120 = arch >= 120 && arch < 130;
+  switch (math) {
+    case LX_MATH_BF16:
+      return w == LX_W_BF16 ? kBF16 : w == LX_W_INT8 ? kW8I8 : w == LX_W_FP8 ? kW8F8 : kW4A16;
+    case LX_MATH_INT8:
+      return w == LX_W_INT8 ? kI8 : -1;
+    case LX_MATH_FP8:
+      return w == LX_W_FP8 && sm89 ? kF8 : w == LX_W_NVFP4 && sm120 ? kW4A8 : -1;
+    case LX_MATH_FP4:
+      return w == LX_W_NVFP4 && sm120 ? kF4 : -1;
+  }
+  return -1;
+}
+
+// Bits per stored weight value, and the K granularity the kernels need: weight rows a multiple of 16
+// bytes, and NVFP4 scale rows a whole number of the kind's K tiles.
+inline int weight_bits(lx_wtype w) { return w == LX_W_BF16 ? 16 : w == LX_W_NVFP4 ? 4 : 8; }
+inline bool k_ok(int kind, lx_wtype w, int K) {
+  if ((static_cast<int64_t>(K) * weight_bits(w) / 8) % 16 != 0) return false;
+  if (w != LX_W_NVFP4) return true;
+  const int ktile = kind == lx::tc::kF4 ? 256 : kind == lx::tc::kW4A8 ? 128 : 64;
+  return K % ktile == 0;
+}
+
+// The math the activations are quantized to for a kind (BF16: not quantized).
+inline lx_math act_math(int kind) {
+  using namespace lx::tc;
+  return kind == kI8 ? LX_MATH_INT8 : kind == kF4 ? LX_MATH_FP4 : (kind == kF8 || kind == kW4A8) ? LX_MATH_FP8 : LX_MATH_BF16;
+}
 
 }  // namespace lx::gemmw
