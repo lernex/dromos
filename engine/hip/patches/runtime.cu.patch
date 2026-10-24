@@ -1,0 +1,22 @@
+--- a/runtime.cu
++++ b/runtime.cu
+@@ -34,7 +34,7 @@
+ 
+ int lx_rt_host_alloc(void** ptr, int64_t bytes) {
+   *ptr = nullptr;
+-  return bytes <= 0 ? 0 : status(hipMallocHost(ptr, static_cast<size_t>(bytes)));
++  return bytes <= 0 ? 0 : status(hipHostMalloc(ptr, static_cast<size_t>(bytes), hipHostMallocDefault));
+ }
+ 
+ int lx_rt_host_free(void* ptr) { return status(hipFreeHost(ptr)); }
+@@ -83,8 +83,8 @@
+   hipGraph_t g = nullptr;
+   if (hipError_t e = hipStreamEndCapture(as_stream(stream), &g); e != hipSuccess) return status(e);
+   hipGraphExec_t exec = nullptr;
+-  const hipError_t e = hipGraphInstantiate(&exec, g, 0);
+-  hipGraphDestroy(g);
++  const hipError_t e = hipGraphInstantiate(&exec, g, nullptr, nullptr, 0);
++  (void)hipGraphDestroy(g);  // the instance is self-contained, so the template is no longer needed
+   *graph = exec;
+   return status(e);
+ }

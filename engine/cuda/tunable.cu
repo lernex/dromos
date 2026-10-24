@@ -2,7 +2,11 @@
 
 #include <cuda_runtime.h>
 
+#include "cuda/kernels.h"
+
+#include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <string>
@@ -10,6 +14,17 @@
 #include <vector>
 
 namespace {
+
+lx::TuneProblem to_problem(const lx_tune_problem& p) {
+  lx::TuneProblem t;
+  t.M = p.M;
+  t.N = p.N;
+  t.K = p.K;
+  t.experts = p.experts;
+  t.weight = p.weight;
+  t.math = p.math;
+  return t;
+}
 
 std::mutex& lock() {
   static std::mutex m;
@@ -29,6 +44,16 @@ int device_arch() {
 std::map<std::string, std::vector<std::string>>& registry() {
   static std::map<std::string, std::vector<std::string>> r;
   return r;
+}
+
+std::map<std::string, lx::TuneRunner>& runners() {
+  static std::map<std::string, lx::TuneRunner> r;
+  return r;
+}
+
+std::map<std::string, lx::TuneAdmit>& admitters() {
+  static std::map<std::string, lx::TuneAdmit> a;
+  return a;
 }
 
 using Key = std::tuple<std::string, int, int, int>;
@@ -81,9 +106,25 @@ int lx_tune_get(const char* kernel, int M, int N, int K) {
   return it == table().end() ? -1 : it->second;
 }
 
-void lx_tune_set(const char* kernel, int M, int N, int K, int variant) {
+int lx_tune_set(const char* kernel, int M, int N, int K, int variant) {
   std::lock_guard<std::mutex> g(lock());
+  auto reg = registry().find(kernel);
+  if (reg != registry().end()) {
+    if (variant < 0 || variant >= static_cast<int>(reg->second.size())) return LX_ERR_TUNE_VARIANT;
+    auto adm = admitters().find(kernel);
+    if (adm != admitters().end() && !adm->second(variant, M, N, K)) return LX_ERR_TUNE_REJECTED;
+  }
   table()[Key{kernel, bucket(M), N, K}] = variant;
+  return 0;
+}
+
+int lx_tune_force(const char* kernel, int M, int N, int K, int variant) {
+  std::lock_guard<std::mutex> g(lock());
+  auto reg = registry().find(kernel);
+  if (reg != registry().end() && (variant < 0 || variant >= static_cast<int>(reg->second.size())))
+    return LX_ERR_TUNE_VARIANT;
+  table()[Key{kernel, bucket(M), N, K}] = variant;
+  return 0;
 }
 
 void lx_tune_clear(void) {
@@ -114,15 +155,60 @@ const char* lx_tune_variant_name(const char* kernel, int variant) {
   return it->second[variant].c_str();
 }
 
+int lx_tune_run(const char* kernel, int variant, const lx_tune_problem* problem, float* out, void* stream) {
+  const lx::TuneRunner runner = lx::tunable_runner(kernel);
+  if (!runner) return LX_ERR_NOT_SUPPORTED;
+  return runner(variant, to_problem(*problem), out, stream);
+}
+
+int lx_tune_runnable(const char* kernel) { return lx::tunable_runner(kernel) ? 1 : 0; }
+
+int lx_tune_key(const char* kernel, const lx_tune_problem* problem, char* out, int capacity) {
+  const std::string key = lx::tune_key(kernel, to_problem(*problem));
+  if (capacity > 0) {
+    const size_t n = std::min(key.size(), static_cast<size_t>(capacity - 1));
+    std::memcpy(out, key.data(), n);
+    out[n] = '\0';
+  }
+  return static_cast<int>(key.size());
+}
+
 }  // extern "C"
 
 namespace lx {
+
+std::string tune_key(const char* kernel, const TuneProblem& p) {
+  std::string key = kernel;
+  if (p.weight != 0 || p.math != 0) key += "@w" + std::to_string(p.weight) + "m" + std::to_string(p.math);
+  if (p.experts != 1) key += "@e" + std::to_string(p.experts);
+  return key;
+}
+
+TuneRunner tunable_runner(const char* kernel) {
+  std::lock_guard<std::mutex> g(lock());
+  auto it = runners().find(kernel);
+  return it == runners().end() ? nullptr : it->second;
+}
 
 TunableRegistration::TunableRegistration(const char* kernel, std::initializer_list<const char*> variants) {
   std::lock_guard<std::mutex> g(lock());
   auto& v = registry()[kernel];
   v.clear();
   for (const char* name : variants) v.emplace_back(name);
+}
+
+TunableRegistration::TunableRegistration(const char* kernel, std::initializer_list<const char*> variants,
+                                         TuneRunner runner)
+    : TunableRegistration(kernel, variants) {
+  std::lock_guard<std::mutex> g(lock());
+  runners()[kernel] = runner;
+}
+
+TunableRegistration::TunableRegistration(const char* kernel, std::initializer_list<const char*> variants,
+                                         TuneAdmit admit)
+    : TunableRegistration(kernel, variants) {
+  std::lock_guard<std::mutex> g(lock());
+  admitters()[kernel] = admit;
 }
 
 }  // namespace lx

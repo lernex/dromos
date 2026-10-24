@@ -25,8 +25,9 @@ def ptr(t):
     return c_void_p(t.data_ptr()) if t is not None else c_void_p(None)
 
 
-class Weight(ctypes.Structure):
-    _fields_ = [("type", c_int), ("data", c_void_p), ("scale", c_void_p), ("global_", c_float)]
+class Weight(ctypes.Structure):  # lx_weight
+    _fields_ = [("type", c_int), ("data", c_void_p), ("scale", c_void_p), ("global_", c_float),
+                ("expert_global", c_void_p)]
 
 
 class Fx(ctypes.Structure):

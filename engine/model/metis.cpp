@@ -2,10 +2,12 @@
 
 #include <cmath>
 #include <algorithm>
+#include <cstdio>
+#include <vector>
 #include <cstdlib>
+#include <fstream>
 #include <initializer_list>
 #include <map>
-#include <fstream>
 #include <set>
 #include <tuple>
 #include <cstring>
@@ -13,12 +15,15 @@
 
 #include "cuda/kernels.h"
 #include "model/glue.h"
+#include "runtime/offload.h"
 
 namespace lx {
 namespace {
 
 void check(int status, const char* what) {
-  if (status != 0) throw std::runtime_error(std::string(what) + " failed with CUDA error " + std::to_string(status));
+  if (status != 0)
+    throw std::runtime_error(std::string(what) + " failed with error " + std::to_string(status) + ": " +
+                             lx_rt_error_string(status));
 }
 #define LX_CHECK(expr) check((expr), #expr)
 
@@ -45,10 +50,12 @@ std::vector<float> host_values(const WeightView& w) {
   for (auto d : w.shape) n *= d;
   std::vector<float> out(n);
   if (w.dtype == LX_F32) {
-    check(static_cast<int>(cudaMemcpy(out.data(), w.data, n * 4, cudaMemcpyDeviceToHost)), "cudaMemcpy");
+    check(lx_rt_copy(out.data(), w.data, n * 4, LX_COPY_D2H, nullptr), "device to host copy");
+    check(lx_rt_stream_sync(nullptr), "device to host copy");
   } else {
     std::vector<uint16_t> raw(n);
-    check(static_cast<int>(cudaMemcpy(raw.data(), w.data, n * 2, cudaMemcpyDeviceToHost)), "cudaMemcpy");
+    check(lx_rt_copy(raw.data(), w.data, n * 2, LX_COPY_D2H, nullptr), "device to host copy");
+    check(lx_rt_stream_sync(nullptr), "device to host copy");
     for (int64_t i = 0; i < n; ++i) out[i] = bf16_to_float(raw[i]);
   }
   return out;
@@ -56,14 +63,19 @@ std::vector<float> host_values(const WeightView& w) {
 
 }  // namespace
 
-// A projection: its bf16 weight (prefill, through cuBLASLt) and, when quantized, an int8 copy with
-// per-row scales that decode steps read instead, at half the bytes.
+// A projection: its bf16 weight (prefill, through the dense GEMM) and, when quantized, an int8 copy with
+// per-row scales that decode steps read instead, at half the bytes. With LX_BF16X, decode reads a
+// lossless compressed copy instead (LX_W_BF16X: the same bf16 values in ~12.2 bits, so the same
+// logits to the bit at ~1.3x fewer bytes).
 struct Linear {
   const void* w = nullptr;     // bf16 [N, K]
   const void* bias = nullptr;  // bf16 [N] or null
   int8_t* q = nullptr;         // int8 [N, K], or null to decode from w
   float* scale = nullptr;      // f32 [N]
+  void* x16 = nullptr;         // LX_W_BF16X encoding of w, or null
   int N = 0, K = 0;
+  bool host = false;           // w is in pinned host memory (offload): prefill stages it into VRAM
+  lx_weight pw{LX_W_BF16, nullptr, nullptr, 1.0f};  // what prefill multiplies by (LX_PREFILL): w, or a copy
 };
 
 struct MetisModel::Impl {
@@ -86,6 +98,8 @@ struct MetisModel::Impl {
     const void *expert_emb, *gate_up, *down;      // bf16 experts, for prefill
     int8_t *gate_up_q = nullptr, *down_q = nullptr;  // int8 experts, for decode
     float *gate_up_scale = nullptr, *down_scale = nullptr;
+    lx_weight gate_up_pw{}, down_pw{};  // the experts as prefill multiplies them (LX_PREFILL)
+    void *gate_up_x16 = nullptr, *down_x16 = nullptr;  // LX_W_BF16X experts, for decode (LX_BF16X)
     const float *router_w, *router_b, *selection_bias;
     Connection mixer_conn, moe_conn;
   };
@@ -106,6 +120,16 @@ struct MetisModel::Impl {
   // ---- persistent state, per (pass, layer) ---------------------------------------------------
   std::vector<float*> conv_state, ssm_state;
   std::vector<void*> k_cache, v_cache;
+  // speculative mode: each Mamba layer's pending positions (kernels.h, "Speculative decoding")
+  bool speculative = false;
+  std::vector<float*> conv_hist, ssm_hist;
+  // feature taps: tap_col[pass * (L_layers + 1) + layer + 1] is the tap's first column in tap_out,
+  // or -1 (layer -1, slot 0, is the end of the pass)
+  std::vector<FeatureTap> taps;
+  std::vector<int> tap_col;
+  float* tap_out = nullptr;   // f32 [max_tokens, tap_dim]
+  float* tap_mean = nullptr;  // scratch [max_tokens, D]
+  int tap_dim = 0;
 
   // ---- per-step scratch --------------------------------------------------------------------
   std::vector<void*> allocations;
@@ -113,29 +137,68 @@ struct MetisModel::Impl {
       *cont_in, *cont_hidden, *cont_logit, *continuation, *update, *zxbcdt, *xbc, *ssm_y, *qkv_buf, *latent,
       *router_in, *router_logits, *route_w, *entropy, *confidence, *routed, *shared_gu, *summary, *bank_k,
       *bank_v, *entry;
-  int32_t *route_ids, *d_meta, *d_tokens, *d_cu, *d_slots, *d_has_state, *d_start_pos;
+  int32_t *route_ids, *d_meta, *d_tokens, *d_cu, *d_slots, *d_has_state, *d_start_pos, *d_fold, *d_keep;
   int32_t* h_meta = nullptr;  // pinned staging for d_meta, so the upload is one async copy
   size_t meta_count = 0;
-  cudaEvent_t meta_copied = nullptr;
+  void* meta_copied = nullptr;
   float* last_rows = nullptr;
-  // Decode steps (one token per sequence) replay a captured graph: the first step of a shape runs
-  // eagerly (which also warms cuBLASLt up), the second captures, every later one replays.
-  using GraphKey = std::tuple<int, int, bool, float*>;
+  // Decode steps (one token per sequence) and verify steps of up to kGemvRows tokens replay a captured
+  // graph: the first step of a shape runs eagerly (which also warms the dense GEMM up), the second
+  // captures, every later one replays.
+  using GraphKey = std::tuple<int, int, bool, float*, bool>;
   std::set<GraphKey> seen;
-  std::map<GraphKey, cudaGraphExec_t> graphs;
+  std::map<GraphKey, void*> graphs;
   bool use_graphs = true;
-  // decode-sized products (at most this many rows) run as GEMVs; larger ones on cuBLASLt
+  // decode-sized products (at most this many rows) run as GEMVs; larger ones on the dense GEMM
   static constexpr int kGemvRows = 8;
-  void* cast_bf = nullptr;  // bf16 copy of an f32 input for a cuBLASLt product
+  void* cast_bf = nullptr;  // bf16 copy of an f32 input for a dense GEMM product
   size_t cast_capacity = 0;
   void* moe_workspace = nullptr;
+  offload::ExpertOffload* offload = nullptr;  // the routed experts, when they run offloaded
+  FILE* route_trace = nullptr;                // LX_ROUTE_TRACE: every layer's routing, for the placement stats
+  // With the trace: the next layer's routing predicted from the streams as they leave this layer
+  // (the next layer's MoE read, latent_down and router applied early, with this layer's features).
+  float *pred_mixed = nullptr, *pred_latent = nullptr, *pred_router_in = nullptr, *pred_logits = nullptr,
+        *pred_w = nullptr, *pred_entropy = nullptr, *pred_confidence = nullptr;
+  void* pred_h = nullptr;
+  int32_t* pred_ids = nullptr;
+  static constexpr int kPredicted = 8;
+  // LX_OFFLOAD_PREFETCH=n: in offloaded decode steps, a graph branch predicts the next layer's routing
+  // the same way and copies the top n predicted experts that are not in VRAM ahead of the layer.
+  int prefetch = 0;
+  void* side = nullptr;
+  std::vector<void*> fork_events, join_events;  // per (pass, layer)
+  // Projections kept in host memory (offload, LX_OFFLOAD_DENSE_HOST): a prefill product copies its
+  // weight into one of two VRAM buffers on a copy stream, so the next weight crosses PCIe while this
+  // product runs, instead of the product reading host memory tile by tile.
+  size_t stage_bytes = 0;
+  void* stage[2] = {nullptr, nullptr};
+  int stage_next = 0;
+  void* stage_stream = nullptr;
+  void *stage_copied[2] = {nullptr, nullptr}, *stage_free[2] = {nullptr, nullptr};
+  // Prefill products (more than kGemvRows rows): lx_gemm_w and lx_moe_experts_grouped on the weight
+  // format and math LX_PREFILL names (bf16, w8a16, w4a16, int8, fp8, w4a8, fp4); LX_PREFILL_KEEP lists
+  // name fragments that stay bf16. The default keeps what the FP8 release keeps (the Mamba-2 output
+  // projection, the tied LM head, the depth memory, the latent projections and the shared expert), so
+  // only the experts, the Mamba-2 input projections and the attention projections are quantized: the
+  // measured best trade (W8A16 then sits at the BF16 noise floor; INT8 at 0.010 / 0.024 / 0.0058).
+  lx_wtype prefill_w = LX_W_BF16;
+  lx_math prefill_math = LX_MATH_BF16;
+  std::string prefill_keep;
+  bool grouped_experts = true;  // LX_OLD_EXPERTS=1: lx_moe_experts for prefill, as before
+  void* gemm_ws = nullptr;
+  void* moe_grouped_ws = nullptr;
   std::string w8_keep;  // LX_W8_KEEP: comma-separated name fragments that stay bf16 for decode
+  bool bf16x = false;        // LX_BF16X: decode reads lossless compressed bf16 copies (no int8)
+  bool keep_bf16x = false;   // LX_KEEP_BF16X: what decode would read as plain bf16 it reads as LX_W_BF16X
+  bool decode_bf16 = false;  // LX_DECODE_BF16: plain bf16 decode products run on bf16x.cu's kernels
   void *streams_bf, *retrieved_bf, *feat_in_bf, *h_bf, *normed_bf, *lora_bf, *att_bf, *latent_bf, *shared_bf,
       *routed_bf, *entry_bf, *meta_bf, *out_bf;
 
   // ---- decode programs (decode_*.cu): a decode step as one persistent kernel ------------------
-  // Built on a shape's first decode step and run from then on, with LX_PROGRAM set; otherwise decode
-  // goes through the kernel-per-op path above (captured in graphs), which is still the faster one.
+  // Built on a shape's first decode step and run from then on, with LX_PROGRAM set and nothing the
+  // program does not cover (decode_program_covers); otherwise decode goes through the kernel-per-op
+  // path above, captured in graphs.
   bool use_program = false;
   std::map<std::pair<int, float*>, lx_program*> programs;
   // route_projection without its difference columns, for the routing inside a pass (where the
@@ -154,17 +217,27 @@ struct MetisModel::Impl {
   template <typename T>
   T* alloc(size_t count, size_t elem = sizeof(T)) {
     void* p = nullptr;
-    check(static_cast<int>(cudaMalloc(&p, count * elem)), "cudaMalloc");
-    check(static_cast<int>(cudaMemset(p, 0, count * elem)), "cudaMemset");
+    const int64_t bytes = static_cast<int64_t>(count * elem);
+    const std::string what = "device allocation of " + std::to_string(bytes) + " bytes";
+    check(lx_rt_alloc(&p, bytes), what.c_str());  // zeroed by the runtime
     allocations.push_back(p);
     return static_cast<T*>(p);
   }
   ~Impl() {
     for (auto& [key, prog] : programs) lx_program_destroy(prog);
-    for (auto& [key, exec] : graphs) cudaGraphExecDestroy(exec);
-    if (meta_copied) cudaEventDestroy(meta_copied);
-    if (h_meta) cudaFreeHost(h_meta);
-    for (void* p : allocations) cudaFree(p);
+    if (route_trace) std::fclose(route_trace);
+    for (void* e : fork_events) lx_rt_event_destroy(e);
+    for (void* e : join_events) lx_rt_event_destroy(e);
+    if (side) lx_rt_stream_destroy(side);
+    for (int b = 0; b < 2; ++b) {
+      if (stage_copied[b]) lx_rt_event_destroy(stage_copied[b]);
+      if (stage_free[b]) lx_rt_event_destroy(stage_free[b]);
+    }
+    if (stage_stream) lx_rt_stream_destroy(stage_stream);
+    for (auto& [key, exec] : graphs) lx_rt_graph_destroy(exec);
+    if (meta_copied) lx_rt_event_destroy(meta_copied);
+    if (h_meta) lx_rt_host_free(h_meta);
+    for (void* p : allocations) lx_rt_free(p);
   }
 };
 
@@ -187,18 +260,48 @@ const void* need(const WeightLookup& lookup, const std::string& name, int dtype,
 
 // Whether a weight stays bf16 for decode: LX_W8_KEEP lists name fragments to keep, for measuring
 // what quantizing each part of the model costs.
-bool kept_bf16(const Impl& m, const std::string& name) {
-  for (size_t pos = 0; pos < m.w8_keep.size();) {
-    const size_t end = m.w8_keep.find(',', pos);
-    const std::string frag = m.w8_keep.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+bool listed(const std::string& list, const std::string& name) {
+  for (size_t pos = 0; pos < list.size();) {
+    const size_t end = list.find(',', pos);
+    const std::string frag = list.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
     if (!frag.empty() && name.find(frag) != std::string::npos) return true;
-    pos = end == std::string::npos ? m.w8_keep.size() : end + 1;
+    pos = end == std::string::npos ? list.size() : end + 1;
   }
   return false;
 }
+bool kept_bf16(const Impl& m, const std::string& name) { return listed(m.w8_keep, name); }
+
+// The prefill copy of a bf16 [rows, cols] weight (rows may be a whole expert stack) in m.prefill_w;
+// an int8 decode copy is shared when the formats agree.
+lx_weight prefill_weight(Impl& m, const void* w, int8_t* q, float* scale, int64_t rows, int64_t cols) {
+  lx_weight out{LX_W_BF16, w, nullptr, 1.0f};
+  if (m.prefill_w == LX_W_BF16) return out;
+  if (m.prefill_w == LX_W_INT8 && q) return lx_weight{LX_W_INT8, q, scale, 1.0f};
+  out.type = m.prefill_w;
+  if (m.prefill_w == LX_W_NVFP4) {
+    out.data = m.alloc<uint8_t>(static_cast<size_t>(rows) * cols / 2);
+    out.scale = m.alloc<uint8_t>(static_cast<size_t>(rows) * cols / 16);
+  } else {
+    out.data = m.alloc<uint8_t>(static_cast<size_t>(rows) * cols);
+    out.scale = m.alloc<float>(rows);
+  }
+  LX_CHECK(lx_quantize_weight(w, &out, rows, static_cast<int>(cols), nullptr));
+  return out;
+}
+
+// The lossless compressed copy of a bf16 tensor ([rows, K]), for decode.
+void* encode_bf16x(Impl& m, const void* w, int64_t rows, int64_t K) {
+  const int64_t bytes = lx_bf16x_bytes(w, rows, static_cast<int>(K), nullptr);
+  if (bytes <= 0) throw std::runtime_error("lx_bf16x_bytes failed");
+  void* out = m.alloc<uint8_t>(static_cast<size_t>(bytes));
+  LX_CHECK(lx_bf16x_encode(w, rows, static_cast<int>(K), out, bytes, nullptr));
+  return out;
+}
 
 // A projection from the checkpoint; with `quantize`, also its int8 decode copy, unless its name
-// contains a fragment of LX_W8_KEEP (for measuring what quantizing each part costs).
+// contains a fragment of LX_W8_KEEP (for measuring what quantizing each part costs). With LX_BF16X,
+// every projection whose rows the format makes smaller gets a lossless copy instead, whatever
+// `quantize` says (lossless, so the Mamba out_proj too).
 Linear make_linear(Impl& m, const WeightLookup& lw, const std::string& weight, const std::string& bias, int64_t N,
                    int64_t K, bool quantize) {
   Linear l;
@@ -206,12 +309,26 @@ Linear make_linear(Impl& m, const WeightLookup& lw, const std::string& weight, c
   if (!bias.empty()) l.bias = need(lw, bias, LX_BF16, {N});
   l.N = static_cast<int>(N);
   l.K = static_cast<int>(K);
-  const bool keep = !quantize || kept_bf16(m, weight);
-  if (!keep) {
+  // A host-resident weight up to kStageMaxBytes is staged for prefill; a larger one (the tied head's
+  // embedding table, 335 MB on Logos, read by prefill only when every row's logits are wanted) is
+  // read across PCIe where it lies rather than doubling its size in VRAM buffers.
+  constexpr size_t kStageMaxBytes = 128ull << 20;
+  const size_t bytes = static_cast<size_t>(N) * static_cast<size_t>(K) * 2;
+  if (lx_rt_is_host_memory(l.w) && bytes <= kStageMaxBytes) {
+    l.host = true;
+    m.stage_bytes = std::max(m.stage_bytes, bytes);
+  }
+  if (m.bf16x) {
+    if (lx_bf16x_row_bytes(static_cast<int>(K)) < 2 * K) l.x16 = encode_bf16x(m, l.w, N, K);
+  } else if (quantize && !kept_bf16(m, weight)) {
     l.q = m.alloc<int8_t>(static_cast<size_t>(N) * K);
     l.scale = m.alloc<float>(N);
     LX_CHECK(lx_quantize_w8(l.w, l.q, l.scale, N, static_cast<int>(K), nullptr));
+  } else if (m.keep_bf16x && lx_bf16x_row_bytes(static_cast<int>(K)) < 2 * K) {
+    l.x16 = encode_bf16x(m, l.w, N, K);
   }
+  l.pw = lx_weight{LX_W_BF16, l.w, nullptr, 1.0f};
+  if (quantize && !listed(m.prefill_keep, weight)) l.pw = prefill_weight(m, l.w, l.q, l.scale, N, K);
   return l;
 }
 
@@ -265,7 +382,9 @@ float* connection_params(Impl& m, const WeightLookup& lookup, const std::string&
     softmax(write_logits, S * S + S, dst + S * S + S);
   }
   float* d = m.alloc<float>(params.size());
-  check(static_cast<int>(cudaMemcpy(d, params.data(), params.size() * 4, cudaMemcpyHostToDevice)), "cudaMemcpy");
+  check(lx_rt_copy(d, params.data(), static_cast<int64_t>(params.size() * 4), LX_COPY_H2D, nullptr),
+        "host to device copy");
+  check(lx_rt_stream_sync(nullptr), "host to device copy");
   return d;
 }
 
@@ -279,34 +398,32 @@ lx_weight wview(const Linear& l) {
   return w;
 }
 
-// The columns [c0, c1) of every row of a row-major [rows, cols] matrix (elem bytes per value) into
-// dst at column d0 of a [rows, dst_cols] one.
-void copy_columns(const void* src, int cols, int c0, int c1, void* dst, int dst_cols, int d0, int rows, int elem) {
-  check(static_cast<int>(cudaMemcpy2D(static_cast<char*>(dst) + static_cast<size_t>(d0) * elem,
-                                      static_cast<size_t>(dst_cols) * elem,
-                                      static_cast<const char*>(src) + static_cast<size_t>(c0) * elem,
-                                      static_cast<size_t>(cols) * elem, static_cast<size_t>(c1 - c0) * elem, rows,
-                                      cudaMemcpyDeviceToDevice)),
-        "cudaMemcpy2D");
-}
-
 // route_projection [R, 3D + R] without the difference columns [2D, 3D): [R, 2D + R], in the
 // decode format of the full weight (an int8 copy keeps its rows' scales).
 Linear route_without_difference(Impl& m, const Linear& full, int D, int R) {
   Linear l = full;
-  const int K = 3 * D + R, Kin = 2 * D + R;
-  l.K = Kin;
+  const int K = 3 * D + R, Kin = 2 * D + R, elem = full.q ? 1 : 2;
+  const void* src = full.q ? static_cast<const void*>(full.q) : full.w;
+  std::vector<char> h(static_cast<size_t>(R) * K * elem), out(static_cast<size_t>(R) * Kin * elem);
+  check(lx_rt_copy(h.data(), src, static_cast<int64_t>(h.size()), LX_COPY_D2H, nullptr), "device to host copy");
+  check(lx_rt_stream_sync(nullptr), "device to host copy");
+  for (int r = 0; r < R; ++r) {
+    const char* row = h.data() + static_cast<size_t>(r) * K * elem;
+    char* dst = out.data() + static_cast<size_t>(r) * Kin * elem;
+    std::memcpy(dst, row, static_cast<size_t>(2 * D) * elem);
+    std::memcpy(dst + static_cast<size_t>(2 * D) * elem, row + static_cast<size_t>(3 * D) * elem,
+                static_cast<size_t>(R) * elem);
+  }
+  void* d = m.alloc<char>(out.size());
+  check(lx_rt_copy(d, out.data(), static_cast<int64_t>(out.size()), LX_COPY_H2D, nullptr), "host to device copy");
+  check(lx_rt_stream_sync(nullptr), "host to device copy");
   if (full.q) {
-    l.q = m.alloc<int8_t>(static_cast<size_t>(R) * Kin);
-    copy_columns(full.q, K, 0, 2 * D, l.q, Kin, 0, R, 1);
-    copy_columns(full.q, K, 3 * D, K, l.q, Kin, 2 * D, R, 1);
+    l.q = static_cast<int8_t*>(d);
     l.scale = full.scale;
   } else {
-    void* w = m.alloc<uint16_t>(static_cast<size_t>(R) * Kin);
-    copy_columns(full.w, K, 0, 2 * D, w, Kin, 0, R, 2);
-    copy_columns(full.w, K, 3 * D, K, w, Kin, 2 * D, R, 2);
-    l.w = w;
+    l.w = d;
   }
+  l.K = Kin;
   return l;
 }
 
@@ -366,18 +483,36 @@ void build_bank_projection(Impl& m, const WeightLookup& lw, const std::string& d
     wb[i] = static_cast<uint16_t>(u >> 16);
   }
   uint16_t* dw = m.alloc<uint16_t>(wb.size());
-  check(static_cast<int>(cudaMemcpy(dw, wb.data(), wb.size() * 2, cudaMemcpyHostToDevice)), "cudaMemcpy");
+  check(lx_rt_copy(dw, wb.data(), static_cast<int64_t>(wb.size() * 2), LX_COPY_H2D, nullptr), "host to device copy");
   m.bank_b = m.alloc<float>(rows);
-  check(static_cast<int>(cudaMemcpy(m.bank_b, b.data(), rows * 4, cudaMemcpyHostToDevice)), "cudaMemcpy");
+  check(lx_rt_copy(m.bank_b, b.data(), static_cast<int64_t>(rows) * 4, LX_COPY_H2D, nullptr), "host to device copy");
+  check(lx_rt_stream_sync(nullptr), "host to device copy");
   m.bank_w = {LX_W_BF16, dw, nullptr, 1.0f};
 }
 
 }  // namespace
 
 MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slots, int kv_capacity,
-                       int max_tokens)
-    : cfg_(c), slot_len_(max_slots, 0), impl_(new Impl) {
+                       int max_tokens, offload::ExpertOffload* experts, bool speculative)
+    : cfg_(c), slot_len_(max_slots, 0), folded_(max_slots, 0), pending_(max_slots, 0), impl_(new Impl) {
+  // A constructor that throws (a device allocation that fails, say) never reaches the destructor, so the device
+  // memory this build took would stay allocated for the life of the process: free it on the way out.
+  struct FreeOnThrow {
+    Impl*& impl;
+    bool armed = true;
+    ~FreeOnThrow() {
+      if (armed) {
+        delete impl;
+        impl = nullptr;
+      }
+    }
+  } free_on_throw{impl_};
   Impl& m = *impl_;
+  m.offload = experts;
+  if (const char* trace = std::getenv("LX_ROUTE_TRACE")) {
+    m.route_trace = std::fopen(trace, "wb");
+    if (!m.route_trace) throw std::runtime_error(std::string("cannot open ") + trace);
+  }
   m.S = c.n_streams;
   m.D = c.hidden_size;
   m.L_layers = c.num_hidden_layers;
@@ -413,6 +548,36 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
   // 0.026), as it was for the GGUF, FP8 and MLX releases. LX_W8_KEEP overrides the list.
   m.w8_keep = std::getenv("LX_W8_KEEP") ? std::getenv("LX_W8_KEEP") : "out_proj";
   if (std::getenv("LX_NO_W8")) m.w8_keep = "layers,depth_memory,embedding";
+  m.prefill_keep = std::getenv("LX_PREFILL_KEEP") ? std::getenv("LX_PREFILL_KEEP")
+                                                  : "out_proj,embedding,depth_memory,latent_down,latent_up,shared_expert";
+  m.grouped_experts = std::getenv("LX_OLD_EXPERTS") == nullptr;
+  if (const char* p = std::getenv("LX_PREFILL")) {
+    const std::string v = p;
+    struct Mode {
+      const char* name;
+      lx_wtype w;
+      lx_math math;
+    };
+    const Mode modes[] = {{"bf16", LX_W_BF16, LX_MATH_BF16},   {"w8a16", LX_W_INT8, LX_MATH_BF16},
+                          {"w8a16f", LX_W_FP8, LX_MATH_BF16},  {"w4a16", LX_W_NVFP4, LX_MATH_BF16},
+                          {"int8", LX_W_INT8, LX_MATH_INT8},   {"fp8", LX_W_FP8, LX_MATH_FP8},
+                          {"w4a8", LX_W_NVFP4, LX_MATH_FP8},   {"fp4", LX_W_NVFP4, LX_MATH_FP4}};
+    bool found = false;
+    for (const Mode& mode : modes)
+      if (v == mode.name) {
+        m.prefill_w = mode.w;
+        m.prefill_math = mode.math;
+        found = true;
+      }
+    if (!found) throw std::runtime_error("LX_PREFILL: unknown mode " + v);
+  }
+  // LX_W_BF16X (bf16x.cu) is lossless, so either switch keeps the logits of the path it replaces to
+  // the bit. LX_BF16X: every decode projection is read compressed instead of int8 or bf16 (BF16
+  // logits). LX_KEEP_BF16X: int8 stays, and what stays bf16 (LX_W8_KEEP) is read compressed.
+  // LX_DECODE_BF16 (for measuring the format against the same kernels): plain bf16 through them.
+  m.bf16x = std::getenv("LX_BF16X") != nullptr;
+  m.keep_bf16x = std::getenv("LX_KEEP_BF16X") != nullptr;
+  m.decode_bf16 = std::getenv("LX_DECODE_BF16") != nullptr;
   m.embedding = need(lw, "embedding.weight", LX_BF16, {V, D});
   m.head = make_linear(m, lw, "embedding.weight", "", V, D, true);
   m.stream_emb = need(lw, "stream_embeddings", LX_BF16, {S, D});
@@ -437,7 +602,14 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
   m.c_hidden_b = static_cast<const float*>(need(lw, "continuation.hidden.bias", LX_F32, {R}));
   m.c_out_w = static_cast<const float*>(need(lw, "continuation.output.weight", LX_F32, {1, R}));
   m.c_out_b = static_cast<const float*>(need(lw, "continuation.output.bias", LX_F32, {1}));
-  m.use_program = std::getenv("LX_PROGRAM") != nullptr;
+  // The decode program (LX_PROGRAM): not for what it does not cover yet (decode_program_covers), and
+  // only on a backend that has it.
+  m.use_program = std::getenv("LX_PROGRAM") && !speculative && !experts && !m.bf16x && !m.keep_bf16x;
+  if (m.use_program) {
+    lx_program* probe = lx_program_create(1, nullptr, nullptr, nullptr, nullptr);
+    m.use_program = probe != nullptr;
+    if (probe) lx_program_destroy(probe);
+  }
   if (m.use_program) {
     m.route_in = route_without_difference(m, m.m_route, D, R);
     build_bank_projection(m, lw, dm);
@@ -471,11 +643,16 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
     layer.latent_down = make_linear(m, lw, e + "latent_down.weight", "", Lat, D, true);
     layer.latent_up = make_linear(m, lw, e + "latent_up.weight", "", D, Lat, true);
     layer.expert_emb = need(lw, e + "expert_embeddings", LX_BF16, {E, R});
-    layer.gate_up = need(lw, e + "local_experts.gate_up.weight", LX_BF16, {E, 2 * m.Iexp, Lat});
-    layer.down = need(lw, e + "local_experts.down.weight", LX_BF16, {E, Lat, m.Iexp});
+    if (!m.offload) {
+      layer.gate_up = need(lw, e + "local_experts.gate_up.weight", LX_BF16, {E, 2 * m.Iexp, Lat});
+      layer.down = need(lw, e + "local_experts.down.weight", LX_BF16, {E, Lat, m.Iexp});
+    }
     layer.shared_gate_up = make_linear(m, lw, e + "shared_expert.gate_up.weight", "", 2 * m.Ishared, Lat, true);
     layer.shared_down = make_linear(m, lw, e + "shared_expert.down.weight", "", Lat, m.Ishared, true);
-    if (!kept_bf16(m, e + "local_experts.gate_up.weight")) {
+    if (!m.offload && (m.bf16x || (m.keep_bf16x && kept_bf16(m, e + "local_experts.gate_up.weight")))) {
+      layer.gate_up_x16 = encode_bf16x(m, layer.gate_up, static_cast<int64_t>(E) * 2 * m.Iexp, Lat);
+      layer.down_x16 = encode_bf16x(m, layer.down, static_cast<int64_t>(E) * Lat, m.Iexp);
+    } else if (!m.offload && !kept_bf16(m, e + "local_experts.gate_up.weight")) {
       const int64_t gu_rows = static_cast<int64_t>(E) * 2 * m.Iexp, dn_rows = static_cast<int64_t>(E) * Lat;
       layer.gate_up_q = m.alloc<int8_t>(gu_rows * Lat);
       layer.gate_up_scale = m.alloc<float>(gu_rows);
@@ -483,6 +660,14 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
       layer.down_scale = m.alloc<float>(dn_rows);
       LX_CHECK(lx_quantize_w8(layer.gate_up, layer.gate_up_q, layer.gate_up_scale, gu_rows, Lat, nullptr));
       LX_CHECK(lx_quantize_w8(layer.down, layer.down_q, layer.down_scale, dn_rows, m.Iexp, nullptr));
+    }
+    if (listed(m.prefill_keep, e + "local_experts.gate_up.weight")) {
+      layer.gate_up_pw = lx_weight{LX_W_BF16, layer.gate_up, nullptr, 1.0f};
+      layer.down_pw = lx_weight{LX_W_BF16, layer.down, nullptr, 1.0f};
+    } else {
+      layer.gate_up_pw = prefill_weight(m, layer.gate_up, layer.gate_up_q, layer.gate_up_scale,
+                                        static_cast<int64_t>(E) * 2 * m.Iexp, Lat);
+      layer.down_pw = prefill_weight(m, layer.down, layer.down_q, layer.down_scale, static_cast<int64_t>(E) * Lat, m.Iexp);
     }
     layer.router_w = static_cast<const float*>(need(lw, e + "expert_router.weight", LX_F32, {E, Lat + R}));
     layer.router_b = static_cast<const float*>(need(lw, e + "expert_router.bias", LX_F32, {E}));
@@ -509,8 +694,15 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
         m.k_cache.push_back(nullptr);
         m.v_cache.push_back(nullptr);
       }
+      const bool hist = speculative && !m.layers[i].attention;
+      m.conv_hist.push_back(hist ? m.alloc<float>(static_cast<size_t>(max_slots) * LX_SPEC_MAX_PENDING * m.conv_dim)
+                                 : nullptr);
+      m.ssm_hist.push_back(
+          hist ? m.alloc<float>(static_cast<size_t>(max_slots) * lx_spec_ssm_hist_floats(m.H, m.Pd, m.N)) : nullptr);
     }
   }
+  m.speculative = speculative;
+  m.tap_col.assign(static_cast<size_t>(m.P_passes) * (m.L_layers + 1), -1);
 
   // per-step scratch, for up to max_tokens tokens
   const size_t T = max_tokens, TS = T * S;
@@ -573,33 +765,216 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
   }
   m.cast_capacity = TS * static_cast<size_t>(std::max({3 * D + R, m.I, m.proj, D}));
   m.cast_bf = m.alloc<uint16_t>(m.cast_capacity);
-  m.moe_workspace = m.alloc<char>(static_cast<size_t>(lx_moe_workspace_bytes(Impl::kGemvRows, m.Iexp, m.K)));
-  m.meta_count = T + (max_slots + 1) + 3 * static_cast<size_t>(max_slots);
+  m.moe_workspace = m.alloc<char>(static_cast<size_t>(std::max(lx_moe_workspace_bytes(Impl::kGemvRows, m.Iexp, m.K),
+                                                                 lx_moe_bf16x_workspace_bytes(Impl::kGemvRows, m.Iexp, m.K))));
+  {
+    const int kmax = std::max({3 * D + R, m.I, m.proj, D, Lat, m.Ishared, m.AH * m.Dh});
+    const int rows = static_cast<int>(T);
+    const int64_t ws =
+        std::max(lx_gemm_workspace_bytes(rows, kmax, m.prefill_math), lx_gemm_workspace_bytes(rows, kmax, LX_MATH_BF16));
+    m.gemm_ws = m.alloc<char>(static_cast<size_t>(ws));
+    m.moe_grouped_ws =
+        m.alloc<char>(static_cast<size_t>(lx_moe_grouped_workspace_bytes(rows, Lat, m.Iexp, E, m.K, m.prefill_math)));
+  }
+  m.meta_count = T + (max_slots + 1) + 5 * static_cast<size_t>(max_slots);
   m.d_meta = m.alloc<int32_t>(m.meta_count);
   m.d_tokens = m.d_meta;
   m.d_cu = m.d_tokens + T;
   m.d_slots = m.d_cu + max_slots + 1;
   m.d_has_state = m.d_slots + max_slots;
   m.d_start_pos = m.d_has_state + max_slots;
-  check(static_cast<int>(cudaMallocHost(&m.h_meta, m.meta_count * 4)), "cudaMallocHost");
-  check(static_cast<int>(cudaEventCreateWithFlags(&m.meta_copied, cudaEventDisableTiming)), "cudaEventCreate");
-  m.use_graphs = std::getenv("LX_NO_GRAPHS") == nullptr;
+  m.d_fold = m.d_start_pos + max_slots;
+  m.d_keep = m.d_fold + max_slots;
+  void* pinned = nullptr;
+  check(lx_rt_host_alloc(&pinned, static_cast<int64_t>(m.meta_count * 4)), "pinned host allocation");
+  m.h_meta = static_cast<int32_t*>(pinned);
+  check(lx_rt_event_create(&m.meta_copied), "event create");
+  if (m.offload && std::getenv("LX_OFFLOAD_PREFETCH")) m.prefetch = std::atoi(std::getenv("LX_OFFLOAD_PREFETCH"));
+  if (m.route_trace || m.prefetch > 0) {
+    m.pred_mixed = m.alloc<float>(TS * D);
+    m.pred_h = m.alloc<uint16_t>(T * D);
+    m.pred_latent = m.alloc<float>(T * Lat);
+    m.pred_router_in = m.alloc<float>(T * (Lat + R));
+    m.pred_logits = m.alloc<float>(T * E);
+    m.pred_ids = m.alloc<int32_t>(T * Impl::kPredicted);
+    m.pred_w = m.alloc<float>(T * Impl::kPredicted);
+    m.pred_entropy = m.alloc<float>(T);
+    m.pred_confidence = m.alloc<float>(T);
+  }
+  if (m.prefetch > 0) {
+    check(lx_rt_stream_create(&m.side), "stream create");
+    for (int k = 0; k < m.P_passes * m.L_layers; ++k) {
+      void *a = nullptr, *b = nullptr;
+      check(lx_rt_event_create(&a), "event create");
+      check(lx_rt_event_create(&b), "event create");
+      m.fork_events.push_back(a);
+      m.join_events.push_back(b);
+    }
+  }
+  if (m.stage_bytes) {
+    for (int b = 0; b < 2; ++b) {
+      m.stage[b] = m.alloc<uint16_t>(m.stage_bytes / 2);
+      check(lx_rt_event_create(&m.stage_copied[b]), "event create");
+      check(lx_rt_event_create(&m.stage_free[b]), "event create");
+    }
+    check(lx_rt_stream_create(&m.stage_stream), "stream create");
+  }
+  if (m.stage_bytes) m.use_program = false;  // projections in host memory (LX_OFFLOAD_DENSE_HOST)
+  m.use_graphs = std::getenv("LX_NO_GRAPHS") == nullptr && !m.route_trace;
+  free_on_throw.armed = false;
 }
 
 MetisModel::~MetisModel() { delete impl_; }
 
-void MetisModel::reset_slot(int slot) { slot_len_.at(slot) = 0; }
+void MetisModel::reset_slot(int slot) {
+  slot_len_.at(slot) = 0;
+  folded_.at(slot) = 0;
+  pending_.at(slot) = 0;
+}
+
+int MetisModel::max_verify_tokens() const {
+  return std::min({LX_SPEC_MAX_PENDING, Impl::kGemvRows, 63 / impl_->KVH});
+}
+
+void MetisModel::set_feature_taps(const std::vector<FeatureTap>& taps) {
+  Impl& m = *impl_;
+  auto same = [](const FeatureTap& a, const FeatureTap& b) { return a.pass == b.pass && a.layer == b.layer; };
+  if (taps.size() == m.taps.size() && std::equal(taps.begin(), taps.end(), m.taps.begin(), same)) return;
+  std::fill(m.tap_col.begin(), m.tap_col.end(), -1);
+  int col = 0;
+  for (const FeatureTap& t : taps) {
+    if (t.pass < 0 || t.pass >= m.P_passes || t.layer < -1 || t.layer >= m.L_layers)
+      throw std::runtime_error("feature tap out of range");
+    int& slot = m.tap_col[static_cast<size_t>(t.pass) * (m.L_layers + 1) + t.layer + 1];
+    if (slot >= 0) throw std::runtime_error("feature tap given twice");
+    slot = col;
+    col += m.D;
+  }
+  m.taps = taps;
+  if (col != m.tap_dim) {
+    if (m.tap_out) {
+      lx_rt_free(m.tap_out);
+      lx_rt_free(m.tap_mean);
+      m.allocations.erase(std::remove(m.allocations.begin(), m.allocations.end(), static_cast<void*>(m.tap_out)),
+                          m.allocations.end());
+      m.allocations.erase(std::remove(m.allocations.begin(), m.allocations.end(), static_cast<void*>(m.tap_mean)),
+                          m.allocations.end());
+      m.tap_out = m.tap_mean = nullptr;
+    }
+    m.tap_dim = col;
+    if (col > 0) {
+      m.tap_out = m.alloc<float>(static_cast<size_t>(m.max_tokens) * col);
+      m.tap_mean = m.alloc<float>(static_cast<size_t>(m.max_tokens) * m.D);
+    }
+  }
+  // captured steps have the old taps baked in
+  for (auto& [key, exec] : m.graphs) lx_rt_graph_destroy(exec);
+  m.graphs.clear();
+  m.seen.clear();
+}
+
+int MetisModel::feature_dim() const { return impl_->tap_dim; }
+const float* MetisModel::features() const { return impl_->tap_out; }
+
+MetisModel::HeadWeights MetisModel::head_weights() const {
+  return {impl_->head.w, impl_->head.q, impl_->head.scale};
+}
+
+namespace {
+
+// The snapshot's pieces for one slot, in layout order: `piece(device_ptr, bytes, is_kv)`.
+template <typename Fn>
+void each_piece(const Impl& m, int slot, int length, Fn&& piece) {
+  const size_t kv_row = static_cast<size_t>(m.KVH) * m.Dh;  // elements per position
+  for (int pass = 0; pass < m.P_passes; ++pass) {
+    for (int i = 0; i < m.L_layers; ++i) {
+      const int idx = pass * m.L_layers + i;
+      if (m.layers[i].attention) {
+        const size_t base = static_cast<size_t>(slot) * m.kv_capacity * kv_row;  // elements
+        const size_t bytes = sizeof(uint16_t) * static_cast<size_t>(length) * kv_row;
+        piece(static_cast<char*>(m.k_cache[idx]) + sizeof(uint16_t) * base, bytes, true);
+        piece(static_cast<char*>(m.v_cache[idx]) + sizeof(uint16_t) * base, bytes, true);
+      } else {
+        const size_t conv = static_cast<size_t>(m.W - 1) * m.conv_dim;
+        const size_t ssm = static_cast<size_t>(m.H) * m.Pd * m.N;
+        piece(m.conv_state[idx] + static_cast<size_t>(slot) * conv, sizeof(float) * conv, false);
+        piece(m.ssm_state[idx] + static_cast<size_t>(slot) * ssm, sizeof(float) * ssm, false);
+      }
+    }
+  }
+}
+
+}  // namespace
+
+size_t MetisModel::slot_state_bytes(int length) const {
+  const Impl& m = *impl_;
+  size_t total = 0;
+  each_piece(m, 0, length, [&total](const void*, size_t bytes, bool) { total += bytes; });
+  return total;
+}
+
+void MetisModel::save_slot(int slot, void* dst, int length, void* stream) {
+  Impl& m = *impl_;
+  if (slot < 0 || slot >= m.max_slots || length < 0 || length > m.kv_capacity)
+    throw std::runtime_error("save_slot: slot or length out of range");
+  // A speculative slot's Mamba state stops at its folded positions: fold the pending ones first.
+  if (pending_.at(slot) != 0) throw std::runtime_error("save_slot: the slot has pending positions (fold_pending)");
+  char* out = static_cast<char*>(dst);
+  size_t off = 0;
+  each_piece(m, slot, length, [&](const void* src, size_t bytes, bool) {
+    check(lx_rt_copy(out + off, src, static_cast<int64_t>(bytes), LX_COPY_DEFAULT, stream), "slot state copy");
+    off += bytes;
+  });
+}
+
+void MetisModel::restore_slot(int slot, const void* src, int length, void* stream) {
+  Impl& m = *impl_;
+  if (slot < 0 || slot >= m.max_slots || length < 0 || length > m.kv_capacity)
+    throw std::runtime_error("restore_slot: slot or length out of range");
+  const char* in = static_cast<const char*>(src);
+  size_t off = 0;
+  each_piece(m, slot, length, [&](const void* dst, size_t bytes, bool) {
+    check(lx_rt_copy(const_cast<void*>(dst), in + off, static_cast<int64_t>(bytes), LX_COPY_DEFAULT, stream),
+          "slot state copy");
+    off += bytes;
+  });
+  slot_len_.at(slot) = length;
+  folded_.at(slot) = length;
+  pending_.at(slot) = 0;
+}
 
 namespace {
 
 // y = alpha * (x @ W^T + bias) + beta * y for M rows of x (f32 or bf16). Decode-sized products run
-// as GEMVs on the int8 copy when there is one, reading x as it is; larger ones go to cuBLASLt on
-// the bf16 weight, through a bf16 copy of x when x is f32.
+// as GEMVs on the int8 copy when there is one, reading x as it is; larger ones go to the dense GEMM on
+// the bf16 weight, through a bf16 copy of x when x is f32. `rows_per_token` > 1 marks a product
+// with that many rows per token (the depth memory's per-stream rows): in a decode-sized step those
+// stay GEMVs, 8 rows at a time, so that a token's rows get the same bits whatever the step's size.
 void linear(Impl& m, const Linear& l, const void* x, lx_dtype x_dtype, int ld_x, void* y, lx_dtype y_dtype, int ld_y,
-            int M, cudaStream_t s, float alpha = 1.0f, float beta = 0.0f) {
-  if (M <= Impl::kGemvRows) {
-    LX_CHECK(lx_gemv(x, x_dtype, ld_x, l.q ? static_cast<const void*>(l.q) : l.w, l.q ? LX_W_INT8 : LX_W_BF16, l.scale,
-                     l.bias, LX_BF16, y, y_dtype, ld_y, M, l.N, l.K, alpha, beta, s));
+            int M, void* s, float alpha = 1.0f, float beta = 0.0f, int rows_per_token = 1) {
+  const bool decode_step = M / rows_per_token <= Impl::kGemvRows;
+  if (M <= Impl::kGemvRows || decode_step) {
+    const size_t xs = x_dtype == LX_F32 ? 4 : 2, ys = y_dtype == LX_F32 ? 4 : 2;
+    for (int r0 = 0; r0 < M; r0 += Impl::kGemvRows) {
+      const int rows = std::min(Impl::kGemvRows, M - r0);
+      const void* xr = static_cast<const char*>(x) + xs * r0 * ld_x;
+      void* yr = static_cast<char*>(y) + ys * r0 * ld_y;
+      if (l.x16)
+        LX_CHECK(lx_gemv_bf16x(xr, x_dtype, ld_x, l.x16, l.bias, LX_BF16, yr, y_dtype, ld_y, rows, l.N, l.K, alpha, beta, s));
+      else if (m.decode_bf16 && !l.q)
+        LX_CHECK(lx_gemv_decode_bf16(xr, x_dtype, ld_x, l.w, l.bias, LX_BF16, yr, y_dtype, ld_y, rows, l.N, l.K, alpha,
+                                     beta, s));
+      else
+        LX_CHECK(lx_gemv(xr, x_dtype, ld_x, l.q ? static_cast<const void*>(l.q) : l.w, l.q ? LX_W_INT8 : LX_W_BF16,
+                         l.scale, l.bias, LX_BF16, yr, y_dtype, ld_y, rows, l.N, l.K, alpha, beta, s));
+    }
+    return;
+  }
+  if (l.pw.type != LX_W_BF16 || m.prefill_math != LX_MATH_BF16) {
+    // a weight kept bf16 multiplies under BF16 math whatever the mode
+    const lx_math math = l.pw.type == LX_W_BF16 ? LX_MATH_BF16 : m.prefill_math;
+    LX_CHECK(lx_gemm_w(x, x_dtype, ld_x, &l.pw, math, l.bias, LX_BF16, y, y_dtype, ld_y, M, l.N, l.K, alpha, beta,
+                       m.gemm_ws, s));
     return;
   }
   if (x_dtype == LX_F32) {
@@ -608,34 +983,57 @@ void linear(Impl& m, const Linear& l, const void* x, lx_dtype x_dtype, int ld_x,
     x = m.cast_bf;
     ld_x = l.K;
   }
+  if (l.host) {  // copy the weight in on the copy stream once the product that last used the buffer is done
+    const int b = m.stage_next;
+    m.stage_next ^= 1;
+    check(lx_rt_stream_wait(m.stage_stream, m.stage_free[b]), "stream wait");
+    check(lx_rt_copy(m.stage[b], l.w, static_cast<int64_t>(static_cast<size_t>(l.N) * l.K * 2), LX_COPY_H2D,
+                     m.stage_stream),
+          "weight staging copy");
+    check(lx_rt_event_record(m.stage_copied[b], m.stage_stream), "event record");
+    check(lx_rt_stream_wait(s, m.stage_copied[b]), "stream wait");
+    LX_CHECK(lx_gemm_bf16(x, ld_x, m.stage[b], l.bias, y, y_dtype, ld_y, M, l.N, l.K, alpha, beta, s));
+    check(lx_rt_event_record(m.stage_free[b], s), "event record");
+    return;
+  }
   LX_CHECK(lx_gemm_bf16(x, ld_x, l.w, l.bias, y, y_dtype, ld_y, M, l.N, l.K, alpha, beta, s));
 }
 
-void to_bf16(const float* src, int ld_src, void* dst, int ld_dst, int rows, int cols, cudaStream_t s) {
+// The f32 products (routers, the depth head): batch invariant in decode-sized steps (kernels.h,
+// lx_spec_gemv_f32), the dense GEMM otherwise.
+void gemm_f32(const float* x, int ld_x, const float* w, const float* bias, float* y, int ld_y, int M, int N, int K,
+              void* s) {
+  if (M <= Impl::kGemvRows)
+    LX_CHECK(lx_spec_gemv_f32(x, ld_x, w, bias, y, ld_y, M, N, K, s));
+  else
+    LX_CHECK(lx_gemm_f32(x, ld_x, w, bias, y, ld_y, M, N, K, s));
+}
+
+void to_bf16(const float* src, int ld_src, void* dst, int ld_dst, int rows, int cols, void* s) {
   LX_CHECK(lx_copy2d(src, LX_F32, ld_src, dst, LX_BF16, ld_dst, rows, cols, s));
 }
 
-void copy_f32(const float* src, int ld_src, float* dst, int ld_dst, int rows, int cols, cudaStream_t s) {
+void copy_f32(const float* src, int ld_src, float* dst, int ld_dst, int rows, int cols, void* s) {
   LX_CHECK(lx_copy2d(src, LX_F32, ld_src, dst, LX_F32, ld_dst, rows, cols, s));
 }
 
 // Depth-memory read: attend over the token's bank and gate the result into the streams. Leaves
 // the mean retrieved vector in mem_summary (zeros while the bank is empty).
-void memory_retrieve(Impl& m, int T, int n_entries, cudaStream_t s) {
+void memory_retrieve(Impl& m, int T, int n_entries, void* s) {
   const int S = m.S, D = m.D, Mm = m.M;
   if (n_entries == 0) {
-    cudaMemsetAsync(m.mem_summary, 0, sizeof(float) * T * D, s);
+    lx_rt_memset(m.mem_summary, 0, static_cast<int64_t>(sizeof(float) * T * D), s);
     return;
   }
-  linear(m, m.m_query, m.streams, LX_F32, D, m.q, LX_F32, Mm, T * S, s);
+  linear(m, m.m_query, m.streams, LX_F32, D, m.q, LX_F32, Mm, T * S, s, 1.0f, 0.0f, S);
   LX_CHECK(lx_memory_attend(m.q, m.bank_k, m.bank_v, n_entries, m.Emax, m.retrieved_bf, T, S, Mm, s));
-  linear(m, m.m_out, m.retrieved_bf, LX_BF16, Mm, m.projected, LX_F32, D, T * S, s);
+  linear(m, m.m_out, m.retrieved_bf, LX_BF16, Mm, m.projected, LX_F32, D, T * S, s, 1.0f, 0.0f, S);
   LX_CHECK(lx_memory_fuse(m.streams, m.projected, m.m_gate, m.m_gate_b, m.mem_summary, T, S, D, s));
 }
 
 // [a | b | c | d] into one row per token, as bf16 (for a GEMM) or f32.
 void concat4(Impl& m, const float* a, const float* b, const float* c, const float* d, void* out, lx_dtype dtype,
-             int T, cudaStream_t s) {
+             int T, void* s) {
   const int D = m.D, R = m.R, ld = 3 * D + R;
   const size_t es = dtype == LX_F32 ? 4 : 2;
   char* o = static_cast<char*>(out);
@@ -646,14 +1044,14 @@ void concat4(Impl& m, const float* a, const float* b, const float* c, const floa
 }
 
 // Routing features: tanh(route_projection([state, retrieved, difference, history])).
-void routing_features(Impl& m, int T, cudaStream_t s) {
+void routing_features(Impl& m, int T, void* s) {
   concat4(m, m.state, m.mem_summary, m.difference, m.history, m.feat_in_bf, LX_BF16, T, s);
   linear(m, m.m_route, m.feat_in_bf, LX_BF16, 3 * m.D + m.R, m.features, LX_F32, m.R, T, s);
   LX_CHECK(lx_activate_f32(m.features, static_cast<int64_t>(T) * m.R, 0, s));
 }
 
 // A new memory entry from the streams and the last MoE's routing; stores its key and value.
-void memory_write(Impl& m, const MetisConfig& c, int T, int pass, int anchor, int& n_entries, cudaStream_t s) {
+void memory_write(Impl& m, const MetisConfig& c, int T, int pass, int anchor, int& n_entries, void* s) {
   const int D = m.D, R = m.R, Mm = m.M;
   LX_CHECK(lx_stream_mean(m.streams, m.state, T, m.S, D, s));
   linear(m, m.m_state, m.state, LX_F32, D, m.entry, LX_F32, Mm, T, s);
@@ -668,6 +1066,14 @@ void memory_write(Impl& m, const MetisConfig& c, int T, int pass, int anchor, in
   linear(m, m.m_key, m.entry, LX_F32, Mm, m.bank_k + n_entries * Mm, LX_F32, ld_bank, T, s);
   linear(m, m.m_value, m.entry, LX_F32, Mm, m.bank_v + n_entries * Mm, LX_F32, ld_bank, T, s);
   ++n_entries;
+}
+
+// A feature tap after block `layer` of `pass`: the stream mean, into its columns of tap_out.
+void write_tap(Impl& m, int pass, int layer, int T, void* s) {
+  const int col = m.tap_col[static_cast<size_t>(pass) * (m.L_layers + 1) + layer + 1];
+  if (col < 0) return;
+  LX_CHECK(lx_stream_mean(m.streams, m.tap_mean, T, m.S, m.D, s));
+  copy_f32(m.tap_mean, m.D, m.tap_out + col, m.tap_dim, T, m.D, s);
 }
 
 // ---- The decode program ------------------------------------------------------------------------
@@ -1024,9 +1430,54 @@ lx_program* build_program(Impl& m, const MetisConfig& c, int T, float* logits) {
   return p;
 }
 
+
+
+// Whether the decode program runs this step: a decode step (one token per sequence, at most 8) of a
+// model whose program was built (LX_PROGRAM, and none of what it does not cover yet: speculative
+// models, so a verify step and the steps around it share one path, offloaded experts, projections
+// in host memory, BF16X copies), with no route trace or feature taps to write.
+bool decode_program_covers(const Impl& m, int T, int n_seq, bool spec) {
+  if (!m.use_program || spec || T != n_seq || T > 8 || m.route_trace) return false;
+  for (int col : m.tap_col)
+    if (col >= 0) return false;
+  return true;
+}
+
+// Runs a decode step as the shape's program, building it on the shape's first step. One token per
+// sequence: every row is a last row, so all_rows changes nothing.
+void run_program(Impl& m, const MetisConfig& c, int T, float* logits, void* s) {
+  auto it = m.programs.find({T, logits});
+  if (it == m.programs.end()) {
+    std::vector<std::pair<int, std::string>> names;
+    g_op_names = &names;
+    try {
+      it = m.programs.emplace(std::make_pair(T, logits), build_program(m, c, T, logits)).first;
+    } catch (...) {
+      g_op_names = nullptr;
+      throw;
+    }
+    g_op_names = nullptr;
+    m.program_names[it->second] = std::move(names);
+  }
+  LX_CHECK(lx_program_run(it->second, s));
+  // LX_PROGRAM_TRACE_OUT=DIR (with LX_PROGRAM_TRACE): one step's task timeline and op names, the
+  // 32nd step's or LX_PROGRAM_TRACE_STEP's
+  const char* dir = std::getenv("LX_PROGRAM_TRACE_OUT");
+  const char* at = std::getenv("LX_PROGRAM_TRACE_STEP");
+  if (dir && ++m.traced_steps == (at ? std::atoi(at) : 32)) {
+    check(lx_rt_stream_sync(s), "stream sync");
+    std::vector<int64_t> rec(static_cast<size_t>(1) << 24);
+    const int n = lx_program_trace(it->second, rec.data(), static_cast<int>(rec.size() / 4));
+    std::ofstream(std::string(dir) + "/trace.bin", std::ios::binary)
+        .write(reinterpret_cast<const char*>(rec.data()), static_cast<std::streamsize>(n) * 32);
+    std::ofstream names(std::string(dir) + "/ops.txt");
+    for (const auto& [op, what] : m.program_names[it->second]) names << op << " " << what << "\n";
+  }
+}
+
 }  // namespace
 
-void MetisModel::forward(const StepBatch& b, float* logits, bool all_rows, cudaStream_t s) {
+void MetisModel::forward(const StepBatch& b, float* logits, bool all_rows, void* s) {
   Impl& m = *impl_;
   const int T = static_cast<int>(b.tokens.size());
   const int n_seq = static_cast<int>(b.slots.size());
@@ -1034,88 +1485,169 @@ void MetisModel::forward(const StepBatch& b, float* logits, bool all_rows, cudaS
   if (T > m.max_tokens) throw std::runtime_error("step has more tokens than max_tokens");
   if (n_seq > m.max_slots || static_cast<int>(b.cu_seqlens.size()) != n_seq + 1)
     throw std::runtime_error("bad step batch");
+  fold_pending(b, s);
+  stage(b, false, s);
+  launch(T, n_seq, all_rows, logits, false, s);
+  for (int i = 0; i < n_seq; ++i) {
+    slot_len_[b.slots[i]] += b.cu_seqlens[i + 1] - b.cu_seqlens[i];
+    folded_[b.slots[i]] = slot_len_[b.slots[i]];
+  }
+}
 
-  // stage the step's metadata (wait until the previous step's copy has left the staging buffer)
-  cudaEventSynchronize(m.meta_copied);
+void MetisModel::forward_spec(const StepBatch& b, float* logits, void* s) {
+  Impl& m = *impl_;
+  if (!m.speculative) throw std::runtime_error("forward_spec needs a model built with speculative = true");
+  const int T = static_cast<int>(b.tokens.size());
+  const int n_seq = static_cast<int>(b.slots.size());
+  if (T == 0) return;
+  if (T > m.max_tokens) throw std::runtime_error("step has more tokens than max_tokens");
+  if (n_seq > m.max_slots || static_cast<int>(b.cu_seqlens.size()) != n_seq + 1)
+    throw std::runtime_error("bad step batch");
+  for (int i = 0; i < n_seq; ++i)
+    if (b.cu_seqlens[i + 1] - b.cu_seqlens[i] > LX_SPEC_MAX_PENDING)
+      throw std::runtime_error("a verify step takes at most LX_SPEC_MAX_PENDING tokens per sequence");
+  stage(b, true, s);
+  launch(T, n_seq, true, logits, true, s);
+  for (int i = 0; i < n_seq; ++i) {
+    const int slot = b.slots[i], n = b.cu_seqlens[i + 1] - b.cu_seqlens[i];
+    // as stage() decided: fold only what makes room for the new tokens
+    const int fold = std::max(0, pending_[slot] + n - LX_SPEC_MAX_PENDING);
+    folded_[slot] += fold;
+    pending_[slot] += n - fold;
+    slot_len_[slot] += n;
+  }
+}
+
+void MetisModel::truncate(int slot, int length) {
+  if (length < folded_.at(slot) || length > slot_len_[slot])
+    throw std::runtime_error("truncate past the slot's pending positions");
+  pending_[slot] -= slot_len_[slot] - length;
+  slot_len_[slot] = length;
+}
+
+// Stages a step's metadata for the device (waiting until the previous step's copy has left the
+// staging buffer). A verify step folds a slot's oldest pending positions only when the new tokens
+// would not fit after them, so each position is folded once and the base state is written on few
+// steps; its has_state says whether the base state holds anything.
+void MetisModel::stage(const StepBatch& b, bool spec, void* s) {
+  Impl& m = *impl_;
+  const int T = static_cast<int>(b.tokens.size());
+  const int n_seq = static_cast<int>(b.slots.size());
+  lx_rt_event_sync(m.meta_copied);
   int32_t* tokens = m.h_meta;
   int32_t* cu = tokens + (m.d_cu - m.d_tokens);
   int32_t* slots = tokens + (m.d_slots - m.d_tokens);
   int32_t* has_state = tokens + (m.d_has_state - m.d_tokens);
   int32_t* start_pos = tokens + (m.d_start_pos - m.d_tokens);
+  int32_t* fold = tokens + (m.d_fold - m.d_tokens);
+  int32_t* keep = tokens + (m.d_keep - m.d_tokens);
   std::memcpy(tokens, b.tokens.data(), 4 * T);
   std::memcpy(cu, b.cu_seqlens.data(), 4 * (n_seq + 1));
   std::memcpy(slots, b.slots.data(), 4 * n_seq);
   for (int i = 0; i < n_seq; ++i) {
-    const int slot = b.slots[i];
-    has_state[i] = slot_len_[slot] > 0;
+    const int slot = b.slots[i], n = b.cu_seqlens[i + 1] - b.cu_seqlens[i];
     start_pos[i] = slot_len_[slot];
-    if (start_pos[i] + b.cu_seqlens[i + 1] - b.cu_seqlens[i] > m.kv_capacity)
-      throw std::runtime_error("sequence longer than the KV capacity");
+    if (start_pos[i] + n > m.kv_capacity) throw std::runtime_error("sequence longer than the KV capacity");
+    if (spec) {
+      has_state[i] = folded_[slot] > 0;
+      fold[i] = std::max(0, pending_[slot] + n - LX_SPEC_MAX_PENDING);
+      keep[i] = pending_[slot] - fold[i];
+    } else {
+      has_state[i] = slot_len_[slot] > 0;
+      fold[i] = keep[i] = 0;
+    }
   }
-  cudaMemcpyAsync(m.d_meta, m.h_meta, m.meta_count * 4, cudaMemcpyHostToDevice, s);
-  cudaEventRecord(m.meta_copied, s);
+  lx_rt_copy(m.d_meta, m.h_meta, static_cast<int64_t>(m.meta_count * 4), LX_COPY_H2D, s);
+  lx_rt_event_record(m.meta_copied, s);
+}
 
-  const bool decode = T == n_seq;
-  const Impl::GraphKey key{T, n_seq, all_rows, logits};
-  if (m.use_program && decode && T <= 8) {
-    // one token per sequence: every row is a last row, so all_rows changes nothing
-    auto it = m.programs.find({T, logits});
-    if (it == m.programs.end()) {
-      std::vector<std::pair<int, std::string>> names;
-      g_op_names = &names;
-      it = m.programs.emplace(std::make_pair(T, logits), build_program(m, cfg_, T, logits)).first;
-      g_op_names = nullptr;
-      m.program_names[it->second] = std::move(names);
-    }
-    LX_CHECK(lx_program_run(it->second, s));
-    // LX_PROGRAM_TRACE_OUT=DIR (with LX_PROGRAM_TRACE): one step's task timeline and op names, the
-    // 32nd step's or LX_PROGRAM_TRACE_STEP's
-    const char* dir = std::getenv("LX_PROGRAM_TRACE_OUT");
-    const char* at = std::getenv("LX_PROGRAM_TRACE_STEP");
-    if (dir && ++m.traced_steps == (at ? std::atoi(at) : 32)) {
-      cudaStreamSynchronize(s);
-      std::vector<int64_t> rec(static_cast<size_t>(1) << 24);
-      const int n = lx_program_trace(it->second, rec.data(), static_cast<int>(rec.size() / 4));
-      std::ofstream(std::string(dir) + "/trace.bin", std::ios::binary)
-          .write(reinterpret_cast<const char*>(rec.data()), static_cast<std::streamsize>(n) * 32);
-      std::ofstream names(std::string(dir) + "/ops.txt");
-      for (const auto& [op, what] : m.program_names[it->second]) names << op << " " << what << "\n";
-    }
-  } else if (m.use_graphs && decode) {
+// Runs the staged step: as the decode program when it covers the step, else replaying a captured
+// graph for decode and verify shapes.
+void MetisModel::launch(int T, int n_seq, bool all_rows, float* logits, bool spec, void* s) {
+  Impl& m = *impl_;
+  if (decode_program_covers(m, T, n_seq, spec)) {
+    run_program(m, cfg_, T, logits, s);
+    return;
+  }
+  // Offloaded steps larger than a decode stage their experts from the host, which is not capturable.
+  const bool capturable = spec ? T <= Impl::kGemvRows : T == n_seq && !(m.offload && T > Impl::kGemvRows);
+  const Impl::GraphKey key{T, n_seq, all_rows, logits, spec};
+  if (m.use_graphs && capturable) {
     auto it = m.graphs.find(key);
     if (it == m.graphs.end() && m.seen.count(key)) {
-      cudaGraph_t graph;
-      check(static_cast<int>(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal)), "cudaStreamBeginCapture");
-      run(T, n_seq, all_rows, logits, s);
-      check(static_cast<int>(cudaStreamEndCapture(s, &graph)), "cudaStreamEndCapture");
-      cudaGraphExec_t exec;
-      check(static_cast<int>(cudaGraphInstantiate(&exec, graph, 0)), "cudaGraphInstantiate");
-      cudaGraphDestroy(graph);
-      it = m.graphs.emplace(key, exec).first;
+      // A backend without graphs declines the capture (LX_ERR_NOT_SUPPORTED), and every step
+      // runs eagerly from then on.
+      const int capture = lx_rt_capture_begin(s);
+      if (capture == LX_ERR_NOT_SUPPORTED) {
+        m.use_graphs = false;
+      } else {
+        check(capture, "graph capture start");
+        run(T, n_seq, all_rows, logits, spec, s);
+        void* exec = nullptr;
+        check(lx_rt_capture_end(s, &exec), "graph capture end");
+        it = m.graphs.emplace(key, exec).first;
+      }
     }
     if (it != m.graphs.end()) {
-      check(static_cast<int>(cudaGraphLaunch(it->second, s)), "cudaGraphLaunch");
+      check(lx_rt_graph_launch(it->second, s), "graph launch");
     } else {
-      run(T, n_seq, all_rows, logits, s);
+      run(T, n_seq, all_rows, logits, spec, s);
       m.seen.insert(key);
     }
   } else {
-    run(T, n_seq, all_rows, logits, s);
+    run(T, n_seq, all_rows, logits, spec, s);
   }
-  for (int i = 0; i < n_seq; ++i) slot_len_[b.slots[i]] += b.cu_seqlens[i + 1] - b.cu_seqlens[i];
+}
+
+// Folds every pending position of the step's slots into their base state, so that a normal step
+// (which has no history) can continue them: the Mamba layers' spec kernels with no new tokens.
+void MetisModel::fold_pending(const StepBatch& b, void* s) {
+  Impl& m = *impl_;
+  std::vector<int32_t> slots, has, fold;
+  for (int slot : b.slots)
+    if (pending_[slot] > 0) {
+      slots.push_back(slot);
+      has.push_back(folded_[slot] > 0);
+      fold.push_back(pending_[slot]);
+    }
+  if (slots.empty()) return;
+  const int n = static_cast<int>(slots.size());
+  // [slots | has | fold | keep | cu], uploaded after the previous step's metadata copy is done
+  lx_rt_event_sync(m.meta_copied);
+  int32_t* h = m.h_meta;
+  int32_t* d = m.d_meta;
+  std::memcpy(h, slots.data(), 4 * n);
+  std::memcpy(h + n, has.data(), 4 * n);
+  std::memcpy(h + 2 * n, fold.data(), 4 * n);
+  std::memset(h + 3 * n, 0, 4 * (2 * n + 1));
+  lx_rt_copy(d, h, static_cast<int64_t>(4 * (5 * n + 1)), LX_COPY_H2D, s);
+  lx_rt_event_record(m.meta_copied, s);
+  for (size_t li = 0; li < m.conv_hist.size(); ++li) {
+    if (!m.conv_hist[li]) continue;
+    const Impl::Layer& layer = m.layers[li % m.L_layers];
+    LX_CHECK(lx_spec_conv1d(m.xbc, m.proj, layer.conv_w, layer.conv_b, m.conv_state[li], m.conv_hist[li], d, d + n,
+                            d + 2 * n, d + 3 * n, d + 4 * n, n, m.xbc, m.conv_dim, m.W, s));
+    LX_CHECK(lx_spec_ssm_scan(m.xbc, m.conv_dim, m.xbc, m.proj, m.xbc, m.xbc, m.conv_dim, layer.A_log, layer.D,
+                              layer.dt_bias, m.ssm_state[li], m.ssm_hist[li], d, d + n, d + 2 * n, d + 3 * n, d + 4 * n,
+                              n, m.ssm_y, m.H, m.Pd, m.G, m.N, s));
+  }
+  for (int slot : slots) {
+    folded_[slot] = slot_len_[slot];
+    pending_[slot] = 0;
+  }
 }
 
 // The step's device work, from the token ids in d_meta to the logits. Everything it decides on the
 // host depends only on (T, n_seq, all_rows), which is what makes it capturable.
-void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, cudaStream_t s) {
+void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, void* s) {
   Impl& m = *impl_;
   const MetisConfig& c = cfg_;
   const int S = m.S, D = m.D, R = m.R, Lat = m.Lat, E = m.E;
 
   LX_CHECK(lx_embed_streams(m.embedding, m.d_tokens, m.stream_emb, m.streams, T, S, D, s));
   LX_CHECK(lx_stream_mean(m.streams, m.previous, T, S, D, s));
-  cudaMemsetAsync(m.history, 0, sizeof(float) * T * R, s);
-  cudaMemsetAsync(m.continuation, 0, sizeof(float) * T, s);
+  lx_rt_memset(m.history, 0, static_cast<int64_t>(sizeof(float) * T * R), s);
+  lx_rt_memset(m.continuation, 0, static_cast<int64_t>(sizeof(float) * T), s);
   int n_entries = 0;
 
   for (int pass = 0; pass < m.P_passes; ++pass) {
@@ -1147,12 +1679,23 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, cudaStream_
       } else {
         const int gn = m.G * m.N;
         linear(m, layer.in_proj, m.h_bf, LX_BF16, D, m.zxbcdt, LX_F32, m.proj, T, s);
-        LX_CHECK(lx_conv1d_varlen(m.zxbcdt + m.I, m.proj, layer.conv_w, layer.conv_b, m.conv_state[slot_index],
-                                  m.d_slots, m.d_has_state, m.d_cu, n_seq, m.xbc, m.conv_dim, m.W, s));
-        LX_CHECK(lx_ssm_scan_varlen(m.xbc, m.conv_dim, m.zxbcdt + m.I + m.conv_dim, m.proj, m.xbc + m.I,
+        if (spec) {
+          // the step's tokens become pending positions (kernels.h, "Speculative decoding")
+          LX_CHECK(lx_spec_conv1d(m.zxbcdt + m.I, m.proj, layer.conv_w, layer.conv_b, m.conv_state[slot_index],
+                                  m.conv_hist[slot_index], m.d_slots, m.d_has_state, m.d_fold, m.d_keep, m.d_cu, n_seq,
+                                  m.xbc, m.conv_dim, m.W, s));
+          LX_CHECK(lx_spec_ssm_scan(m.xbc, m.conv_dim, m.zxbcdt + m.I + m.conv_dim, m.proj, m.xbc + m.I,
                                     m.xbc + m.I + gn, m.conv_dim, layer.A_log, layer.D, layer.dt_bias,
-                                    m.ssm_state[slot_index], m.d_slots, m.d_has_state, m.d_cu, n_seq, m.ssm_y, m.H,
-                                    m.Pd, m.G, m.N, s));
+                                    m.ssm_state[slot_index], m.ssm_hist[slot_index], m.d_slots, m.d_has_state,
+                                    m.d_fold, m.d_keep, m.d_cu, n_seq, m.ssm_y, m.H, m.Pd, m.G, m.N, s));
+        } else {
+          LX_CHECK(lx_conv1d_varlen(m.zxbcdt + m.I, m.proj, layer.conv_w, layer.conv_b, m.conv_state[slot_index],
+                                    m.d_slots, m.d_has_state, m.d_cu, n_seq, m.xbc, m.conv_dim, m.W, s));
+          LX_CHECK(lx_ssm_scan_varlen(m.xbc, m.conv_dim, m.zxbcdt + m.I + m.conv_dim, m.proj, m.xbc + m.I,
+                                      m.xbc + m.I + gn, m.conv_dim, layer.A_log, layer.D, layer.dt_bias,
+                                      m.ssm_state[slot_index], m.d_slots, m.d_has_state, m.d_cu, n_seq, m.ssm_y, m.H,
+                                      m.Pd, m.G, m.N, s));
+        }
         LX_CHECK(lx_gated_rmsnorm(m.ssm_y, m.zxbcdt, m.proj, layer.norm_w, m.normed_bf, T, m.I, m.G,
                                   c.mamba_norm_eps, s));
         linear(m, layer.out_proj, m.normed_bf, LX_BF16, m.I, m.update, LX_F32, D, T, s);
@@ -1166,12 +1709,39 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, cudaStream_
       to_bf16(m.latent, Lat, m.latent_bf, Lat, T, Lat, s);
       copy_f32(m.latent, Lat, m.router_in, Lat + R, T, Lat, s);
       copy_f32(m.features, R, m.router_in + Lat, Lat + R, T, R, s);
-      LX_CHECK(lx_gemm_f32(m.router_in, Lat + R, layer.router_w, layer.router_b, m.router_logits, E, T, E, Lat + R, s));
+      gemm_f32(m.router_in, Lat + R, layer.router_w, layer.router_b, m.router_logits, E, T, E, Lat + R, s);
       LX_CHECK(lx_moe_route(m.router_logits, layer.selection_bias, m.route_ids, m.route_w, m.entropy, m.confidence, T,
                             E, m.K, s));
-      if (T <= Impl::kGemvRows && layer.gate_up_q)
+      if (m.route_trace) {  // pass, layer, T, then T * K expert ids (int32)
+        std::vector<int32_t> ids(static_cast<size_t>(T) * m.K);
+        check(lx_rt_copy(ids.data(), m.route_ids, static_cast<int64_t>(ids.size() * 4), LX_COPY_D2H, s),
+              "route trace copy");
+        check(lx_rt_stream_sync(s), "stream sync");
+        const int32_t head[3] = {pass, i, T};
+        std::fwrite(head, 4, 3, m.route_trace);
+        std::fwrite(ids.data(), 4, ids.size(), m.route_trace);
+      }
+      const bool prefetching = m.prefetch > 0 && T <= Impl::kGemvRows;
+      if (m.offload) {
+        if (prefetching && i > 0)  // the branch that prefetched this layer's experts must be done
+          check(lx_rt_stream_wait(s, m.join_events[slot_index - 1]), "stream wait");
+        if (T <= Impl::kGemvRows)
+          m.offload->decode(i, m.route_ids, m.route_w, m.latent_bf, m.routed, T, s);
+        else
+          m.offload->prefill(i, m.route_ids, m.route_w, m.latent_bf, m.routed, T, s);
+      } else if (T <= Impl::kGemvRows && layer.gate_up_x16)
+        LX_CHECK(lx_moe_experts_bf16x(m.latent_bf, m.route_ids, m.route_w, layer.gate_up_x16, layer.down_x16, m.routed,
+                                      m.moe_workspace, T, Lat, m.Iexp, m.K, s));
+      else if (T <= Impl::kGemvRows && m.decode_bf16 && !layer.gate_up_q)
+        LX_CHECK(lx_moe_experts_decode_bf16(m.latent_bf, m.route_ids, m.route_w, layer.gate_up, layer.down, m.routed,
+                                            m.moe_workspace, T, Lat, m.Iexp, m.K, s));
+      else if (T <= Impl::kGemvRows && layer.gate_up_q)
         LX_CHECK(lx_moe_experts_w8(m.latent_bf, m.route_ids, m.route_w, layer.gate_up_q, layer.gate_up_scale,
                                    layer.down_q, layer.down_scale, m.routed, m.moe_workspace, T, Lat, m.Iexp, m.K, s));
+      else if (m.grouped_experts)
+        LX_CHECK(lx_moe_experts_grouped(m.latent_bf, m.route_ids, m.route_w, &layer.gate_up_pw, &layer.down_pw,
+                                        layer.gate_up_pw.type == LX_W_BF16 ? LX_MATH_BF16 : m.prefill_math, m.routed,
+                                        m.moe_grouped_ws, T, Lat, m.Iexp, E, m.K, s));
       else
         LX_CHECK(lx_moe_experts(m.latent_bf, m.route_ids, m.route_w, layer.gate_up, layer.down, m.routed, T, Lat,
                                 m.Iexp, m.K, s));
@@ -1182,19 +1752,65 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, cudaStream_
       LX_CHECK(lx_moe_summary(m.route_ids, m.route_w, layer.expert_emb, m.summary, T, R, m.K, s));
       LX_CHECK(lx_mhc_write(m.mixed, ec + S * S + S, m.update, m.streams, T, S, D, s));
 
+      if (prefetching && i + 1 < m.L_layers) {
+        // On this stream, the inputs the branch needs, so nothing it reads changes under it: the next
+        // layer's MoE read of the streams, and this layer's routing features. Then the branch: the
+        // next layer's latent_down and router, the top n experts, and their copies into VRAM.
+        const Impl::Layer& nx = m.layers[i + 1];
+        const float* nc = nx.moe_conn.params + pass * params;
+        LX_CHECK(lx_mhc_read(m.streams, nc, nc + S * S, nx.moe_conn.norm, c.rms_norm_eps, m.pred_mixed, m.pred_h, T, S,
+                             D, s));
+        copy_f32(m.features, R, m.pred_router_in + Lat, Lat + R, T, R, s);
+        check(lx_rt_event_record(m.fork_events[slot_index], s), "event record");
+        void* b = m.side;
+        check(lx_rt_stream_wait(b, m.fork_events[slot_index]), "stream wait");
+        linear(m, nx.latent_down, m.pred_h, LX_BF16, D, m.pred_latent, LX_F32, Lat, T, b);
+        copy_f32(m.pred_latent, Lat, m.pred_router_in, Lat + R, T, Lat, b);
+        LX_CHECK(lx_gemm_f32(m.pred_router_in, Lat + R, nx.router_w, nx.router_b, m.pred_logits, E, T, E, Lat + R, b));
+        LX_CHECK(lx_moe_route(m.pred_logits, nx.selection_bias, m.pred_ids, m.pred_w, m.pred_entropy, m.pred_confidence,
+                              T, E, Impl::kPredicted, b));
+        // one token: its top n; several: the first n of the flattened [T, 8] (each token's best first
+        // would need a reorder; a decode batch of one is what this is for)
+        m.offload->prefetch(i + 1, m.pred_ids, std::min(m.prefetch, T * Impl::kPredicted), b);
+        check(lx_rt_event_record(m.join_events[slot_index], b), "event record");
+      }
+
+      if (m.route_trace && i + 1 < m.L_layers) {  // record: pass | 0x10000, layer, T, then T * 8 ids
+        const Impl::Layer& nx = m.layers[i + 1];
+        const float* nc = nx.moe_conn.params + pass * params;
+        LX_CHECK(lx_mhc_read(m.streams, nc, nc + S * S, nx.moe_conn.norm, c.rms_norm_eps, m.pred_mixed, m.pred_h, T, S,
+                             D, s));
+        linear(m, nx.latent_down, m.pred_h, LX_BF16, D, m.pred_latent, LX_F32, Lat, T, s);
+        copy_f32(m.pred_latent, Lat, m.pred_router_in, Lat + R, T, Lat, s);
+        copy_f32(m.features, R, m.pred_router_in + Lat, Lat + R, T, R, s);
+        LX_CHECK(lx_gemm_f32(m.pred_router_in, Lat + R, nx.router_w, nx.router_b, m.pred_logits, E, T, E, Lat + R, s));
+        LX_CHECK(lx_moe_route(m.pred_logits, nx.selection_bias, m.pred_ids, m.pred_w, m.pred_entropy, m.pred_confidence,
+                              T, E, Impl::kPredicted, s));
+        std::vector<int32_t> ids(static_cast<size_t>(T) * Impl::kPredicted);
+        check(lx_rt_copy(ids.data(), m.pred_ids, static_cast<int64_t>(ids.size() * 4), LX_COPY_D2H, s),
+              "route trace copy");
+        check(lx_rt_stream_sync(s), "stream sync");
+        const int32_t head[3] = {pass | 0x10000, i + 1, T};
+        std::fwrite(head, 4, 3, m.route_trace);
+        std::fwrite(ids.data(), 4, ids.size(), m.route_trace);
+      }
+
       LX_CHECK(glue::axpby(m.history, m.summary, 0.5f, 0.5f, static_cast<int64_t>(T) * R, s));
       if (layer.attention) memory_write(m, c, T, pass, anchor++, n_entries, s);
+      write_tap(m, pass, i, T, s);
     }
 
     // the end of a pass: one more read, the depth head, and an entry for where the pass left the token
     memory_retrieve(m, T, n_entries, s);
     LX_CHECK(lx_stream_mean(m.streams, m.state, T, S, D, s));
+    if (const int col = m.tap_col[static_cast<size_t>(pass) * (m.L_layers + 1)]; col >= 0)
+      copy_f32(m.state, D, m.tap_out + col, m.tap_dim, T, D, s);
     LX_CHECK(glue::sub(m.state, m.previous, m.difference, static_cast<int64_t>(T) * D, s));
     routing_features(m, T, s);
     concat4(m, m.state, m.mem_summary, m.difference, m.features, m.cont_in, LX_F32, T, s);
-    LX_CHECK(lx_gemm_f32(m.cont_in, 3 * D + R, m.c_hidden_w, m.c_hidden_b, m.cont_hidden, R, T, R, 3 * D + R, s));
+    gemm_f32(m.cont_in, 3 * D + R, m.c_hidden_w, m.c_hidden_b, m.cont_hidden, R, T, R, 3 * D + R, s);
     LX_CHECK(lx_activate_f32(m.cont_hidden, static_cast<int64_t>(T) * R, 1, s));
-    LX_CHECK(lx_gemm_f32(m.cont_hidden, R, m.c_out_w, m.c_out_b, m.cont_logit, 1, T, 1, R, s));
+    gemm_f32(m.cont_hidden, R, m.c_out_w, m.c_out_b, m.cont_logit, 1, T, 1, R, s);
     LX_CHECK(lx_continuation_finish(m.cont_logit, m.state, m.difference, c.continuation_logit_limit, m.continuation, T,
                                     D, s));
     memory_write(m, c, T, pass, anchor, n_entries, s);

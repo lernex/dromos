@@ -1,8 +1,7 @@
-// Small kernels the Metis forward pass needs between the library kernels. They are specific to
-// how the model wires its pieces together, so they live with the model rather than in the ABI.
-#include "model/glue.h"
-
+// Small kernels the Metis forward pass needs between the library kernels (kernels.h, "Model glue"). They
+// are specific to how the model wires its pieces together; every backend provides them as plain ops.
 #include "cuda/common.cuh"
+#include "cuda/kernels.h"
 
 namespace {
 
@@ -40,29 +39,29 @@ int blocks(int64_t n) { return static_cast<int>((n + 255) / 256); }
 
 }  // namespace
 
-namespace lx::glue {
+extern "C" {
 
-int axpby(float* y, const float* x, float a, float b, int64_t n, cudaStream_t s) {
-  if (n > 0) axpby_kernel<<<blocks(n), 256, 0, s>>>(y, x, a, b, n);
-  return launch_status();
+int lx_axpby_f32(float* y, const float* x, float a, float b, int64_t n, void* stream) {
+  if (n > 0) axpby_kernel<<<blocks(n), 256, 0, static_cast<cudaStream_t>(stream)>>>(y, x, a, b, n);
+  return lx::launch_status();
 }
 
-int sub(const float* a, const float* b, float* out, int64_t n, cudaStream_t s) {
-  if (n > 0) sub_kernel<<<blocks(n), 256, 0, s>>>(a, b, out, n);
-  return launch_status();
+int lx_sub_f32(const float* a, const float* b, float* out, int64_t n, void* stream) {
+  if (n > 0) sub_kernel<<<blocks(n), 256, 0, static_cast<cudaStream_t>(stream)>>>(a, b, out, n);
+  return lx::launch_status();
 }
 
-int meta_scalars(const float* entropy, const float* confidence, const float* continuation, float mean_k,
-                 float inv_log_experts, void* meta, int ld, int col, int T, cudaStream_t s) {
+int lx_meta_scalars(const float* entropy, const float* confidence, const float* continuation, float mean_k,
+                    float inv_log_experts, void* meta, int ld, int col, int T, void* stream) {
   if (T > 0)
-    meta_scalars_kernel<<<blocks(T), 256, 0, s>>>(entropy, confidence, continuation, mean_k, inv_log_experts,
-                                                  static_cast<__nv_bfloat16*>(meta), ld, col, T);
-  return launch_status();
+    meta_scalars_kernel<<<blocks(T), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        entropy, confidence, continuation, mean_k, inv_log_experts, static_cast<__nv_bfloat16*>(meta), ld, col, T);
+  return lx::launch_status();
 }
 
-int gather_last(const float* src, const int32_t* cu, float* out, int n_seq, int D, cudaStream_t s) {
-  if (n_seq > 0) gather_last_kernel<<<n_seq, 256, 0, s>>>(src, cu, out, D);
-  return launch_status();
+int lx_gather_last(const float* src, const int32_t* cu, float* out, int n_seq, int D, void* stream) {
+  if (n_seq > 0) gather_last_kernel<<<n_seq, 256, 0, static_cast<cudaStream_t>(stream)>>>(src, cu, out, D);
+  return lx::launch_status();
 }
 
-}  // namespace lx::glue
+}  // extern "C"

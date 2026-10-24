@@ -1,11 +1,14 @@
 #include "core/device.h"
 
-#include <cuda_runtime.h>
-
 #include <algorithm>
+#include <cctype>
 #include <span>
 #include <stdexcept>
 #include <utility>
+
+#include "cuda/kernels.h"
+#include "cuda/tunable.h"
+#include "runtime/plan.h"
 
 namespace lx {
 namespace {
@@ -13,8 +16,8 @@ namespace {
 // Tensors start on this boundary so every one can feed a vectorized kernel directly.
 constexpr size_t kAlignment = 256;
 
-void check(cudaError_t err, const std::string& what) {
-  if (err != cudaSuccess) throw std::runtime_error(what + ": " + cudaGetErrorString(err));
+void check(int status, const std::string& what) {
+  if (status != 0) throw std::runtime_error(what + ": " + lx_rt_error_string(status));
 }
 
 size_t align_up(size_t n) { return (n + kAlignment - 1) / kAlignment * kAlignment; }
@@ -33,7 +36,7 @@ std::string format_shape(std::span<const int64_t> shape) {
 DeviceBuffer::DeviceBuffer(size_t bytes) {
   if (bytes == 0) return;
   void* p = nullptr;
-  check(cudaMalloc(&p, bytes), "cudaMalloc of " + std::to_string(bytes) + " bytes");
+  check(lx_rt_alloc(&p, static_cast<int64_t>(bytes)), "device allocation of " + std::to_string(bytes) + " bytes");
   ptr_ = p;
   bytes_ = bytes;
 }
@@ -43,7 +46,7 @@ DeviceBuffer::DeviceBuffer(DeviceBuffer&& other) noexcept
 
 DeviceBuffer& DeviceBuffer::operator=(DeviceBuffer&& other) noexcept {
   if (this != &other) {
-    if (ptr_) cudaFree(ptr_);
+    if (ptr_) lx_rt_free(ptr_);
     ptr_ = std::exchange(other.ptr_, nullptr);
     bytes_ = std::exchange(other.bytes_, 0);
   }
@@ -51,7 +54,7 @@ DeviceBuffer& DeviceBuffer::operator=(DeviceBuffer&& other) noexcept {
 }
 
 DeviceBuffer::~DeviceBuffer() {
-  if (ptr_) cudaFree(ptr_);
+  if (ptr_) lx_rt_free(ptr_);
 }
 
 int64_t Tensor::numel() const noexcept {
@@ -82,7 +85,11 @@ Weights Weights::upload(const SafetensorsSet& set) {
   for (size_t i = 0; i < order.size(); ++i) {
     const TensorInfo& t = *order[i];
     void* dst = base + offsets[i];
-    if (t.bytes) check(cudaMemcpy(dst, t.data, t.bytes, cudaMemcpyHostToDevice), "uploading \"" + t.name + "\"");
+    if (t.bytes) {
+      const std::string what = "uploading \"" + t.name + "\"";
+      check(lx_rt_copy(dst, t.data, static_cast<int64_t>(t.bytes), LX_COPY_H2D, nullptr), what);
+      check(lx_rt_stream_sync(nullptr), what);
+    }
     w.tensors_.emplace(t.name, Tensor{t.name, t.dtype, t.shape, t.bytes, dst});
   }
   return w;
@@ -107,3 +114,66 @@ const Tensor& Weights::get(const std::string& name, DType dtype, std::initialize
 }
 
 }  // namespace lx
+
+namespace lx::runtime {
+std::string DeviceInfo::slug() const {
+  std::string out;
+  for (char ch : name) {
+    if (std::isalnum(static_cast<unsigned char>(ch))) {
+      out += ch;
+    } else if (!out.empty() && out.back() != '_') {
+      out += '_';
+    }
+  }
+  while (!out.empty() && out.back() == '_') out.pop_back();
+  out += "_sm" + std::to_string(real_cc());
+  if (cc() != real_cc()) out += "_as" + std::to_string(cc());  // an arch override is part of the identity
+  return out;
+}
+
+DeviceInfo query_device(int ordinal) {
+  if (lx_rt_set_device(ordinal) != 0) throw std::runtime_error("no device " + std::to_string(ordinal));
+  DeviceInfo d;
+  d.ordinal = ordinal;
+  lx_device_props props{};
+  if (lx_rt_device_props(ordinal, &props) != 0)
+    throw std::runtime_error("reading the properties of device " + std::to_string(ordinal));
+  d.name = props.name;
+
+  d.real_cc_major = props.cc_major;
+  d.real_cc_minor = props.cc_minor;
+  const int effective = lx_arch();  // the real capability, lowered by any override
+  d.cc_major = effective / 10;
+  d.cc_minor = effective % 10;
+
+  d.sms = props.sms;
+  d.l2_bytes = static_cast<size_t>(props.l2_bytes);
+  // Peak bandwidth: the memory clock (kHz) with two transfers per clock, times the bus width in bytes.
+  const double clock_khz = static_cast<double>(props.mem_clock_khz);
+  const double bus_bits = props.bus_bits;
+  d.bandwidth_gbs = clock_khz * 1e3 * 2.0 * (bus_bits / 8.0) / 1e9;
+
+  int64_t free_bytes = 0, total_bytes = 0;
+  if (lx_rt_mem_info(&free_bytes, &total_bytes) != 0) throw std::runtime_error("reading device memory info");
+  d.free_bytes = static_cast<size_t>(free_bytes);
+  d.total_bytes = static_cast<size_t>(total_bytes);
+
+  // The tensor-core instructions the engine's kernel variants use, by capability. FP4 block-scaled
+  // multiplies are the arch-specific 100a / 120a instructions.
+  const int cc = d.cc();
+  d.bf16_mma = cc >= 80;
+  d.int8_mma = cc >= 80;
+  d.fp8_mma = cc >= 89;
+  d.fp4_mma = cc == 100 || cc == 120;
+  d.clusters = cc >= kClusterArch;
+  d.built = kernels_built_for(d.real_cc());
+
+  const int driver = props.driver_version, runtime = props.runtime_version;
+  d.driver = driver;
+  d.runtime = runtime;
+  d.driver_text = std::to_string(driver / 1000) + "." + std::to_string((driver % 1000) / 10);
+  d.runtime_text = std::to_string(runtime / 1000) + "." + std::to_string((runtime % 1000) / 10);
+  return d;
+}
+
+}  // namespace lx::runtime

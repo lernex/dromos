@@ -51,3 +51,26 @@ run in vLLM (Praxis FP8 checkpoint: 0.0077 / 0.040 / 0.0066), and must not be wo
 | Logos, 1 / 32 streams | FP8 | vLLM 117 / 770 tok/s |
 | Praxis, 1 stream | 4-bit | llama.cpp Q4_K_M 250 tok/s |
 | Prefill | every format | vLLM and llama.cpp, same file |
+
+## Backends: one model, every machine
+
+The owner's bar: Metis runs at its best wherever it is, on anything, as fast as that thing can
+run it, at the highest quality it can. So the engine has four backends sharing one model
+implementation, one set of weight formats, one server and one CLI:
+
+| Backend | Hardware | Notes |
+|---|---|---|
+| CUDA | NVIDIA, sm_80+ | `engine/cuda`, the reference backend |
+| HIP | AMD (RDNA 3/4, CDNA 3) | `engine/hip`, ported from the CUDA kernels; wave32 and wave64, WMMA / MFMA for native math |
+| Metal | Apple silicon | `engine/metal`, unified memory: weights mapped straight from the file, no copies |
+| CPU | x86 (AVX2, AVX-VNNI, AVX-512) and ARM (NEON, SVE where present) | `engine/cpu`, also the offload tier's CPU expert path |
+
+The backend interface is the kernels.h ABI, including its "Runtime" section (memory, copies,
+streams, events, graph capture), plus tunable.h (each backend reports its own `lx_arch`). Each
+backend is one shared library exporting every `lx_*` function, and the model code calls nothing
+else. The `lernex` binary loads the best backend present at startup (CUDA or HIP when a GPU and
+driver are found, Metal on a Mac, the CPU otherwise). Every backend runs the same kernel test
+suite (tests/kernels, with a backend option) and the same end-to-end KL check.
+
+Offloading (VRAM + pinned RAM over PCIe + CPU compute + NVMe at once) is a core capability, not a
+fallback: Logos is ~90% routed experts and a token touches 2% of them.
