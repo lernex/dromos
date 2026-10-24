@@ -4,6 +4,8 @@
 #include <cstring>
 #include <stdexcept>
 
+#include "cuda/kernels.h"
+
 namespace lx::runtime {
 
 namespace {
@@ -29,12 +31,12 @@ std::vector<uint64_t> prefix_hashes(const std::vector<int32_t>& tokens, int limi
   return out;
 }
 
-PrefixCache::PrefixCache(size_t device_bytes, size_t host_bytes, cudaStream_t stream)
+PrefixCache::PrefixCache(size_t device_bytes, size_t host_bytes, void* stream)
     : device_budget_(device_bytes), host_budget_(host_bytes), stream_(stream) {}
 
 PrefixCache::~PrefixCache() {
   for (Entry& e : entries_)
-    if (e.host) cudaFreeHost(e.host);
+    if (e.host) lx_rt_host_free(e.host);
 }
 
 bool PrefixCache::find(const std::vector<int32_t>& tokens, int limit, int multiple, Hit& hit) {
@@ -81,13 +83,13 @@ bool PrefixCache::store(const std::vector<int32_t>& tokens, int length, size_t b
     fill(e.device.data());
   } else if (bytes <= host_budget_) {
     make_room(bytes, false);
-    if (cudaMallocHost(&e.host, bytes) != cudaSuccess) return false;
+    if (lx_rt_host_alloc(&e.host, static_cast<int64_t>(bytes)) != 0) return false;
     fill(e.host);
   } else {
     return false;
   }
   // the copies are queued on the stream: wait for them before the entry is ever read or evicted
-  if (cudaStreamSynchronize(stream_) != cudaSuccess) throw std::runtime_error("the prefix snapshot copy failed");
+  if (lx_rt_stream_sync(stream_) != 0) throw std::runtime_error("the prefix snapshot copy failed");
   if (e.host) host_used_ += bytes;
   else device_used_ += bytes;
   entries_.push_front(std::move(e));
@@ -121,13 +123,13 @@ void PrefixCache::spill_or_drop(std::list<Entry>::iterator it) {
     return;
   }
   void* host = nullptr;
-  if (cudaMallocHost(&host, it->bytes) != cudaSuccess) {
+  if (lx_rt_host_alloc(&host, static_cast<int64_t>(it->bytes)) != 0) {
     drop(it);
     return;
   }
-  if (cudaMemcpyAsync(host, it->device.data(), it->bytes, cudaMemcpyDeviceToHost, stream_) != cudaSuccess ||
-      cudaStreamSynchronize(stream_) != cudaSuccess) {
-    cudaFreeHost(host);
+  if (lx_rt_copy(host, it->device.data(), static_cast<int64_t>(it->bytes), LX_COPY_D2H, stream_) != 0 ||
+      lx_rt_stream_sync(stream_) != 0) {
+    lx_rt_host_free(host);
     drop(it);
     return;
   }
@@ -140,7 +142,7 @@ void PrefixCache::spill_or_drop(std::list<Entry>::iterator it) {
 void PrefixCache::drop(std::list<Entry>::iterator it) {
   if (it->on_host()) host_used_ -= it->bytes;
   else device_used_ -= it->bytes;
-  if (it->host) cudaFreeHost(it->host);
+  if (it->host) lx_rt_host_free(it->host);
   entries_.erase(it);
 }
 

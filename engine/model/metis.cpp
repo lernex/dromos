@@ -19,7 +19,9 @@ namespace lx {
 namespace {
 
 void check(int status, const char* what) {
-  if (status != 0) throw std::runtime_error(std::string(what) + " failed with CUDA error " + std::to_string(status));
+  if (status != 0)
+    throw std::runtime_error(std::string(what) + " failed with error " + std::to_string(status) + ": " +
+                             lx_rt_error_string(status));
 }
 #define LX_CHECK(expr) check((expr), #expr)
 
@@ -46,10 +48,12 @@ std::vector<float> host_values(const WeightView& w) {
   for (auto d : w.shape) n *= d;
   std::vector<float> out(n);
   if (w.dtype == LX_F32) {
-    check(static_cast<int>(cudaMemcpy(out.data(), w.data, n * 4, cudaMemcpyDeviceToHost)), "cudaMemcpy");
+    check(lx_rt_copy(out.data(), w.data, n * 4, LX_COPY_D2H, nullptr), "device to host copy");
+    check(lx_rt_stream_sync(nullptr), "device to host copy");
   } else {
     std::vector<uint16_t> raw(n);
-    check(static_cast<int>(cudaMemcpy(raw.data(), w.data, n * 2, cudaMemcpyDeviceToHost)), "cudaMemcpy");
+    check(lx_rt_copy(raw.data(), w.data, n * 2, LX_COPY_D2H, nullptr), "device to host copy");
+    check(lx_rt_stream_sync(nullptr), "device to host copy");
     for (int64_t i = 0; i < n; ++i) out[i] = bf16_to_float(raw[i]);
   }
   return out;
@@ -57,7 +61,7 @@ std::vector<float> host_values(const WeightView& w) {
 
 }  // namespace
 
-// A projection: its bf16 weight (prefill, through cuBLASLt) and, when quantized, an int8 copy with
+// A projection: its bf16 weight (prefill, through the dense GEMM) and, when quantized, an int8 copy with
 // per-row scales that decode steps read instead, at half the bytes. With LX_BF16X, decode reads a
 // lossless compressed copy instead (LX_W_BF16X: the same bf16 values in ~12.2 bits, so the same
 // logits to the bit at ~1.3x fewer bytes).
@@ -134,18 +138,18 @@ struct MetisModel::Impl {
   int32_t *route_ids, *d_meta, *d_tokens, *d_cu, *d_slots, *d_has_state, *d_start_pos, *d_fold, *d_keep;
   int32_t* h_meta = nullptr;  // pinned staging for d_meta, so the upload is one async copy
   size_t meta_count = 0;
-  cudaEvent_t meta_copied = nullptr;
+  void* meta_copied = nullptr;
   float* last_rows = nullptr;
   // Decode steps (one token per sequence) and verify steps of up to kGemvRows tokens replay a captured
-  // graph: the first step of a shape runs eagerly (which also warms cuBLASLt up), the second
+  // graph: the first step of a shape runs eagerly (which also warms the dense GEMM up), the second
   // captures, every later one replays.
   using GraphKey = std::tuple<int, int, bool, float*, bool>;
   std::set<GraphKey> seen;
-  std::map<GraphKey, cudaGraphExec_t> graphs;
+  std::map<GraphKey, void*> graphs;
   bool use_graphs = true;
-  // decode-sized products (at most this many rows) run as GEMVs; larger ones on cuBLASLt
+  // decode-sized products (at most this many rows) run as GEMVs; larger ones on the dense GEMM
   static constexpr int kGemvRows = 8;
-  void* cast_bf = nullptr;  // bf16 copy of an f32 input for a cuBLASLt product
+  void* cast_bf = nullptr;  // bf16 copy of an f32 input for a dense GEMM product
   size_t cast_capacity = 0;
   void* moe_workspace = nullptr;
   offload::ExpertOffload* offload = nullptr;  // the routed experts, when they run offloaded
@@ -160,16 +164,16 @@ struct MetisModel::Impl {
   // LX_OFFLOAD_PREFETCH=n: in offloaded decode steps, a graph branch predicts the next layer's routing
   // the same way and copies the top n predicted experts that are not in VRAM ahead of the layer.
   int prefetch = 0;
-  cudaStream_t side = nullptr;
-  std::vector<cudaEvent_t> fork_events, join_events;  // per (pass, layer)
+  void* side = nullptr;
+  std::vector<void*> fork_events, join_events;  // per (pass, layer)
   // Projections kept in host memory (offload, LX_OFFLOAD_DENSE_HOST): a prefill product copies its
   // weight into one of two VRAM buffers on a copy stream, so the next weight crosses PCIe while this
   // product runs, instead of the product reading host memory tile by tile.
   size_t stage_bytes = 0;
   void* stage[2] = {nullptr, nullptr};
   int stage_next = 0;
-  cudaStream_t stage_stream = nullptr;
-  cudaEvent_t stage_copied[2] = {nullptr, nullptr}, stage_free[2] = {nullptr, nullptr};
+  void* stage_stream = nullptr;
+  void *stage_copied[2] = {nullptr, nullptr}, *stage_free[2] = {nullptr, nullptr};
   // Prefill products (more than kGemvRows rows): lx_gemm_w and lx_moe_experts_grouped on the weight
   // format and math LX_PREFILL names (bf16, w8a16, w4a16, int8, fp8, w4a8, fp4); LX_PREFILL_KEEP lists
   // name fragments that stay bf16. The default keeps what the FP8 release keeps (the Mamba-2 output
@@ -192,25 +196,26 @@ struct MetisModel::Impl {
   template <typename T>
   T* alloc(size_t count, size_t elem = sizeof(T)) {
     void* p = nullptr;
-    check(static_cast<int>(cudaMalloc(&p, count * elem)), "cudaMalloc");
-    check(static_cast<int>(cudaMemset(p, 0, count * elem)), "cudaMemset");
+    const int64_t bytes = static_cast<int64_t>(count * elem);
+    const std::string what = "device allocation of " + std::to_string(bytes) + " bytes";
+    check(lx_rt_alloc(&p, bytes), what.c_str());  // zeroed by the runtime
     allocations.push_back(p);
     return static_cast<T*>(p);
   }
   ~Impl() {
     if (route_trace) std::fclose(route_trace);
-    for (cudaEvent_t e : fork_events) cudaEventDestroy(e);
-    for (cudaEvent_t e : join_events) cudaEventDestroy(e);
-    if (side) cudaStreamDestroy(side);
+    for (void* e : fork_events) lx_rt_event_destroy(e);
+    for (void* e : join_events) lx_rt_event_destroy(e);
+    if (side) lx_rt_stream_destroy(side);
     for (int b = 0; b < 2; ++b) {
-      if (stage_copied[b]) cudaEventDestroy(stage_copied[b]);
-      if (stage_free[b]) cudaEventDestroy(stage_free[b]);
+      if (stage_copied[b]) lx_rt_event_destroy(stage_copied[b]);
+      if (stage_free[b]) lx_rt_event_destroy(stage_free[b]);
     }
-    if (stage_stream) cudaStreamDestroy(stage_stream);
-    for (auto& [key, exec] : graphs) cudaGraphExecDestroy(exec);
-    if (meta_copied) cudaEventDestroy(meta_copied);
-    if (h_meta) cudaFreeHost(h_meta);
-    for (void* p : allocations) cudaFree(p);
+    if (stage_stream) lx_rt_stream_destroy(stage_stream);
+    for (auto& [key, exec] : graphs) lx_rt_graph_destroy(exec);
+    if (meta_copied) lx_rt_event_destroy(meta_copied);
+    if (h_meta) lx_rt_host_free(h_meta);
+    for (void* p : allocations) lx_rt_free(p);
   }
 };
 
@@ -287,8 +292,7 @@ Linear make_linear(Impl& m, const WeightLookup& lw, const std::string& weight, c
   // read across PCIe where it lies rather than doubling its size in VRAM buffers.
   constexpr size_t kStageMaxBytes = 128ull << 20;
   const size_t bytes = static_cast<size_t>(N) * static_cast<size_t>(K) * 2;
-  cudaPointerAttributes attr{};
-  if (cudaPointerGetAttributes(&attr, l.w) == cudaSuccess && attr.type == cudaMemoryTypeHost && bytes <= kStageMaxBytes) {
+  if (lx_rt_is_host_memory(l.w) && bytes <= kStageMaxBytes) {
     l.host = true;
     m.stage_bytes = std::max(m.stage_bytes, bytes);
   }
@@ -356,7 +360,9 @@ float* connection_params(Impl& m, const WeightLookup& lookup, const std::string&
     softmax(write_logits, S * S + S, dst + S * S + S);
   }
   float* d = m.alloc<float>(params.size());
-  check(static_cast<int>(cudaMemcpy(d, params.data(), params.size() * 4, cudaMemcpyHostToDevice)), "cudaMemcpy");
+  check(lx_rt_copy(d, params.data(), static_cast<int64_t>(params.size() * 4), LX_COPY_H2D, nullptr),
+        "host to device copy");
+  check(lx_rt_stream_sync(nullptr), "host to device copy");
   return d;
 }
 
@@ -365,7 +371,7 @@ float* connection_params(Impl& m, const WeightLookup& lookup, const std::string&
 MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slots, int kv_capacity,
                        int max_tokens, offload::ExpertOffload* experts, bool speculative)
     : cfg_(c), slot_len_(max_slots, 0), folded_(max_slots, 0), pending_(max_slots, 0), impl_(new Impl) {
-  // A constructor that throws (a cudaMalloc that fails, say) never reaches the destructor, so the device
+  // A constructor that throws (a device allocation that fails, say) never reaches the destructor, so the device
   // memory this build took would stay allocated for the life of the process: free it on the way out.
   struct FreeOnThrow {
     Impl*& impl;
@@ -632,8 +638,10 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
   m.d_start_pos = m.d_has_state + max_slots;
   m.d_fold = m.d_start_pos + max_slots;
   m.d_keep = m.d_fold + max_slots;
-  check(static_cast<int>(cudaMallocHost(&m.h_meta, m.meta_count * 4)), "cudaMallocHost");
-  check(static_cast<int>(cudaEventCreateWithFlags(&m.meta_copied, cudaEventDisableTiming)), "cudaEventCreate");
+  void* pinned = nullptr;
+  check(lx_rt_host_alloc(&pinned, static_cast<int64_t>(m.meta_count * 4)), "pinned host allocation");
+  m.h_meta = static_cast<int32_t*>(pinned);
+  check(lx_rt_event_create(&m.meta_copied), "event create");
   if (m.offload && std::getenv("LX_OFFLOAD_PREFETCH")) m.prefetch = std::atoi(std::getenv("LX_OFFLOAD_PREFETCH"));
   if (m.route_trace || m.prefetch > 0) {
     m.pred_mixed = m.alloc<float>(TS * D);
@@ -647,11 +655,11 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
     m.pred_confidence = m.alloc<float>(T);
   }
   if (m.prefetch > 0) {
-    check(static_cast<int>(cudaStreamCreateWithFlags(&m.side, cudaStreamNonBlocking)), "cudaStreamCreate");
+    check(lx_rt_stream_create(&m.side), "stream create");
     for (int k = 0; k < m.P_passes * m.L_layers; ++k) {
-      cudaEvent_t a, b;
-      check(static_cast<int>(cudaEventCreateWithFlags(&a, cudaEventDisableTiming)), "cudaEventCreate");
-      check(static_cast<int>(cudaEventCreateWithFlags(&b, cudaEventDisableTiming)), "cudaEventCreate");
+      void *a = nullptr, *b = nullptr;
+      check(lx_rt_event_create(&a), "event create");
+      check(lx_rt_event_create(&b), "event create");
       m.fork_events.push_back(a);
       m.join_events.push_back(b);
     }
@@ -659,10 +667,10 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
   if (m.stage_bytes) {
     for (int b = 0; b < 2; ++b) {
       m.stage[b] = m.alloc<uint16_t>(m.stage_bytes / 2);
-      check(static_cast<int>(cudaEventCreateWithFlags(&m.stage_copied[b], cudaEventDisableTiming)), "cudaEventCreate");
-      check(static_cast<int>(cudaEventCreateWithFlags(&m.stage_free[b], cudaEventDisableTiming)), "cudaEventCreate");
+      check(lx_rt_event_create(&m.stage_copied[b]), "event create");
+      check(lx_rt_event_create(&m.stage_free[b]), "event create");
     }
-    check(static_cast<int>(cudaStreamCreateWithFlags(&m.stage_stream, cudaStreamNonBlocking)), "cudaStreamCreate");
+    check(lx_rt_stream_create(&m.stage_stream), "stream create");
   }
   m.use_graphs = std::getenv("LX_NO_GRAPHS") == nullptr && !m.route_trace;
   free_on_throw.armed = false;
@@ -697,8 +705,8 @@ void MetisModel::set_feature_taps(const std::vector<FeatureTap>& taps) {
   m.taps = taps;
   if (col != m.tap_dim) {
     if (m.tap_out) {
-      cudaFree(m.tap_out);
-      cudaFree(m.tap_mean);
+      lx_rt_free(m.tap_out);
+      lx_rt_free(m.tap_mean);
       m.allocations.erase(std::remove(m.allocations.begin(), m.allocations.end(), static_cast<void*>(m.tap_out)),
                           m.allocations.end());
       m.allocations.erase(std::remove(m.allocations.begin(), m.allocations.end(), static_cast<void*>(m.tap_mean)),
@@ -712,7 +720,7 @@ void MetisModel::set_feature_taps(const std::vector<FeatureTap>& taps) {
     }
   }
   // captured steps have the old taps baked in
-  for (auto& [key, exec] : m.graphs) cudaGraphExecDestroy(exec);
+  for (auto& [key, exec] : m.graphs) lx_rt_graph_destroy(exec);
   m.graphs.clear();
   m.seen.clear();
 }
@@ -757,7 +765,7 @@ size_t MetisModel::slot_state_bytes(int length) const {
   return total;
 }
 
-void MetisModel::save_slot(int slot, void* dst, int length, cudaStream_t stream) {
+void MetisModel::save_slot(int slot, void* dst, int length, void* stream) {
   Impl& m = *impl_;
   if (slot < 0 || slot >= m.max_slots || length < 0 || length > m.kv_capacity)
     throw std::runtime_error("save_slot: slot or length out of range");
@@ -766,20 +774,20 @@ void MetisModel::save_slot(int slot, void* dst, int length, cudaStream_t stream)
   char* out = static_cast<char*>(dst);
   size_t off = 0;
   each_piece(m, slot, length, [&](const void* src, size_t bytes, bool) {
-    check(static_cast<int>(cudaMemcpyAsync(out + off, src, bytes, cudaMemcpyDefault, stream)), "cudaMemcpyAsync");
+    check(lx_rt_copy(out + off, src, static_cast<int64_t>(bytes), LX_COPY_DEFAULT, stream), "slot state copy");
     off += bytes;
   });
 }
 
-void MetisModel::restore_slot(int slot, const void* src, int length, cudaStream_t stream) {
+void MetisModel::restore_slot(int slot, const void* src, int length, void* stream) {
   Impl& m = *impl_;
   if (slot < 0 || slot >= m.max_slots || length < 0 || length > m.kv_capacity)
     throw std::runtime_error("restore_slot: slot or length out of range");
   const char* in = static_cast<const char*>(src);
   size_t off = 0;
   each_piece(m, slot, length, [&](const void* dst, size_t bytes, bool) {
-    check(static_cast<int>(cudaMemcpyAsync(const_cast<void*>(dst), in + off, bytes, cudaMemcpyDefault, stream)),
-          "cudaMemcpyAsync");
+    check(lx_rt_copy(const_cast<void*>(dst), in + off, static_cast<int64_t>(bytes), LX_COPY_DEFAULT, stream),
+          "slot state copy");
     off += bytes;
   });
   slot_len_.at(slot) = length;
@@ -790,12 +798,12 @@ void MetisModel::restore_slot(int slot, const void* src, int length, cudaStream_
 namespace {
 
 // y = alpha * (x @ W^T + bias) + beta * y for M rows of x (f32 or bf16). Decode-sized products run
-// as GEMVs on the int8 copy when there is one, reading x as it is; larger ones go to cuBLASLt on
+// as GEMVs on the int8 copy when there is one, reading x as it is; larger ones go to the dense GEMM on
 // the bf16 weight, through a bf16 copy of x when x is f32. `rows_per_token` > 1 marks a product
 // with that many rows per token (the depth memory's per-stream rows): in a decode-sized step those
 // stay GEMVs, 8 rows at a time, so that a token's rows get the same bits whatever the step's size.
 void linear(Impl& m, const Linear& l, const void* x, lx_dtype x_dtype, int ld_x, void* y, lx_dtype y_dtype, int ld_y,
-            int M, cudaStream_t s, float alpha = 1.0f, float beta = 0.0f, int rows_per_token = 1) {
+            int M, void* s, float alpha = 1.0f, float beta = 0.0f, int rows_per_token = 1) {
   const bool decode_step = M / rows_per_token <= Impl::kGemvRows;
   if (M <= Impl::kGemvRows || decode_step) {
     const size_t xs = x_dtype == LX_F32 ? 4 : 2, ys = y_dtype == LX_F32 ? 4 : 2;
@@ -830,43 +838,43 @@ void linear(Impl& m, const Linear& l, const void* x, lx_dtype x_dtype, int ld_x,
   if (l.host) {  // copy the weight in on the copy stream once the product that last used the buffer is done
     const int b = m.stage_next;
     m.stage_next ^= 1;
-    check(static_cast<int>(cudaStreamWaitEvent(m.stage_stream, m.stage_free[b], 0)), "cudaStreamWaitEvent");
-    check(static_cast<int>(cudaMemcpyAsync(m.stage[b], l.w, static_cast<size_t>(l.N) * l.K * 2, cudaMemcpyHostToDevice,
-                                           m.stage_stream)),
-          "cudaMemcpyAsync");
-    check(static_cast<int>(cudaEventRecord(m.stage_copied[b], m.stage_stream)), "cudaEventRecord");
-    check(static_cast<int>(cudaStreamWaitEvent(s, m.stage_copied[b], 0)), "cudaStreamWaitEvent");
+    check(lx_rt_stream_wait(m.stage_stream, m.stage_free[b]), "stream wait");
+    check(lx_rt_copy(m.stage[b], l.w, static_cast<int64_t>(static_cast<size_t>(l.N) * l.K * 2), LX_COPY_H2D,
+                     m.stage_stream),
+          "weight staging copy");
+    check(lx_rt_event_record(m.stage_copied[b], m.stage_stream), "event record");
+    check(lx_rt_stream_wait(s, m.stage_copied[b]), "stream wait");
     LX_CHECK(lx_gemm_bf16(x, ld_x, m.stage[b], l.bias, y, y_dtype, ld_y, M, l.N, l.K, alpha, beta, s));
-    check(static_cast<int>(cudaEventRecord(m.stage_free[b], s)), "cudaEventRecord");
+    check(lx_rt_event_record(m.stage_free[b], s), "event record");
     return;
   }
   LX_CHECK(lx_gemm_bf16(x, ld_x, l.w, l.bias, y, y_dtype, ld_y, M, l.N, l.K, alpha, beta, s));
 }
 
 // The f32 products (routers, the depth head): batch invariant in decode-sized steps (kernels.h,
-// lx_spec_gemv_f32), cuBLASLt otherwise.
+// lx_spec_gemv_f32), the dense GEMM otherwise.
 void gemm_f32(const float* x, int ld_x, const float* w, const float* bias, float* y, int ld_y, int M, int N, int K,
-              cudaStream_t s) {
+              void* s) {
   if (M <= Impl::kGemvRows)
     LX_CHECK(lx_spec_gemv_f32(x, ld_x, w, bias, y, ld_y, M, N, K, s));
   else
     LX_CHECK(lx_gemm_f32(x, ld_x, w, bias, y, ld_y, M, N, K, s));
 }
 
-void to_bf16(const float* src, int ld_src, void* dst, int ld_dst, int rows, int cols, cudaStream_t s) {
+void to_bf16(const float* src, int ld_src, void* dst, int ld_dst, int rows, int cols, void* s) {
   LX_CHECK(lx_copy2d(src, LX_F32, ld_src, dst, LX_BF16, ld_dst, rows, cols, s));
 }
 
-void copy_f32(const float* src, int ld_src, float* dst, int ld_dst, int rows, int cols, cudaStream_t s) {
+void copy_f32(const float* src, int ld_src, float* dst, int ld_dst, int rows, int cols, void* s) {
   LX_CHECK(lx_copy2d(src, LX_F32, ld_src, dst, LX_F32, ld_dst, rows, cols, s));
 }
 
 // Depth-memory read: attend over the token's bank and gate the result into the streams. Leaves
 // the mean retrieved vector in mem_summary (zeros while the bank is empty).
-void memory_retrieve(Impl& m, int T, int n_entries, cudaStream_t s) {
+void memory_retrieve(Impl& m, int T, int n_entries, void* s) {
   const int S = m.S, D = m.D, Mm = m.M;
   if (n_entries == 0) {
-    cudaMemsetAsync(m.mem_summary, 0, sizeof(float) * T * D, s);
+    lx_rt_memset(m.mem_summary, 0, static_cast<int64_t>(sizeof(float) * T * D), s);
     return;
   }
   linear(m, m.m_query, m.streams, LX_F32, D, m.q, LX_F32, Mm, T * S, s, 1.0f, 0.0f, S);
@@ -877,7 +885,7 @@ void memory_retrieve(Impl& m, int T, int n_entries, cudaStream_t s) {
 
 // [a | b | c | d] into one row per token, as bf16 (for a GEMM) or f32.
 void concat4(Impl& m, const float* a, const float* b, const float* c, const float* d, void* out, lx_dtype dtype,
-             int T, cudaStream_t s) {
+             int T, void* s) {
   const int D = m.D, R = m.R, ld = 3 * D + R;
   const size_t es = dtype == LX_F32 ? 4 : 2;
   char* o = static_cast<char*>(out);
@@ -888,14 +896,14 @@ void concat4(Impl& m, const float* a, const float* b, const float* c, const floa
 }
 
 // Routing features: tanh(route_projection([state, retrieved, difference, history])).
-void routing_features(Impl& m, int T, cudaStream_t s) {
+void routing_features(Impl& m, int T, void* s) {
   concat4(m, m.state, m.mem_summary, m.difference, m.history, m.feat_in_bf, LX_BF16, T, s);
   linear(m, m.m_route, m.feat_in_bf, LX_BF16, 3 * m.D + m.R, m.features, LX_F32, m.R, T, s);
   LX_CHECK(lx_activate_f32(m.features, static_cast<int64_t>(T) * m.R, 0, s));
 }
 
 // A new memory entry from the streams and the last MoE's routing; stores its key and value.
-void memory_write(Impl& m, const MetisConfig& c, int T, int pass, int anchor, int& n_entries, cudaStream_t s) {
+void memory_write(Impl& m, const MetisConfig& c, int T, int pass, int anchor, int& n_entries, void* s) {
   const int D = m.D, R = m.R, Mm = m.M;
   LX_CHECK(lx_stream_mean(m.streams, m.state, T, m.S, D, s));
   linear(m, m.m_state, m.state, LX_F32, D, m.entry, LX_F32, Mm, T, s);
@@ -913,7 +921,7 @@ void memory_write(Impl& m, const MetisConfig& c, int T, int pass, int anchor, in
 }
 
 // A feature tap after block `layer` of `pass`: the stream mean, into its columns of tap_out.
-void write_tap(Impl& m, int pass, int layer, int T, cudaStream_t s) {
+void write_tap(Impl& m, int pass, int layer, int T, void* s) {
   const int col = m.tap_col[static_cast<size_t>(pass) * (m.L_layers + 1) + layer + 1];
   if (col < 0) return;
   LX_CHECK(lx_stream_mean(m.streams, m.tap_mean, T, m.S, m.D, s));
@@ -922,7 +930,7 @@ void write_tap(Impl& m, int pass, int layer, int T, cudaStream_t s) {
 
 }  // namespace
 
-void MetisModel::forward(const StepBatch& b, float* logits, bool all_rows, cudaStream_t s) {
+void MetisModel::forward(const StepBatch& b, float* logits, bool all_rows, void* s) {
   Impl& m = *impl_;
   const int T = static_cast<int>(b.tokens.size());
   const int n_seq = static_cast<int>(b.slots.size());
@@ -939,7 +947,7 @@ void MetisModel::forward(const StepBatch& b, float* logits, bool all_rows, cudaS
   }
 }
 
-void MetisModel::forward_spec(const StepBatch& b, float* logits, cudaStream_t s) {
+void MetisModel::forward_spec(const StepBatch& b, float* logits, void* s) {
   Impl& m = *impl_;
   if (!m.speculative) throw std::runtime_error("forward_spec needs a model built with speculative = true");
   const int T = static_cast<int>(b.tokens.size());
@@ -974,11 +982,11 @@ void MetisModel::truncate(int slot, int length) {
 // staging buffer). A verify step folds a slot's oldest pending positions only when the new tokens
 // would not fit after them, so each position is folded once and the base state is written on few
 // steps; its has_state says whether the base state holds anything.
-void MetisModel::stage(const StepBatch& b, bool spec, cudaStream_t s) {
+void MetisModel::stage(const StepBatch& b, bool spec, void* s) {
   Impl& m = *impl_;
   const int T = static_cast<int>(b.tokens.size());
   const int n_seq = static_cast<int>(b.slots.size());
-  cudaEventSynchronize(m.meta_copied);
+  lx_rt_event_sync(m.meta_copied);
   int32_t* tokens = m.h_meta;
   int32_t* cu = tokens + (m.d_cu - m.d_tokens);
   int32_t* slots = tokens + (m.d_slots - m.d_tokens);
@@ -1002,12 +1010,12 @@ void MetisModel::stage(const StepBatch& b, bool spec, cudaStream_t s) {
       fold[i] = keep[i] = 0;
     }
   }
-  cudaMemcpyAsync(m.d_meta, m.h_meta, m.meta_count * 4, cudaMemcpyHostToDevice, s);
-  cudaEventRecord(m.meta_copied, s);
+  lx_rt_copy(m.d_meta, m.h_meta, static_cast<int64_t>(m.meta_count * 4), LX_COPY_H2D, s);
+  lx_rt_event_record(m.meta_copied, s);
 }
 
 // Runs the staged step, replaying a captured graph for decode and verify shapes.
-void MetisModel::launch(int T, int n_seq, bool all_rows, float* logits, bool spec, cudaStream_t s) {
+void MetisModel::launch(int T, int n_seq, bool all_rows, float* logits, bool spec, void* s) {
   Impl& m = *impl_;
   // Offloaded steps larger than a decode stage their experts from the host, which is not capturable.
   const bool capturable = spec ? T <= Impl::kGemvRows : T == n_seq && !(m.offload && T > Impl::kGemvRows);
@@ -1015,17 +1023,21 @@ void MetisModel::launch(int T, int n_seq, bool all_rows, float* logits, bool spe
   if (m.use_graphs && capturable) {
     auto it = m.graphs.find(key);
     if (it == m.graphs.end() && m.seen.count(key)) {
-      cudaGraph_t graph;
-      check(static_cast<int>(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal)), "cudaStreamBeginCapture");
-      run(T, n_seq, all_rows, logits, spec, s);
-      check(static_cast<int>(cudaStreamEndCapture(s, &graph)), "cudaStreamEndCapture");
-      cudaGraphExec_t exec;
-      check(static_cast<int>(cudaGraphInstantiate(&exec, graph, 0)), "cudaGraphInstantiate");
-      cudaGraphDestroy(graph);
-      it = m.graphs.emplace(key, exec).first;
+      // A backend without graphs declines the capture (LX_ERR_NOT_SUPPORTED), and every step
+      // runs eagerly from then on.
+      const int capture = lx_rt_capture_begin(s);
+      if (capture == LX_ERR_NOT_SUPPORTED) {
+        m.use_graphs = false;
+      } else {
+        check(capture, "graph capture start");
+        run(T, n_seq, all_rows, logits, spec, s);
+        void* exec = nullptr;
+        check(lx_rt_capture_end(s, &exec), "graph capture end");
+        it = m.graphs.emplace(key, exec).first;
+      }
     }
     if (it != m.graphs.end()) {
-      check(static_cast<int>(cudaGraphLaunch(it->second, s)), "cudaGraphLaunch");
+      check(lx_rt_graph_launch(it->second, s), "graph launch");
     } else {
       run(T, n_seq, all_rows, logits, spec, s);
       m.seen.insert(key);
@@ -1037,7 +1049,7 @@ void MetisModel::launch(int T, int n_seq, bool all_rows, float* logits, bool spe
 
 // Folds every pending position of the step's slots into their base state, so that a normal step
 // (which has no history) can continue them: the Mamba layers' spec kernels with no new tokens.
-void MetisModel::fold_pending(const StepBatch& b, cudaStream_t s) {
+void MetisModel::fold_pending(const StepBatch& b, void* s) {
   Impl& m = *impl_;
   std::vector<int32_t> slots, has, fold;
   for (int slot : b.slots)
@@ -1049,15 +1061,15 @@ void MetisModel::fold_pending(const StepBatch& b, cudaStream_t s) {
   if (slots.empty()) return;
   const int n = static_cast<int>(slots.size());
   // [slots | has | fold | keep | cu], uploaded after the previous step's metadata copy is done
-  cudaEventSynchronize(m.meta_copied);
+  lx_rt_event_sync(m.meta_copied);
   int32_t* h = m.h_meta;
   int32_t* d = m.d_meta;
   std::memcpy(h, slots.data(), 4 * n);
   std::memcpy(h + n, has.data(), 4 * n);
   std::memcpy(h + 2 * n, fold.data(), 4 * n);
   std::memset(h + 3 * n, 0, 4 * (2 * n + 1));
-  cudaMemcpyAsync(d, h, 4 * (5 * n + 1), cudaMemcpyHostToDevice, s);
-  cudaEventRecord(m.meta_copied, s);
+  lx_rt_copy(d, h, static_cast<int64_t>(4 * (5 * n + 1)), LX_COPY_H2D, s);
+  lx_rt_event_record(m.meta_copied, s);
   for (size_t li = 0; li < m.conv_hist.size(); ++li) {
     if (!m.conv_hist[li]) continue;
     const Impl::Layer& layer = m.layers[li % m.L_layers];
@@ -1075,15 +1087,15 @@ void MetisModel::fold_pending(const StepBatch& b, cudaStream_t s) {
 
 // The step's device work, from the token ids in d_meta to the logits. Everything it decides on the
 // host depends only on (T, n_seq, all_rows), which is what makes it capturable.
-void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, cudaStream_t s) {
+void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, void* s) {
   Impl& m = *impl_;
   const MetisConfig& c = cfg_;
   const int S = m.S, D = m.D, R = m.R, Lat = m.Lat, E = m.E;
 
   LX_CHECK(lx_embed_streams(m.embedding, m.d_tokens, m.stream_emb, m.streams, T, S, D, s));
   LX_CHECK(lx_stream_mean(m.streams, m.previous, T, S, D, s));
-  cudaMemsetAsync(m.history, 0, sizeof(float) * T * R, s);
-  cudaMemsetAsync(m.continuation, 0, sizeof(float) * T, s);
+  lx_rt_memset(m.history, 0, static_cast<int64_t>(sizeof(float) * T * R), s);
+  lx_rt_memset(m.continuation, 0, static_cast<int64_t>(sizeof(float) * T), s);
   int n_entries = 0;
 
   for (int pass = 0; pass < m.P_passes; ++pass) {
@@ -1150,9 +1162,9 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
                             E, m.K, s));
       if (m.route_trace) {  // pass, layer, T, then T * K expert ids (int32)
         std::vector<int32_t> ids(static_cast<size_t>(T) * m.K);
-        check(static_cast<int>(cudaMemcpyAsync(ids.data(), m.route_ids, ids.size() * 4, cudaMemcpyDeviceToHost, s)),
-              "cudaMemcpyAsync");
-        check(static_cast<int>(cudaStreamSynchronize(s)), "cudaStreamSynchronize");
+        check(lx_rt_copy(ids.data(), m.route_ids, static_cast<int64_t>(ids.size() * 4), LX_COPY_D2H, s),
+              "route trace copy");
+        check(lx_rt_stream_sync(s), "stream sync");
         const int32_t head[3] = {pass, i, T};
         std::fwrite(head, 4, 3, m.route_trace);
         std::fwrite(ids.data(), 4, ids.size(), m.route_trace);
@@ -1160,7 +1172,7 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
       const bool prefetching = m.prefetch > 0 && T <= Impl::kGemvRows;
       if (m.offload) {
         if (prefetching && i > 0)  // the branch that prefetched this layer's experts must be done
-          check(static_cast<int>(cudaStreamWaitEvent(s, m.join_events[slot_index - 1], 0)), "cudaStreamWaitEvent");
+          check(lx_rt_stream_wait(s, m.join_events[slot_index - 1]), "stream wait");
         if (T <= Impl::kGemvRows)
           m.offload->decode(i, m.route_ids, m.route_w, m.latent_bf, m.routed, T, s);
         else
@@ -1197,9 +1209,9 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
         LX_CHECK(lx_mhc_read(m.streams, nc, nc + S * S, nx.moe_conn.norm, c.rms_norm_eps, m.pred_mixed, m.pred_h, T, S,
                              D, s));
         copy_f32(m.features, R, m.pred_router_in + Lat, Lat + R, T, R, s);
-        check(static_cast<int>(cudaEventRecord(m.fork_events[slot_index], s)), "cudaEventRecord");
-        cudaStream_t b = m.side;
-        check(static_cast<int>(cudaStreamWaitEvent(b, m.fork_events[slot_index], 0)), "cudaStreamWaitEvent");
+        check(lx_rt_event_record(m.fork_events[slot_index], s), "event record");
+        void* b = m.side;
+        check(lx_rt_stream_wait(b, m.fork_events[slot_index]), "stream wait");
         linear(m, nx.latent_down, m.pred_h, LX_BF16, D, m.pred_latent, LX_F32, Lat, T, b);
         copy_f32(m.pred_latent, Lat, m.pred_router_in, Lat + R, T, Lat, b);
         LX_CHECK(lx_gemm_f32(m.pred_router_in, Lat + R, nx.router_w, nx.router_b, m.pred_logits, E, T, E, Lat + R, b));
@@ -1208,7 +1220,7 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
         // one token: its top n; several: the first n of the flattened [T, 8] (each token's best first
         // would need a reorder; a decode batch of one is what this is for)
         m.offload->prefetch(i + 1, m.pred_ids, std::min(m.prefetch, T * Impl::kPredicted), b);
-        check(static_cast<int>(cudaEventRecord(m.join_events[slot_index], b)), "cudaEventRecord");
+        check(lx_rt_event_record(m.join_events[slot_index], b), "event record");
       }
 
       if (m.route_trace && i + 1 < m.L_layers) {  // record: pass | 0x10000, layer, T, then T * 8 ids
@@ -1223,9 +1235,9 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
         LX_CHECK(lx_moe_route(m.pred_logits, nx.selection_bias, m.pred_ids, m.pred_w, m.pred_entropy, m.pred_confidence,
                               T, E, Impl::kPredicted, s));
         std::vector<int32_t> ids(static_cast<size_t>(T) * Impl::kPredicted);
-        check(static_cast<int>(cudaMemcpyAsync(ids.data(), m.pred_ids, ids.size() * 4, cudaMemcpyDeviceToHost, s)),
-              "cudaMemcpyAsync");
-        check(static_cast<int>(cudaStreamSynchronize(s)), "cudaStreamSynchronize");
+        check(lx_rt_copy(ids.data(), m.pred_ids, static_cast<int64_t>(ids.size() * 4), LX_COPY_D2H, s),
+              "route trace copy");
+        check(lx_rt_stream_sync(s), "stream sync");
         const int32_t head[3] = {pass | 0x10000, i + 1, T};
         std::fwrite(head, 4, 3, m.route_trace);
         std::fwrite(ids.data(), 4, ids.size(), m.route_trace);

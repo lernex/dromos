@@ -15,8 +15,8 @@
 namespace lx::runtime {
 namespace {
 
-void check(int status, const char* what) {
-  if (status != 0) throw std::runtime_error(std::string(what) + " failed with CUDA error " + std::to_string(status));
+void check(int status, const std::string& what) {
+  if (status != 0) throw std::runtime_error(what + " failed: " + lx_rt_error_string(status));
 }
 #define LX_CHECK(expr) check(static_cast<int>(expr), #expr)
 
@@ -37,8 +37,16 @@ constexpr double kSurplusWeight = 0.2;  // of the newest proposal in the running
 template <typename T>
 T* device_alloc(size_t count) {
   void* p = nullptr;
-  LX_CHECK(cudaMalloc(&p, count * sizeof(T)));
-  LX_CHECK(cudaMemset(p, 0, count * sizeof(T)));
+  check(lx_rt_alloc(&p, static_cast<int64_t>(count * sizeof(T))),
+        "device allocation of " + std::to_string(count * sizeof(T)) + " bytes");  // zeroed
+  return static_cast<T*>(p);
+}
+
+template <typename T>
+T* host_alloc(size_t count) {
+  void* p = nullptr;
+  check(lx_rt_host_alloc(&p, static_cast<int64_t>(count * sizeof(T))),
+        "host allocation of " + std::to_string(count * sizeof(T)) + " bytes");
   return static_cast<T*>(p);
 }
 
@@ -124,7 +132,7 @@ struct BlockDrafter::Impl {
   }
 
   // y[M, N] = x[M, K] @ w^T (+ beta * y): x bf16, y f32
-  void gemv(const uint16_t* x_, int ld_x, const Lin& w, float* y, int ld_y, int M, float beta, cudaStream_t s,
+  void gemv(const uint16_t* x_, int ld_x, const Lin& w, float* y, int ld_y, int M, float beta, void* s,
             const void* bias = nullptr) {
     LX_CHECK(lx_gemv(x_, LX_BF16, ld_x, w.q ? static_cast<const void*>(w.q) : w.w, w.q ? LX_W_INT8 : LX_W_BF16, w.scale,
                      bias, LX_BF16, y, LX_F32, ld_y, M, w.N, w.K, 1.0f, beta, s));
@@ -178,11 +186,14 @@ BlockDrafter::BlockDrafter(const std::string& dir, const MetisModel& target, lx_
     layer.down = m.lin(m.need(p + "down.weight", {D, I}), m.D, m.I, true);
     auto* qkv = m.alloc<uint16_t>(static_cast<size_t>(m.qkv_w) * D);
     const size_t qb = sizeof(uint16_t) * H * Dh * D, kb = sizeof(uint16_t) * KVH * Dh * D;
-    LX_CHECK(cudaMemcpy(qkv, m.need(p + "q.weight", {H * Dh, D}), qb, cudaMemcpyDeviceToDevice));
-    LX_CHECK(cudaMemcpy(reinterpret_cast<char*>(qkv) + qb, m.need(p + "k.weight", {KVH * Dh, D}), kb,
-                        cudaMemcpyDeviceToDevice));
-    LX_CHECK(cudaMemcpy(reinterpret_cast<char*>(qkv) + qb + kb, m.need(p + "v.weight", {KVH * Dh, D}), kb,
-                        cudaMemcpyDeviceToDevice));
+    LX_CHECK(lx_rt_copy(qkv, m.need(p + "q.weight", {H * Dh, D}), static_cast<int64_t>(qb), LX_COPY_D2D, nullptr));
+    LX_CHECK(lx_rt_stream_sync(nullptr));
+    LX_CHECK(lx_rt_copy(reinterpret_cast<char*>(qkv) + qb, m.need(p + "k.weight", {KVH * Dh, D}),
+                        static_cast<int64_t>(kb), LX_COPY_D2D, nullptr));
+    LX_CHECK(lx_rt_stream_sync(nullptr));
+    LX_CHECK(lx_rt_copy(reinterpret_cast<char*>(qkv) + qb + kb, m.need(p + "v.weight", {KVH * Dh, D}),
+                        static_cast<int64_t>(kb), LX_COPY_D2D, nullptr));
+    LX_CHECK(lx_rt_stream_sync(nullptr));
     layer.qkv = m.lin(qkv, m.qkv_w, m.D, true);
     m.layers.push_back(layer);
     m.ring_k.push_back(m.alloc<float>(static_cast<size_t>(m.W) * KVH * Dh));
@@ -215,28 +226,31 @@ BlockDrafter::BlockDrafter(const std::string& dir, const MetisModel& target, lx_
   m.d_acc = m.alloc<int32_t>(2);
   m.d_filters = m.alloc<lx_spec_filter>(B);
   m.d_rng = m.alloc<lx_spec_rng>(B);
-  LX_CHECK(cudaMallocHost(&m.h_tokens, sizeof(int32_t) * B));
-  LX_CHECK(cudaMallocHost(&m.h_conf, sizeof(float) * 2 * B));
+  m.h_tokens = host_alloc<int32_t>(B);
+  m.h_conf = host_alloc<float>(2 * B);
   // rows 1 .. B-1 of every block start as the mask embedding
   for (int j = 1; j < m.B; ++j) LX_CHECK(lx_copy2d(m.mask, LX_BF16, m.D, m.x_init + j * D, LX_F32, m.D, 1, m.D, nullptr));
   const int32_t cu[2] = {0, m.B - 1};
-  LX_CHECK(cudaMemcpy(m.d_cu, cu, sizeof(cu), cudaMemcpyHostToDevice));
+  LX_CHECK(lx_rt_copy(m.d_cu, cu, static_cast<int64_t>(sizeof(cu)), LX_COPY_H2D, nullptr));
+  LX_CHECK(lx_rt_stream_sync(nullptr));
   const std::vector<lx_spec_filter> filters(B, filter_);
-  LX_CHECK(cudaMemcpy(m.d_filters, filters.data(), sizeof(lx_spec_filter) * B, cudaMemcpyHostToDevice));
-  LX_CHECK(cudaDeviceSynchronize());
+  LX_CHECK(lx_rt_copy(m.d_filters, filters.data(), static_cast<int64_t>(sizeof(lx_spec_filter) * B), LX_COPY_H2D,
+                      nullptr));
+  LX_CHECK(lx_rt_stream_sync(nullptr));
+  LX_CHECK(lx_rt_device_sync());
 }
 
 BlockDrafter::~BlockDrafter() {
-  for (void* p : m_->owned) cudaFree(p);
-  cudaFreeHost(m_->h_tokens);
-  cudaFreeHost(m_->h_conf);
+  for (void* p : m_->owned) lx_rt_free(p);
+  lx_rt_host_free(m_->h_tokens);
+  lx_rt_host_free(m_->h_conf);
 }
 
 std::vector<FeatureTap> BlockDrafter::feature_taps() const { return m_->taps; }
 int BlockDrafter::block_size() const { return m_->B; }
 const float* BlockDrafter::last_logits() const { return m_->logits; }
 
-void BlockDrafter::begin(const std::vector<int32_t>&, cudaStream_t) {
+void BlockDrafter::begin(const std::vector<int32_t>&, void*) {
   m_->committed = 0;
   lambda_ = 1.0;
   last_k_ = 0;
@@ -250,7 +264,7 @@ void BlockDrafter::begin(const std::vector<int32_t>&, cudaStream_t) {
   skip_ = backoff_ = 0;
 }
 
-void BlockDrafter::observe_features(const float* rows, int n, int feature_dim, cudaStream_t s) {
+void BlockDrafter::observe_features(const float* rows, int n, int feature_dim, void* s) {
   Impl& m = *m_;
   if (feature_dim != m.F) throw std::runtime_error("block drafter: feature rows of the wrong width");
   // only the last W positions can ever be read again
@@ -297,8 +311,8 @@ Draft BlockDrafter::propose(const DraftRequest& r) {
   const int B = m.B, D = m.D, rows = B - 1;
   const int64_t P = m.committed;  // the anchor's position
   const int32_t anchor = ctx.back();
-  cudaStream_t s = r.stream;
-  LX_CHECK(cudaMemcpyAsync(m.x, m.x_init, sizeof(float) * B * D, cudaMemcpyDeviceToDevice, s));
+  void* s = r.stream;
+  LX_CHECK(lx_rt_copy(m.x, m.x_init, static_cast<int64_t>(sizeof(float) * B * D), LX_COPY_D2D, s));
   LX_CHECK(lx_copy2d(static_cast<const uint16_t*>(m.head_bf16) + static_cast<int64_t>(anchor) * D, LX_BF16, D, m.x,
                      LX_F32, D, 1, D, s));
   const int n_ctx = static_cast<int>(std::min<int64_t>(m.committed, m.W));
@@ -328,13 +342,13 @@ Draft BlockDrafter::propose(const DraftRequest& r) {
   } else {
     std::vector<lx_spec_rng> rng(rows);
     for (int j = 0; j < rows; ++j) rng[j] = {seed_ ^ 0xB10C0B10C0ull, r.position + j};
-    LX_CHECK(cudaMemcpyAsync(m.d_rng, rng.data(), sizeof(lx_spec_rng) * rows, cudaMemcpyHostToDevice, s));
+    LX_CHECK(lx_rt_copy(m.d_rng, rng.data(), static_cast<int64_t>(sizeof(lx_spec_rng) * rows), LX_COPY_H2D, s));
     LX_CHECK(lx_spec_probs(m.logits, m.V, m.d_filters, rows, m.probs, s));
     LX_CHECK(lx_spec_sample(m.probs, m.V, nullptr, m.d_rng, kDomainBlock, rows, m.d_tokens, s));
   }
-  LX_CHECK(cudaMemcpyAsync(m.h_tokens, m.d_tokens, sizeof(int32_t) * rows, cudaMemcpyDeviceToHost, s));
-  LX_CHECK(cudaMemcpyAsync(m.h_conf, m.conf_out, sizeof(float) * 2 * rows, cudaMemcpyDeviceToHost, s));
-  LX_CHECK(cudaStreamSynchronize(s));
+  LX_CHECK(lx_rt_copy(m.h_tokens, m.d_tokens, static_cast<int64_t>(sizeof(int32_t) * rows), LX_COPY_D2H, s));
+  LX_CHECK(lx_rt_copy(m.h_conf, m.conf_out, static_cast<int64_t>(sizeof(float) * 2 * rows), LX_COPY_D2H, s));
+  LX_CHECK(lx_rt_stream_sync(s));
 
   tokens_.assign(m.h_tokens, m.h_tokens + rows);
   conf_.resize(2 * rows);
@@ -360,7 +374,7 @@ Draft BlockDrafter::propose(const DraftRequest& r) {
   return d;
 }
 
-void BlockDrafter::observe(int accepted, int32_t, cudaStream_t) {
+void BlockDrafter::observe(int accepted, int32_t, void*) {
   const double c = cost_.cost[std::min<size_t>(last_k_ + 1, cost_.cost.size() - 1)];
   lambda_ = 0.9 * lambda_ + 0.1 * (accepted + 1) / c;
   for (size_t j = 0; j < predicted_.size(); ++j) predicted_[j] *= kDecay, held_[j] *= kDecay;

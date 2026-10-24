@@ -11,7 +11,6 @@
 // the same family, or an n-gram lookup are all a Drafter.
 #pragma once
 
-#include <cuda_runtime.h>
 #include <stdint.h>
 
 #include <memory>
@@ -34,7 +33,7 @@ struct DraftRequest {
   int feature_dim = 0;
   int max_drafts = 0;     // propose at most this many
   uint64_t position = 0;  // index, among the emitted tokens, of the first proposal (keys any draws)
-  cudaStream_t stream = nullptr;
+  void* stream = nullptr;
 };
 
 struct Draft {
@@ -51,16 +50,16 @@ class Drafter {
   // The target hidden states this drafter reads; empty when it needs none.
   virtual std::vector<FeatureTap> feature_taps() const { return {}; }
   // A new sequence; the target is about to prefill `prompt`.
-  virtual void begin(const std::vector<int32_t>& prompt, cudaStream_t stream) = 0;
+  virtual void begin(const std::vector<int32_t>& prompt, void* stream) = 0;
   // The target's feature rows (f32 [n, feature_dim], device, valid during the call) for the next n
   // positions it committed, in order: every prefill chunk, then after each step the positions it
   // kept (the pending token and the accepted drafts). Drafters that keep their own context state
   // over the target's features (an EAGLE head's attention, a block drafter's injected keys and
   // values) build it from these. Called only when feature_taps() is not empty.
-  virtual void observe_features(const float* rows, int n, int feature_dim, cudaStream_t stream) {}
+  virtual void observe_features(const float* rows, int n, int feature_dim, void* stream) {}
   virtual Draft propose(const DraftRequest& request) = 0;
   // The target kept the first `accepted` proposals of the last draft, then emitted `next`.
-  virtual void observe(int accepted, int32_t next, cudaStream_t stream) = 0;
+  virtual void observe(int accepted, int32_t next, void* stream) = 0;
 };
 
 // How long a draft is worth verifying. cost[T] is a verify step of T tokens in units of a plain
@@ -84,9 +83,9 @@ class NgramDrafter final : public Drafter {
  public:
   explicit NgramDrafter(int max_ngram = 4, int min_ngram = 1, DraftCost cost = DraftCost::rtx5070ti_praxis());
   const char* name() const override { return "ngram"; }
-  void begin(const std::vector<int32_t>& prompt, cudaStream_t stream) override;
+  void begin(const std::vector<int32_t>& prompt, void* stream) override;
   Draft propose(const DraftRequest& request) override;
-  void observe(int accepted, int32_t next, cudaStream_t stream) override;
+  void observe(int accepted, int32_t next, void* stream) override;
   void set_adaptive(bool on) { adaptive_ = on; }
 
   // Per match length n: drafted and accepted tokens, for tuning.
@@ -115,9 +114,9 @@ class ModelDrafter final : public Drafter {
   ModelDrafter(MetisModel& model, int slot, lx_spec_filter filter, uint64_t seed, float min_confidence = 0.0f);
   ~ModelDrafter() override;
   const char* name() const override { return "model"; }
-  void begin(const std::vector<int32_t>& prompt, cudaStream_t stream) override;
+  void begin(const std::vector<int32_t>& prompt, void* stream) override;
   Draft propose(const DraftRequest& request) override;
-  void observe(int accepted, int32_t next, cudaStream_t stream) override;
+  void observe(int accepted, int32_t next, void* stream) override;
 
  private:
   MetisModel& model_;
@@ -161,12 +160,12 @@ class SpecDecoder {
   SpecDecoder& operator=(const SpecDecoder&) = delete;
 
   std::vector<int32_t> generate(Drafter* drafter, const std::vector<int32_t>& prompt, const SpecConfig& config,
-                                SpecStats& stats, cudaStream_t stream);
+                                SpecStats& stats, void* stream);
 
  private:
   // Picks the step's tokens: accepted drafts and the final token. rows = 1 + drafts.
   void accept(const SpecConfig& config, const std::vector<int32_t>& step, const float* q, uint64_t position,
-              int& accepted, int32_t& next, cudaStream_t stream);
+              int& accepted, int32_t& next, void* stream);
 
   MetisModel& target_;
   int max_rows_;

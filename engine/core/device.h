@@ -12,7 +12,7 @@
 
 namespace lx {
 
-// Move-only owner of one cudaMalloc'd block. A zero-byte buffer owns nothing.
+// Move-only owner of one device block. A zero-byte buffer owns nothing.
 class DeviceBuffer {
  public:
   DeviceBuffer() noexcept = default;

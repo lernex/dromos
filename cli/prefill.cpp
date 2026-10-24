@@ -1,8 +1,6 @@
 // lernex prefill: time one sequence's prefill of T tokens (only the last row's logits, as serving asks for
 // them), for measuring prefill throughput. Tokens are taken from PROMPTS_JSON, concatenated and repeated
 // to T, so the experts see text-like routing. The first run warms up; the median of the rest is reported.
-#include <cuda_runtime.h>
-
 #include <algorithm>
 #include <cstdio>
 #include <fstream>
@@ -49,29 +47,33 @@ int cmd_prefill(int argc, char** argv) {
     };
     lx::MetisModel model(config, lookup, 1, std::max(4096, T), T);
     float* d_logits = nullptr;
-    if (cudaMalloc(&d_logits, sizeof(float) * config.vocab_size) != cudaSuccess) throw std::runtime_error("cudaMalloc");
-    cudaStream_t stream;
-    cudaStreamCreate(&stream);
-    cudaEvent_t e0, e1;
-    cudaEventCreate(&e0);
-    cudaEventCreate(&e1);
+    const int64_t logit_bytes = static_cast<int64_t>(sizeof(float) * config.vocab_size);
+    if (lx_rt_alloc(reinterpret_cast<void**>(&d_logits), logit_bytes) != 0)
+      throw std::runtime_error("device allocation of " + std::to_string(logit_bytes) + " bytes");
+    void* stream = nullptr;
+    if (lx_rt_stream_create(&stream) != 0) throw std::runtime_error("creating a device stream");
+    void* e0 = nullptr;
+    void* e1 = nullptr;
+    if (lx_rt_event_create_timed(&e0) != 0) throw std::runtime_error("creating a timing event");
+    if (lx_rt_event_create_timed(&e1) != 0) throw std::runtime_error("creating a timing event");
     std::vector<float> ms;
     for (int r = 0; r <= runs; ++r) {
       model.reset_slot(0);
       lx::StepBatch step{tokens, {0, T}, {0}};
-      cudaEventRecord(e0, stream);
+      lx_rt_event_record(e0, stream);
       model.forward(step, d_logits, false, stream);
-      cudaEventRecord(e1, stream);
-      cudaEventSynchronize(e1);
+      lx_rt_event_record(e1, stream);
+      lx_rt_event_sync(e1);
       float t = 0;
-      cudaEventElapsedTime(&t, e0, e1);
+      lx_rt_event_elapsed(e0, e1, &t);
       if (r > 0) ms.push_back(t);
     }
-    if (cudaGetLastError() != cudaSuccess) throw std::runtime_error("CUDA error during the run");
+    if (const int err = lx_rt_last_error())
+      throw std::runtime_error(std::string(lx_rt_error_string(err)) + " during the run");
     std::sort(ms.begin(), ms.end());
     const float med = ms[ms.size() / 2];
     std::printf("prefill %d tokens: %.1f ms median of %d (min %.1f), %.0f tok/s\n", T, med, runs, ms.front(), T / (med / 1e3));
-    cudaFree(d_logits);
+    lx_rt_free(d_logits);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "error: %s\n", e.what());
     return 1;

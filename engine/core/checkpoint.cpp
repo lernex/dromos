@@ -23,8 +23,6 @@
 // stay bf16 there too, as in every target.
 #include "core/checkpoint.h"
 
-#include <cuda_runtime.h>
-
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
@@ -38,12 +36,12 @@
 namespace lx {
 namespace {
 
-void check(cudaError_t err, const std::string& what) {
-  if (err != cudaSuccess) throw std::runtime_error(what + ": " + cudaGetErrorString(err));
+void check(int status, const std::string& what) {
+  if (status != 0) throw std::runtime_error(what + ": " + lx_rt_error_string(status));
 }
 
 void check_lx(int status, const std::string& what) {
-  if (status != 0) throw std::runtime_error(what + " failed with CUDA error " + std::to_string(status));
+  if (status != 0) throw std::runtime_error(what + " failed with error code " + std::to_string(status));
 }
 
 size_t align256(size_t n) { return (n + 255) / 256 * 256; }
@@ -257,7 +255,10 @@ struct CheckpointBuilder {
 
   // Copies a host range into a device buffer.
   static void upload(void* dst, const void* src, size_t bytes, const std::string& what) {
-    if (bytes) check(cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice), "uploading " + what);
+    if (bytes) {
+      check(lx_rt_copy(dst, src, static_cast<int64_t>(bytes), LX_COPY_H2D, nullptr), "uploading " + what);
+      check(lx_rt_stream_sync(nullptr), "uploading " + what);
+    }
   }
 
   // Expert e of a projection (or the whole matrix for a plain one), as bf16 at `dst` on the device.
@@ -290,7 +291,7 @@ struct CheckpointBuilder {
     // expert at a time.
     for (const Projection& p : list) {
       if (p.key != "embedding")
-        bf16 = std::max(bf16, static_cast<size_t>(target == LX_W_BF16X ? p.E : 1) * p.N * p.K * 2);
+        bf16 = std::max<size_t>(bf16, static_cast<size_t>(target == LX_W_BF16X ? p.E : 1) * p.N * p.K * 2);
       if (p.src == LX_W_BF16) continue;
       data = std::max(data, static_cast<size_t>(p.N) * row_bytes(p.src, p.K));
       scale = std::max(scale, static_cast<size_t>(p.N) * scale_row_bytes(p.src, p.K));
@@ -373,8 +374,9 @@ struct CheckpointBuilder {
         bf16 = scratch_bf16.data();
       }
       if (p.dst == LX_W_BF16) {
-        check(cudaMemcpy(d + e * p.N * per_row, bf16, static_cast<size_t>(p.N * p.K * 2), cudaMemcpyDeviceToDevice),
+        check(lx_rt_copy(d + e * p.N * per_row, bf16, static_cast<int64_t>(p.N * p.K * 2), LX_COPY_D2D, nullptr),
               "copying " + p.key);
+        check(lx_rt_stream_sync(nullptr), "copying " + p.key);
         continue;
       }
       lx_weight q{};
@@ -525,8 +527,9 @@ lx_weight ModelWeights::projection_expert(const std::string& name, int64_t e) co
   v.expert_global = nullptr;
   if (w->expert_global) {
     float g = 1.0f;
-    check(cudaMemcpy(&g, w->expert_global + e, sizeof(float), cudaMemcpyDeviceToHost),
-          "reading the expert global of " + name);
+    const std::string what = "reading the expert global of " + name;
+    check(lx_rt_copy(&g, w->expert_global + e, static_cast<int64_t>(sizeof(float)), LX_COPY_D2H, nullptr), what);
+    check(lx_rt_stream_sync(nullptr), what);
     v.global = g;
   }
   return v;

@@ -1,13 +1,13 @@
 // The Metis forward pass (Metis-1.6 Logos and Praxis), built from the kernel library.
 #pragma once
 
-#include <cuda_runtime.h>
-
+#include <cstddef>
 #include <functional>
 #include <string>
 #include <vector>
 
 #include "core/config.h"
+#include "cuda/kernels.h"
 
 namespace lx {
 
@@ -60,13 +60,13 @@ class MetisModel {
   // SSM state; an attention layer's K then V for the first `length` positions. `dst` and `src` are
   // device or pinned host memory; the copies run on `stream` in order with the model's steps.
   size_t slot_state_bytes(int length) const;
-  void save_slot(int slot, void* dst, int length, cudaStream_t stream);
-  void restore_slot(int slot, const void* src, int length, cudaStream_t stream);  // the slot now holds `length`
+  void save_slot(int slot, void* dst, int length, void* stream);
+  void restore_slot(int slot, const void* src, int length, void* stream);  // the slot now holds `length`
 
   // Runs one step. Writes f32 logits to `logits` (device): every token's row [T, V] when
   // all_rows, otherwise each sequence's last row [n_seq, V]. A slot with pending positions folds
   // them into its state first (it can no longer be truncated before this step).
-  void forward(const StepBatch& batch, float* logits, bool all_rows, cudaStream_t stream);
+  void forward(const StepBatch& batch, float* logits, bool all_rows, void* stream);
 
   // ---- Speculative decoding ----------------------------------------------------------------
   // A verify step: like forward with all_rows, but each sequence's new tokens (at most
@@ -74,7 +74,7 @@ class MetisModel {
   // Steps of up to 8 tokens give every row the bits a one-token step gives it (the decode
   // numerics are batch invariant), so row j's logits are exactly what plain decoding computes
   // after the same tokens.
-  void forward_spec(const StepBatch& batch, float* logits, cudaStream_t stream);
+  void forward_spec(const StepBatch& batch, float* logits, void* stream);
   // Drops the slot's positions from `length` on. length can go back as far as the slot's folded
   // length (pending positions only: at most the last LX_SPEC_MAX_PENDING).
   void truncate(int slot, int length);
@@ -108,10 +108,10 @@ class MetisModel {
   struct Impl;
 
  private:
-  void run(int T, int n_seq, bool all_rows, float* logits, bool spec, cudaStream_t stream);
-  void stage(const StepBatch& b, bool spec, cudaStream_t stream);
-  void launch(int T, int n_seq, bool all_rows, float* logits, bool spec, cudaStream_t stream);
-  void fold_pending(const StepBatch& b, cudaStream_t stream);
+  void run(int T, int n_seq, bool all_rows, float* logits, bool spec, void* stream);
+  void stage(const StepBatch& b, bool spec, void* stream);
+  void launch(int T, int n_seq, bool all_rows, float* logits, bool spec, void* stream);
+  void fold_pending(const StepBatch& b, void* stream);
 
   MetisConfig cfg_;
   std::vector<int> slot_len_;

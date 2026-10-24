@@ -7,7 +7,7 @@
 //                                                     prompt, then decode the rest one token at a time
 //
 // The plan comes from the environment:
-//   LX_VRAM_BUDGET_GB   everything this process may hold on the GPU, CUDA context included (default:
+//   LX_VRAM_BUDGET_GB   everything this process may hold on the GPU, its context included (default:
 //                       the card); other processes only limit it through the memory they leave free
 //   LX_RAM_BUDGET_GB    pinned RAM for experts (default: all of them; the rest stay on NVMe)
 //   LX_EXPERTS          bf16 | int8 | fp8 (default: the checkpoint's format; int8 converts from BF16)
@@ -18,8 +18,6 @@
 //                       held-out routing LRU beats any pinned share, see tools/routing_stats.py)
 //   LX_OFFLOAD_CPU_FRACTION, LX_OFFLOAD_CPU_PAIRS   the CPU lane's share of misses, pairs per step
 //   LX_OFFLOAD_FILL=0   GPU misses are not written into VRAM
-#include <cuda_runtime.h>
-
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -32,6 +30,7 @@
 #include <vector>
 
 #include "core/config.h"
+#include "cuda/kernels.h"
 #include "model/metis.h"
 #include "runtime/offload.h"
 #include "runtime/offload_model.h"
@@ -42,6 +41,17 @@ using Clock = std::chrono::steady_clock;
 namespace off = lx::offload;
 
 double seconds_since(Clock::time_point t) { return std::chrono::duration<double>(Clock::now() - t).count(); }
+
+// Device memory for `count` values of T.
+template <typename T>
+T* device_alloc(size_t count) {
+  void* p = nullptr;
+  const int64_t bytes = static_cast<int64_t>(sizeof(T) * count);
+  const int status = lx_rt_alloc(&p, bytes);
+  if (status != 0)
+    throw std::runtime_error("device allocation of " + std::to_string(bytes) + " bytes: " + lx_rt_error_string(status));
+  return static_cast<T*>(p);
+}
 
 double env_double(const char* name, double fallback) {
   const char* v = std::getenv(name);
@@ -127,10 +137,9 @@ int cmd_eval(int argc, char** argv) {
   for (auto& [name, ids] : prompts.items()) longest = std::max(longest, ids.size());
   Loaded l = load(dir, static_cast<int>(longest));
   const int V = l.model->vocab_size();
-  float* d_logits = nullptr;
-  if (cudaMalloc(&d_logits, sizeof(float) * longest * V) != cudaSuccess) throw std::runtime_error("cudaMalloc");
-  cudaStream_t stream;
-  cudaStreamCreate(&stream);
+  float* d_logits = device_alloc<float>(longest * V);
+  void* stream = nullptr;
+  lx_rt_stream_create(&stream);
   for (auto& [name, ids_json] : prompts.items()) {
     const std::vector<int32_t> ids = ids_json.get<std::vector<int32_t>>();
     const int T = static_cast<int>(ids.size());
@@ -141,19 +150,19 @@ int cmd_eval(int argc, char** argv) {
     const auto t0 = Clock::now();
     lx::StepBatch step{{ids.begin(), ids.begin() + first}, {0, first}, {0}};
     l.model->forward(step, d_logits, true, stream);
-    cudaMemcpyAsync(logits.data(), d_logits, sizeof(float) * first * V, cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
+    lx_rt_copy(logits.data(), d_logits, static_cast<int64_t>(sizeof(float) * first * V), LX_COPY_D2H, stream);
+    lx_rt_stream_sync(stream);
     const double prefill_s = seconds_since(t0);
     const auto t1 = Clock::now();
     for (int t = first; t < T; ++t) {
       lx::StepBatch one{{ids[t]}, {0, 1}, {0}};
       l.model->forward(one, d_logits, true, stream);
-      cudaMemcpyAsync(logits.data() + static_cast<size_t>(t) * V, d_logits, sizeof(float) * V, cudaMemcpyDeviceToHost,
-                      stream);
+      lx_rt_copy(logits.data() + static_cast<size_t>(t) * V, d_logits, static_cast<int64_t>(sizeof(float) * V),
+                 LX_COPY_D2H, stream);
     }
-    cudaStreamSynchronize(stream);
+    lx_rt_stream_sync(stream);
     const double decode_s = seconds_since(t1);
-    if (cudaGetLastError() != cudaSuccess) throw std::runtime_error("CUDA error during the run");
+    if (lx_rt_last_error() != 0) throw std::runtime_error("device error during the run");
     if (l.weights->experts().error()) throw std::runtime_error("the CPU lane stopped answering");
     if (write)
       std::ofstream(out_dir / (name + ".f32"), std::ios::binary)
@@ -163,7 +172,7 @@ int cmd_eval(int argc, char** argv) {
     std::printf("\n");
     print_counters(l.weights->experts(), std::max(1, T - first));
   }
-  cudaFree(d_logits);
+  lx_rt_free(d_logits);
   return 0;
 }
 
@@ -180,10 +189,9 @@ int cmd_bench(int argc, char** argv) {
   size_t longest = 1;
   for (auto& [name, ids] : prompts.items()) longest = std::max(longest, ids.size());
   Loaded l = load(dir, static_cast<int>(longest));
-  float* d_logits = nullptr;
-  if (cudaMalloc(&d_logits, sizeof(float) * l.model->vocab_size()) != cudaSuccess) throw std::runtime_error("cudaMalloc");
-  cudaStream_t stream;
-  cudaStreamCreate(&stream);
+  float* d_logits = device_alloc<float>(static_cast<size_t>(l.model->vocab_size()));
+  void* stream = nullptr;
+  lx_rt_stream_create(&stream);
   double total_s = 0;
   int total_tokens = 0;
   for (int r = 0; r < repeat; ++r) {
@@ -192,11 +200,11 @@ int cmd_bench(int argc, char** argv) {
       const int T = static_cast<int>(ids.size());
       if (T <= split + 4) continue;
       l.model->reset_slot(0);
-      cudaStreamSynchronize(stream);
+      lx_rt_stream_sync(stream);
       const auto tp = Clock::now();
       lx::StepBatch step{{ids.begin(), ids.begin() + split}, {0, split}, {0}};
       l.model->forward(step, d_logits, false, stream);
-      cudaStreamSynchronize(stream);
+      lx_rt_stream_sync(stream);
       const double prefill_s = seconds_since(tp);
       std::printf("%-20s prefill %d tokens in %.1f ms: %.0f tok/s\n", name.c_str(), split, prefill_s * 1e3,
                   split / prefill_s);
@@ -205,17 +213,17 @@ int cmd_bench(int argc, char** argv) {
         lx::StepBatch one{{ids[t]}, {0, 1}, {0}};
         l.model->forward(one, d_logits, false, stream);
       }
-      cudaStreamSynchronize(stream);
+      lx_rt_stream_sync(stream);
       l.weights->experts().reset_counters();
       const auto t0 = Clock::now();
       for (int t = split + 2; t < T; ++t) {
         lx::StepBatch one{{ids[t]}, {0, 1}, {0}};
         l.model->forward(one, d_logits, false, stream);
       }
-      cudaStreamSynchronize(stream);
+      lx_rt_stream_sync(stream);
       const double s = seconds_since(t0);
       const int n = T - split - 2;
-      if (cudaGetLastError() != cudaSuccess) throw std::runtime_error("CUDA error during the run");
+      if (lx_rt_last_error() != 0) throw std::runtime_error("device error during the run");
       std::printf("%-20s decode %d tokens in %.1f ms: %.1f tok/s (%.3f ms/token)\n", name.c_str(), n, s * 1e3, n / s,
                   s * 1e3 / n);
       print_counters(l.weights->experts(), n);
@@ -225,14 +233,14 @@ int cmd_bench(int argc, char** argv) {
   }
   if (l.weights->experts().error()) throw std::runtime_error("the CPU lane stopped answering");
   std::printf("all: %d tokens, %.1f tok/s\n", total_tokens, total_tokens / total_s);
-  size_t free_b = 0, total_b = 0;
-  cudaMemGetInfo(&free_b, &total_b);
+  int64_t free_b = 0, total_b = 0;
+  lx_rt_mem_info(&free_b, &total_b);
   std::printf("device memory in use at the end: %.2f GiB of %.2f", (total_b - free_b) / 1073741824.0,
               total_b / 1073741824.0);
   const int64_t mine = off::process_vram_bytes();
   if (mine >= 0) std::printf(", this process %.2f GiB", mine / 1073741824.0);
   std::printf("\n");
-  cudaFree(d_logits);
+  lx_rt_free(d_logits);
   return 0;
 }
 

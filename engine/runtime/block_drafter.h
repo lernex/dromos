@@ -23,8 +23,6 @@
 // it cannot predict costs a proposal every 16 steps instead of one every step.
 #pragma once
 
-#include <cuda_runtime.h>
-
 #include <memory>
 #include <string>
 #include <vector>
@@ -50,10 +48,10 @@ class BlockDrafter final : public Drafter {
 
   const char* name() const override { return "block"; }
   std::vector<FeatureTap> feature_taps() const override;
-  void begin(const std::vector<int32_t>& prompt, cudaStream_t stream) override;
-  void observe_features(const float* rows, int n, int feature_dim, cudaStream_t stream) override;
+  void begin(const std::vector<int32_t>& prompt, void* stream) override;
+  void observe_features(const float* rows, int n, int feature_dim, void* stream) override;
   Draft propose(const DraftRequest& request) override;
-  void observe(int accepted, int32_t next, cudaStream_t stream) override;
+  void observe(int accepted, int32_t next, void* stream) override;
 
   // Off: always propose every draft the request allows, whatever the confidence head says.
   void set_adaptive(bool on) { adaptive_ = on; }

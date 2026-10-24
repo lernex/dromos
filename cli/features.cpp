@@ -17,8 +17,6 @@
 // the disk streams through a bounded window. DONE marks the end. --skip-seqs N resumes a stream:
 // the first N sequences it would have written (over all epochs, same seed) are skipped. Run it with
 // LX_NO_W8=1: prefill reads the bf16 weights, and the int8 decode copies would only take memory.
-#include <cuda_runtime.h>
-
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -64,6 +62,17 @@ size_t waiting_shards(const fs::path& dir) {
   for (const auto& e : fs::directory_iterator(dir))
     if (e.path().extension() == ".bin") ++n;
   return n;
+}
+
+// Device memory for `count` values of T.
+template <typename T>
+T* device_alloc(size_t count) {
+  void* p = nullptr;
+  const int64_t bytes = static_cast<int64_t>(sizeof(T) * count);
+  const int status = lx_rt_alloc(&p, bytes);
+  if (status != 0)
+    throw std::runtime_error("device allocation of " + std::to_string(bytes) + " bytes: " + lx_rt_error_string(status));
+  return static_cast<T*>(p);
 }
 
 }  // namespace
@@ -133,13 +142,10 @@ int cmd_features(int argc, char** argv) {
     lx::MetisModel model(config, lookup, 1, max_len, max_len);
     model.set_feature_taps(taps);
     const int F = model.feature_dim(), V = config.vocab_size;
-    float* d_logits = nullptr;
-    void* d_bf = nullptr;
-    if (cudaMalloc(&d_logits, sizeof(float) * V) != cudaSuccess ||
-        cudaMalloc(&d_bf, sizeof(uint16_t) * static_cast<size_t>(max_len) * F) != cudaSuccess)
-      throw std::runtime_error("cudaMalloc");
-    cudaStream_t stream;
-    cudaStreamCreate(&stream);
+    float* d_logits = device_alloc<float>(static_cast<size_t>(V));
+    void* d_bf = device_alloc<uint16_t>(static_cast<size_t>(max_len) * F);
+    void* stream = nullptr;
+    lx_rt_stream_create(&stream);
     std::printf("%zu sequences, %d taps (%d features per token), %d epochs\n", data.size(), static_cast<int>(taps.size()),
                 F, epochs);
 
@@ -193,9 +199,9 @@ int cmd_features(int argc, char** argv) {
           throw std::runtime_error("lx_copy2d failed");
         const size_t at = feat.size();
         feat.resize(at + static_cast<size_t>(T) * F);
-        cudaMemcpyAsync(feat.data() + at, d_bf, sizeof(uint16_t) * static_cast<size_t>(T) * F, cudaMemcpyDeviceToHost,
-                        stream);
-        cudaStreamSynchronize(stream);
+        lx_rt_copy(feat.data() + at, d_bf, static_cast<int64_t>(sizeof(uint16_t) * static_cast<size_t>(T) * F),
+                   LX_COPY_D2H, stream);
+        lx_rt_stream_sync(stream);
         lengths.push_back(static_cast<uint32_t>(T));
         tok.insert(tok.end(), s.tokens.begin(), s.tokens.end());
         mask.insert(mask.end(), s.mask.begin(), s.mask.end());
@@ -207,7 +213,7 @@ int cmd_features(int argc, char** argv) {
       std::printf("epoch %d done: %lld tokens, %.0f tok/s\n", epoch, static_cast<long long>(done_tokens), done_tokens / secs);
       std::fflush(stdout);
     }
-    if (cudaGetLastError() != cudaSuccess) throw std::runtime_error("CUDA error during the run");
+    if (lx_rt_last_error() != 0) throw std::runtime_error("device error during the run");
     std::ofstream(out / "DONE") << "ok\n";
   } catch (const std::exception& e) {
     std::fprintf(stderr, "error: %s\n", e.what());

@@ -1,7 +1,5 @@
 #include "runtime/engine.h"
 
-#include <cuda_runtime.h>
-
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -27,12 +25,9 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-void check_cuda(cudaError_t status, const char* what) {
-  if (status != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(status));
-}
-
-void check_lx(int status, const char* what) {
-  if (status != 0) throw std::runtime_error(std::string(what) + " failed with CUDA error " + std::to_string(status));
+// Every backend call returns 0 on success; anything else throws, with the backend's text for the code.
+void check(int status, const char* what) {
+  if (status != 0) throw std::runtime_error(std::string(what) + " failed: " + lx_rt_error_string(status));
 }
 
 lx::WeightLookup lookup_for(const lx::Weights& weights) {
@@ -52,11 +47,11 @@ template <typename T>
 class PinnedArray {
  public:
   explicit PinnedArray(size_t count) : count_(count) {
-    check_cuda(cudaMallocHost(reinterpret_cast<void**>(&data_), sizeof(T) * std::max<size_t>(count, 1)),
-               "cudaMallocHost");
+    const auto bytes = static_cast<int64_t>(sizeof(T) * std::max<size_t>(count, 1));
+    check(lx_rt_host_alloc(reinterpret_cast<void**>(&data_), bytes), "pinned host allocation");
   }
   ~PinnedArray() {
-    if (data_) cudaFreeHost(data_);
+    if (data_) lx_rt_host_free(data_);
   }
   PinnedArray(const PinnedArray&) = delete;
   PinnedArray& operator=(const PinnedArray&) = delete;
@@ -122,7 +117,7 @@ struct Engine::Impl {
       throw std::invalid_argument("this build loads BF16 weights only; the other formats are not wired into the engine yet");
     if (options.load_tokenizer) tokenizer = lx::text::Tokenizer::load(dir);
 
-    check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
+    check(lx_rt_stream_create(&stream), "stream creation");
     const lx::SafetensorsSet set = lx::SafetensorsSet::open(dir);
     weights = std::make_unique<lx::Weights>(lx::Weights::upload(set));
     model = std::make_unique<lx::MetisModel>(config, lookup_for(*weights), max_slots, kv_capacity, max_step_tokens);
@@ -144,8 +139,11 @@ struct Engine::Impl {
     top_ids = DeviceBuffer(sizeof(int32_t) * slots * kMaxTopLogprobs);
     top_lp = DeviceBuffer(sizeof(float) * slots * kMaxTopLogprobs);
     prompt_scratch = DeviceBuffer(sizeof(int32_t) * static_cast<size_t>(kv_capacity));
-    check_cuda(cudaMemset(seen.data(), 0, seen.size()), "cudaMemset");
-    check_cuda(cudaMemset(out_counts.data(), 0, out_counts.size()), "cudaMemset");
+    check(lx_rt_memset(seen.data(), 0, static_cast<int64_t>(seen.size()), nullptr), "clearing the seen counts");
+    check(lx_rt_stream_sync(nullptr), "clearing the seen counts");
+    check(lx_rt_memset(out_counts.data(), 0, static_cast<int64_t>(out_counts.size()), nullptr),
+          "clearing the output counts");
+    check(lx_rt_stream_sync(nullptr), "clearing the output counts");
 
     if (tokenizer) {
       token_texts.resize(static_cast<size_t>(V));
@@ -169,7 +167,7 @@ struct Engine::Impl {
   }
 
   ~Impl() {
-    if (stream) cudaStreamDestroy(stream);
+    if (stream) lx_rt_stream_destroy(stream);
   }
 
   double now() const { return std::chrono::duration<double>(Clock::now() - epoch).count(); }
@@ -199,7 +197,7 @@ struct Engine::Impl {
   std::unique_ptr<PinnedArray<int32_t>> host_mask_rows;
   std::unique_ptr<PinnedArray<uint32_t>> host_mask_bits;
   std::unique_ptr<lx::text::Tokenizer> tokenizer;
-  cudaStream_t stream = nullptr;
+  void* stream = nullptr;
   int V;
   int max_slots, kv_capacity, max_step_tokens, prefill_chunk;
   int grid;  // the prefill grid, or 0
@@ -389,17 +387,17 @@ void Engine::Impl::admit() {
     free_slots.pop_back();
     model->reset_slot(s->slot);
     restore_prefix(s);
-    check_lx(lx_sampler_reset(static_cast<int32_t*>(seen.data()), static_cast<int32_t*>(out_counts.data()), s->slot,
-                              V, stream),
-             "lx_sampler_reset");
+    check(lx_sampler_reset(static_cast<int32_t*>(seen.data()), static_cast<int32_t*>(out_counts.data()), s->slot,
+                           V, stream),
+          "lx_sampler_reset");
     // the prompt counts toward the repetition penalty from its first token on
     const size_t n = s->request.prompt.size();
-    check_cuda(cudaMemcpyAsync(prompt_scratch.data(), s->request.prompt.data(), sizeof(int32_t) * n,
-                               cudaMemcpyHostToDevice, stream),
-               "cudaMemcpyAsync");
-    check_lx(lx_sampler_observe(static_cast<int32_t*>(seen.data()), static_cast<int32_t*>(out_counts.data()), s->slot,
-                                V, static_cast<const int32_t*>(prompt_scratch.data()), static_cast<int>(n), 0, stream),
-             "lx_sampler_observe");
+    check(lx_rt_copy(prompt_scratch.data(), s->request.prompt.data(), static_cast<int64_t>(sizeof(int32_t) * n),
+                     LX_COPY_H2D, stream),
+          "copy of the prompt to the device");
+    check(lx_sampler_observe(static_cast<int32_t*>(seen.data()), static_cast<int32_t*>(out_counts.data()), s->slot,
+                             V, static_cast<const int32_t*>(prompt_scratch.data()), static_cast<int>(n), 0, stream),
+          "lx_sampler_observe");
     running.push_back(s);
   }
 }
@@ -498,39 +496,40 @@ void Engine::Impl::sample(const std::vector<int>& rows, const std::vector<std::s
     constrained += 1;
   }
   if (constrained > 0) {
-    check_cuda(cudaMemcpyAsync(mask_rows.data(), host_mask_rows->data(), sizeof(int32_t) * constrained,
-                               cudaMemcpyHostToDevice, stream),
-               "cudaMemcpyAsync");
-    check_cuda(cudaMemcpyAsync(mask_bits.data(), host_mask_bits->data(),
-                               sizeof(uint32_t) * constrained * mask_words, cudaMemcpyHostToDevice, stream),
-               "cudaMemcpyAsync");
-    check_lx(lx_mask_logits(static_cast<float*>(logits.data()), V, static_cast<const int32_t*>(mask_rows.data()),
-                            static_cast<const uint32_t*>(mask_bits.data()), constrained, stream),
-             "lx_mask_logits");
+    check(lx_rt_copy(mask_rows.data(), host_mask_rows->data(), static_cast<int64_t>(sizeof(int32_t) * constrained),
+                     LX_COPY_H2D, stream),
+          "copy of the mask rows to the device");
+    check(lx_rt_copy(mask_bits.data(), host_mask_bits->data(),
+                     static_cast<int64_t>(sizeof(uint32_t) * constrained * mask_words), LX_COPY_H2D, stream),
+          "copy of the mask bits to the device");
+    check(lx_mask_logits(static_cast<float*>(logits.data()), V, static_cast<const int32_t*>(mask_rows.data()),
+                         static_cast<const uint32_t*>(mask_bits.data()), constrained, stream),
+          "lx_mask_logits");
   }
-  check_cuda(cudaMemcpyAsync(params.data(), host_params->data(), sizeof(lx_sampling) * n, cudaMemcpyHostToDevice, stream),
-             "cudaMemcpyAsync");
-  check_lx(lx_sample(static_cast<const float*>(logits.data()), V, static_cast<const lx_sampling*>(params.data()), n,
-                     static_cast<int32_t*>(seen.data()), static_cast<int32_t*>(out_counts.data()),
-                     static_cast<float*>(work.data()), static_cast<int32_t*>(tokens.data()),
-                     want_lp ? static_cast<float*>(token_lp.data()) : nullptr, top_n,
-                     static_cast<int32_t*>(top_ids.data()), static_cast<float*>(top_lp.data()), stream),
-           "lx_sample");
-  check_cuda(cudaMemcpyAsync(host_tokens->data(), tokens.data(), sizeof(int32_t) * n, cudaMemcpyDeviceToHost, stream),
-             "cudaMemcpyAsync");
+  check(lx_rt_copy(params.data(), host_params->data(), static_cast<int64_t>(sizeof(lx_sampling) * n),
+                   LX_COPY_H2D, stream),
+        "copy of the sampling parameters to the device");
+  check(lx_sample(static_cast<const float*>(logits.data()), V, static_cast<const lx_sampling*>(params.data()), n,
+                  static_cast<int32_t*>(seen.data()), static_cast<int32_t*>(out_counts.data()),
+                  static_cast<float*>(work.data()), static_cast<int32_t*>(tokens.data()),
+                  want_lp ? static_cast<float*>(token_lp.data()) : nullptr, top_n,
+                  static_cast<int32_t*>(top_ids.data()), static_cast<float*>(top_lp.data()), stream),
+        "lx_sample");
+  check(lx_rt_copy(host_tokens->data(), tokens.data(), static_cast<int64_t>(sizeof(int32_t) * n), LX_COPY_D2H, stream),
+        "copy of the sampled tokens to the host");
   if (want_lp) {
-    check_cuda(cudaMemcpyAsync(host_lp->data(), token_lp.data(), sizeof(float) * n, cudaMemcpyDeviceToHost, stream),
-               "cudaMemcpyAsync");
+    check(lx_rt_copy(host_lp->data(), token_lp.data(), static_cast<int64_t>(sizeof(float) * n), LX_COPY_D2H, stream),
+          "copy of the token logprobs to the host");
   }
   if (top_n > 0) {
-    check_cuda(cudaMemcpyAsync(host_top_ids->data(), top_ids.data(), sizeof(int32_t) * n * top_n,
-                               cudaMemcpyDeviceToHost, stream),
-               "cudaMemcpyAsync");
-    check_cuda(cudaMemcpyAsync(host_top_lp->data(), top_lp.data(), sizeof(float) * n * top_n, cudaMemcpyDeviceToHost,
-                               stream),
-               "cudaMemcpyAsync");
+    check(lx_rt_copy(host_top_ids->data(), top_ids.data(), static_cast<int64_t>(sizeof(int32_t) * n * top_n),
+                     LX_COPY_D2H, stream),
+          "copy of the top token ids to the host");
+    check(lx_rt_copy(host_top_lp->data(), top_lp.data(), static_cast<int64_t>(sizeof(float) * n * top_n),
+                     LX_COPY_D2H, stream),
+          "copy of the top logprobs to the host");
   }
-  check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+  check(lx_rt_stream_sync(stream), "waiting for the step's results");
 
   std::vector<std::shared_ptr<Sequence>> ended;
   for (int j = 0; j < n; ++j) {
@@ -669,7 +668,7 @@ void Engine::Impl::restore_prefix(const std::shared_ptr<Sequence>& s) {
   const int limit = static_cast<int>(s->request.prompt.size()) - 1;
   if (cache->find(s->request.prompt, limit, grid, hit)) {
     model->restore_slot(s->slot, hit.data, hit.length, stream);
-    check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize");  // the snapshot may be evicted next
+    check(lx_rt_stream_sync(stream), "waiting for the prefix restore");  // the snapshot may be evicted next
     s->cached = hit.length;
     s->prompt_fed = hit.length;
     std::lock_guard<std::mutex> lock(mu);
@@ -705,7 +704,7 @@ void Engine::Impl::retire(const std::shared_ptr<Sequence>& s) {
   }
 }
 
-// A CUDA failure or shutdown: the engine cannot continue, so every request ends with an error.
+// A device failure or shutdown: the engine cannot continue, so every request ends with an error.
 void Engine::Impl::fail_all(const std::string& reason) {
   std::vector<std::shared_ptr<Sequence>> all;
   {
