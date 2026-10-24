@@ -254,12 +254,16 @@ LX_API int lx_rt_last_error(void);  // and clears it
 //               (requires K % 16 == 0; the loader folds a checkpoint's global scale so the
 //               engine always multiplies)
 // Stacked expert weights are [E, N, K] in the same format, every expert laid out as above, one
-// after the other (scales likewise [E, N] or [E, N, K / 16]; global is one value for the stack).
+// after the other (scales likewise [E, N] or [E, N, K / 16]). An NVFP4 stack's experts each have a
+// global scale in the checkpoint (weight_scale_2 is [E]); folding those into the e4m3 block scales
+// would round them twice, so the stack carries them: expert_global is [E] f32 on the device, and
+// null means every expert uses `global`. Consumers of a stack read the expert's own global.
 typedef struct {
   lx_wtype type;
   const void* data;
-  const void* scale;  // f32 [N] for INT8 / FP8, e4m3 [N, K / 16] for NVFP4, null for BF16
-  float global;       // NVFP4 only (1 otherwise)
+  const void* scale;          // f32 [N] for INT8 / FP8, e4m3 [N, K / 16] for NVFP4, null for BF16
+  float global;               // NVFP4 only (1 otherwise)
+  const float* expert_global;  // NVFP4 stacks only: f32 [E] on the device, or null
 } lx_weight;
 
 // How a tensor-core product does its math. Weights are always read in their stored format; this
@@ -291,6 +295,22 @@ LX_API int lx_gemm_w(const void* x, lx_dtype x_dtype, int ld_x, const lx_weight*
                      float beta, void* workspace, void* stream);
 LX_API int64_t lx_gemm_workspace_bytes(int M, int K, lx_math math);
 
+// Per-token activation quantization: the first step of lx_gemm_w and lx_moe_experts_grouped under the
+// low-precision maths, exposed so one quantization can serve several products of the same x.
+// x: [M, K] (x_dtype, row stride ld_x). Per row, with a = max_k |x[m, k]|:
+//   LX_MATH_INT8  q int8 [M, ld_q]: q = round_half_even(x * (127 / a)) clamped to [-127, 127];
+//                 scale[m] = a / 127
+//   LX_MATH_FP8   q e4m3 [M, ld_q]: q = e4m3(x * (448 / a)); scale[m] = a / 448
+//   LX_MATH_FP4   q [M, ld_q], two e2m1 per byte (low nibble = even k); block_scale e4m3 [M, ld_bs], one
+//                 per 16 k; scale[m] = g = a / (448 * 6). Block b with absmax a_b:
+//                 s_b = e4m3(a_b / (6 * g)), q = e2m1(x / (s_b * g)), and q = 0 where s_b = 0.
+//                 Requires K % 16 == 0.
+// Every rounding is to nearest, ties to even, saturating at the format's largest value; the products
+// and quotients are float32. A zero row gets scale 1 and q = 0. ld_q and ld_bs are in bytes;
+// block_scale is used for FP4 only.
+LX_API int lx_quantize_act(const void* x, lx_dtype x_dtype, int ld_x, lx_math math, void* q, int ld_q, float* scale,
+                           void* block_scale, int ld_bs, int M, int K, void* stream);
+
 // Routed experts on any weight format (contract of lx_moe_experts; gate_up [E, 2I, L],
 // down [E, L, I] as lx_weight stacks). Two implementations with one contract:
 //   lx_moe_experts_decode  few tokens (T <= 8): one pass over the chosen experts' weights,
@@ -312,6 +332,11 @@ LX_API int64_t lx_moe_grouped_workspace_bytes(int T, int L, int I, int E, int to
 // block's e4m3 scale as its absmax / (6 * global), rounded to e4m3. Used when the engine is asked
 // for a format the file is not stored in; checkpoints made with GPTQ are loaded as they are.
 LX_API int lx_quantize_weight(const void* w, lx_weight* out, int64_t rows, int cols, void* stream);
+
+// The reverse: out[r, c] = w[r, c] as bf16 for an [rows, cols] matrix in any format, with its row
+// factor applied (the row scale, or the NVFP4 global). The loader uses it to hold a quantized
+// embedding's bf16 gather table, and the acceptance checks compare dequantized weights with BF16.
+LX_API int lx_dequantize_weight(const lx_weight* w, void* out, int64_t rows, int cols, void* stream);
 
 #ifdef __cplusplus
 }

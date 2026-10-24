@@ -1,21 +1,38 @@
 cmake_minimum_required(VERSION 3.28)
+# Backends: each is one shared library exporting every lx_* function of engine/cuda/kernels.h.
+#   LX_BACKEND_CUDA  liblernex_kernels.so plus the CUDA runtime, model and CLI (the default)
+#   LX_BACKEND_CPU   liblernex_cpu.so, x86 (AVX2, AVX-VNNI, AVX-512) and ARM (NEON, dot product, I8MM,
+#                    BF16), no CUDA needed: cmake -DLX_BACKEND_CUDA=OFF -DLX_BACKEND_CPU=ON
+option(LX_BACKEND_CUDA "Build the CUDA backend, model and CLI" ON)
+option(LX_BACKEND_CPU "Build the CPU backend (liblernex_cpu.so)" OFF)
+
 # Blackwell consumer (RTX 50) for development; release builds list every architecture. 120a, not
 # 120: the block-scaled FP4 / FP8 tensor-core instructions exist only in the arch-specific target.
 # Set before project(), which otherwise fills in an old default. Real code only: PTX from a
 # toolkit newer than the driver would not load.
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+if(LX_BACKEND_CUDA AND NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 120a-real)
 endif()
-project(lernex_engine LANGUAGES CXX CUDA)
+project(lernex_engine LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_STANDARD 20)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
+
+if(LX_BACKEND_CPU)
+  add_subdirectory(engine/cpu)
+endif()
+
+if(NOT LX_BACKEND_CUDA)
+  return()
+endif()
+
+enable_language(CUDA)
+set(CMAKE_CUDA_STANDARD 20)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr -lineinfo")
 
 find_package(CUDAToolkit REQUIRED)
