@@ -29,14 +29,115 @@ template <> struct NaxB<W_INT8> { using T = int8_t; };
 template <int AF, int WF> struct NaxAcc { using T = float; };
 template <> struct NaxAcc<A_INT8, W_INT8> { using T = int; };
 
+// Two-phase staging: load_raw issues the loads of a thread's 16 values as stored (and the NVFP4 block
+// scale) before the multiply, stage_raw decodes them into the staged form after it, so the loads are in
+// flight under the multiply instead of stalling the decode in front of it. A row that is not vector
+// aligned, the tail of K and rows past the end are staged at load time (rare).
+struct Raw16 {
+  uint4 w[4];
+  uint scale;
+  bool staged;
+};
+
+template <int AF>
+inline void load_act_raw(const device uchar* row, const device uchar* blocks, int k, int K, bool vec, bool valid,
+                         thread Raw16& r) {
+  r.staged = !(vec && valid);
+  if (r.staged) {
+    stage_act<AF, true>(row, blocks, k, K, vec, valid, r.w);
+    return;
+  }
+  if (AF == A_BF16) {
+    const device uint4* p = (const device uint4*)((const device ushort*)row + k);
+    r.w[0] = p[0];
+    r.w[1] = p[1];
+  } else if (AF == A_F32 || AF == A_F32X) {
+    const device uint4* p = (const device uint4*)((const device float*)row + k);
+    for (int q = 0; q < 4; ++q) r.w[q] = p[q];
+  } else if (AF == A_INT8 || AF == A_E4M3) {
+    r.w[0] = *(const device uint4*)(row + k);
+  } else {
+    const uint2 w = *(const device uint2*)(row + k / 2);
+    r.w[0] = uint4(w.x, w.y, 0u, 0u);
+    r.scale = blocks[k / 16];
+  }
+}
+template <int AF>
+inline void stage_act_raw(const thread Raw16& r, thread uint4* w) {
+  if (r.staged || AF == A_BF16 || AF == A_INT8) {  // int8 activations stay codes (INT8 math)
+    w[0] = r.w[0];
+    w[1] = r.w[1];
+    return;
+  }
+  float v[16];
+  if (AF == A_F32 || AF == A_F32X) {
+    for (int q = 0; q < 4; ++q) decode_chunk<W_F32>(r.w[q], 1.0f, 1.0f, v + 4 * q);
+    if (AF == A_F32)
+      for (int i = 0; i < 16; ++i) v[i] = bf(to_bf(v[i]));  // rounded to bf16, as BF16 math reads f32
+  } else if (AF == A_E4M3) {
+    decode_chunk<W_FP8>(r.w[0], 1.0f, 1.0f, v);
+  } else {
+    const float sc = e4m3(r.scale);
+    decode_chunk<W_NVFP4>(r.w[0], sc, sc, v);  // the first 8 bytes: one block of 16
+  }
+  pack_bf16(v, w);
+}
+
+template <int WF>
+inline void load_w_raw(const device uchar* row, const device uchar* scales, int k, int K, bool vec, bool valid,
+                       thread Raw16& r) {
+  r.staged = !(vec && valid);
+  if (r.staged) {
+    stage_w<WF, true>(row, scales, k, K, vec, valid, r.w);
+    return;
+  }
+  if (WF == W_BF16) {
+    const device uint4* p = (const device uint4*)(row + long(k) * 2);
+    r.w[0] = p[0];
+    r.w[1] = p[1];
+  } else if (WF == W_INT8 || WF == W_FP8) {
+    r.w[0] = *(const device uint4*)(row + k);
+  } else {
+    const uint2 w = *(const device uint2*)(row + k / 2);
+    r.w[0] = uint4(w.x, w.y, 0u, 0u);
+    r.scale = scales[k / 16];
+  }
+}
+template <int WF>
+inline void stage_w_raw(const thread Raw16& r, thread uint4* w) {
+  if (r.staged || WF == W_BF16 || WF == W_INT8) {  // int8 weights stay codes
+    w[0] = r.w[0];
+    w[1] = r.w[1];
+    return;
+  }
+  float v[16];
+  if (WF == W_FP8) {
+    decode_chunk<W_FP8>(r.w[0], 1.0f, 1.0f, v);
+  } else {
+    const float sc = e4m3(r.scale);
+    decode_chunk<W_NVFP4>(r.w[0], sc, sc, v);
+  }
+  pack_bf16(v, w);
+}
+
 // MODE 0: a plain GEMM, grid (N / 64, M / 64). MODE 1: grouped gate_up, grid (I / 32, tiles), weight rows
 // interleaving gate and up. MODE 2: grouped down, grid (L / 64, tiles). As in gemm.metal.
+//
+// In the grouped modes each simdgroup multiplies its own 16 rows of the activation tile (a slab) by the
+// whole weight tile, and skips that while its rows are past the tile's. At prefill most experts get a
+// few tokens each, so most tiles hold fewer than 16 rows, and multiplying all 64 rows over the four
+// simdgroups is what bounded these stages under NVFP4 on the M5. Measured on Praxis's experts (GPU time
+// per call, both stages): 300 tokens NVFP4 3.4 -> 2.0 ms, BF16 5.3 -> 4.8, INT8 unchanged; 2048 tokens
+// NVFP4 5.4 -> 4.3 ms, INT8 5.1 -> 4.8, BF16 within 3%.
+constant constexpr int kSlab = kTileM / 4;
+
 template <int AF, int WF, int MODE>
 kernel void gemm_nax(constant GemmArgs& a [[buffer(0)]], threadgroup uchar* smem [[threadgroup(0)]],
                      uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
   using TA = typename NaxA<AF>::T;
   using TB = typename NaxB<WF>::T;
   using Acc = typename NaxAcc<AF, WF>::T;
+  constexpr bool SLAB = MODE != 0;
   // Per stage: the 64 x 32 activation tile, then the 64 x 32 weight tile.
   constexpr int kABytes = kTileM * kTileK * int(sizeof(TA));
   constexpr int kStageBytes = kABytes + kTileN * kTileK * int(sizeof(TB));
@@ -87,20 +188,35 @@ kernel void gemm_nax(constant GemmArgs& a [[buffer(0)]], threadgroup uchar* smem
                                    : ((ulong(wdata) & 15ul) == 0 && (row_offset<WF>(1, K) & 15) == 0);
   const bool x_vec = a.x_vec != 0;
 
-  constexpr auto desc = matmul2d_descriptor(kTileM, kTileN, kTileK, false, true, false,
-                                            matmul2d_descriptor::mode::multiply_accumulate);
-  matmul2d<desc, execution_simdgroups<4>> op;
   using TileA = tensor<threadgroup TA, extents<int32_t, kTileK, kTileM>, tensor_inline>;
   using TileB = tensor<threadgroup TB, extents<int32_t, kTileK, kTileN>, tensor_inline>;
+  using SlabA = tensor<threadgroup TA, extents<int32_t, kTileK, kSlab>, tensor_inline>;
+  constexpr auto desc = matmul2d_descriptor(kTileM, kTileN, kTileK, false, true, false,
+                                            matmul2d_descriptor::mode::multiply_accumulate);
+  constexpr auto sdesc = matmul2d_descriptor(kSlab, kTileN, kTileK, false, true, false,
+                                             matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroups<4>> op;
+  matmul2d<sdesc, execution_simdgroup> sop;
+  const int sg = int(tid) >> 5;
+  const bool slab_live = sg * kSlab < rows;  // this simdgroup's slab holds some of the tile's rows
   auto acc = op.template get_destination_cooperative_tensor<TileA, TileB, Acc>();
-  for (uint16_t i = 0; i < acc.get_capacity(); ++i)
-    if (acc.is_valid_element(i)) acc[i] = Acc(0);
+  auto sacc = sop.template get_destination_cooperative_tensor<SlabA, TileB, Acc>();
+  if (SLAB) {
+    for (uint16_t i = 0; i < sacc.get_capacity(); ++i)
+      if (sacc.is_valid_element(i)) sacc[i] = Acc(0);
+  } else {
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i)
+      if (acc.is_valid_element(i)) acc[i] = Acc(0);
+  }
 
   const int steps = (K + kTileK - 1) / kTileK;
   const int at = ar * kTileK + ac;  // this thread's element in either tile
+  Raw16 ra, rb;
   uint4 wa[2], wb[2];
-  stage_act<AF, true>(arow, ablk, ac, K, kTileK <= K && x_vec, a_valid, wa);
-  stage_w<WF, true>(brow, bscl, ac, K, kTileK <= K && w_vec, b_valid, wb);
+  load_act_raw<AF>(arow, ablk, ac, K, kTileK <= K && x_vec, a_valid, ra);
+  load_w_raw<WF>(brow, bscl, ac, K, kTileK <= K && w_vec, b_valid, rb);
+  stage_act_raw<AF>(ra, wa);
+  stage_w_raw<WF>(rb, wb);
   stage_store((threadgroup TA*)smem + at, wa);
   stage_store((threadgroup TB*)(smem + kABytes) + at, wb);
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -111,13 +227,20 @@ kernel void gemm_nax(constant GemmArgs& a [[buffer(0)]], threadgroup uchar* smem
     if (more) {
       const int k0 = (s + 1) * kTileK;
       const bool full = k0 + kTileK <= K;
-      stage_act<AF, true>(arow, ablk, k0 + ac, K, full && x_vec, a_valid, wa);
-      stage_w<WF, true>(brow, bscl, k0 + ac, K, full && w_vec, b_valid, wb);
+      load_act_raw<AF>(arow, ablk, k0 + ac, K, full && x_vec, a_valid, ra);
+      load_w_raw<WF>(brow, bscl, k0 + ac, K, full && w_vec, b_valid, rb);
     }
-    TileA ta((threadgroup TA*)cur, extents<int32_t, kTileK, kTileM>());
     TileB tb((threadgroup TB*)(cur + kABytes), extents<int32_t, kTileK, kTileN>());
-    op.run(ta, tb, acc);
+    if (SLAB) {
+      SlabA ta((threadgroup TA*)cur + sg * kSlab * kTileK, extents<int32_t, kTileK, kSlab>());
+      if (slab_live) sop.run(ta, tb, sacc);
+    } else {
+      TileA ta((threadgroup TA*)cur, extents<int32_t, kTileK, kTileM>());
+      op.run(ta, tb, acc);
+    }
     if (more) {
+      stage_act_raw<AF>(ra, wa);
+      stage_w_raw<WF>(rb, wb);
       stage_store((threadgroup TA*)nxt + at, wa);
       stage_store((threadgroup TB*)(nxt + kABytes) + at, wb);
     }
@@ -126,8 +249,14 @@ kernel void gemm_nax(constant GemmArgs& a [[buffer(0)]], threadgroup uchar* smem
 
   // The finished tile into threadgroup memory (over the stages, which every simdgroup is done with).
   threadgroup Acc* cs = (threadgroup Acc*)smem;
-  tensor<threadgroup Acc, extents<int32_t, kTileN, kTileM>, tensor_inline> tc(cs, extents<int32_t, kTileN, kTileM>());
-  acc.store(tc);
+  if (SLAB) {
+    tensor<threadgroup Acc, extents<int32_t, kTileN, kSlab>, tensor_inline> tc(cs + sg * kSlab * kTileN,
+                                                                               extents<int32_t, kTileN, kSlab>());
+    if (slab_live) sacc.store(tc);
+  } else {
+    tensor<threadgroup Acc, extents<int32_t, kTileN, kTileM>, tensor_inline> tc(cs, extents<int32_t, kTileN, kTileM>());
+    acc.store(tc);
+  }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   // Epilogue: thread tid takes row r = tid / 2 and 32 columns from c0.
