@@ -13,6 +13,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <memory>
 
 #include "metal/kernels/args.h"
 
@@ -76,11 +78,16 @@ std::atomic<int> g_async_error{0};
 
 // LX_METAL_PROFILE=1: command buffers, dispatches and GPU busy time, printed at exit. =2 also commits
 // every dispatch on its own and prints the GPU time per kernel (slower: for attribution, not timing).
+// =3 keeps the command buffers but gives every dispatch its own encoder, ordered after the one before,
+// and prints the GPU time per kernel from timestamps at the encoders' ends: in place, as the model runs
+// (serialized, so independent kernels no longer overlap).
 struct Profile {
   int level = 0;
   std::atomic<uint64_t> buffers{0}, dispatches{0}, gpu_ns{0}, barriers{0};
   std::mutex mu;
   std::unordered_map<std::string, std::pair<uint64_t, uint64_t>> kernels;  // name: (count, ns)
+  double ns_per_tick = 1.0;  // GPU timestamp ticks (level 3), calibrated before printing
+  std::function<double()> calibrate;
 
   static Profile* get() {
     static Profile* p = []() -> Profile* {
@@ -100,14 +107,20 @@ struct Profile {
     k.second += ns;
   }
   void print() {
+    if (calibrate) ns_per_tick = calibrate();
     std::fprintf(stderr, "lernex metal: %llu command buffers, %llu dispatches, %llu barriers, GPU busy %.1f ms\n",
                  (unsigned long long)buffers.load(), (unsigned long long)dispatches.load(),
                  (unsigned long long)barriers.load(), gpu_ns.load() / 1e6);
     std::vector<std::pair<std::string, std::pair<uint64_t, uint64_t>>> rows(kernels.begin(), kernels.end());
     std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
-    for (const auto& [name, k] : rows)
+    const double scale = level >= 3 ? ns_per_tick : 1.0;
+    double total = 0;
+    for (const auto& [name, k] : rows) {
+      total += k.second * scale;
       std::fprintf(stderr, "  %-40s %8llu x %8.2f us = %9.2f ms\n", name.c_str(), (unsigned long long)k.first,
-                   k.second / 1e3 / double(k.first), k.second / 1e6);
+                   k.second * scale / 1e3 / double(k.first), k.second * scale / 1e6);
+    }
+    if (level >= 3) std::fprintf(stderr, "  kernels in all %.1f ms\n", total / 1e6);
   }
 };
 thread_local int t_last_error = 0;
@@ -119,8 +132,59 @@ int note(int status) {
 
 // Whether every dispatch is committed on its own (LX_METAL_PROFILE=2).
 bool profile_each() {
-  static const bool each = Profile::get() && Profile::get()->level >= 2;
+  static const bool each = Profile::get() && Profile::get()->level == 2;
   return each;
+}
+
+// Whether every dispatch is timed in its own encoder (LX_METAL_PROFILE=3), where the GPU can.
+constexpr size_t kTimedMax = 128;  // timed encoders per command buffer
+bool profile_timed() {
+  static const bool timed = [] {
+    Profile* p = Profile::get();
+    if (!p || p->level < 3) return false;
+    id<MTLDevice> d = Device::get().mtl();
+    if (![d supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+      std::fprintf(stderr, "lernex metal: this GPU cannot time encoders; LX_METAL_PROFILE=3 counts only\n");
+      return false;
+    }
+    MTLTimestamp cpu0 = 0, gpu0 = 0;
+    [d sampleTimestamps:&cpu0 gpuTimestamp:&gpu0];
+    p->calibrate = [d, cpu0, gpu0] {  // the CPU side of the pair counts nanoseconds
+      MTLTimestamp cpu1 = 0, gpu1 = 0;
+      [d sampleTimestamps:&cpu1 gpuTimestamp:&gpu1];
+      return gpu1 > gpu0 ? double(cpu1 - cpu0) / double(gpu1 - gpu0) : 1.0;
+    };
+    return true;
+  }();
+  return timed;
+}
+
+// Sample buffers for the timed encoders, reused once their command buffer finished.
+std::mutex g_samples_mu;
+std::vector<id<MTLCounterSampleBuffer>> g_samples;
+
+id<MTLCounterSampleBuffer> take_samples() {
+  {
+    std::lock_guard<std::mutex> g(g_samples_mu);
+    if (!g_samples.empty()) {
+      id<MTLCounterSampleBuffer> b = g_samples.back();
+      g_samples.pop_back();
+      return b;
+    }
+  }
+  id<MTLDevice> d = Device::get().mtl();
+  MTLCounterSampleBufferDescriptor* desc = [MTLCounterSampleBufferDescriptor new];
+  for (id<MTLCounterSet> set in d.counterSets)
+    if ([set.name isEqualToString:MTLCommonCounterSetTimestamp]) desc.counterSet = set;
+  desc.storageMode = MTLStorageModeShared;
+  desc.sampleCount = 2 * kTimedMax;
+  NSError* err = nil;
+  id<MTLCounterSampleBuffer> b = [d newCounterSampleBufferWithDescriptor:desc error:&err];
+  if (!b) {
+    std::fprintf(stderr, "lernex metal: no counter sample buffer: %s\n", err.localizedDescription.UTF8String);
+    std::abort();
+  }
+  return b;
 }
 
 }  // namespace
@@ -434,8 +498,58 @@ uint64_t Stream::address(const void* p, size_t bytes, bool write) {
   return b.gpuAddress + (a - lo);
 }
 
+static bool skipped(id<MTLComputePipelineState> pipeline) {
+  static const char* env = std::getenv("LX_METAL_SKIP");
+  if (!env || !*env || !pipeline.label) return false;
+  const bool invert = env[0] == '!';
+  const std::string name = pipeline.label.UTF8String, list = env + (invert ? 1 : 0);
+  size_t at = 0;
+  while (at <= list.size()) {
+    size_t end = list.find(',', at);
+    if (end == std::string::npos) end = list.size();
+    const std::string want = list.substr(at, end - at);
+    if (!want.empty() && name.rfind(want, 0) == 0) return !invert;
+    at = end + 1;
+  }
+  return invert;
+}
+
 void Stream::dispatch(id<MTLComputePipelineState> pipeline, const void* args, size_t args_bytes, MTLSize groups,
                       MTLSize threads, NSUInteger threadgroup_bytes) {
+  if (skipped(pipeline)) {
+    if (!serial()) hazard();
+    return;
+  }
+  dispatch_one(pipeline, args, args_bytes, groups, threads, threadgroup_bytes);
+}
+
+void Stream::timed_encoder(id<MTLComputePipelineState> pipeline, const std::vector<id<MTLBuffer>>* keep) {
+  if (timed_.size() >= kTimedMax) {
+    flush();
+    open();
+    if (keep)
+      for (id<MTLBuffer> b : *keep) [enc_ useResource:b usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+  }
+  if (!samples_) samples_ = take_samples();
+  if (!fence_) fence_ = [Device::get().mtl() newFence];
+  [enc_ updateFence:fence_];
+  [enc_ endEncoding];
+  MTLComputePassDescriptor* d = [MTLComputePassDescriptor computePassDescriptor];
+  d.dispatchType = MTLDispatchTypeSerial;
+  d.sampleBufferAttachments[0].sampleBuffer = samples_;
+  d.sampleBufferAttachments[0].startOfEncoderSampleIndex = 2 * timed_.size();
+  d.sampleBufferAttachments[0].endOfEncoderSampleIndex = 2 * timed_.size() + 1;
+  enc_ = [cb_ computeCommandEncoderWithDescriptor:d];
+  [enc_ waitForFence:fence_];
+  for (const Wrap& w : wraps_) [enc_ useResource:w.buffer usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+  if (keep)
+    for (id<MTLBuffer> b : *keep) [enc_ useResource:b usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+  bound_ = nil;
+  timed_.push_back(pipeline.label ? pipeline.label.UTF8String : "?");
+}
+
+void Stream::dispatch_one(id<MTLComputePipelineState> pipeline, const void* args, size_t args_bytes, MTLSize groups,
+                          MTLSize threads, NSUInteger threadgroup_bytes) {
   if (graph_) {
     Command c;
     c.pipeline = pipeline;
@@ -448,7 +562,10 @@ void Stream::dispatch(id<MTLComputePipelineState> pipeline, const void* args, si
     return;
   }
   open();
-  if (!serial() && (hazard() || barrier_next_)) {
+  const bool barrier = !serial() && (hazard() || barrier_next_);
+  if (profile_timed()) {
+    timed_encoder(pipeline, nullptr);
+  } else if (barrier) {
     [enc_ memoryBarrierWithScope:MTLBarrierScopeBuffers];
     if (Profile* p = Profile::get()) p->barriers += 1;
   }
@@ -470,14 +587,29 @@ uint64_t Stream::flush() {
   [cb_ encodeSignalEvent:timeline_ value:value];
   Profile* profile = Profile::get();
   const int dispatches = pending_;
-  NSString* kernel = profile && profile->level >= 2 && bound_ ? bound_.label : nil;
+  NSString* kernel = profile && profile->level == 2 && bound_ ? bound_.label : nil;
+  id<MTLCounterSampleBuffer> samples = samples_;
+  auto timed = std::make_shared<std::vector<std::string>>(std::move(timed_));
+  samples_ = nil;
+  timed_.clear();
   [cb_ addCompletedHandler:^(id<MTLCommandBuffer> b) {
     if (profile) {
-      const auto ns = static_cast<uint64_t>((b.GPUEndTime - b.GPUStartTime) * 1e9);
+      const auto ns = b.GPUStartTime > 0 && b.GPUEndTime > b.GPUStartTime
+                          ? static_cast<uint64_t>((b.GPUEndTime - b.GPUStartTime) * 1e9)
+                          : 0;
       profile->buffers += 1;
       profile->dispatches += static_cast<uint64_t>(dispatches);
       profile->gpu_ns += ns;
       if (kernel && dispatches == 1) profile->add_kernel(kernel.UTF8String, ns);
+    }
+    if (samples) {
+      NSData* data = [samples resolveCounterRange:NSMakeRange(0, 2 * timed->size())];
+      const auto* ts = static_cast<const MTLCounterResultTimestamp*>(data.bytes);
+      for (size_t i = 0; ts && i < timed->size(); ++i)
+        if (ts[2 * i + 1].timestamp > ts[2 * i].timestamp && ts[2 * i].timestamp != MTLCounterErrorValue)
+          profile->add_kernel((*timed)[i], ts[2 * i + 1].timestamp - ts[2 * i].timestamp);
+      std::lock_guard<std::mutex> g(g_samples_mu);
+      g_samples.push_back(samples);
     }
     if (b.status == MTLCommandBufferStatusError) {
       std::fprintf(stderr, "lernex metal: command buffer failed: %s\n", b.error.localizedDescription.UTF8String);
@@ -572,8 +704,12 @@ void Stream::replay(const Graph& graph) {
   open();
   for (id<MTLBuffer> b : graph.keep) [enc_ useResource:b usage:MTLResourceUsageRead | MTLResourceUsageWrite];
   bool first = true;
+  // A step usually starts on an idle GPU: the first few commands go at once, the rest in the usual chunks.
+  int limit = std::min(flush_interval(), 16);
   for (const Command& c : graph.commands) {
-    if (!serial() && (c.barrier || (first && after))) {
+    if (profile_timed()) {
+      timed_encoder(c.pipeline, &graph.keep);
+    } else if (!serial() && (c.barrier || (first && after))) {
       [enc_ memoryBarrierWithScope:MTLBarrierScopeBuffers];
       if (Profile* p = Profile::get()) p->barriers += 1;
     }
@@ -585,10 +721,11 @@ void Stream::replay(const Graph& graph) {
     [enc_ setBytes:c.args.data() length:c.args.size() atIndex:0];
     if (c.threadgroup_bytes) [enc_ setThreadgroupMemoryLength:(c.threadgroup_bytes + 15) / 16 * 16 atIndex:0];
     [enc_ dispatchThreadgroups:c.groups threadsPerThreadgroup:c.threads];
-    if (++pending_ >= flush_interval() || profile_each()) {
+    if (++pending_ >= limit || profile_each()) {
       flush();
       open();
       for (id<MTLBuffer> b : graph.keep) [enc_ useResource:b usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+      limit = flush_interval();
     }
   }
   reads_.clear();

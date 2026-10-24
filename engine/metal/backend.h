@@ -78,6 +78,8 @@ class Stream {
   // Appends one dispatch of `pipeline` with its argument struct.
   void dispatch(id<MTLComputePipelineState> pipeline, const void* args, size_t args_bytes, MTLSize groups,
                 MTLSize threads, NSUInteger threadgroup_bytes = 0);
+  void dispatch_one(id<MTLComputePipelineState> pipeline, const void* args, size_t args_bytes, MTLSize groups,
+                    MTLSize threads, NSUInteger threadgroup_bytes);
 
   // Commits the open command buffer (if it has work) and returns the timeline value that marks it.
   uint64_t flush();
@@ -106,6 +108,8 @@ class Stream {
   void open();
   void retire();
   bool hazard();  // whether the pending ranges need a barrier; then tracks them
+  // LX_METAL_PROFILE=3: ends the encoder and opens one for the next dispatch alone, timed at its ends.
+  void timed_encoder(id<MTLComputePipelineState> pipeline, const std::vector<id<MTLBuffer>>* keep);
 
   // Ranges the dispatch being built touches, and those touched since the last barrier.
   struct Access {
@@ -135,6 +139,10 @@ class Stream {
   size_t ring_head_ = 0;
   std::vector<std::pair<uint64_t, size_t>> ring_marks_;  // (timeline value, ring head after it)
   Graph* graph_ = nullptr;
+  // LX_METAL_PROFILE=3: the open command buffer's samples, its timed kernels, and the fence ordering them.
+  id<MTLCounterSampleBuffer> samples_ = nil;
+  std::vector<std::string> timed_;
+  id<MTLFence> fence_ = nil;
 };
 
 // The process-wide device: buffers, the registry, the residency set, the library and pipelines.
