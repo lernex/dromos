@@ -11,12 +11,14 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "core/config.h"
 #include "runtime/plan.h"
+#include "runtime/tool_grammar.h"
 #include "text/tokenizer.h"
 
 namespace lx::runtime {
@@ -44,6 +46,10 @@ struct GenerateRequest {
   std::vector<std::string> stop_strings;  // end the reply when one appears; the text before it is kept
   bool thinking = true;             // the reply's reasoning is split off when true, as the template does
   bool ignore_eos = false;          // keep going past end ids (benchmarks)
+  // When set, the reply after its reasoning is a tool call the grammar allows (tool_choice required
+  // or named). Needs a tokenizer.
+  std::optional<ToolGrammarSpec> tool_grammar;
+  std::string tools_json;           // the request's tools array (OpenAI shape): types each argument by its schema
 };
 
 // What one generated token brings to the caller. Text is what is now safe to show: the
@@ -80,6 +86,13 @@ struct RequestCallbacks {
 struct EngineOptions {
   size_t max_queue = 4096;   // waiting requests beyond this are refused
   bool load_tokenizer = true;
+  // Reuse the state of prompts already run: a new request starts from the longest cached prefix of
+  // its tokens that ends on the prefill grid. Needs the model's slot state (LX_SLOT_STATE).
+  bool prefix_cache = true;
+  // Prompts are fed in pieces that end on multiples of this (absolute positions), and the state is
+  // kept at those points. A request that starts from a snapshot then computes exactly what a cold
+  // run computes. 0 feeds prompts in whole chunks, with no snapshots.
+  int prefill_grid = 512;
 };
 
 struct EngineStats {
@@ -90,6 +103,11 @@ struct EngineStats {
   int running = 0;
   int waiting = 0;
   int slots = 0;
+  uint64_t prefix_hits = 0;           // requests that started from a cached prefix
+  uint64_t prefix_tokens_reused = 0;  // prompt tokens not fed because a cached prefix covered them
+  uint64_t prefix_snapshots = 0;      // state snapshots taken
+  uint64_t prefix_device_bytes = 0;   // snapshot bytes held now, in device memory and pinned host memory
+  uint64_t prefix_host_bytes = 0;
 };
 
 class Engine {

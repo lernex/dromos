@@ -355,6 +355,10 @@ LX_API int lx_sampler_reset(int32_t* seen, int32_t* out_counts, int slot, int V,
 LX_API int lx_sampler_observe(int32_t* seen, int32_t* out_counts, int slot, int V, const int32_t* tokens, int n,
                               int is_output, void* stream);
 
+// Constrained decoding: sets to -inf the logits that a token mask rules out. Entry j applies its
+// mask bits[j * ((V + 31) / 32) ...] (one bit per token) to logits row rows[j] ([rows, V] f32).
+LX_API int lx_mask_logits(float* logits, int V, const int32_t* rows, const uint32_t* bits, int n, void* stream);
+
 #ifdef __cplusplus
 }
 #endif

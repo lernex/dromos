@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <string>
 
 #include "runtime/engine.h"
@@ -22,8 +23,22 @@ struct Model {
 // Throws std::runtime_error with a plain message.
 Model find_model(const std::string& name, bool download);
 
-// The plan for this GPU, the model, and the user's wishes (0 and -1 for automatic).
-runtime::Plan plan_for(const Model& model, int sequences, int context, int weights = -1);
+// The plan for this GPU, the model, and the user's wishes (0 and -1 for automatic). memory_fraction is
+// the share of the free memory the plan may use.
+runtime::Plan plan_for(const Model& model, int sequences, int context, int weights = -1, double memory_fraction = 0.92);
+
+// The engine for a plan. When the memory the plan asked for is not there (another process took it
+// after the plan was made), it plans again with fewer sequences and a smaller share of the free
+// memory, and says so on stderr. Other failures are thrown as they are.
+struct StartedEngine {
+  runtime::Plan plan;
+  std::unique_ptr<runtime::Engine> engine;
+};
+// Starts an engine with a plan for `sequences` at `context` (0 is the plan's own choice). The plan takes
+// `memory_fraction` of the memory free now; if the engine's allocations still fail, it retries with fewer
+// sequences and a smaller fraction, and says so on stderr.
+StartedEngine start_engine(const Model& model, int sequences, int context, int weights,
+                           const runtime::EngineOptions& options, double memory_fraction = 0.92);
 
 // The sampling a model recommends (generation_config.json), for a chat that asks for nothing else.
 runtime::SamplingParams recommended_sampling(const Model& model);

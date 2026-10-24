@@ -10,6 +10,7 @@ namespace lx::runtime {
 struct SchedSeq {
   int prompt_left = 0;        // prompt tokens not yet fed to the model
   bool decode_ready = false;  // a sampled token is waiting to be fed (the sequence is decoding)
+  int prompt_pos = 0;         // prompt tokens already fed: where the next chunk starts
 };
 
 struct SchedEntry {
@@ -26,6 +27,9 @@ struct SchedPlan {
 // progress. They start from the cursor, so when the budget cannot cover them all, each takes its
 // turn; the cursor advances by one each step. The rest of the budget goes to prompt chunks (at
 // most prefill_chunk tokens each), in the order the sequences were admitted.
-SchedPlan plan_step(const std::vector<SchedSeq>& seqs, int budget, int prefill_chunk, unsigned& cursor);
+// With a grid, prompt chunks end on its multiples (absolute prompt positions), and a chunk that does
+// not fit the budget waits: the same prompt is always cut the same way, so its state is the same
+// however the batch was packed, and a cached prefix on the grid is exactly what a cold run computes.
+SchedPlan plan_step(const std::vector<SchedSeq>& seqs, int budget, int prefill_chunk, unsigned& cursor, int grid = 0);
 
 }  // namespace lx::runtime

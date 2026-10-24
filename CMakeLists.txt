@@ -43,6 +43,13 @@ add_library(lernex_kernels SHARED ${LX_CUDA_SOURCES})
 target_include_directories(lernex_kernels PUBLIC engine)
 target_link_libraries(lernex_kernels PUBLIC CUDA::cudart CUDA::cublasLt)
 
+# The prefix cache snapshots the model's slot state. That needs MetisModel::save_slot and restore_slot,
+# which live in docs/handoff/serving-metis.diff until the lead applies it to engine/model/metis.cpp.
+option(LX_SLOT_STATE "Build the prefix cache on the model's slot state (needs the serving-metis handoff)" OFF)
+if(LX_SLOT_STATE)
+  add_compile_definitions(LX_SLOT_STATE=1)
+endif()
+
 # The runtime: config, weights, the Metis model, caches, the plan and the tuner.
 file(GLOB LX_CORE_SOURCES CONFIGURE_DEPENDS engine/core/*.cpp engine/model/*.cpp engine/model/*.cu engine/runtime/*.cpp
      engine/runtime/*.cu engine/text/*.cpp engine/server/*.cpp)
@@ -94,4 +101,10 @@ if(LX_UNIT_SOURCES AND TARGET lernex_core)
   add_executable(lernex_unit ${LX_UNIT_SOURCES})
   target_include_directories(lernex_unit PRIVATE third_party/doctest)
   target_link_libraries(lernex_unit PRIVATE lernex_core)
+endif()
+
+# The prefix cache, end to end on the model (run on the GPU server, see tests/gpu/prefix).
+if(LX_SLOT_STATE AND TARGET lernex_core)
+  add_executable(lernex_prefix_check tests/gpu/prefix/prefix_check.cpp)
+  target_link_libraries(lernex_prefix_check PRIVATE lernex_core)
 endif()

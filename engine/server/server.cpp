@@ -1,11 +1,13 @@
 #include "server/server.h"
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <deque>
 #include <fstream>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <vector>
@@ -253,6 +255,30 @@ std::string read_tools(const json& body, bool& any) {
   }
   any = true;
   return tools.dump();
+}
+
+// The grammar a tool choice imposes: "required" may call any tool, a named function only that one.
+// Nothing for "auto" or "none".
+std::optional<runtime::ToolGrammarSpec> tool_grammar_for(const json& body) {
+  if (!body.contains("tool_choice") || body["tool_choice"].is_null()) return std::nullopt;
+  const json& tc = body["tool_choice"];
+  const bool required = tc.is_string() && tc.get<std::string>() == "required";
+  const bool named = tc.is_object();
+  if (!required && !named) return std::nullopt;
+  if (!body.contains("tools") || !body["tools"].is_array() || body["tools"].empty())
+    invalid("tool_choice needs tools", "tool_choice");
+  runtime::ToolGrammarSpec spec;
+  const std::string only = named ? tc.value("function", json::object()).value("name", "") : "";
+  spec.named = named;
+  for (const auto& t : body["tools"]) {
+    const json fn = t.value("function", json::object());
+    const std::string name = fn.value("name", "");
+    if (name.empty() || (named && name != only)) continue;
+    const json params = fn.contains("parameters") && !fn["parameters"].is_null() ? fn["parameters"] : json::object();
+    spec.tools.emplace_back(name, params.dump());
+  }
+  if (spec.tools.empty()) invalid("tool_choice names no tool in tools", "tool_choice");
+  return spec;
 }
 
 const char* finish_name(runtime::FinishReason r, bool tools) {
@@ -609,6 +635,8 @@ bool Server::run() {
       options.tools_json = tools_text;
       if (!body.contains("messages")) invalid("messages is required", "messages");
       const std::string prompt = lx::text::render_chat(read_messages(body["messages"]), options);
+      job.request.tool_grammar = tool_grammar_for(body);
+      job.request.tools_json = tools_text;
       if (!tokenizer) throw ApiError(500, "server_error", "this server has no tokenizer");
       job.request.prompt = tokenizer->encode(prompt, true);
       serve(std::move(job), res);

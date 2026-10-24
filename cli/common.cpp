@@ -1,5 +1,6 @@
 #include "cli/common.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -59,14 +60,43 @@ Model find_model(const std::string& name, bool download) {
   return Model{dir, name, ref.repo};
 }
 
-runtime::Plan plan_for(const Model& model, int sequences, int context, int weights) {
+runtime::Plan plan_for(const Model& model, int sequences, int context, int weights, double memory_fraction) {
   const MetisConfig config = load_config(model.dir.string());
   runtime::PlanRequest request;
   request.sequences = sequences;
   request.context = context;
   request.weights = weights;
+  request.memory_fraction = memory_fraction;
   const runtime::CheckpointInfo checkpoint = runtime::inspect_checkpoint(model.dir.string());
   return runtime::make_plan(runtime::query_device(0), config, checkpoint, request);
+}
+
+StartedEngine start_engine(const Model& model, int sequences, int context, int weights,
+                           const runtime::EngineOptions& options, double memory_fraction) {
+  double fraction = memory_fraction;
+  int wanted = sequences;
+  int format = weights;
+  for (int attempt = 1;; ++attempt) {
+    runtime::Plan plan = plan_for(model, wanted, context, format, fraction);
+    try {
+      auto engine = std::make_unique<runtime::Engine>(model.dir.string(), plan, options);
+      return StartedEngine{std::move(plan), std::move(engine)};
+    } catch (const std::runtime_error& e) {
+      const std::string what = e.what();
+      // cudaErrorMemoryAllocation is error 2: it comes back from cudaMalloc, from a kernel that allocates, or from a copy.
+      const bool memory = what.find("cudaMalloc") != std::string::npos || what.find("out of memory") != std::string::npos ||
+                          what.find("CUDA error 2") != std::string::npos;
+      if (!memory || attempt >= 4) throw;
+      // The retry keeps the format this attempt chose: re-planning could pick one the build cannot load.
+      format = static_cast<int>(plan.weights);
+      fraction = std::max(0.4, fraction * 0.8);
+      wanted = std::max(1, (wanted > 0 ? wanted : plan.max_slots) / 2);
+      std::fprintf(stderr,
+                   "The memory the plan asked for was not free (%s).\n"
+                   "Retrying with %d sequences and %.0f%% of the free memory.\n",
+                   what.c_str(), wanted, fraction * 100.0);
+    }
+  }
 }
 
 runtime::SamplingParams recommended_sampling(const Model& model) {

@@ -361,3 +361,21 @@ extern "C" int lx_sampler_observe(int32_t* seen, int32_t* out_counts, int slot, 
   if (is_output) observe_kernel<<<(n + 255) / 256, 256, 0, s>>>(out_counts + offset, tokens, n);
   return lx::launch_status();
 }
+
+// Constrained decoding: the logits of each listed row that the token mask rules out become -inf.
+// bits[j] is the mask of entry j (one bit per token, row-major, (V + 31) / 32 words).
+__global__ void mask_logits_kernel(float* logits, int V, const int32_t* rows, const uint32_t* bits, int words) {
+  const int j = blockIdx.y;
+  const int v = blockIdx.x * blockDim.x + threadIdx.x;
+  if (v >= V) return;
+  const uint32_t word = bits[static_cast<size_t>(j) * words + (v >> 5)];
+  if (!((word >> (v & 31)) & 1u)) logits[static_cast<size_t>(rows[j]) * V + v] = -INFINITY;
+}
+
+extern "C" int lx_mask_logits(float* logits, int V, const int32_t* rows, const uint32_t* bits, int n, void* stream) {
+  if (n <= 0) return 0;
+  auto s = static_cast<cudaStream_t>(stream);
+  const int words = (V + 31) / 32;
+  mask_logits_kernel<<<dim3((V + 255) / 256, n), 256, 0, s>>>(logits, V, rows, bits, words);
+  return lx::launch_status();
+}
