@@ -219,3 +219,21 @@ def test_mixed_lossless_pair_is_refused(lx):
         ctypes.pointer(gu_lw), ctypes.pointer(dn.lx()), ctypes.c_void_p(out.data_ptr()),
         ctypes.c_void_p(ws.data_ptr()), T, L, I, top_k, None)
     assert status == 801  # cudaErrorNotSupported
+
+
+@pytest.mark.parametrize("fmt", list(FORMATS))
+def test_rows_do_not_depend_on_the_batch(lx, fmt):
+    # Batch invariance, as the GEMV rule has it: a token's row is the same bits whatever batch it is in. Each
+    # token of a batch of T (1 to 8) equals that token run alone at T = 1, on the Praxis expert stacks (E = 128).
+    L, I, top_k = METIS
+    E = 128
+    gu = stack_weight(FORMATS[fmt], E, 2 * I, L, seed=51, reference=False)
+    dn = stack_weight(FORMATS[fmt], E, L, I, seed=52, reference=False)
+    latent, ids, weights = make_inputs(8, E, L, I, top_k, seed=53)
+    alone = torch.cat(
+        [run_decode(lx, latent[t : t + 1], ids[t : t + 1], weights[t : t + 1], gu, dn, I, top_k) for t in range(8)]
+    )
+    for T in range(1, 9):
+        out = run_decode(lx, latent[:T], ids[:T], weights[:T], gu, dn, I, top_k)
+        for t in range(T):
+            assert torch.equal(out[t], alone[t]), f"token {t} of a T={T} batch differs from the token alone"
