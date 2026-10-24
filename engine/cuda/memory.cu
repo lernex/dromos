@@ -1,7 +1,14 @@
 // Depth memory: the per-token attention over its bank, the gated fuse into the streams, and the
 // depth head's last step. Keys and values are projected when an entry is written, so a read only
-// attends.
+// attends. At decode (T <= kDecodeTokens) attend loads each row's vectors up front, and fuse splits a
+// token over a cluster of blocks, so one token uses several SMs rather than one.
+#include <cooperative_groups.h>
+
+#include <algorithm>
+
 #include "cuda/common.cuh"
+
+namespace cg = cooperative_groups;
 
 namespace {
 
@@ -11,7 +18,23 @@ constexpr int kMaxEntries = 8;
 // Attend runs one warp per (token, stream) row.
 constexpr int kWarpsPerBlock = 4;
 
+// Decode path: at most this many tokens per step take the spread-out kernels.
+constexpr int kDecodeTokens = 8;
+
+// Streams held in registers by the decode fuse, and the cluster width a token's columns split over.
+constexpr int kMaxStreams = 8;
+constexpr int kCluster = 8;
+
+// A decode block holds one column per thread (see streams.cu): slices are at most this wide.
+constexpr int kClusterThreads = 512;
+
+// Decode attend: a lane holds this many float4 of a row, so the vector path covers M <= 4 * 32 * this.
+constexpr int kLaneVecs = 2;
+
 inline int row_threads(int dim) { return dim >= 256 ? 256 : ((dim + 31) / 32) * 32; }
+
+// Columns of a token's row owned by one block of its cluster.
+inline int slice_width(int dim) { return (dim + kCluster - 1) / kCluster; }
 
 __device__ __forceinline__ float sigmoid(float v) { return 1.0f / (1.0f + expf(-v)); }
 
@@ -63,6 +86,89 @@ __global__ void memory_attend_kernel(const float* q, const float* bank_k, const 
   }
 }
 
+// Decode attend: one warp per (token, stream) row, one row per block. Every load the row needs is
+// issued before any math (the query, then each entry's key and value), so the warp waits on memory
+// once rather than once per entry. Lanes take float4 chunks of M, and the eight score sums are
+// independent warp reductions that overlap. Needs M % 4 == 0 for the vector loads to stay aligned.
+__global__ void memory_attend_vec_kernel(const float* q, const float* bank_k, const float* bank_v, int n_entries,
+                                         int max_entries, __nv_bfloat16* out, int rows, int S, int M) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const int lane = threadIdx.x & 31;
+  const int t = row / S;
+  const int chunks = M / 4;  // float4 per row
+  const float4* qr = reinterpret_cast<const float4*>(q + static_cast<int64_t>(row) * M);
+  const float4* kb = reinterpret_cast<const float4*>(bank_k + static_cast<int64_t>(t) * max_entries * M);
+  const float4* vb = reinterpret_cast<const float4*>(bank_v + static_cast<int64_t>(t) * max_entries * M);
+
+  // Every load is unconditional, with indices clamped into the row and the bank: a guarded load
+  // would split the warp's memory traffic into one round trip per entry. Clamped entries and lanes
+  // past chunks re-read finite data that the arithmetic below never uses.
+  const int last = n_entries - 1;
+  float4 qv[kLaneVecs], kv[kMaxEntries][kLaneVecs], vv[kMaxEntries][kLaneVecs];
+#pragma unroll
+  for (int j = 0; j < kLaneVecs; ++j) qv[j] = qr[min(lane + 32 * j, chunks - 1)];
+#pragma unroll
+  for (int e = 0; e < kMaxEntries; ++e) {
+    const int be = min(e, last) * chunks;
+#pragma unroll
+    for (int j = 0; j < kLaneVecs; ++j) {
+      const int c = min(lane + 32 * j, chunks - 1);
+      kv[e][j] = kb[be + c];
+      vv[e][j] = vb[be + c];
+    }
+  }
+
+  float score[kMaxEntries];
+#pragma unroll
+  for (int e = 0; e < kMaxEntries; ++e) {
+    float dot = 0.0f;
+#pragma unroll
+    for (int j = 0; j < kLaneVecs; ++j) {
+      if (lane + 32 * j < chunks)
+        dot += qv[j].x * kv[e][j].x + qv[j].y * kv[e][j].y + qv[j].z * kv[e][j].z + qv[j].w * kv[e][j].w;
+    }
+    score[e] = dot;
+  }
+  const float scale = rsqrtf(static_cast<float>(M));
+#pragma unroll
+  for (int e = 0; e < kMaxEntries; ++e) score[e] = lx::warp_sum(score[e]) * scale;
+
+  float top = score[0];
+#pragma unroll
+  for (int e = 1; e < kMaxEntries; ++e)
+    if (e < n_entries) top = fmaxf(top, score[e]);
+  float total = 0.0f;
+#pragma unroll
+  for (int e = 0; e < kMaxEntries; ++e) {
+    if (e < n_entries) {
+      score[e] = expf(score[e] - top);
+      total += score[e];
+    }
+  }
+  const float norm = 1.0f / total;
+
+#pragma unroll
+  for (int j = 0; j < kLaneVecs; ++j) {
+    const int c = lane + 32 * j;
+    if (c < chunks) {
+      float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+      for (int e = 0; e < kMaxEntries; ++e) {
+        if (e < n_entries) {
+          acc.x += score[e] * vv[e][j].x;
+          acc.y += score[e] * vv[e][j].y;
+          acc.z += score[e] * vv[e][j].z;
+          acc.w += score[e] * vv[e][j].w;
+        }
+      }
+      __nv_bfloat162* dst = reinterpret_cast<__nv_bfloat162*>(out + static_cast<int64_t>(row) * M + 4 * c);
+      dst[0] = __floats2bfloat162_rn(acc.x * norm, acc.y * norm);
+      dst[1] = __floats2bfloat162_rn(acc.z * norm, acc.w * norm);
+    }
+  }
+}
+
 // One block per token. The gate for each stream is a dot over its own row, taken before that row
 // is updated, so the gate sees the streams as they were. Streams are handled one at a time, each
 // with its own block reduction. The summary reads only projected, so it runs last.
@@ -86,6 +192,85 @@ __global__ void memory_fuse_kernel(float* streams, const float* projected, const
   for (int d = threadIdx.x; d < D; d += blockDim.x) {
     float acc = 0.0f;
     for (int s = 0; s < S; ++s) acc += projected[base + static_cast<int64_t>(s) * D + d];
+    summary[static_cast<int64_t>(t) * D + d] = acc / S;
+  }
+}
+
+// Decode fuse. Block `rank` of a token's cluster owns the columns [rank * W, rank * W + W), one per
+// thread. Each block forms its slice's share of every stream's gate dot and pushes it into every
+// peer. After the cluster barrier each block sums the shares in rank order, so all blocks get the
+// same totals, then gates and updates only its own columns. The dots read the streams as they were:
+// each column is read and written by its one owning thread, and nothing is written before the barrier.
+__global__ void __launch_bounds__(kClusterThreads) __cluster_dims__(kCluster, 1, 1)
+memory_fuse_cluster_kernel(float* streams, const float* projected, const __nv_bfloat16* gate,
+                           const __nv_bfloat16* gate_bias, float* summary, int S, int D, int W) {
+  __shared__ float warp_dots[32][kMaxStreams];
+  __shared__ float parts[kCluster][kMaxStreams];  // the cluster's shares, [rank][stream]
+
+  cg::cluster_group cluster = cg::this_cluster();
+  const int rank = static_cast<int>(cluster.block_rank());
+  const int t = blockIdx.x / kCluster;
+  const int d = rank * W + threadIdx.x;
+  const bool own = threadIdx.x < W && d < D;
+  const int64_t base = static_cast<int64_t>(t) * S * D;
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+
+  // Padding threads read a valid column (dc) and never write it; streams past S are never loaded.
+  const int dc = min(d, D - 1);
+  float x[kMaxStreams], p[kMaxStreams], g_in[kMaxStreams];
+#pragma unroll
+  for (int s = 0; s < kMaxStreams; ++s) {
+    const int64_t at = base + static_cast<int64_t>(s) * D + dc;
+    x[s] = (s < S) ? streams[at] : 0.0f;
+    p[s] = (s < S) ? projected[at] : 0.0f;
+    g_in[s] = (s < S) ? lx::to_f32(gate[s * D + dc]) : 0.0f;
+  }
+  float dot[kMaxStreams];
+#pragma unroll
+  for (int s = 0; s < kMaxStreams; ++s) dot[s] = (own && s < S) ? x[s] * g_in[s] : 0.0f;
+
+#pragma unroll
+  for (int s = 0; s < kMaxStreams; ++s) dot[s] = lx::warp_sum(dot[s]);
+  if (lane == 0) {
+#pragma unroll
+    for (int s = 0; s < kMaxStreams; ++s) warp_dots[warp][s] = dot[s];
+  }
+  __syncthreads();
+
+  // Push each stream's share of this block into every peer's slot for this rank: one remote store
+  // per (peer, stream). Every thread that pushes a stream computes the same share from the warp sums.
+  const int warps = (blockDim.x + 31) / 32;
+  for (int i = threadIdx.x; i < kCluster * S; i += blockDim.x) {
+    const int s = i % S;
+    const int k = i / S;
+    float share = 0.0f;
+    for (int w = 0; w < warps; ++w) share += warp_dots[w][s];
+    *cluster.map_shared_rank(&parts[rank][s], k) = share;
+  }
+  cluster.sync();
+
+  // Every share is now in this block's parts. Sum them in rank order: all blocks get identical totals.
+  float total[kMaxStreams];
+#pragma unroll
+  for (int s = 0; s < kMaxStreams; ++s) {
+    total[s] = 0.0f;
+#pragma unroll
+    for (int k = 0; k < kCluster; ++k)
+      if (s < S) total[s] += parts[k][s];
+  }
+
+  if (own) {
+    const float inv_sqrt_d = rsqrtf(static_cast<float>(D));
+    float acc = 0.0f;
+#pragma unroll
+    for (int s = 0; s < kMaxStreams; ++s) {
+      if (s < S) {
+        const float g = sigmoid(total[s] * inv_sqrt_d + lx::to_f32(gate_bias[s]));
+        streams[base + static_cast<int64_t>(s) * D + d] = x[s] + g * p[s];
+        acc += p[s];
+      }
+    }
     summary[static_cast<int64_t>(t) * D + d] = acc / S;
   }
 }
@@ -122,6 +307,11 @@ extern "C" int lx_memory_attend(const float* q, const float* bank_k, const float
     return static_cast<int>(cudaErrorInvalidValue);
   if (T <= 0 || S <= 0 || M <= 0) return 0;
   const int rows = T * S;
+  if (T <= kDecodeTokens && M % 4 == 0 && M <= 4 * 32 * kLaneVecs) {
+    memory_attend_vec_kernel<<<rows, 32, 0, static_cast<cudaStream_t>(stream)>>>(
+        q, bank_k, bank_v, n_entries, max_entries, static_cast<__nv_bfloat16*>(out), rows, S, M);
+    return lx::launch_status();
+  }
   memory_attend_kernel<<<(rows + kWarpsPerBlock - 1) / kWarpsPerBlock, 32 * kWarpsPerBlock, 0,
                          static_cast<cudaStream_t>(stream)>>>(
       q, bank_k, bank_v, n_entries, max_entries, static_cast<__nv_bfloat16*>(out), rows, S, M);
@@ -131,6 +321,14 @@ extern "C" int lx_memory_attend(const float* q, const float* bank_k, const float
 extern "C" int lx_memory_fuse(float* streams, const float* projected, const void* gate, const void* gate_bias,
                               float* summary, int T, int S, int D, void* stream) {
   if (T <= 0 || S <= 0 || D <= 0) return 0;
+  if (T <= kDecodeTokens && S <= kMaxStreams && slice_width(D) <= kClusterThreads) {
+    const int W = slice_width(D);
+    const int threads = (W + 31) / 32 * 32;  // one thread per owned column
+    memory_fuse_cluster_kernel<<<T * kCluster, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+        streams, projected, static_cast<const __nv_bfloat16*>(gate), static_cast<const __nv_bfloat16*>(gate_bias),
+        summary, S, D, W);
+    return lx::launch_status();
+  }
   memory_fuse_kernel<<<T, row_threads(D), 0, static_cast<cudaStream_t>(stream)>>>(
       streams, projected, static_cast<const __nv_bfloat16*>(gate), static_cast<const __nv_bfloat16*>(gate_bias),
       summary, S, D);

@@ -15,6 +15,14 @@ from conftest import close
         (300, 4, 256, 8, 8),
         (5, 3, 100, 5, 2),  # odd widths, bank larger than the valid prefix
         (2, 1, 33, 8, 5),
+        # Decode path (T <= 8, M % 4 == 0, M <= 256): vector loads, one warp per row.
+        (8, 4, 256, 8, 8),
+        (4, 4, 256, 8, 1),
+        (8, 4, 256, 8, 5),
+        (1, 8, 256, 8, 8),
+        (7, 2, 64, 8, 8),
+        (4, 4, 256, 3, 3),  # bank of 3 entries: the kernel must not read past it
+        (2, 4, 512, 8, 8),  # wider than the decode path's vector cap: one warp per row, scalar
     ],
 )
 def test_memory_attend(lx, T, S, M, E, n):
@@ -36,7 +44,24 @@ def test_memory_attend(lx, T, S, M, E, n):
     close(out, want, atol=1e-3, rtol=1e-2)
 
 
-@pytest.mark.parametrize("T,S,D", [(1, 4, 2048), (300, 4, 2048), (3, 3, 37), (2, 4, 2560)])
+@pytest.mark.parametrize(
+    "T,S,D",
+    [
+        (1, 4, 2048),
+        (300, 4, 2048),
+        (3, 3, 37),
+        (2, 4, 2560),
+        # Decode path: a cluster of 8 blocks per token, one column per thread (rows up to 8 * 512).
+        (8, 4, 2048),
+        (4, 4, 2048),
+        (1, 8, 2048),
+        (5, 8, 300),
+        (8, 3, 37),
+        (2, 4, 4096),
+        (1, 4, 8192),  # past the decode path: one block per token
+        (1, 4, 9000),
+    ],
+)
 def test_memory_fuse(lx, T, S, D):
     torch.manual_seed(0)
     streams = torch.randn(T, S, D, device="cuda")
@@ -76,3 +101,38 @@ def test_continuation_finish(lx, T, D, limit):
     z = logit.double() + torch.tanh(innovation / scale) - 0.5
     want = torch.sigmoid(torch.clamp(z, -limit, limit))
     close(out, want, atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.parametrize("T,S,M,E,n", [(8, 4, 256, 8, 8), (1, 4, 256, 8, 3)])
+def test_decode_attend_is_repeatable(lx, T, S, M, E, n):
+    torch.manual_seed(0)
+    q = torch.randn(T, S, M, device="cuda")
+    bank_k = torch.randn(T, E, M, device="cuda")
+    bank_v = torch.randn(T, E, M, device="cuda")
+    first = None
+    for _ in range(20):
+        out = torch.empty(T, S, M, device="cuda", dtype=torch.bfloat16)
+        lx("memory_attend", q, bank_k, bank_v, n, E, out, T, S, M)
+        if first is None:
+            first = out
+        else:
+            assert torch.equal(out, first), "memory_attend differs between runs"
+
+
+@pytest.mark.parametrize("T,S,D", [(8, 4, 2048), (1, 8, 2560)])
+def test_decode_fuse_is_repeatable(lx, T, S, D):
+    torch.manual_seed(0)
+    streams0 = torch.randn(T, S, D, device="cuda")
+    projected = torch.randn(T, S, D, device="cuda") * 0.5
+    gate = torch.randn(S, D, device="cuda").to(torch.bfloat16)
+    gate_bias = torch.randn(S, device="cuda").to(torch.bfloat16)
+    first = None
+    for _ in range(20):
+        streams = streams0.clone()  # the kernel updates streams in place
+        summary = torch.empty(T, D, device="cuda")
+        lx("memory_fuse", streams, projected, gate, gate_bias, summary, T, S, D)
+        if first is None:
+            first = (streams, summary)
+        else:
+            assert torch.equal(streams, first[0]), "memory_fuse streams differ between runs"
+            assert torch.equal(summary, first[1]), "memory_fuse summary differs between runs"

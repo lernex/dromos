@@ -1,6 +1,7 @@
 #include "model/metis.h"
 
 #include <cmath>
+#include <algorithm>
 #include <cstdlib>
 #include <map>
 #include <set>
@@ -53,6 +54,16 @@ std::vector<float> host_values(const WeightView& w) {
 
 }  // namespace
 
+// A projection: its bf16 weight (prefill, through cuBLASLt) and, when quantized, an int8 copy with
+// per-row scales that decode steps read instead, at half the bytes.
+struct Linear {
+  const void* w = nullptr;     // bf16 [N, K]
+  const void* bias = nullptr;  // bf16 [N] or null
+  int8_t* q = nullptr;         // int8 [N, K], or null to decode from w
+  float* scale = nullptr;      // f32 [N]
+  int N = 0, K = 0;
+};
+
 struct MetisModel::Impl {
   // ---- weights -----------------------------------------------------------------------------
   struct Connection {
@@ -62,21 +73,26 @@ struct MetisModel::Impl {
   struct Layer {
     bool attention;
     // Mamba-2
-    const void *in_proj, *conv_w, *conv_b, *norm_w, *out_proj;
+    Linear in_proj, out_proj;
+    const void *conv_w, *conv_b, *norm_w;
     const float *A_log, *D, *dt_bias;
     // attention
-    const void *qkv, *out, *lora_down, *lora_up;
+    Linear qkv, out, lora_down, lora_up;
     std::vector<float> pass_gate;  // tanh(pass_gates[p]) rounded to bf16, per pass
     // MoE
-    const void *latent_down, *latent_up, *expert_emb, *gate_up, *down, *shared_gate_up, *shared_down;
+    Linear latent_down, latent_up, shared_gate_up, shared_down;
+    const void *expert_emb, *gate_up, *down;      // bf16 experts, for prefill
+    int8_t *gate_up_q = nullptr, *down_q = nullptr;  // int8 experts, for decode
+    float *gate_up_scale = nullptr, *down_scale = nullptr;
     const float *router_w, *router_b, *selection_bias;
     Connection mixer_conn, moe_conn;
   };
   std::vector<Layer> layers;
   const void *embedding, *stream_emb, *final_norm;
+  Linear head;  // the tied LM head (the embedding)
   // depth memory
-  const void *m_state_w, *m_state_b, *m_meta_w, *m_meta_b, *m_pass_emb, *m_anchor_emb, *m_query_w, *m_query_b,
-      *m_key_w, *m_key_b, *m_value_w, *m_value_b, *m_out_w, *m_out_b, *m_route_w, *m_route_b, *m_gate, *m_gate_b;
+  Linear m_state, m_meta, m_query, m_key, m_value, m_out, m_route;
+  const void *m_pass_emb, *m_anchor_emb, *m_gate, *m_gate_b;
   const float *c_hidden_w, *c_hidden_b, *c_out_w, *c_out_b;
 
   // ---- dimensions --------------------------------------------------------------------------
@@ -106,6 +122,12 @@ struct MetisModel::Impl {
   std::set<GraphKey> seen;
   std::map<GraphKey, cudaGraphExec_t> graphs;
   bool use_graphs = true;
+  // decode-sized products (at most this many rows) run as GEMVs; larger ones on cuBLASLt
+  static constexpr int kGemvRows = 8;
+  void* cast_bf = nullptr;  // bf16 copy of an f32 input for a cuBLASLt product
+  size_t cast_capacity = 0;
+  void* moe_workspace = nullptr;
+  std::string w8_keep;  // LX_W8_KEEP: comma-separated name fragments that stay bf16 for decode
   void *streams_bf, *retrieved_bf, *feat_in_bf, *h_bf, *normed_bf, *lora_bf, *att_bf, *latent_bf, *shared_bf,
       *routed_bf, *entry_bf, *meta_bf, *out_bf;
 
@@ -140,6 +162,36 @@ const void* need(const WeightLookup& lookup, const std::string& name, int dtype,
     throw std::runtime_error("weight " + name + " has shape [ " + got + "], expected [ " + want + "]");
   }
   return w.data;
+}
+
+// Whether a weight stays bf16 for decode: LX_W8_KEEP lists name fragments to keep, for measuring
+// what quantizing each part of the model costs.
+bool kept_bf16(const Impl& m, const std::string& name) {
+  for (size_t pos = 0; pos < m.w8_keep.size();) {
+    const size_t end = m.w8_keep.find(',', pos);
+    const std::string frag = m.w8_keep.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+    if (!frag.empty() && name.find(frag) != std::string::npos) return true;
+    pos = end == std::string::npos ? m.w8_keep.size() : end + 1;
+  }
+  return false;
+}
+
+// A projection from the checkpoint; with `quantize`, also its int8 decode copy, unless its name
+// contains a fragment of LX_W8_KEEP (for measuring what quantizing each part costs).
+Linear make_linear(Impl& m, const WeightLookup& lw, const std::string& weight, const std::string& bias, int64_t N,
+                   int64_t K, bool quantize) {
+  Linear l;
+  l.w = need(lw, weight, LX_BF16, {N, K});
+  if (!bias.empty()) l.bias = need(lw, bias, LX_BF16, {N});
+  l.N = static_cast<int>(N);
+  l.K = static_cast<int>(K);
+  const bool keep = !quantize || kept_bf16(m, weight);
+  if (!keep) {
+    l.q = m.alloc<int8_t>(static_cast<size_t>(N) * K);
+    l.scale = m.alloc<float>(N);
+    LX_CHECK(lx_quantize_w8(l.w, l.q, l.scale, N, static_cast<int>(K), nullptr));
+  }
+  return l;
 }
 
 // The Sinkhorn mix, read and write weights of one hyper-connection for every pass. They depend
@@ -232,30 +284,29 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
   m.kv_capacity = kv_capacity;
   const int D = m.D, S = m.S, V = c.vocab_size, R = m.R, Mm = m.M, E = m.E, Lat = m.Lat;
 
+  // Decode reads int8 copies of every large projection except the Mamba-2 output projection: it is
+  // the one part of Metis that int8 visibly hurts (alone it takes the tool-prompt KL from 0.014 to
+  // 0.026), as it was for the GGUF, FP8 and MLX releases. LX_W8_KEEP overrides the list.
+  m.w8_keep = std::getenv("LX_W8_KEEP") ? std::getenv("LX_W8_KEEP") : "out_proj";
+  if (std::getenv("LX_NO_W8")) m.w8_keep = "layers,depth_memory,embedding";
   m.embedding = need(lw, "embedding.weight", LX_BF16, {V, D});
+  m.head = make_linear(m, lw, "embedding.weight", "", V, D, true);
   m.stream_emb = need(lw, "stream_embeddings", LX_BF16, {S, D});
   m.final_norm = need(lw, "final_norm.weight", LX_BF16, {D});
   const auto pass_embeddings = host_values(lw("pass_embeddings"));
   need(lw, "pass_embeddings", LX_BF16, {c.max_passes, c.mhc_pass_embedding_dim});
 
   const std::string dm = "depth_memory.";
-  m.m_state_w = need(lw, dm + "state_write.weight", LX_BF16, {Mm, D});
-  m.m_state_b = need(lw, dm + "state_write.bias", LX_BF16, {Mm});
-  m.m_meta_w = need(lw, dm + "metadata_write.weight", LX_BF16, {Mm, R + 4});
-  m.m_meta_b = need(lw, dm + "metadata_write.bias", LX_BF16, {Mm});
+  m.m_state = make_linear(m, lw, dm + "state_write.weight", dm + "state_write.bias", Mm, D, true);
+  m.m_meta = make_linear(m, lw, dm + "metadata_write.weight", dm + "metadata_write.bias", Mm, R + 4, false);
   m.m_pass_emb = need(lw, dm + "pass_embeddings", LX_BF16, {c.max_passes, Mm});
   m.m_anchor_emb =
       need(lw, dm + "anchor_embeddings", LX_BF16, {static_cast<int64_t>(c.attention_layer_indices.size() + 1), Mm});
-  m.m_query_w = need(lw, dm + "query.weight", LX_BF16, {Mm, D});
-  m.m_query_b = need(lw, dm + "query.bias", LX_BF16, {Mm});
-  m.m_key_w = need(lw, dm + "key.weight", LX_BF16, {Mm, Mm});
-  m.m_key_b = need(lw, dm + "key.bias", LX_BF16, {Mm});
-  m.m_value_w = need(lw, dm + "value.weight", LX_BF16, {Mm, Mm});
-  m.m_value_b = need(lw, dm + "value.bias", LX_BF16, {Mm});
-  m.m_out_w = need(lw, dm + "output.weight", LX_BF16, {D, Mm});
-  m.m_out_b = need(lw, dm + "output.bias", LX_BF16, {D});
-  m.m_route_w = need(lw, dm + "route_projection.weight", LX_BF16, {R, 3 * D + R});
-  m.m_route_b = need(lw, dm + "route_projection.bias", LX_BF16, {R});
+  m.m_query = make_linear(m, lw, dm + "query.weight", dm + "query.bias", Mm, D, true);
+  m.m_key = make_linear(m, lw, dm + "key.weight", dm + "key.bias", Mm, Mm, false);
+  m.m_value = make_linear(m, lw, dm + "value.weight", dm + "value.bias", Mm, Mm, false);
+  m.m_out = make_linear(m, lw, dm + "output.weight", dm + "output.bias", D, Mm, true);
+  m.m_route = make_linear(m, lw, dm + "route_projection.weight", dm + "route_projection.bias", R, 3 * D + R, true);
   m.m_gate = need(lw, dm + "stream_gate", LX_BF16, {S, D});
   m.m_gate_b = need(lw, dm + "stream_gate_bias", LX_BF16, {S});
   m.c_hidden_w = static_cast<const float*>(need(lw, "continuation.hidden.weight", LX_F32, {R, 3 * D + R}));
@@ -269,32 +320,41 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
     layer.attention = c.is_attention(i);
     if (layer.attention) {
       const std::string a = p + "mixer.";
-      layer.qkv = need(lw, a + "qkv.weight", LX_BF16, {m.qkv_width, D});
-      layer.out = need(lw, a + "out.weight", LX_BF16, {D, m.AH * m.Dh});
-      layer.lora_down = need(lw, a + "pass_lora_down.weight", LX_BF16, {m.rank, D});
-      layer.lora_up = need(lw, a + "pass_lora_up.weight", LX_BF16, {m.qkv_width, m.rank});
+      layer.qkv = make_linear(m, lw, a + "qkv.weight", "", m.qkv_width, D, true);
+      layer.out = make_linear(m, lw, a + "out.weight", "", D, m.AH * m.Dh, true);
+      layer.lora_down = make_linear(m, lw, a + "pass_lora_down.weight", "", m.rank, D, false);
+      layer.lora_up = make_linear(m, lw, a + "pass_lora_up.weight", "", m.qkv_width, m.rank, false);
       auto gates = host_values(lw(a + "pass_gates"));
       need(lw, a + "pass_gates", LX_BF16, {c.max_passes});
       for (int pass = 0; pass < m.P_passes; ++pass) layer.pass_gate.push_back(round_bf16(std::tanh(gates[pass])));
     } else {
       const std::string a = p + "mixer.impl.mixer.";
-      layer.in_proj = need(lw, a + "in_proj.weight", LX_BF16, {m.proj, D});
+      layer.in_proj = make_linear(m, lw, a + "in_proj.weight", "", m.proj, D, true);
       layer.conv_w = need(lw, a + "conv1d.weight", LX_BF16, {m.conv_dim, 1, m.W});
       layer.conv_b = need(lw, a + "conv1d.bias", LX_BF16, {m.conv_dim});
       layer.norm_w = need(lw, a + "norm.weight", LX_BF16, {m.I});
-      layer.out_proj = need(lw, a + "out_proj.weight", LX_BF16, {D, m.I});
+      layer.out_proj = make_linear(m, lw, a + "out_proj.weight", "", D, m.I, true);
       layer.A_log = static_cast<const float*>(need(lw, a + "A_log", LX_F32, {m.H}));
       layer.D = static_cast<const float*>(need(lw, a + "D", LX_F32, {m.H}));
       layer.dt_bias = static_cast<const float*>(need(lw, a + "dt_bias", LX_F32, {m.H}));
     }
     const std::string e = p + "moe.";
-    layer.latent_down = need(lw, e + "latent_down.weight", LX_BF16, {Lat, D});
-    layer.latent_up = need(lw, e + "latent_up.weight", LX_BF16, {D, Lat});
+    layer.latent_down = make_linear(m, lw, e + "latent_down.weight", "", Lat, D, true);
+    layer.latent_up = make_linear(m, lw, e + "latent_up.weight", "", D, Lat, true);
     layer.expert_emb = need(lw, e + "expert_embeddings", LX_BF16, {E, R});
     layer.gate_up = need(lw, e + "local_experts.gate_up.weight", LX_BF16, {E, 2 * m.Iexp, Lat});
     layer.down = need(lw, e + "local_experts.down.weight", LX_BF16, {E, Lat, m.Iexp});
-    layer.shared_gate_up = need(lw, e + "shared_expert.gate_up.weight", LX_BF16, {2 * m.Ishared, Lat});
-    layer.shared_down = need(lw, e + "shared_expert.down.weight", LX_BF16, {Lat, m.Ishared});
+    layer.shared_gate_up = make_linear(m, lw, e + "shared_expert.gate_up.weight", "", 2 * m.Ishared, Lat, true);
+    layer.shared_down = make_linear(m, lw, e + "shared_expert.down.weight", "", Lat, m.Ishared, true);
+    if (!kept_bf16(m, e + "local_experts.gate_up.weight")) {
+      const int64_t gu_rows = static_cast<int64_t>(E) * 2 * m.Iexp, dn_rows = static_cast<int64_t>(E) * Lat;
+      layer.gate_up_q = m.alloc<int8_t>(gu_rows * Lat);
+      layer.gate_up_scale = m.alloc<float>(gu_rows);
+      layer.down_q = m.alloc<int8_t>(dn_rows * m.Iexp);
+      layer.down_scale = m.alloc<float>(dn_rows);
+      LX_CHECK(lx_quantize_w8(layer.gate_up, layer.gate_up_q, layer.gate_up_scale, gu_rows, Lat, nullptr));
+      LX_CHECK(lx_quantize_w8(layer.down, layer.down_q, layer.down_scale, dn_rows, m.Iexp, nullptr));
+    }
     layer.router_w = static_cast<const float*>(need(lw, e + "expert_router.weight", LX_F32, {E, Lat + R}));
     layer.router_b = static_cast<const float*>(need(lw, e + "expert_router.bias", LX_F32, {E}));
     layer.selection_bias = static_cast<const float*>(need(lw, e + "selection_bias", LX_F32, {E}));
@@ -371,6 +431,9 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
   m.meta_bf = m.alloc<uint16_t>(T * (R + 4));
   m.out_bf = m.alloc<uint16_t>(T * D);
   m.last_rows = m.alloc<float>(static_cast<size_t>(max_slots) * D);
+  m.cast_capacity = TS * static_cast<size_t>(std::max({3 * D + R, m.I, m.proj, D}));
+  m.cast_bf = m.alloc<uint16_t>(m.cast_capacity);
+  m.moe_workspace = m.alloc<char>(static_cast<size_t>(lx_moe_workspace_bytes(Impl::kGemvRows, m.Iexp, m.K)));
   m.meta_count = T + (max_slots + 1) + 3 * static_cast<size_t>(max_slots);
   m.d_meta = m.alloc<int32_t>(m.meta_count);
   m.d_tokens = m.d_meta;
@@ -389,10 +452,23 @@ void MetisModel::reset_slot(int slot) { slot_len_.at(slot) = 0; }
 
 namespace {
 
-// y = alpha * (x @ w^T + bias) + beta * y with bf16 inputs.
-void gemm(const void* x, int ld_x, const void* w, const void* bias, void* y, lx_dtype y_dtype, int ld_y, int M,
-          int N, int K, cudaStream_t s, float alpha = 1.0f, float beta = 0.0f) {
-  LX_CHECK(lx_gemm_bf16(x, ld_x, w, bias, y, y_dtype, ld_y, M, N, K, alpha, beta, s));
+// y = alpha * (x @ W^T + bias) + beta * y for M rows of x (f32 or bf16). Decode-sized products run
+// as GEMVs on the int8 copy when there is one, reading x as it is; larger ones go to cuBLASLt on
+// the bf16 weight, through a bf16 copy of x when x is f32.
+void linear(Impl& m, const Linear& l, const void* x, lx_dtype x_dtype, int ld_x, void* y, lx_dtype y_dtype, int ld_y,
+            int M, cudaStream_t s, float alpha = 1.0f, float beta = 0.0f) {
+  if (M <= Impl::kGemvRows) {
+    LX_CHECK(lx_gemv(x, x_dtype, ld_x, l.q ? static_cast<const void*>(l.q) : l.w, l.q ? LX_W_INT8 : LX_W_BF16, l.scale,
+                     l.bias, LX_BF16, y, y_dtype, ld_y, M, l.N, l.K, alpha, beta, s));
+    return;
+  }
+  if (x_dtype == LX_F32) {
+    if (static_cast<size_t>(M) * l.K > m.cast_capacity) throw std::runtime_error("cast scratch too small");
+    LX_CHECK(lx_copy2d(x, LX_F32, ld_x, m.cast_bf, LX_BF16, l.K, M, l.K, s));
+    x = m.cast_bf;
+    ld_x = l.K;
+  }
+  LX_CHECK(lx_gemm_bf16(x, ld_x, l.w, l.bias, y, y_dtype, ld_y, M, l.N, l.K, alpha, beta, s));
 }
 
 void to_bf16(const float* src, int ld_src, void* dst, int ld_dst, int rows, int cols, cudaStream_t s) {
@@ -411,10 +487,9 @@ void memory_retrieve(Impl& m, int T, int n_entries, cudaStream_t s) {
     cudaMemsetAsync(m.mem_summary, 0, sizeof(float) * T * D, s);
     return;
   }
-  to_bf16(m.streams, D, m.streams_bf, D, T * S, D, s);
-  gemm(m.streams_bf, D, m.m_query_w, m.m_query_b, m.q, LX_F32, Mm, T * S, Mm, D, s);
+  linear(m, m.m_query, m.streams, LX_F32, D, m.q, LX_F32, Mm, T * S, s);
   LX_CHECK(lx_memory_attend(m.q, m.bank_k, m.bank_v, n_entries, m.Emax, m.retrieved_bf, T, S, Mm, s));
-  gemm(m.retrieved_bf, Mm, m.m_out_w, m.m_out_b, m.projected, LX_F32, D, T * S, D, Mm, s);
+  linear(m, m.m_out, m.retrieved_bf, LX_BF16, Mm, m.projected, LX_F32, D, T * S, s);
   LX_CHECK(lx_memory_fuse(m.streams, m.projected, m.m_gate, m.m_gate_b, m.mem_summary, T, S, D, s));
 }
 
@@ -433,7 +508,7 @@ void concat4(Impl& m, const float* a, const float* b, const float* c, const floa
 // Routing features: tanh(route_projection([state, retrieved, difference, history])).
 void routing_features(Impl& m, int T, cudaStream_t s) {
   concat4(m, m.state, m.mem_summary, m.difference, m.history, m.feat_in_bf, LX_BF16, T, s);
-  gemm(m.feat_in_bf, 3 * m.D + m.R, m.m_route_w, m.m_route_b, m.features, LX_F32, m.R, T, m.R, 3 * m.D + m.R, s);
+  linear(m, m.m_route, m.feat_in_bf, LX_BF16, 3 * m.D + m.R, m.features, LX_F32, m.R, T, s);
   LX_CHECK(lx_activate_f32(m.features, static_cast<int64_t>(T) * m.R, 0, s));
 }
 
@@ -441,19 +516,17 @@ void routing_features(Impl& m, int T, cudaStream_t s) {
 void memory_write(Impl& m, const MetisConfig& c, int T, int pass, int anchor, int& n_entries, cudaStream_t s) {
   const int D = m.D, R = m.R, Mm = m.M;
   LX_CHECK(lx_stream_mean(m.streams, m.state, T, m.S, D, s));
-  to_bf16(m.state, D, m.out_bf, D, T, D, s);
-  gemm(m.out_bf, D, m.m_state_w, m.m_state_b, m.entry, LX_F32, Mm, T, Mm, D, s);
+  linear(m, m.m_state, m.state, LX_F32, D, m.entry, LX_F32, Mm, T, s);
   LX_CHECK(lx_copy2d(m.summary, LX_F32, R, m.meta_bf, LX_BF16, R + 4, T, R, s));
   const float mean_k = static_cast<float>(c.num_experts_per_tok) / static_cast<float>(c.max_routed_k);
   const float inv_log_e = c.n_routed_experts > 1 ? 1.0f / std::log(static_cast<float>(c.n_routed_experts)) : 1.0f;
   LX_CHECK(glue::meta_scalars(m.entropy, m.confidence, m.continuation, mean_k, inv_log_e, m.meta_bf, R + 4, R, T, s));
-  gemm(m.meta_bf, R + 4, m.m_meta_w, m.m_meta_b, m.entry, LX_F32, Mm, T, Mm, R + 4, s, 1.0f, 1.0f);
+  linear(m, m.m_meta, m.meta_bf, LX_BF16, R + 4, m.entry, LX_F32, Mm, T, s, 1.0f, 1.0f);
   LX_CHECK(lx_add_row_bf16(m.entry, static_cast<const uint16_t*>(m.m_pass_emb) + pass * Mm, T, Mm, s));
   LX_CHECK(lx_add_row_bf16(m.entry, static_cast<const uint16_t*>(m.m_anchor_emb) + anchor * Mm, T, Mm, s));
-  to_bf16(m.entry, Mm, m.entry_bf, Mm, T, Mm, s);
   const int ld_bank = m.Emax * Mm;
-  gemm(m.entry_bf, Mm, m.m_key_w, m.m_key_b, m.bank_k + n_entries * Mm, LX_F32, ld_bank, T, Mm, Mm, s);
-  gemm(m.entry_bf, Mm, m.m_value_w, m.m_value_b, m.bank_v + n_entries * Mm, LX_F32, ld_bank, T, Mm, Mm, s);
+  linear(m, m.m_key, m.entry, LX_F32, Mm, m.bank_k + n_entries * Mm, LX_F32, ld_bank, T, s);
+  linear(m, m.m_value, m.entry, LX_F32, Mm, m.bank_v + n_entries * Mm, LX_F32, ld_bank, T, s);
   ++n_entries;
 }
 
@@ -545,17 +618,17 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, cudaStream_
       const float* mc = layer.mixer_conn.params + pass * params;
       LX_CHECK(lx_mhc_read(m.streams, mc, mc + S * S, layer.mixer_conn.norm, c.rms_norm_eps, m.mixed, m.h_bf, T, S, D, s));
       if (layer.attention) {
-        gemm(m.h_bf, D, layer.qkv, nullptr, m.qkv_buf, LX_F32, m.qkv_width, T, m.qkv_width, D, s);
-        gemm(m.h_bf, D, layer.lora_down, nullptr, m.lora_bf, LX_BF16, m.rank, T, m.rank, D, s);
-        gemm(m.lora_bf, m.rank, layer.lora_up, nullptr, m.qkv_buf, LX_F32, m.qkv_width, T, m.qkv_width, m.rank, s,
+        linear(m, layer.qkv, m.h_bf, LX_BF16, D, m.qkv_buf, LX_F32, m.qkv_width, T, s);
+        linear(m, layer.lora_down, m.h_bf, LX_BF16, D, m.lora_bf, LX_BF16, m.rank, T, s);
+        linear(m, layer.lora_up, m.lora_bf, LX_BF16, m.rank, m.qkv_buf, LX_F32, m.qkv_width, T, s,
              layer.pass_gate[pass], 1.0f);
         LX_CHECK(lx_attention_varlen(m.qkv_buf, m.qkv_width, m.k_cache[slot_index], m.v_cache[slot_index], m.d_slots,
                                      m.d_start_pos, m.d_cu, n_seq, m.kv_capacity, m.att_bf, m.AH, m.KVH, m.Dh,
                                      1.0f / std::sqrt(static_cast<float>(m.Dh)), s));
-        gemm(m.att_bf, m.AH * m.Dh, layer.out, nullptr, m.update, LX_F32, D, T, D, m.AH * m.Dh, s);
+        linear(m, layer.out, m.att_bf, LX_BF16, m.AH * m.Dh, m.update, LX_F32, D, T, s);
       } else {
         const int gn = m.G * m.N;
-        gemm(m.h_bf, D, layer.in_proj, nullptr, m.zxbcdt, LX_F32, m.proj, T, m.proj, D, s);
+        linear(m, layer.in_proj, m.h_bf, LX_BF16, D, m.zxbcdt, LX_F32, m.proj, T, s);
         LX_CHECK(lx_conv1d_varlen(m.zxbcdt + m.I, m.proj, layer.conv_w, layer.conv_b, m.conv_state[slot_index],
                                   m.d_slots, m.d_has_state, m.d_cu, n_seq, m.xbc, m.conv_dim, m.W, s));
         LX_CHECK(lx_ssm_scan_varlen(m.xbc, m.conv_dim, m.zxbcdt + m.I + m.conv_dim, m.proj, m.xbc + m.I,
@@ -564,27 +637,30 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, cudaStream_
                                     m.Pd, m.G, m.N, s));
         LX_CHECK(lx_gated_rmsnorm(m.ssm_y, m.zxbcdt, m.proj, layer.norm_w, m.normed_bf, T, m.I, m.G,
                                   c.mamba_norm_eps, s));
-        gemm(m.normed_bf, m.I, layer.out_proj, nullptr, m.update, LX_F32, D, T, D, m.I, s);
+        linear(m, layer.out_proj, m.normed_bf, LX_BF16, m.I, m.update, LX_F32, D, T, s);
       }
       LX_CHECK(lx_mhc_write(m.mixed, mc + S * S + S, m.update, m.streams, T, S, D, s));
 
       // latent mixture of experts
       const float* ec = layer.moe_conn.params + pass * params;
       LX_CHECK(lx_mhc_read(m.streams, ec, ec + S * S, layer.moe_conn.norm, c.rms_norm_eps, m.mixed, m.h_bf, T, S, D, s));
-      gemm(m.h_bf, D, layer.latent_down, nullptr, m.latent, LX_F32, Lat, T, Lat, D, s);
+      linear(m, layer.latent_down, m.h_bf, LX_BF16, D, m.latent, LX_F32, Lat, T, s);
       to_bf16(m.latent, Lat, m.latent_bf, Lat, T, Lat, s);
       copy_f32(m.latent, Lat, m.router_in, Lat + R, T, Lat, s);
       copy_f32(m.features, R, m.router_in + Lat, Lat + R, T, R, s);
       LX_CHECK(lx_gemm_f32(m.router_in, Lat + R, layer.router_w, layer.router_b, m.router_logits, E, T, E, Lat + R, s));
       LX_CHECK(lx_moe_route(m.router_logits, layer.selection_bias, m.route_ids, m.route_w, m.entropy, m.confidence, T,
                             E, m.K, s));
-      LX_CHECK(lx_moe_experts(m.latent_bf, m.route_ids, m.route_w, layer.gate_up, layer.down, m.routed, T, Lat, m.Iexp,
-                              m.K, s));
-      gemm(m.latent_bf, Lat, layer.shared_gate_up, nullptr, m.shared_gu, LX_F32, 2 * m.Ishared, T, 2 * m.Ishared, Lat, s);
+      if (T <= Impl::kGemvRows && layer.gate_up_q)
+        LX_CHECK(lx_moe_experts_w8(m.latent_bf, m.route_ids, m.route_w, layer.gate_up_q, layer.gate_up_scale,
+                                   layer.down_q, layer.down_scale, m.routed, m.moe_workspace, T, Lat, m.Iexp, m.K, s));
+      else
+        LX_CHECK(lx_moe_experts(m.latent_bf, m.route_ids, m.route_w, layer.gate_up, layer.down, m.routed, T, Lat,
+                                m.Iexp, m.K, s));
+      linear(m, layer.shared_gate_up, m.latent_bf, LX_BF16, Lat, m.shared_gu, LX_F32, 2 * m.Ishared, T, s);
       LX_CHECK(lx_silu_mul(m.shared_gu, 2 * m.Ishared, m.shared_bf, LX_BF16, T, m.Ishared, s));
-      gemm(m.shared_bf, m.Ishared, layer.shared_down, nullptr, m.routed, LX_F32, Lat, T, Lat, m.Ishared, s, 1.0f, 1.0f);
-      to_bf16(m.routed, Lat, m.routed_bf, Lat, T, Lat, s);
-      gemm(m.routed_bf, Lat, layer.latent_up, nullptr, m.update, LX_F32, D, T, D, Lat, s);
+      linear(m, layer.shared_down, m.shared_bf, LX_BF16, m.Ishared, m.routed, LX_F32, Lat, T, s, 1.0f, 1.0f);
+      linear(m, layer.latent_up, m.routed, LX_F32, Lat, m.update, LX_F32, D, T, s);
       LX_CHECK(lx_moe_summary(m.route_ids, m.route_w, layer.expert_emb, m.summary, T, R, m.K, s));
       LX_CHECK(lx_mhc_write(m.mixed, ec + S * S + S, m.update, m.streams, T, S, D, s));
 
@@ -611,11 +687,11 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, cudaStream_
   LX_CHECK(lx_stream_mean(m.streams, m.state, T, S, D, s));
   if (all_rows) {
     LX_CHECK(lx_rmsnorm(m.state, LX_F32, m.final_norm, m.out_bf, LX_BF16, T, D, c.rms_norm_eps, s));
-    gemm(m.out_bf, D, m.embedding, nullptr, logits, LX_F32, c.vocab_size, T, c.vocab_size, D, s);
+    linear(m, m.head, m.out_bf, LX_BF16, D, logits, LX_F32, c.vocab_size, T, s);
   } else {
     LX_CHECK(glue::gather_last(m.state, m.d_cu, m.last_rows, n_seq, D, s));
     LX_CHECK(lx_rmsnorm(m.last_rows, LX_F32, m.final_norm, m.out_bf, LX_BF16, n_seq, D, c.rms_norm_eps, s));
-    gemm(m.out_bf, D, m.embedding, nullptr, logits, LX_F32, c.vocab_size, n_seq, c.vocab_size, D, s);
+    linear(m, m.head, m.out_bf, LX_BF16, D, logits, LX_F32, c.vocab_size, n_seq, s);
   }
 }
 
