@@ -5,6 +5,8 @@
 
 int cmd_inspect(int argc, char** argv);
 int cmd_eval(int argc, char** argv);
+int cmd_doctor(int argc, char** argv);
+int cmd_tune(int argc, char** argv);
 int cmd_bench(int argc, char** argv);
 int cmd_run(int argc, char** argv);
 int cmd_serve(int argc, char** argv);
@@ -23,6 +25,9 @@ void usage() {
                "  list                                      the models and which are installed\n"
                "  bench MODEL [--streams 1,8,32,64] [--prompt-tokens N] [--gen-tokens N]\n"
                "                                            throughput of the engine on this GPU\n"
+               "  doctor [MODEL_DIR] [--weights F] [--context N] [--sequences N]\n"
+               "                                            the GPU, what it can run, and the plan for a model\n"
+               "  tune MODEL_DIR [--out PATH] [--log]       time the kernel variants on this GPU, keep the winners\n"
                "  inspect MODEL_DIR                         load a model and describe it\n"
                "  eval MODEL_DIR PROMPTS_JSON OUT_DIR [N]   logits for reference prompts; with N, the\n"
                "                                            first N tokens at once and the rest one by one\n");
@@ -39,6 +44,8 @@ int main(int argc, char** argv) {
   try {
     if (!std::strcmp(cmd, "inspect")) return cmd_inspect(argc - 1, argv + 1);
     if (!std::strcmp(cmd, "eval")) return cmd_eval(argc - 1, argv + 1);
+    if (!std::strcmp(cmd, "doctor")) return cmd_doctor(argc - 1, argv + 1);
+    if (!std::strcmp(cmd, "tune")) return cmd_tune(argc - 1, argv + 1);
     if (!std::strcmp(cmd, "bench")) return cmd_bench(argc - 1, argv + 1);
     if (!std::strcmp(cmd, "run")) return cmd_run(argc - 1, argv + 1);
     if (!std::strcmp(cmd, "serve")) return cmd_serve(argc - 1, argv + 1);
