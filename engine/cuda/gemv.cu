@@ -45,6 +45,7 @@
 #include <type_traits>
 
 #include "cuda/common.cuh"
+#include "cuda/gemv_class.cuh"
 #include "cuda/kernels.h"
 #include "cuda/tunable.h"
 #include "cuda/wformat.cuh"
@@ -955,6 +956,8 @@ cudaError_t launch_format(const Args& a) {
 bool valid_dtype(lx_dtype d) { return d == LX_F32 || d == LX_BF16; }
 
 }  // namespace
+
+int lx::gemv_order_class(int format, int N, int K) { return order_class(format, N, K); }
 
 extern "C" int lx_gemv_w(const void* x, lx_dtype x_dtype, int ld_x, const lx_weight* w, const void* bias,
                          lx_dtype bias_dtype, void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K, float alpha,

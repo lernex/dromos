@@ -5,12 +5,15 @@ The format must reproduce every bf16 bit, so nothing here has a tolerance:
   - decoding gives back the input bits, including zeros, subnormals, infinities and NaNs, rows with
     more patches than their slots (overflow records), and K that is not a multiple of 128
   - lx_gemv_bf16x equals lx_gemv on the original bf16 weights bit for bit, for every path (vec with
-    each split, small, strided x, every M, every dtype), and is deterministic; so does
-    lx_gemv_decode_bf16 (the same kernel on plain bf16), checked in every one of those cases
+    each split, small, strided x, every M, every dtype, every variant either may be tuned to), is
+    deterministic, and is batch invariant: a row's bits do not depend on M (lx_gemv_decode_bf16, now
+    lx_gemv itself, is checked alongside)
   - lx_moe_experts_bf16x and lx_moe_experts_decode_bf16 equal lx_moe_experts bit for bit
 """
 
 import ctypes
+import json
+from pathlib import Path
 
 import pytest
 import torch
@@ -22,12 +25,15 @@ METIS_SHAPES = [  # (N, K) of every Praxis decode product
     (10304, 2048),
     (3072, 2048),
     (2048, 4096),
+    (2048, 2048),
     (65536, 2048),
     (1024, 2048),
     (2048, 1024),
+    (1024, 1024),
     (1024, 512),
     (256, 6400),
     (256, 2048),
+    (8, 2048),
     (2048, 256),
     (256, 256),
 ]
@@ -339,6 +345,106 @@ def test_gemv_patches_and_overflow(lx, N, K, M):
     ref, got = both_gemv(lx, M, N, K, torch.float32, torch.float32, None, 1.0, 0.0,
                          make=lambda n, k: wide_range(n, k, lo=-40.0, hi=2.0))
     assert same(got, ref)
+
+
+TUNING = Path(__file__).resolve().parents[2] / "tuning" / "NVIDIA_GeForce_RTX_5070_Ti_sm120_0.2.json"
+LX_ERR_TUNE_REJECTED = 802
+
+
+def setup_tuner(lib):
+    lib.lx_tune_set.restype = ctypes.c_int
+    lib.lx_tune_set.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+    lib.lx_tune_clear.restype = None
+    lib.lx_tune_clear.argtypes = []
+    lib.lx_tune_variants.restype = ctypes.c_int
+    lib.lx_tune_variants.argtypes = [ctypes.c_char_p]
+
+
+@pytest.mark.parametrize("x_dtype", [torch.float32, torch.bfloat16])
+def test_gemv_every_tuned_variant(lx, x_dtype):
+    # Any variant the tuner may pin for bf16 (gemv_w_bf16, the shape's order class) leaves lx_gemv equal to
+    # the BF16X GEMV, which runs that class whatever bf16 is tuned to. Shapes with partial row groups, a
+    # partial last step (1040, 1296), more parts than steps, M below its bucket, and rows with patches.
+    lib = lx.lib
+    setup_tuner(lib)
+    kernel = b"gemv_w_bf16"
+    variants = lib.lx_tune_variants(kernel)
+    assert variants > 0
+    try:
+        for M, N, K in [(1, 300, 1040), (3, 77, 2048), (8, 129, 1024), (5, 50, 1296), (2, 64, 528), (4, 33, 4096)]:
+            admitted = 0
+            for v in range(variants):
+                lib.lx_tune_clear()
+                status = lib.lx_tune_set(kernel, M, N, K, v)
+                assert status in (0, LX_ERR_TUNE_REJECTED)
+                if status != 0:
+                    continue
+                admitted += 1
+                torch.manual_seed(M * 13 + N + K + v)
+                ref, got = both_gemv(lx, M, N, K, x_dtype, torch.float32, torch.bfloat16, 1.0, 0.0,
+                                     make=lambda n, k: wide_range(n, k, lo=-30.0, hi=2.0))
+                assert same(got, ref), f"variant {v} at M={M} N={N} K={K}"
+            assert admitted > 0
+    finally:
+        lib.lx_tune_clear()
+
+
+@pytest.mark.parametrize("x_dtype", [torch.float32, torch.bfloat16])
+def test_gemv_every_own_variant(lx, x_dtype):
+    # Rows per warp, steps in flight and the loop form are this format's own ("gemv_bf16x"), carry no split
+    # and change no sum: every variant is admitted at every key, and each equals lx_gemv.
+    lib = lx.lib
+    setup_tuner(lib)
+    variants = lib.lx_tune_variants(b"gemv_bf16x")
+    assert variants > 0
+    try:
+        for M, N, K in [(1, 300, 1040), (3, 77, 2048), (8, 129, 1024), (5, 50, 1296), (2, 7, 528), (8, 33, 4096)]:
+            for v in range(variants):
+                lib.lx_tune_clear()
+                assert lib.lx_tune_set(b"gemv_bf16x", M, N, K, v) == 0
+                torch.manual_seed(M * 7 + N + K + v)
+                ref, got = both_gemv(lx, M, N, K, x_dtype, torch.float32, torch.bfloat16, 1.0, 0.0,
+                                     make=lambda n, k: wide_range(n, k, lo=-30.0, hi=2.0))
+                assert same(got, ref), f"variant {v} at M={M} N={N} K={K}"
+    finally:
+        lib.lx_tune_clear()
+
+
+def use_table(lib, which):
+    """Clears the tuner, then for "shipped" applies the 5070 Ti table's GEMV entries the way the engine does."""
+    lib.lx_tune_clear()
+    if which == "shipped":
+        for e in json.loads(TUNING.read_text())["entries"]:
+            if e["key"].startswith("gemv_w_") or e["key"].startswith("gemv_bf16x"):
+                status = lib.lx_tune_set(e["key"].encode(), e["M"], e["N"], e["K"], e["variant"])
+                assert status == 0, f"the shipped table rejects {e['key']} M={e['M']} N={e['N']} K={e['K']}"
+
+
+@pytest.mark.parametrize("table", ["default", "shipped"])
+@pytest.mark.parametrize("N,K", METIS_SHAPES + [(300, 1040), (37, 6400)])
+@pytest.mark.parametrize("x_dtype", [torch.float32, torch.bfloat16])
+def test_gemv_rows_do_not_depend_on_the_batch(lx, x_dtype, N, K, table):
+    # Batch invariance (test_gemv_w.py's rule for every format): a row's bits depend on N, K, the row and the
+    # weight, never on M or the other rows, so a speculative verify step (M up to 8) reproduces the
+    # one-token steps bit for bit. Each row of an M = 1 .. 8 batch equals the row run alone, with the default
+    # picks and with the shipped tuning table.
+    lib = lx.lib
+    setup_tuner(lib)
+    use_table(lib, table)
+    try:
+        torch.manual_seed(N * 3 + K)
+        data = encode(lx, wide_range(N, K, lo=-30.0, hi=2.0))
+        x = torch.randn(8, K, device="cuda").to(x_dtype)
+        alone = torch.empty(8, N, device="cuda")
+        for m in range(8):
+            gemv(lx, "bf16x", x[m:m + 1], data, None, alone[m:m + 1], 1.0, 0.0, 1, N, K, K, N)
+        for M in range(1, 9):
+            y = torch.full((M, N), float("nan"), device="cuda")
+            gemv(lx, "bf16x", x[:M], data, None, y, 1.0, 0.0, M, N, K, K, N)
+            for m in range(M):
+                assert same(y[m], alone[m]), f"row {m} of an M={M} batch differs from the row alone"
+    finally:
+        lib.lx_tune_clear()
 
 
 @pytest.mark.parametrize("M,N,K", [(1, 256, 2048), (8, 8, 2048), (8, 10304, 2048), (3, 128, 1280)])
