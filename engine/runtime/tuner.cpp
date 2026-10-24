@@ -344,8 +344,17 @@ int load_table(const std::string& path, const DeviceInfo& device, std::string* w
   }
   int applied = 0;
   for (const auto& j : doc["entries"]) {
-    lx_tune_set(j["key"].get<std::string>().c_str(), j["M"].get<int>(), j["N"].get<int>(), j["K"].get<int>(),
-                j["variant"].get<int>());
+    const std::string key = j["key"].get<std::string>();
+    const int M = j["M"].get<int>(), N = j["N"].get<int>(), K = j["K"].get<int>(), variant = j["variant"].get<int>();
+    if (lx_tune_set(key.c_str(), M, N, K, variant) != 0) {
+      // A table is all or nothing. An entry its kernel refuses was tuned under other rules (an order class
+      // another batch size would not share), so the whole table is dropped rather than part of it applied.
+      lx_tune_clear();
+      if (why)
+        *why = "entry " + key + " M=" + std::to_string(M) + " N=" + std::to_string(N) + " K=" + std::to_string(K) +
+               " variant " + std::to_string(variant) + " is refused by its kernel";
+      return -1;
+    }
     ++applied;
   }
   return applied;

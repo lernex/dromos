@@ -689,12 +689,13 @@ constexpr VecConfig kVariants[] = {LX_GEMV_VARIANTS(LX_VARIANT_ENTRY)};
 #undef LX_VARIANT_ENTRY
 constexpr int kNumVariants = sizeof(kVariants) / sizeof(kVariants[0]);
 
-// The default variant per format, M bucket and shape: the fastest in a sweep of every variant over the
-// Praxis decode shapes (bench/sweep_gemv.py), taking among those within 1.5% of the fastest the one
-// that is best across the format's other shapes. What wins is set less by the format than by how the
-// grid fills the 70 SMs: rows per block times blocks per SM (which RG and M set through registers)
-// against N, and steps per warp against K. A shape not in the table takes the entry nearest to it in
-// (log2 N, log2 K) for its format and M bucket.
+// The default variant per format, shape and M bucket, from the autotuner (bench/sweep_gemv.py). Each
+// (format, shape) has one order class, its split S, and every M bucket of the shape carries that same S: the
+// class is the split whose worst loss over M = 1, 2, 4 and 8 is smallest, except that a shape whose M = 1 cost
+// of that split is over 1% against the split fastest at M = 1 keeps that M = 1 class (the single-stream guard).
+// Each bucket takes its fastest variant of its class. The class is what keeps a row's bits the same at every
+// batch size (admits<F>, and the static assert on classes_agree). A shape not in the table takes the entry
+// nearest to it in (log2 N, log2 K) for its format and M bucket.
 struct Pick {
   int F;
   int MT;
@@ -705,118 +706,118 @@ struct Pick {
 
 // clang-format off
 constexpr Pick kPicks[] = {
-    {LX_W_BF16, 1, 65536, 2048, {2, 4, 3, 0}},
-    {LX_W_BF16, 1, 10304, 2048, {2, 4, 3, 0}},
-    {LX_W_BF16, 1, 2048, 4096, {2, 4, 3, 0}},
-    {LX_W_BF16, 1, 3072, 2048, {2, 4, 3, 0}},
-    {LX_W_BF16, 1, 2048, 2048, {2, 4, 3, 0}},
-    {LX_W_BF16, 1, 1024, 2048, {2, 4, 3, 0}},
-    {LX_W_BF16, 1, 2048, 1024, {2, 4, 3, 0}},
-    {LX_W_BF16, 2, 65536, 2048, {2, 4, 3, 0}},
-    {LX_W_BF16, 2, 10304, 2048, {2, 4, 3, 0}},
-    {LX_W_BF16, 2, 2048, 4096, {2, 4, 3, 0}},
-    {LX_W_BF16, 2, 3072, 2048, {2, 4, 3, 0}},
-    {LX_W_BF16, 2, 2048, 2048, {2, 4, 3, 0}},
-    {LX_W_BF16, 2, 1024, 2048, {2, 4, 3, 0}},
-    {LX_W_BF16, 2, 2048, 1024, {1, 2, 3, 0}},
-    {LX_W_BF16, 4, 65536, 2048, {2, 4, 3, 0}},
-    {LX_W_BF16, 4, 10304, 2048, {2, 4, 3, 0}},
-    {LX_W_BF16, 4, 2048, 4096, {2, 4, 3, 0}},
-    {LX_W_BF16, 4, 3072, 2048, {2, 4, 3, 0}},
-    {LX_W_BF16, 4, 2048, 2048, {1, 4, 4, 0}},
-    {LX_W_BF16, 4, 1024, 2048, {2, 2, 3, 0}},
-    {LX_W_BF16, 4, 2048, 1024, {1, 2, 3, 0}},
-    {LX_W_BF16, 8, 65536, 2048, {2, 4, 2, 0}},
-    {LX_W_BF16, 8, 10304, 2048, {2, 4, 2, 0}},
+    {LX_W_BF16, 1, 10304, 2048, {1, 4, 4, 0}},
+    {LX_W_BF16, 2, 10304, 2048, {1, 4, 4, 0}},
+    {LX_W_BF16, 4, 10304, 2048, {1, 4, 4, 0}},
+    {LX_W_BF16, 8, 10304, 2048, {1, 2, 4, 1}},
+    {LX_W_BF16, 1, 2048, 4096, {2, 2, 4, 0}},
+    {LX_W_BF16, 2, 2048, 4096, {2, 1, 2, 0}},
+    {LX_W_BF16, 4, 2048, 4096, {2, 4, 2, 0}},
     {LX_W_BF16, 8, 2048, 4096, {2, 4, 3, 0}},
-    {LX_W_BF16, 8, 3072, 2048, {1, 4, 2, 1}},
+    {LX_W_BF16, 1, 3072, 2048, {1, 4, 4, 0}},
+    {LX_W_BF16, 2, 3072, 2048, {1, 4, 4, 0}},
+    {LX_W_BF16, 4, 3072, 2048, {1, 8, 2, 0}},
+    {LX_W_BF16, 8, 3072, 2048, {1, 2, 2, 1}},
+    {LX_W_BF16, 1, 2048, 2048, {1, 1, 2, 0}},
+    {LX_W_BF16, 2, 2048, 2048, {1, 1, 2, 0}},
+    {LX_W_BF16, 4, 2048, 2048, {1, 4, 4, 0}},
     {LX_W_BF16, 8, 2048, 2048, {1, 4, 2, 0}},
+    {LX_W_BF16, 1, 1024, 2048, {2, 1, 2, 0}},
+    {LX_W_BF16, 2, 1024, 2048, {2, 1, 2, 0}},
+    {LX_W_BF16, 4, 1024, 2048, {2, 2, 3, 0}},
     {LX_W_BF16, 8, 1024, 2048, {2, 4, 2, 0}},
+    {LX_W_BF16, 1, 2048, 1024, {1, 4, 4, 0}},
+    {LX_W_BF16, 2, 2048, 1024, {1, 2, 3, 0}},
+    {LX_W_BF16, 4, 2048, 1024, {1, 2, 3, 0}},
     {LX_W_BF16, 8, 2048, 1024, {1, 4, 2, 0}},
-    {LX_W_INT8, 1, 65536, 2048, {2, 2, 3, 0}},
-    {LX_W_INT8, 1, 10304, 2048, {2, 2, 3, 0}},
-    {LX_W_INT8, 1, 2048, 4096, {2, 2, 3, 0}},
-    {LX_W_INT8, 1, 3072, 2048, {2, 2, 3, 0}},
-    {LX_W_INT8, 1, 2048, 2048, {2, 2, 3, 0}},
-    {LX_W_INT8, 1, 1024, 2048, {4, 2, 2, 0}},
-    {LX_W_INT8, 1, 2048, 1024, {2, 2, 3, 0}},
-    {LX_W_INT8, 2, 65536, 2048, {2, 2, 2, 0}},
+    {LX_W_BF16, 1, 65536, 2048, {2, 4, 3, 0}},
+    {LX_W_BF16, 2, 65536, 2048, {2, 4, 3, 0}},
+    {LX_W_BF16, 4, 65536, 2048, {2, 2, 3, 0}},
+    {LX_W_BF16, 8, 65536, 2048, {2, 4, 2, 1}},
+    {LX_W_INT8, 1, 10304, 2048, {2, 4, 3, 0}},
     {LX_W_INT8, 2, 10304, 2048, {2, 2, 2, 0}},
-    {LX_W_INT8, 2, 2048, 4096, {2, 2, 2, 0}},
-    {LX_W_INT8, 2, 3072, 2048, {2, 1, 2, 0}},
-    {LX_W_INT8, 2, 2048, 2048, {2, 2, 2, 0}},
-    {LX_W_INT8, 2, 1024, 2048, {2, 1, 4, 0}},
-    {LX_W_INT8, 2, 2048, 1024, {1, 1, 2, 0}},
-    {LX_W_INT8, 4, 65536, 2048, {2, 4, 3, 0}},
-    {LX_W_INT8, 4, 10304, 2048, {2, 4, 3, 0}},
-    {LX_W_INT8, 4, 2048, 4096, {2, 4, 3, 0}},
-    {LX_W_INT8, 4, 3072, 2048, {1, 2, 3, 0}},
-    {LX_W_INT8, 4, 2048, 2048, {2, 4, 3, 0}},
-    {LX_W_INT8, 4, 1024, 2048, {2, 2, 3, 0}},
-    {LX_W_INT8, 4, 2048, 1024, {2, 4, 3, 0}},
-    {LX_W_INT8, 8, 65536, 2048, {2, 4, 3, 1}},
+    {LX_W_INT8, 4, 10304, 2048, {2, 2, 2, 0}},
     {LX_W_INT8, 8, 10304, 2048, {2, 2, 2, 0}},
-    {LX_W_INT8, 8, 2048, 4096, {1, 2, 4, 1}},
+    {LX_W_INT8, 1, 2048, 4096, {2, 2, 2, 0}},
+    {LX_W_INT8, 2, 2048, 4096, {2, 2, 2, 0}},
+    {LX_W_INT8, 4, 2048, 4096, {2, 4, 3, 0}},
+    {LX_W_INT8, 8, 2048, 4096, {2, 4, 3, 1}},
+    {LX_W_INT8, 1, 3072, 2048, {1, 1, 2, 0}},
+    {LX_W_INT8, 2, 3072, 2048, {1, 1, 2, 0}},
+    {LX_W_INT8, 4, 3072, 2048, {1, 2, 3, 0}},
     {LX_W_INT8, 8, 3072, 2048, {1, 2, 3, 1}},
-    {LX_W_INT8, 8, 2048, 2048, {2, 4, 3, 1}},
-    {LX_W_INT8, 8, 1024, 2048, {2, 4, 3, 0}},
+    {LX_W_INT8, 1, 2048, 2048, {2, 2, 2, 0}},
+    {LX_W_INT8, 2, 2048, 2048, {2, 2, 3, 0}},
+    {LX_W_INT8, 4, 2048, 2048, {2, 4, 3, 0}},
+    {LX_W_INT8, 8, 2048, 2048, {2, 4, 2, 1}},
+    {LX_W_INT8, 1, 1024, 2048, {4, 2, 2, 0}},
+    {LX_W_INT8, 2, 1024, 2048, {4, 2, 4, 0}},
+    {LX_W_INT8, 4, 1024, 2048, {4, 2, 2, 0}},
+    {LX_W_INT8, 8, 1024, 2048, {4, 2, 4, 0}},
+    {LX_W_INT8, 1, 2048, 1024, {2, 2, 2, 0}},
+    {LX_W_INT8, 2, 2048, 1024, {2, 4, 3, 0}},
+    {LX_W_INT8, 4, 2048, 1024, {2, 4, 3, 0}},
     {LX_W_INT8, 8, 2048, 1024, {2, 4, 3, 1}},
-    {LX_W_FP8, 1, 65536, 2048, {2, 2, 2, 0}},
-    {LX_W_FP8, 1, 10304, 2048, {2, 2, 2, 0}},
-    {LX_W_FP8, 1, 2048, 4096, {2, 2, 2, 0}},
-    {LX_W_FP8, 1, 3072, 2048, {2, 2, 2, 0}},
-    {LX_W_FP8, 1, 2048, 2048, {2, 2, 2, 0}},
-    {LX_W_FP8, 1, 1024, 2048, {2, 2, 4, 0}},
-    {LX_W_FP8, 1, 2048, 1024, {2, 2, 2, 0}},
-    {LX_W_FP8, 2, 65536, 2048, {2, 4, 3, 0}},
+    {LX_W_INT8, 1, 65536, 2048, {2, 2, 2, 0}},
+    {LX_W_INT8, 2, 65536, 2048, {2, 2, 2, 0}},
+    {LX_W_INT8, 4, 65536, 2048, {2, 1, 2, 0}},
+    {LX_W_INT8, 8, 65536, 2048, {2, 4, 3, 1}},
+    {LX_W_FP8, 1, 10304, 2048, {2, 4, 2, 0}},
     {LX_W_FP8, 2, 10304, 2048, {2, 2, 2, 0}},
-    {LX_W_FP8, 2, 2048, 4096, {2, 4, 3, 0}},
-    {LX_W_FP8, 2, 3072, 2048, {2, 4, 3, 0}},
-    {LX_W_FP8, 2, 2048, 2048, {2, 4, 3, 0}},
-    {LX_W_FP8, 2, 1024, 2048, {4, 2, 3, 0}},
-    {LX_W_FP8, 2, 2048, 1024, {2, 4, 3, 0}},
-    {LX_W_FP8, 4, 65536, 2048, {2, 4, 3, 0}},
-    {LX_W_FP8, 4, 10304, 2048, {2, 4, 3, 0}},
-    {LX_W_FP8, 4, 2048, 4096, {2, 2, 2, 0}},
-    {LX_W_FP8, 4, 3072, 2048, {1, 2, 3, 0}},
-    {LX_W_FP8, 4, 2048, 2048, {2, 4, 3, 0}},
-    {LX_W_FP8, 4, 1024, 2048, {2, 2, 3, 0}},
-    {LX_W_FP8, 4, 2048, 1024, {2, 4, 2, 0}},
-    {LX_W_FP8, 8, 65536, 2048, {2, 4, 2, 0}},
+    {LX_W_FP8, 4, 10304, 2048, {2, 2, 2, 0}},
     {LX_W_FP8, 8, 10304, 2048, {2, 4, 2, 0}},
+    {LX_W_FP8, 1, 2048, 4096, {2, 2, 2, 0}},
+    {LX_W_FP8, 2, 2048, 4096, {2, 2, 2, 0}},
+    {LX_W_FP8, 4, 2048, 4096, {2, 2, 2, 0}},
     {LX_W_FP8, 8, 2048, 4096, {2, 4, 2, 0}},
+    {LX_W_FP8, 1, 3072, 2048, {1, 2, 3, 0}},
+    {LX_W_FP8, 2, 3072, 2048, {1, 2, 3, 0}},
+    {LX_W_FP8, 4, 3072, 2048, {1, 2, 3, 0}},
     {LX_W_FP8, 8, 3072, 2048, {1, 2, 3, 1}},
+    {LX_W_FP8, 1, 2048, 2048, {2, 2, 2, 0}},
+    {LX_W_FP8, 2, 2048, 2048, {2, 2, 2, 0}},
+    {LX_W_FP8, 4, 2048, 2048, {2, 2, 2, 0}},
     {LX_W_FP8, 8, 2048, 2048, {2, 4, 2, 0}},
+    {LX_W_FP8, 1, 1024, 2048, {2, 1, 4, 0}},
+    {LX_W_FP8, 2, 1024, 2048, {2, 1, 4, 0}},
+    {LX_W_FP8, 4, 1024, 2048, {2, 2, 3, 0}},
     {LX_W_FP8, 8, 1024, 2048, {2, 4, 3, 0}},
+    {LX_W_FP8, 1, 2048, 1024, {2, 2, 2, 0}},
+    {LX_W_FP8, 2, 2048, 1024, {2, 4, 3, 0}},
+    {LX_W_FP8, 4, 2048, 1024, {2, 4, 2, 0}},
     {LX_W_FP8, 8, 2048, 1024, {2, 4, 2, 0}},
-    {LX_W_NVFP4, 1, 65536, 2048, {2, 4, 3, 0}},
+    {LX_W_FP8, 1, 65536, 2048, {2, 2, 3, 0}},
+    {LX_W_FP8, 2, 65536, 2048, {2, 2, 2, 0}},
+    {LX_W_FP8, 4, 65536, 2048, {2, 4, 3, 0}},
+    {LX_W_FP8, 8, 65536, 2048, {2, 4, 2, 0}},
     {LX_W_NVFP4, 1, 10304, 2048, {1, 4, 3, 0}},
-    {LX_W_NVFP4, 1, 2048, 4096, {2, 2, 3, 0}},
-    {LX_W_NVFP4, 1, 3072, 2048, {2, 2, 2, 0}},
-    {LX_W_NVFP4, 1, 2048, 2048, {1, 1, 4, 0}},
-    {LX_W_NVFP4, 1, 1024, 2048, {4, 2, 2, 0}},
-    {LX_W_NVFP4, 1, 2048, 1024, {2, 4, 3, 0}},
-    {LX_W_NVFP4, 2, 65536, 2048, {2, 4, 2, 0}},
     {LX_W_NVFP4, 2, 10304, 2048, {1, 4, 2, 0}},
+    {LX_W_NVFP4, 4, 10304, 2048, {1, 4, 3, 0}},
+    {LX_W_NVFP4, 8, 10304, 2048, {1, 4, 2, 1}},
+    {LX_W_NVFP4, 1, 2048, 4096, {2, 2, 4, 0}},
     {LX_W_NVFP4, 2, 2048, 4096, {2, 2, 4, 0}},
-    {LX_W_NVFP4, 2, 3072, 2048, {1, 4, 4, 0}},
-    {LX_W_NVFP4, 2, 2048, 2048, {2, 2, 3, 0}},
-    {LX_W_NVFP4, 2, 1024, 2048, {4, 2, 2, 0}},
-    {LX_W_NVFP4, 2, 2048, 1024, {2, 4, 2, 0}},
-    {LX_W_NVFP4, 4, 65536, 2048, {2, 4, 2, 0}},
-    {LX_W_NVFP4, 4, 10304, 2048, {2, 4, 2, 0}},
     {LX_W_NVFP4, 4, 2048, 4096, {2, 4, 3, 0}},
-    {LX_W_NVFP4, 4, 3072, 2048, {1, 4, 3, 0}},
-    {LX_W_NVFP4, 4, 2048, 2048, {2, 4, 3, 0}},
-    {LX_W_NVFP4, 4, 1024, 2048, {2, 2, 4, 0}},
-    {LX_W_NVFP4, 4, 2048, 1024, {2, 4, 3, 0}},
-    {LX_W_NVFP4, 8, 65536, 2048, {1, 4, 2, 1}},
-    {LX_W_NVFP4, 8, 10304, 2048, {2, 4, 3, 1}},
     {LX_W_NVFP4, 8, 2048, 4096, {2, 4, 3, 1}},
-    {LX_W_NVFP4, 8, 3072, 2048, {1, 2, 2, 1}},
-    {LX_W_NVFP4, 8, 2048, 2048, {2, 4, 2, 0}},
-    {LX_W_NVFP4, 8, 1024, 2048, {2, 4, 3, 0}},
+    {LX_W_NVFP4, 1, 3072, 2048, {2, 2, 2, 0}},
+    {LX_W_NVFP4, 2, 3072, 2048, {2, 4, 2, 0}},
+    {LX_W_NVFP4, 4, 3072, 2048, {2, 2, 2, 0}},
+    {LX_W_NVFP4, 8, 3072, 2048, {2, 2, 2, 1}},
+    {LX_W_NVFP4, 1, 2048, 2048, {1, 1, 4, 0}},
+    {LX_W_NVFP4, 2, 2048, 2048, {1, 1, 2, 0}},
+    {LX_W_NVFP4, 4, 2048, 2048, {1, 1, 4, 0}},
+    {LX_W_NVFP4, 8, 2048, 2048, {1, 2, 4, 0}},
+    {LX_W_NVFP4, 1, 1024, 2048, {4, 2, 2, 0}},
+    {LX_W_NVFP4, 2, 1024, 2048, {4, 2, 2, 0}},
+    {LX_W_NVFP4, 4, 1024, 2048, {4, 2, 2, 0}},
+    {LX_W_NVFP4, 8, 1024, 2048, {4, 2, 2, 0}},
+    {LX_W_NVFP4, 1, 2048, 1024, {2, 4, 3, 0}},
+    {LX_W_NVFP4, 2, 2048, 1024, {2, 4, 2, 0}},
+    {LX_W_NVFP4, 4, 2048, 1024, {2, 2, 2, 0}},
     {LX_W_NVFP4, 8, 2048, 1024, {2, 4, 2, 0}},
+    {LX_W_NVFP4, 1, 65536, 2048, {1, 2, 3, 0}},
+    {LX_W_NVFP4, 2, 65536, 2048, {1, 2, 2, 0}},
+    {LX_W_NVFP4, 4, 65536, 2048, {1, 4, 3, 0}},
+    {LX_W_NVFP4, 8, 65536, 2048, {1, 4, 2, 1}},
 };
 // clang-format on
 
@@ -833,8 +834,18 @@ constexpr bool all_built() {
 }
 static_assert(all_built(), "every default pick must be a built variant");
 
-VecConfig choose_vec(int N, int K, int M, int F) {
-  const int mt = M <= 1 ? 1 : M <= 2 ? 2 : M <= 4 ? 4 : 8;
+// Every M bucket of a shape carries the same split (its order class): the table is one class per shape.
+constexpr bool classes_agree() {
+  for (const Pick& p : kPicks)
+    for (const Pick& q : kPicks)
+      if (q.F == p.F && q.N == p.N && q.K == p.K && q.c.S != p.c.S) return false;
+  return true;
+}
+static_assert(classes_agree(), "every M bucket of a shape must share one order class");
+
+// The pick nearest a shape in (log2 N, log2 K) for a format and M bucket. Every format has the same shapes in
+// every bucket, so the nearest shape is the same whatever the bucket.
+const Pick* nearest_pick(int F, int N, int K, int mt) {
   const double ln = std::log2(static_cast<double>(N)), lk = std::log2(static_cast<double>(K));
   const Pick* best = nullptr;
   double best_d = 0.0;
@@ -844,7 +855,30 @@ VecConfig choose_vec(int N, int K, int M, int F) {
     const double d = dn * dn + dk * dk;
     if (!best || d < best_d) best = &p, best_d = d;
   }
-  return best ? best->c : VecConfig{1, 1, 4, 0};
+  return best;
+}
+
+// The order class of a product: the split S of its shape. A row sums its steps in an order set by S alone:
+// RG, D and G change how the loads are issued and the steps batched, not the order the sums run in, and the
+// cross-lane reduction gives each output the same tree whatever its warp holds. So a class fixes every row's
+// bits at every batch size, and the class depends on (F, N, K) only.
+int order_class(int F, int N, int K) {
+  const Pick* p = nearest_pick(F, N, K, 1);
+  return p ? p->c.S : 1;
+}
+
+VecConfig choose_vec(int N, int K, int M, int F) {
+  const int mt = M <= 1 ? 1 : M <= 2 ? 2 : M <= 4 ? 4 : 8;
+  const Pick* p = nearest_pick(F, N, K, mt);
+  return p ? p->c : VecConfig{1, 1, 4, 0};
+}
+
+// The admission rule the tuner registry asks: a variant may be a shape's choice only when its split is the
+// shape's order class. M does not enter, so the admitted set is the same at every batch size.
+template <int F>
+bool admits(int variant, int M, int N, int K) {
+  (void)M;
+  return kVariants[variant].S == order_class(F, N, K);
 }
 
 template <int F, int MT>
@@ -890,10 +924,10 @@ const char* tune_name(int F) {
 #define LX_G_SUFFIX_0 ""
 #define LX_G_SUFFIX_1 "g"
 #define LX_VARIANT_NAME(S_, RG_, D_, G_) "s" #S_ "r" #RG_ "d" #D_ LX_G_SUFFIX_##G_,
-const lx::TunableRegistration kRegBf16("gemv_w_bf16", {LX_GEMV_VARIANTS(LX_VARIANT_NAME)});
-const lx::TunableRegistration kRegInt8("gemv_w_int8", {LX_GEMV_VARIANTS(LX_VARIANT_NAME)});
-const lx::TunableRegistration kRegFp8("gemv_w_fp8", {LX_GEMV_VARIANTS(LX_VARIANT_NAME)});
-const lx::TunableRegistration kRegNvfp4("gemv_w_nvfp4", {LX_GEMV_VARIANTS(LX_VARIANT_NAME)});
+const lx::TunableRegistration kRegBf16("gemv_w_bf16", {LX_GEMV_VARIANTS(LX_VARIANT_NAME)}, &admits<LX_W_BF16>);
+const lx::TunableRegistration kRegInt8("gemv_w_int8", {LX_GEMV_VARIANTS(LX_VARIANT_NAME)}, &admits<LX_W_INT8>);
+const lx::TunableRegistration kRegFp8("gemv_w_fp8", {LX_GEMV_VARIANTS(LX_VARIANT_NAME)}, &admits<LX_W_FP8>);
+const lx::TunableRegistration kRegNvfp4("gemv_w_nvfp4", {LX_GEMV_VARIANTS(LX_VARIANT_NAME)}, &admits<LX_W_NVFP4>);
 #undef LX_VARIANT_NAME
 #undef LX_G_SUFFIX_0
 #undef LX_G_SUFFIX_1

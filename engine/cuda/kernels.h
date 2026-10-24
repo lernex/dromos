@@ -372,9 +372,9 @@ LX_API int lx_quantize_act(const void* x, lx_dtype x_dtype, int ld_x, lx_math ma
 //                          weight-only, f32 math. Workspace: lx_moe_decode_workspace_bytes.
 //   lx_moe_experts_grouped any T: tokens grouped by expert, a tensor-core grouped GEMM per
 //                          stage with the given math. Workspace: lx_moe_grouped_workspace_bytes.
-//                          The top_k weighted rows of a token are summed with f32 atomics, so the
-//                          last bits of out can differ between calls; LX_MOE_ORDERED=1 sums them in
-//                          a fixed order instead (3 to 25% slower at T >= 1024 on Praxis).
+//                          The top_k weighted rows of a token are summed in a fixed order, so a token's bits
+//                          do not depend on its batch or on the run. LX_MOE_ORDERED=0 sums with f32 atomics
+//                          instead, whose last bits can differ between calls.
 LX_API int lx_moe_experts_decode(const void* latent, const int32_t* ids, const float* weights,
                                  const lx_weight* gate_up, const lx_weight* down, float* out, void* workspace, int T,
                                  int L, int I, int top_k, void* stream);
