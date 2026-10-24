@@ -254,6 +254,22 @@ LX_API int lx_gemm_w(const void* x, lx_dtype x_dtype, int ld_x, const lx_weight*
                      float beta, void* workspace, void* stream);
 LX_API int64_t lx_gemm_workspace_bytes(int M, int K, lx_math math);
 
+// Per-token activation quantization: the first step of lx_gemm_w and lx_moe_experts_grouped under the
+// low-precision maths, exposed so one quantization can serve several products of the same x.
+// x: [M, K] (x_dtype, row stride ld_x). Per row, with a = max_k |x[m, k]|:
+//   LX_MATH_INT8  q int8 [M, ld_q]: q = round_half_even(x * (127 / a)) clamped to [-127, 127];
+//                 scale[m] = a / 127
+//   LX_MATH_FP8   q e4m3 [M, ld_q]: q = e4m3(x * (448 / a)); scale[m] = a / 448
+//   LX_MATH_FP4   q [M, ld_q], two e2m1 per byte (low nibble = even k); block_scale e4m3 [M, ld_bs], one
+//                 per 16 k; scale[m] = g = a / (448 * 6). Block b with absmax a_b:
+//                 s_b = e4m3(a_b / (6 * g)), q = e2m1(x / (s_b * g)), and q = 0 where s_b = 0.
+//                 Requires K % 16 == 0.
+// Every rounding is to nearest, ties to even, saturating at the format's largest value; the products
+// and quotients are float32. A zero row gets scale 1 and q = 0. ld_q and ld_bs are in bytes;
+// block_scale is used for FP4 only.
+LX_API int lx_quantize_act(const void* x, lx_dtype x_dtype, int ld_x, lx_math math, void* q, int ld_q, float* scale,
+                           void* block_scale, int ld_bs, int M, int K, void* stream);
+
 // Routed experts on any weight format (contract of lx_moe_experts; gate_up [E, 2I, L],
 // down [E, L, I] as lx_weight stacks). Two implementations with one contract:
 //   lx_moe_experts_decode  few tokens (T <= 8): one pass over the chosen experts' weights,
