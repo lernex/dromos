@@ -16,7 +16,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from conftest import close
+from conftest import BACKEND, close
 from wformats import (
     MATH_BF16,
     MATH_FP4,
@@ -45,7 +45,7 @@ PAIRS = [
     ("w4a8", W_NVFP4, MATH_FP8, 120),
     ("fp4", W_NVFP4, MATH_FP4, 120),
 ]
-ARCHS = [0, 89, 80]
+ARCHS = [0, 89, 80] if BACKEND == "cuda" else [0]
 # (T, L, I, E, top_k)
 SHAPES = [
     (5, 256, 256, 8, 2),
@@ -62,7 +62,8 @@ def set_arch(lx, arch):
 
 def native_arch(lx):
     set_arch(lx, 0)
-    return lx.lib.lx_arch()
+    # The GPU families gate the pairs; every other backend runs every pair.
+    return lx.lib.lx_arch() if BACKEND == "cuda" else 1000
 
 
 def workspace_bytes(lx, T, L, I, E, top_k, math):
@@ -191,6 +192,8 @@ def test_moe_grouped_empty_and_invalid(lx):
     assert call_grouped(lx, latent, ids, weights, gu, dn, MATH_BF16, out, ws, 0, 256, 256, 8, 2) == 0
     assert workspace_bytes(lx, 0, 256, 256, 8, 2, MATH_BF16) == 0
     # I not a multiple of 8, and FP4 math with K not a whole number of its 256-wide K tiles
+    if BACKEND != "cuda":
+        return  # the tile-shape limits below are the CUDA kernels'
     assert call_grouped(lx, latent, ids, weights, gu, dn, MATH_BF16, out, ws, 4, 256, 252, 8, 2) == NOT_SUPPORTED
     if native_arch(lx) >= 120:
         g4 = quantize_weight(torch.randn(8, 2 * 128, 256, device="cuda"), W_NVFP4)
@@ -200,6 +203,8 @@ def test_moe_grouped_empty_and_invalid(lx):
 
 
 def test_moe_grouped_tuned_variants(lx):
+    if BACKEND != "cuda":
+        pytest.skip("the tile variants are the CUDA kernels'")
     # Every registered tile variant of every family, picked through the tuner for both stages.
     names = (ctypes.c_char_p * 256)()
     lx.lib.lx_tune_kernels.restype = ctypes.c_int

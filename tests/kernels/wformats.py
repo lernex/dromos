@@ -13,7 +13,8 @@ E2M1_VALUES = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
 
 
 class LxWeight(ctypes.Structure):
-    _fields_ = [("type", ctypes.c_int), ("data", ctypes.c_void_p), ("scale", ctypes.c_void_p), ("glob", ctypes.c_float)]
+    _fields_ = [("type", ctypes.c_int), ("data", ctypes.c_void_p), ("scale", ctypes.c_void_p), ("glob", ctypes.c_float),
+                ("expert_global", ctypes.c_void_p)]
 
 
 class Weight:

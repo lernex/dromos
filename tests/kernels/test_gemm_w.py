@@ -13,7 +13,7 @@ import ctypes
 import pytest
 import torch
 
-from conftest import DTYPE, close
+from conftest import BACKEND, DTYPE, close
 from wformats import (
     MATH_BF16,
     MATH_FP4,
@@ -40,7 +40,7 @@ PAIRS = [
     ("w4a8", W_NVFP4, MATH_FP8, 120),
     ("fp4", W_NVFP4, MATH_FP4, 120),
 ]
-ARCHS = [0, 89, 80]  # 0: the card's own
+ARCHS = [0, 89, 80] if BACKEND == "cuda" else [0]  # 0: the card's own
 SHAPES = [
     (1, 64, 256),
     (7, 136, 512),  # N not a multiple of the 128-wide tile
@@ -65,7 +65,8 @@ def set_arch(lx, arch):
 
 def native_arch(lx):
     set_arch(lx, 0)
-    return lx.lib.lx_arch()
+    # The GPU families gate the pairs; every other backend runs every pair.
+    return lx.lib.lx_arch() if BACKEND == "cuda" else 1000
 
 
 def call_gemm_w(lx, x, ld_x, w, math, bias, y, ld_y, M, N, K, alpha, beta, ws):
@@ -148,6 +149,8 @@ def test_gemm_w_epilogue(lx, name, wtype, math, oldest, x_dtype, y_dtype, alpha,
 
 
 def test_gemm_w_tuned_variants(lx):
+    if BACKEND != "cuda":
+        pytest.skip("the tile variants are the CUDA kernels'")
     # Every registered tile variant of every family gives the same answer when the tuner picks it. The
     # bf16 family runs with an f32 bias (a bf16 bias goes to cuBLASLt).
     names = (ctypes.c_char_p * 256)()

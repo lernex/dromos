@@ -10,7 +10,10 @@ import ctypes
 import pytest
 import torch
 
-from conftest import close
+from conftest import BACKEND, close
+
+# Architecture numbers and the tuning table are the CUDA backend's; other backends report their own.
+pytestmark = pytest.mark.skipif(BACKEND != "cuda", reason="CUDA architecture override")
 
 
 def _lib(lx):
