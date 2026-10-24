@@ -1,0 +1,50 @@
+--- a/mamba.cu
++++ b/mamba.cu
+@@ -95,12 +95,12 @@
+ 
+ __host__ __device__ constexpr int round4(int v) { return (v + 3) & ~3; }
+ 
+-__device__ __forceinline__ void cp_async_f32(float* smem, const float* gmem) {
+-  const uint32_t dst = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
+-  asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(dst), "l"(gmem) : "memory");
+-}
+-__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
+-__device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wait_group 0;\n" ::: "memory"); }
++// The CUDA build stages these with cp.async and waits before the barrier. The HIP port copies in
++// place: the stage is written before the barrier that precedes every read of it, which is the same
++// ordering the wait gave.
++__device__ __forceinline__ void cp_async_f32(float* smem, const float* gmem) { *smem = *gmem; }
++__device__ __forceinline__ void cp_async_commit() {}
++__device__ __forceinline__ void cp_async_wait_all() {}
+ 
+ // One block per (head, sequence). Four lanes own each state row p. Lane q holds the chunks of four
+ // columns at 4 * (q + 4 i) for i < NI in registers for the whole sequence, so a row needs NI * 4
+@@ -209,7 +209,7 @@
+       }
+       float y = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+ #pragma unroll
+-      for (int o = 1; o < 4; o <<= 1) y += __shfl_xor_sync(0xffffffffu, y, o);
++      for (int o = 1; o < 4; o <<= 1) y += __shfl_xor_sync(LX_FULL_MASK, y, o);
+       if (valid && q == 0) a.y[(static_cast<int64_t>(start + c * kChunk + tok) * a.H + h) * P + p] = y + Dh * xp;
+     }
+     cp_async_wait_all();
+@@ -286,7 +286,8 @@
+   if (ld_x < H * P || ld_dt < H || ld_bc < G * N) return static_cast<int>(hipErrorInvalidValue);
+ 
+   // Four lanes per row, rounded up to a whole warp; rows past P are idle.
+-  const int threads = (4 * P + 31) / 32 * 32;
++  const int wave = lx_warp_size();
++  const int threads = (4 * P + wave - 1) / wave * wave;
+   // N/4 column chunks, dealt to the four lanes of a row: NI chunks each (up to 16 for N = 256).
+   const int ni = ((N + 3) / 4 + 3) / 4;
+   const ScanArgs args{x,      ld_x,     dt_raw,  ld_dt,  B,        C,     ld_bc,   A_log,
+@@ -304,7 +305,8 @@
+   if (T <= 0) return 0;
+   if (I <= 0 || groups <= 0 || I % groups != 0 || ld_z < I) return static_cast<int>(hipErrorInvalidValue);
+   const int K = I / groups;
+-  const int threads = K >= 256 ? 256 : ((K + 31) / 32) * 32;
++  const int wave = lx_warp_size();
++  const int threads = K >= 256 ? 256 : ((K + wave - 1) / wave) * wave;
+   auto s = static_cast<hipStream_t>(stream);
+   gated_rmsnorm_kernel<<<T * groups, threads, 0, s>>>(y, z, ld_z, static_cast<const __hip_bfloat16*>(w),
+                                                       static_cast<__hip_bfloat16*>(out), I, groups, eps);
