@@ -116,6 +116,17 @@ __global__ void quantize_nvfp4_kernel(const bf16* __restrict__ w, uint8_t* __res
   }
 }
 
+// Element (n, k) of any format as bf16, with its row factor: the per-row scale, or the global. One
+// thread per element.
+template <int F>
+__global__ void dequantize_kernel(const lx_weight w, bf16* __restrict__ out, int64_t rows, int cols) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= rows * cols) return;
+  const int64_t n = i / cols, k = i % cols;
+  const float v = lx::element<F>(w, n, k, cols) * lx::WordFormat<F>::row_factor(w, n);
+  out[i] = lx::from_f32<bf16>(v);
+}
+
 }  // namespace
 
 extern "C" int lx_quantize_weight(const void* w, lx_weight* out, int64_t rows, int cols, void* stream) {
@@ -126,6 +137,13 @@ extern "C" int lx_quantize_weight(const void* w, lx_weight* out, int64_t rows, i
   switch (out->type) {
     case LX_W_BF16:
       return static_cast<int>(cudaErrorInvalidValue);  // nothing to quantize: the bf16 weight is the result
+    case LX_W_BF16X: {
+      // Lossless: the encoding of the bf16 matrix (sized by lx_bf16x_bytes, which synchronizes the stream).
+      if (!out->data) return static_cast<int>(cudaErrorInvalidValue);
+      const int64_t bytes = lx_bf16x_bytes(w, rows, cols, stream);
+      if (bytes < 0) return static_cast<int>(-bytes);
+      return lx_bf16x_encode(w, rows, cols, const_cast<void*>(out->data), bytes, stream);
+    }
     case LX_W_INT8:
       if (!out->data || !out->scale) return static_cast<int>(cudaErrorInvalidValue);
       return lx_quantize_w8(w, static_cast<int8_t*>(const_cast<void*>(out->data)), static_cast<float*>(const_cast<void*>(out->scale)), rows, cols, stream);
@@ -166,4 +184,32 @@ extern "C" int lx_quantize_weight(const void* w, lx_weight* out, int64_t rows, i
     default:
       return static_cast<int>(cudaErrorInvalidValue);
   }
+}
+
+extern "C" int lx_dequantize_weight(const lx_weight* w, void* out, int64_t rows, int cols, void* stream) {
+  if (!w || !w->data || !out) return static_cast<int>(cudaErrorInvalidValue);
+  if (rows <= 0) return 0;
+  if (cols <= 0) return static_cast<int>(cudaErrorInvalidValue);
+  if (w->type != LX_W_BF16 && w->type != LX_W_BF16X && w->type != LX_W_INT8 && w->type != LX_W_FP8 &&
+      w->type != LX_W_NVFP4)
+    return static_cast<int>(cudaErrorInvalidValue);
+  if (w->type != LX_W_BF16 && w->type != LX_W_BF16X && !w->scale) return static_cast<int>(cudaErrorInvalidValue);
+  if (w->type == LX_W_NVFP4 && cols % 16 != 0) return static_cast<int>(cudaErrorInvalidValue);
+  if (w->type == LX_W_BF16X) return lx_bf16x_decode(w->data, rows, cols, out, stream);
+  if (w->type == LX_W_BF16) {
+    // Nothing to decode: a plain copy of the rows.
+    const cudaError_t e = cudaMemcpyAsync(out, w->data, sizeof(bf16) * rows * cols, cudaMemcpyDeviceToDevice,
+                                          static_cast<cudaStream_t>(stream));
+    return static_cast<int>(e);
+  }
+  const int64_t n = rows * cols;
+  const unsigned int blocks = static_cast<unsigned int>((n + kThreads - 1) / kThreads);
+  auto s = static_cast<cudaStream_t>(stream);
+  auto* o = static_cast<bf16*>(out);
+  switch (w->type) {
+    case LX_W_INT8: dequantize_kernel<LX_W_INT8><<<blocks, kThreads, 0, s>>>(*w, o, rows, cols); break;
+    case LX_W_FP8: dequantize_kernel<LX_W_FP8><<<blocks, kThreads, 0, s>>>(*w, o, rows, cols); break;
+    default: dequantize_kernel<LX_W_NVFP4><<<blocks, kThreads, 0, s>>>(*w, o, rows, cols); break;
+  }
+  return lx::launch_status();
 }

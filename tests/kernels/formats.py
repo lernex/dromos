@@ -9,7 +9,7 @@ import ctypes
 
 import torch
 
-W_BF16, W_INT8, W_FP8, W_NVFP4 = 0, 1, 2, 3
+W_BF16, W_INT8, W_FP8, W_NVFP4, W_BF16X = 0, 1, 2, 3, 4
 FORMATS = {"bf16": W_BF16, "int8": W_INT8, "fp8": W_FP8, "nvfp4": W_NVFP4}
 E2M1_GRID = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float64)
 
@@ -65,25 +65,28 @@ def _e2m1_values(codes):
     return torch.where((codes & 8) > 0, -mag, mag)
 
 
-def random_weight(fmt, N, K, seed, device="cuda", glob=0.0371):
-    """A random [N, K] weight in format `fmt` (a W_* code), with a reference of its exact values."""
+def random_weight(fmt, N, K, seed, device="cuda", glob=0.0371, reference=True):
+    """A random [N, K] weight in format `fmt` (a W_* code), with a reference of its exact values.
+
+    reference=False skips the float64 reference (dense is None): the large shapes do not need it.
+    """
     g = torch.Generator(device="cpu").manual_seed(seed)
     if fmt == W_BF16:
         w = (torch.randn(N, K, generator=g) * 0.5).to(torch.bfloat16).to(device)
-        return Weight(fmt, w, dense=w.double())
+        return Weight(fmt, w, dense=w.double() if reference else None)
     if fmt == W_INT8:
         q = torch.randint(-127, 128, (N, K), generator=g, dtype=torch.int32).to(torch.int8).to(device)
         scale = (torch.rand(N, generator=g) * 0.02 + 0.001).float().to(device)
-        return Weight(fmt, q, scale, dense=q.double() * scale.double()[:, None])
+        return Weight(fmt, q, scale, dense=q.double() * scale.double()[:, None] if reference else None)
     if fmt == W_FP8:
         b = _e4m3_bytes(torch.randn(N, K, generator=g) * 3.0).to(device)
         scale = (torch.rand(N, generator=g) * 0.02 + 0.001).float().to(device)
-        return Weight(fmt, b, scale, dense=_e4m3_values(b) * scale.double()[:, None])
+        return Weight(fmt, b, scale, dense=_e4m3_values(b) * scale.double()[:, None] if reference else None)
     if fmt == W_NVFP4:
         assert K % 16 == 0
         codes = torch.randint(0, 256, (N, K // 2), generator=g, dtype=torch.int32).to(torch.uint8).to(device)
         blocks = _e4m3_bytes(torch.rand(N, K // 16, generator=g) * 2.0).to(device)
-        vals = _nvfp4_dense(codes, blocks, glob)
+        vals = _nvfp4_dense(codes, blocks, glob) if reference else None
         return Weight(fmt, codes, blocks, glob=glob, dense=vals)
     raise ValueError(fmt)
 
@@ -97,15 +100,15 @@ def _nvfp4_dense(codes, blocks, glob):
     return vals * scales * float(glob)
 
 
-def stack_weight(fmt, E, N, K, seed, device="cuda"):
+def stack_weight(fmt, E, N, K, seed, device="cuda", reference=True):
     """An [E, N, K] stack in one format. NVFP4 experts each get their own global, as checkpoints carry."""
     parts = []
     for e in range(E):
         glob = 0.01 + 0.004 * e  # distinct per expert, so a kernel that uses the wrong one fails
-        parts.append(random_weight(fmt, N, K, seed * 1000 + e, device, glob=glob))
+        parts.append(random_weight(fmt, N, K, seed * 1000 + e, device, glob=glob, reference=reference))
     data = torch.stack([p.data for p in parts]).contiguous()
     scale = None if parts[0].scale is None else torch.stack([p.scale for p in parts]).contiguous()
-    dense = torch.stack([p.dense for p in parts])
+    dense = torch.stack([p.dense for p in parts]) if reference else None
     if fmt == W_NVFP4:
         globals_ = torch.tensor([p.glob for p in parts], dtype=torch.float32, device=device)
         return Weight(fmt, data, scale, glob=parts[0].glob, expert_global=globals_, dense=dense)

@@ -10,6 +10,7 @@
 #include <string>
 
 #include "core/config.h"
+#include "dispatch/dispatch.h"
 #include "runtime/plan.h"
 #include "runtime/tuner.h"
 
@@ -27,6 +28,12 @@ std::string archs_text(const std::vector<int>& archs) {
   std::string out;
   for (int cc : archs) out += (out.empty() ? "" : " ") + std::string("sm_") + std::to_string(cc);
   return out;
+}
+
+std::string names_text(const std::vector<std::string>& names) {
+  std::string out;
+  for (const std::string& name : names) out += (out.empty() ? "" : ", ") + name;
+  return out.empty() ? "none" : out;
 }
 
 void print_device(const lx::runtime::DeviceInfo& d) {
@@ -48,10 +55,21 @@ void print_device(const lx::runtime::DeviceInfo& d) {
   std::printf("math       tensor cores: %s\n", math.c_str());
   std::printf("clusters   %s\n", d.clusters ? "yes (sm_90 and up: the cluster paths run)"
                                             : "no (the one-block paths run)");
-  std::printf("CUDA       driver %s, runtime %s\n", d.driver_text.c_str(), d.runtime_text.c_str());
+  const lx::dispatch::Info& backend = lx::dispatch::info();
+  std::printf("%-10s driver %s, runtime %s\n", backend.backend.empty() ? "backend" : backend.backend.c_str(),
+              d.driver_text.c_str(), d.runtime_text.c_str());
   std::printf("build      kernels for %s\n", archs_text(lx::runtime::built_archs()).c_str());
   if (!d.built)
     std::printf("           this card (sm_%d) has no kernels in this build: rebuild with -DLX_ARCHS=all\n", d.real_cc());
+  if (backend.backend.empty()) {
+    std::printf("backend    none: %s\n", backend.error.c_str());
+    std::printf("missing    not checked, no backend loaded\n");
+  } else {
+    const std::size_t slash = backend.path.rfind('/');
+    const std::string file = slash == std::string::npos ? backend.path : backend.path.substr(slash + 1);
+    std::printf("backend    %s, %s (%s)\n", backend.backend.c_str(), file.c_str(), backend.path.c_str());
+    std::printf("missing    %s\n", names_text(backend.missing).c_str());
+  }
 }
 
 }  // namespace

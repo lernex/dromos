@@ -928,46 +928,11 @@ int64_t vram_budget_bytes() {
   return gb > 0 ? static_cast<int64_t>(gb * kGiB) : total_b;
 }
 
-// NVML, loaded by path so nothing links against it: the GPU memory the driver charges this process
-// (its CUDA context included), summed over the devices it has a context on.
+// The GPU memory the driver charges this process (its CUDA context included), or -1 where the backend
+// cannot tell (lx_rt_process_memory).
 int64_t process_vram_bytes() {
-  struct ProcessInfo {  // nvmlProcessInfo_v2_st
-    unsigned int pid;
-    unsigned long long used;
-    unsigned int gpu_instance, compute_instance;
-  };
-  using InitFn = int (*)();
-  using CountFn = int (*)(unsigned int*);
-  using HandleFn = int (*)(unsigned int, void**);
-  using ProcsFn = int (*)(void*, unsigned int*, ProcessInfo*);
-  static void* lib = dlopen("libnvidia-ml.so.1", RTLD_NOW | RTLD_LOCAL);
-  if (!lib) return -1;
-  static const bool ready = [] {
-    auto init = reinterpret_cast<InitFn>(dlsym(lib, "nvmlInit_v2"));
-    return init && init() == 0;
-  }();
-  auto count_fn = reinterpret_cast<CountFn>(dlsym(lib, "nvmlDeviceGetCount_v2"));
-  auto handle_fn = reinterpret_cast<HandleFn>(dlsym(lib, "nvmlDeviceGetHandleByIndex_v2"));
-  auto procs_fn = reinterpret_cast<ProcsFn>(dlsym(lib, "nvmlDeviceGetComputeRunningProcesses_v3"));
-  if (!ready || !count_fn || !handle_fn || !procs_fn) return -1;
-  unsigned int devices = 0;
-  if (count_fn(&devices) != 0) return -1;
-  const unsigned int pid = static_cast<unsigned int>(getpid());
-  int64_t total = 0;
-  bool found = false;
-  for (unsigned int d = 0; d < devices; ++d) {
-    void* h = nullptr;
-    if (handle_fn(d, &h) != 0) continue;
-    ProcessInfo info[64];
-    unsigned int n = 64;
-    if (procs_fn(h, &n, info) != 0) continue;
-    for (unsigned int i = 0; i < n; ++i)
-      if (info[i].pid == pid && info[i].used != ~0ull) {  // ~0: NVML_VALUE_NOT_AVAILABLE
-        total += static_cast<int64_t>(info[i].used);
-        found = true;
-      }
-  }
-  return found ? total : -1;
+  int64_t bytes = 0;
+  return lx_rt_process_memory(&bytes) == 0 ? bytes : -1;
 }
 
 int64_t ram_budget_bytes() {

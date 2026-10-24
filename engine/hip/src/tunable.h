@@ -21,7 +21,8 @@ LX_API int lx_set_arch_override(int arch);  // 0 clears; returns the arch now in
 // (engine/runtime/tuner) times each variant and fills the table. M is bucketed to the next power of
 // two (so one entry covers a range of batch sizes); N and K are exact.
 LX_API int lx_tune_get(const char* kernel, int M, int N, int K);
-LX_API void lx_tune_set(const char* kernel, int M, int N, int K, int variant);
+LX_API int lx_tune_set(const char* kernel, int M, int N, int K, int variant);
+LX_API int lx_tune_force(const char* kernel, int M, int N, int K, int variant);
 LX_API void lx_tune_clear(void);
 // What kernels registered: their names and, per kernel, how many variants and what each is.
 LX_API int lx_tune_kernels(const char** names, int capacity);  // returns the total count

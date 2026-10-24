@@ -1,6 +1,4 @@
 // Device query and the architecture override. Needs the GPU: the test binary runs on the server.
-#include <cuda_runtime.h>
-
 #include <cmath>
 #include <string>
 

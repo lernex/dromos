@@ -174,3 +174,66 @@ def test_global_is_per_expert(lx):
     assert torch.equal(run_decode(lx, latent, ids, weights, gu, dn, I, 2), base)
     dn.expert_global[1] *= 2.0
     assert torch.equal(run_decode(lx, latent, ids, weights, gu, dn, I, 2), base * 2.0)
+
+
+def test_bf16x_stacks_run_the_lossless_experts(lx):
+    # Both stacks lossless: lx_moe_experts_decode is lx_moe_experts_bf16x bit for bit, and that is the
+    # expert mixture of the bf16 stacks the encodings came from.
+    from test_bf16x import encode
+    from formats import LxWeight, W_BF16X
+
+    T, E, L, I, top_k = 4, 8, 256, 128, 2
+    latent, ids, weights = make_inputs(T, E, L, I, top_k, seed=21)
+    gu = stack_weight(W_BF16, E, 2 * I, L, seed=5)
+    dn = stack_weight(W_BF16, E, L, I, seed=6)
+    gu_enc, dn_enc = encode(lx, gu.data), encode(lx, dn.data)
+    gu_lw = LxWeight(type=W_BF16X, data=gu_enc.data_ptr(), scale=None, global_=1.0, expert_global=None)
+    dn_lw = LxWeight(type=W_BF16X, data=dn_enc.data_ptr(), scale=None, global_=1.0, expert_global=None)
+    nbytes = workspace_bytes(lx, T, I, top_k)
+    ws = torch.full((nbytes,), 255, dtype=torch.uint8, device="cuda")
+    out = torch.full((T, L), float("nan"), device="cuda")
+    lx("moe_experts_decode", latent, ids, weights, ctypes.pointer(gu_lw), ctypes.pointer(dn_lw), out, ws, T, L, I, top_k)
+    direct = torch.full((T, L), float("nan"), device="cuda")
+    ws2 = torch.full((nbytes,), 255, dtype=torch.uint8, device="cuda")
+    lx("moe_experts_bf16x", latent, ids, weights, gu_enc, dn_enc, direct, ws2, T, L, I, top_k)
+    assert torch.equal(out, direct)
+    want = experts_reference(latent, ids, weights, gu.dense, dn.dense)
+    close(out, want.float(), atol=1e-3 * want.abs().max().item(), rtol=1e-3)
+
+
+def test_mixed_lossless_pair_is_refused(lx):
+    # A lossless gate/up stack with a stack of another format has no kernel: the call says so.
+    from test_bf16x import encode
+    from formats import LxWeight, W_BF16X
+
+    T, E, L, I, top_k = 2, 4, 128, 64, 2
+    latent, ids, weights = make_inputs(T, E, L, I, top_k, seed=23)
+    gu = stack_weight(W_BF16, E, 2 * I, L, seed=5)
+    dn = stack_weight(W_BF16, E, L, I, seed=6)
+    gu_enc = encode(lx, gu.data)
+    gu_lw = LxWeight(type=W_BF16X, data=gu_enc.data_ptr(), scale=None, global_=1.0, expert_global=None)
+    ws = torch.zeros(workspace_bytes(lx, T, I, top_k), dtype=torch.uint8, device="cuda")
+    out = torch.zeros(T, L, device="cuda")
+    status = lx.lib.lx_moe_experts_decode(
+        ctypes.c_void_p(latent.data_ptr()), ctypes.c_void_p(ids.data_ptr()), ctypes.c_void_p(weights.data_ptr()),
+        ctypes.pointer(gu_lw), ctypes.pointer(dn.lx()), ctypes.c_void_p(out.data_ptr()),
+        ctypes.c_void_p(ws.data_ptr()), T, L, I, top_k, None)
+    assert status == 801  # cudaErrorNotSupported
+
+
+@pytest.mark.parametrize("fmt", list(FORMATS))
+def test_rows_do_not_depend_on_the_batch(lx, fmt):
+    # Batch invariance, as the GEMV rule has it: a token's row is the same bits whatever batch it is in. Each
+    # token of a batch of T (1 to 8) equals that token run alone at T = 1, on the Praxis expert stacks (E = 128).
+    L, I, top_k = METIS
+    E = 128
+    gu = stack_weight(FORMATS[fmt], E, 2 * I, L, seed=51, reference=False)
+    dn = stack_weight(FORMATS[fmt], E, L, I, seed=52, reference=False)
+    latent, ids, weights = make_inputs(8, E, L, I, top_k, seed=53)
+    alone = torch.cat(
+        [run_decode(lx, latent[t : t + 1], ids[t : t + 1], weights[t : t + 1], gu, dn, I, top_k) for t in range(8)]
+    )
+    for T in range(1, 9):
+        out = run_decode(lx, latent[:T], ids[:T], weights[:T], gu, dn, I, top_k)
+        for t in range(T):
+            assert torch.equal(out[t], alone[t]), f"token {t} of a T={T} batch differs from the token alone"

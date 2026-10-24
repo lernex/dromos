@@ -31,8 +31,6 @@
 //     Feeds each prompt's second half one token at a time, then again as verify steps of random
 //     sizes with random rollbacks (and an occasional normal step, which folds), and requires every
 //     verify row's logits to be bit-identical to the one-token step at the same position.
-#include <cuda_runtime.h>
-
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -103,9 +101,11 @@ int run_check(int argc, char** argv) {
   lx::MetisModel& model = *l.model;
   const int V = model.vocab_size(), maxv = model.max_verify_tokens();
   float* d_logits = nullptr;
-  if (cudaMalloc(&d_logits, sizeof(float) * 512 * V) != cudaSuccess) throw std::runtime_error("cudaMalloc");
-  cudaStream_t s;
-  cudaStreamCreate(&s);
+  const int64_t logit_bytes = static_cast<int64_t>(sizeof(float) * 512 * V);
+  if (lx_rt_alloc(reinterpret_cast<void**>(&d_logits), logit_bytes) != 0)
+    throw std::runtime_error("device allocation of " + std::to_string(logit_bytes) + " bytes");
+  void* s = nullptr;
+  if (lx_rt_stream_create(&s) != 0) throw std::runtime_error("creating a device stream");
   std::mt19937 rng(1234);
   bool all_ok = true;
   for (auto& [name, ids_json] : prompts.items()) {
@@ -125,9 +125,10 @@ int run_check(int argc, char** argv) {
     std::vector<float> plain(static_cast<size_t>(n) * V);
     for (int t = 0; t < n; ++t) {
       model.forward({{ids[N + t]}, {0, 1}, {0}}, d_logits, false, s);
-      cudaMemcpyAsync(plain.data() + static_cast<size_t>(t) * V, d_logits, sizeof(float) * V, cudaMemcpyDeviceToHost, s);
+      lx_rt_copy(plain.data() + static_cast<size_t>(t) * V, d_logits, static_cast<int64_t>(sizeof(float)) * V,
+                 LX_COPY_D2H, s);
     }
-    cudaStreamSynchronize(s);
+    lx_rt_stream_sync(s);
     // verify steps with rollbacks
     prefill();
     std::vector<float> rows(static_cast<size_t>(maxv) * V);
@@ -144,8 +145,8 @@ int run_check(int argc, char** argv) {
       } else {
         model.forward_spec(b, d_logits, s);
       }
-      cudaMemcpyAsync(rows.data(), d_logits, sizeof(float) * g * V, cudaMemcpyDeviceToHost, s);
-      cudaStreamSynchronize(s);
+      lx_rt_copy(rows.data(), d_logits, static_cast<int64_t>(sizeof(float)) * g * V, LX_COPY_D2H, s);
+      lx_rt_stream_sync(s);
       for (int r = 0; r < g; ++r) {
         const float* a = rows.data() + static_cast<size_t>(r) * V;
         const float* e = plain.data() + static_cast<size_t>(pos + r) * V;
@@ -161,14 +162,15 @@ int run_check(int argc, char** argv) {
       pos += keep;
       ++steps;
     }
-    if (cudaGetLastError() != cudaSuccess) throw std::runtime_error("CUDA error during the check");
+    if (const int err = lx_rt_last_error())
+      throw std::runtime_error(std::string(lx_rt_error_string(err)) + " during the check");
     const bool ok = identical == compared;
     all_ok &= ok;
     std::printf("%-22s prefill %4d, %3d positions in %3d steps (%d normal): %d of %d rows bit-identical%s",
                 name.c_str(), N, n, steps, folds, identical, compared, ok ? "\n" : "");
     if (!ok) std::printf(", max |diff| %.3g\n", worst);
   }
-  cudaFree(d_logits);
+  lx_rt_free(d_logits);
   return all_ok ? 0 : 1;
 }
 
@@ -182,9 +184,11 @@ int run_cost(int argc, char** argv) {
   lx::MetisModel& model = *l.model;
   const int V = model.vocab_size(), maxv = model.max_verify_tokens();
   float* d_logits = nullptr;
-  if (cudaMalloc(&d_logits, sizeof(float) * 512 * V) != cudaSuccess) throw std::runtime_error("cudaMalloc");
-  cudaStream_t s;
-  cudaStreamCreate(&s);
+  const int64_t logit_bytes = static_cast<int64_t>(sizeof(float) * 512 * V);
+  if (lx_rt_alloc(reinterpret_cast<void**>(&d_logits), logit_bytes) != 0)
+    throw std::runtime_error("device allocation of " + std::to_string(logit_bytes) + " bytes");
+  void* s = nullptr;
+  if (lx_rt_stream_create(&s) != 0) throw std::runtime_error("creating a device stream");
   std::mt19937 rng(7);
   std::vector<int32_t> ids(context + 4096);
   for (auto& t : ids) t = 100 + static_cast<int32_t>(rng() % 30000);
@@ -201,7 +205,7 @@ int run_cost(int argc, char** argv) {
     int pos = context;
     double ms = 0;
     for (int it = 0; it < iters + 5; ++it) {
-      cudaStreamSynchronize(s);
+      lx_rt_stream_sync(s);
       const auto t0 = std::chrono::steady_clock::now();
       lx::StepBatch b{{ids.begin() + pos, ids.begin() + pos + T}, {0, T}, {0}};
       const int before = model.slot_length(0);
@@ -210,7 +214,7 @@ int run_cost(int argc, char** argv) {
       } else {
         model.forward(b, d_logits, false, s);
       }
-      cudaStreamSynchronize(s);
+      lx_rt_stream_sync(s);
       if (spec) model.truncate(0, before + 1);
       if (it >= 5) ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
       pos += 1;
@@ -235,7 +239,7 @@ int run_cost(int argc, char** argv) {
     const double t = median(samples[T]);
     std::printf("  verify step T=%d  %.3f ms  (x%.3f of a plain step)\n", T, t, t / plain);
   }
-  cudaFree(d_logits);
+  lx_rt_free(d_logits);
   return 0;
 }
 
@@ -296,9 +300,11 @@ int cmd_block_check(int argc, char** argv) {
     std::ifstream(std::filesystem::path(argv[2]) / "config.json") >> head;
     const int W = head.at("window");
     float* d_logits = nullptr;
-    if (cudaMalloc(&d_logits, sizeof(float) * V) != cudaSuccess) throw std::runtime_error("cudaMalloc");
-    cudaStream_t s;
-    cudaStreamCreate(&s);
+    const int64_t logit_bytes = static_cast<int64_t>(sizeof(float) * V);
+    if (lx_rt_alloc(reinterpret_cast<void**>(&d_logits), logit_bytes) != 0)
+      throw std::runtime_error("device allocation of " + std::to_string(logit_bytes) + " bytes");
+    void* s = nullptr;
+    if (lx_rt_stream_create(&s) != 0) throw std::runtime_error("creating a device stream");
     for (auto& [name, ids_json] : prompts.items()) {
       const std::vector<int32_t> ids = ids_json.get<std::vector<int32_t>>();
       const int P = static_cast<int>(ids.size()) - 1;  // the anchor's position
@@ -314,10 +320,10 @@ int cmd_block_check(int argc, char** argv) {
         for (int r = std::max(first, off); r < off + n; ++r) {
           const size_t at = window.size();
           window.resize(at + F);
-          cudaMemcpyAsync(window.data() + at, model.features() + static_cast<size_t>(r - off) * F, sizeof(float) * F,
-                          cudaMemcpyDeviceToHost, s);
+          lx_rt_copy(window.data() + at, model.features() + static_cast<size_t>(r - off) * F,
+                     static_cast<int64_t>(sizeof(float)) * F, LX_COPY_D2H, s);
         }
-        cudaStreamSynchronize(s);
+        lx_rt_stream_sync(s);
       }
       std::vector<int32_t> context(ids.begin(), ids.end());
       lx::runtime::DraftRequest req;
@@ -326,7 +332,10 @@ int cmd_block_check(int argc, char** argv) {
       req.stream = s;
       drafter.propose(req);
       std::vector<float> logits(static_cast<size_t>(rows) * V);
-      cudaMemcpy(logits.data(), drafter.last_logits(), sizeof(float) * logits.size(), cudaMemcpyDeviceToHost);
+      if (lx_rt_copy(logits.data(), drafter.last_logits(), static_cast<int64_t>(sizeof(float) * logits.size()),
+                     LX_COPY_D2H, nullptr) != 0)
+        throw std::runtime_error("reading the block drafter's logits");
+      if (lx_rt_stream_sync(nullptr) != 0) throw std::runtime_error("reading the block drafter's logits");
       std::ofstream(out / (name + ".features.f32"), std::ios::binary)
           .write(reinterpret_cast<const char*>(window.data()), sizeof(float) * window.size());
       std::ofstream(out / (name + ".logits.f32"), std::ios::binary)
@@ -340,8 +349,9 @@ int cmd_block_check(int argc, char** argv) {
       for (int32_t t : drafter.last_tokens()) std::printf(" %d", t);
       std::printf("\n");
     }
-    cudaFree(d_logits);
-    if (cudaGetLastError() != cudaSuccess) throw std::runtime_error("CUDA error during the check");
+    lx_rt_free(d_logits);
+    if (const int err = lx_rt_last_error())
+      throw std::runtime_error(std::string(lx_rt_error_string(err)) + " during the check");
   } catch (const std::exception& e) {
     std::fprintf(stderr, "error: %s\n", e.what());
     return 1;
@@ -404,8 +414,8 @@ int cmd_spec(int argc, char** argv) {
       draft = load(draft_dir, 1, cfg.prefill_chunk);
       if (draft.config.vocab_size != target.config.vocab_size) throw std::runtime_error("vocabularies differ");
     }
-    cudaStream_t s;
-    cudaStreamCreate(&s);
+    void* s = nullptr;
+    if (lx_rt_stream_create(&s) != 0) throw std::runtime_error("creating a device stream");
     lx::runtime::SpecDecoder decoder(*target.model);
     lx::runtime::DraftCost cost = lx::runtime::DraftCost::rtx5070ti_praxis();
     if (!cost_list.empty()) {
@@ -442,7 +452,7 @@ int cmd_spec(int argc, char** argv) {
         else if (d == "block-fixed") drafter = block_fixed.get();
         else if (d != "plain") throw std::runtime_error("unknown drafter " + d);
         Run r{d, {}, {}, 0};
-        // a short warm-up of the same shapes, so graph capture and cuBLASLt plans stay out of the timing
+        // a short warm-up of the same shapes, so graph capture and GEMM plans stay out of the timing
         lx::runtime::SpecConfig warm = cfg;
         warm.max_new_tokens = 24;
         lx::runtime::SpecStats ws;
@@ -513,7 +523,8 @@ int cmd_spec(int argc, char** argv) {
                     100.0 * ngram.accepted_by_n[n] / ngram.drafted_by_n[n]);
     std::printf("\n");
     if (!json_out.empty()) std::ofstream(json_out) << report.dump(1) << "\n";
-    if (cudaGetLastError() != cudaSuccess) throw std::runtime_error("CUDA error during the run");
+    if (const int err = lx_rt_last_error())
+      throw std::runtime_error(std::string(lx_rt_error_string(err)) + " during the run");
   } catch (const std::exception& e) {
     std::fprintf(stderr, "error: %s\n", e.what());
     return 1;

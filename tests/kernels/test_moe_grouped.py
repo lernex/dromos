@@ -236,3 +236,26 @@ def test_moe_grouped_tuned_variants(lx):
             label = f"{fam} variant {lx.lib.lx_tune_variant_name(fam.encode(), v)}"
             assert status == 0, f"{label} returned {status}"
             check(out, case, math)
+
+
+@pytest.mark.parametrize("name,wtype,math,oldest", PAIRS)
+def test_moe_grouped_rows_do_not_depend_on_the_batch(lx, name, wtype, math, oldest):
+    # Batch invariance on the decode rows (T <= 8, where a speculative verify step runs): a token's row is the
+    # same bits whatever batch of T (1 to 8) it runs in, so a verify step matches the one-token steps.
+    if native_arch(lx) < oldest:
+        pytest.skip("not on this GPU")
+    L, I, E, top_k = 1024, 512, 32, 4
+    latent, ids, weights, gu, dn = make_case(8, L, I, E, top_k, wtype, seed=77 + math)
+    alone = []
+    for t in range(8):
+        sub = (latent[t : t + 1].contiguous(), ids[t : t + 1].contiguous(), weights[t : t + 1].contiguous(), gu, dn)
+        status, out = run(lx, sub, math, 1, L, I, E, top_k)
+        assert status == 0, f"lx_moe_experts_grouped returned CUDA error {status}"
+        alone.append(out)
+    alone = torch.cat(alone)
+    for T in range(1, 9):
+        sub = (latent[:T].contiguous(), ids[:T].contiguous(), weights[:T].contiguous(), gu, dn)
+        status, out = run(lx, sub, math, T, L, I, E, top_k)
+        assert status == 0, f"lx_moe_experts_grouped returned CUDA error {status}"
+        for t in range(T):
+            assert torch.equal(out[t], alone[t]), f"{name}: token {t} of a T={T} batch differs from the token alone"

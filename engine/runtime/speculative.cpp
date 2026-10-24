@@ -11,23 +11,24 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-void check(int status, const char* what) {
-  if (status != 0) throw std::runtime_error(std::string(what) + " failed with CUDA error " + std::to_string(status));
+void check(int status, const std::string& what) {
+  if (status != 0) throw std::runtime_error(what + " failed: " + lx_rt_error_string(status));
 }
 #define LX_CHECK(expr) check(static_cast<int>(expr), #expr)
 
 template <typename T>
 T* device_alloc(size_t count) {
   void* p = nullptr;
-  LX_CHECK(cudaMalloc(&p, count * sizeof(T)));
-  LX_CHECK(cudaMemset(p, 0, count * sizeof(T)));
+  check(lx_rt_alloc(&p, static_cast<int64_t>(count * sizeof(T))),
+        "device allocation of " + std::to_string(count * sizeof(T)) + " bytes");  // zeroed
   return static_cast<T*>(p);
 }
 
 template <typename T>
 T* host_alloc(size_t count) {
   void* p = nullptr;
-  LX_CHECK(cudaMallocHost(&p, count * sizeof(T)));
+  check(lx_rt_host_alloc(&p, static_cast<int64_t>(count * sizeof(T))),
+        "host allocation of " + std::to_string(count * sizeof(T)) + " bytes");
   return static_cast<T*>(p);
 }
 
@@ -47,7 +48,7 @@ uint64_t hash_ngram(const int32_t* t, int n) {
 // Runs `tokens` through `model` on `slot` in steps of at most `chunk` tokens; the last row's
 // logits end in `logits`.
 void prefill(MetisModel& model, int slot, const std::vector<int32_t>& tokens, int chunk, float* logits,
-             cudaStream_t s) {
+             void* s) {
   for (size_t off = 0; off < tokens.size(); off += chunk) {
     const int n = static_cast<int>(std::min<size_t>(chunk, tokens.size() - off));
     StepBatch b{{tokens.begin() + off, tokens.begin() + off + n}, {0, n}, {slot}};
@@ -92,7 +93,7 @@ NgramDrafter::NgramDrafter(int max_ngram, int min_ngram, DraftCost cost)
       cost_(std::move(cost)),
       last_end_(max_ngram + 1) {}
 
-void NgramDrafter::begin(const std::vector<int32_t>&, cudaStream_t) {
+void NgramDrafter::begin(const std::vector<int32_t>&, void*) {
   for (auto& m : last_end_) m.clear();
   indexed_ = 0;
   last_n_ = last_k_ = 0;
@@ -138,7 +139,7 @@ Draft NgramDrafter::propose(const DraftRequest& r) {
   return d;
 }
 
-void NgramDrafter::observe(int accepted, int32_t, cudaStream_t) {
+void NgramDrafter::observe(int accepted, int32_t, void*) {
   const int k = last_k_;
   const double c = cost_.cost[std::min<size_t>(k + 1, cost_.cost.size() - 1)];
   lambda_ = 0.9 * lambda_ + 0.1 * (accepted + 1) / c;
@@ -169,20 +170,22 @@ ModelDrafter::ModelDrafter(MetisModel& model, int slot, lx_spec_filter filter, u
   h_conf_ = host_alloc<float>(1);
   const int32_t cu[2] = {0, 1};
   const lx_spec_filter filters[2] = {filter_, {1.0f, 1.0f, 0, 0.0f}};  // the proposal's, and the plain softmax
-  LX_CHECK(cudaMemcpy(d_cu_, cu, sizeof(cu), cudaMemcpyHostToDevice));
-  LX_CHECK(cudaMemcpy(d_filter_, filters, sizeof(filters), cudaMemcpyHostToDevice));
+  LX_CHECK(lx_rt_copy(d_cu_, cu, static_cast<int64_t>(sizeof(cu)), LX_COPY_H2D, nullptr));
+  LX_CHECK(lx_rt_stream_sync(nullptr));
+  LX_CHECK(lx_rt_copy(d_filter_, filters, static_cast<int64_t>(sizeof(filters)), LX_COPY_H2D, nullptr));
+  LX_CHECK(lx_rt_stream_sync(nullptr));
 }
 
 ModelDrafter::~ModelDrafter() {
   for (void* p : {static_cast<void*>(logits_), static_cast<void*>(q_), static_cast<void*>(conf_probs_),
                   static_cast<void*>(d_tokens_), static_cast<void*>(d_cu_), static_cast<void*>(d_out_),
                   static_cast<void*>(d_filter_), static_cast<void*>(d_rng_)})
-    cudaFree(p);
-  cudaFreeHost(h_out_);
-  cudaFreeHost(h_conf_);
+    lx_rt_free(p);
+  lx_rt_host_free(h_out_);
+  lx_rt_host_free(h_conf_);
 }
 
-void ModelDrafter::begin(const std::vector<int32_t>& prompt, cudaStream_t s) {
+void ModelDrafter::begin(const std::vector<int32_t>& prompt, void* s) {
   model_.reset_slot(slot_);
   prefill(model_, slot_, prompt, 512, logits_, s);
   fed_ = static_cast<int>(prompt.size());
@@ -209,13 +212,13 @@ Draft ModelDrafter::propose(const DraftRequest& r) {
       LX_CHECK(lx_spec_verify_greedy(row, V, d_tokens_, d_cu_, 1, 1, d_out_ + 2, d_out_, d_out_ + 1, r.stream));
     } else {
       const lx_spec_rng rng{seed_ ^ 0x5D4A5D4Aull, r.position + i};
-      LX_CHECK(cudaMemcpyAsync(d_rng_, &rng, sizeof(rng), cudaMemcpyHostToDevice, r.stream));
+      LX_CHECK(lx_rt_copy(d_rng_, &rng, static_cast<int64_t>(sizeof(rng)), LX_COPY_H2D, r.stream));
       LX_CHECK(lx_spec_probs(row, V, d_filter_, 1, q_ + static_cast<size_t>(i) * V, r.stream));
       LX_CHECK(lx_spec_sample(q_ + static_cast<size_t>(i) * V, V, nullptr, d_rng_, kDomainDraft, 1, d_out_ + 1,
                               r.stream));
     }
-    LX_CHECK(cudaMemcpyAsync(h_out_, d_out_, 2 * sizeof(int32_t), cudaMemcpyDeviceToHost, r.stream));
-    LX_CHECK(cudaStreamSynchronize(r.stream));
+    LX_CHECK(lx_rt_copy(h_out_, d_out_, static_cast<int64_t>(2 * sizeof(int32_t)), LX_COPY_D2H, r.stream));
+    LX_CHECK(lx_rt_stream_sync(r.stream));
     const int32_t token = h_out_[1];
     d.tokens.push_back(token);
     if (min_confidence_ > 0.0f && i + 1 < k) {
@@ -224,8 +227,8 @@ Draft ModelDrafter::propose(const DraftRequest& r) {
         LX_CHECK(lx_spec_probs(row, V, d_filter_ + 1, 1, conf_probs_, r.stream));
         probs = conf_probs_;
       }
-      LX_CHECK(cudaMemcpyAsync(h_conf_, probs + token, sizeof(float), cudaMemcpyDeviceToHost, r.stream));
-      LX_CHECK(cudaStreamSynchronize(r.stream));
+      LX_CHECK(lx_rt_copy(h_conf_, probs + token, static_cast<int64_t>(sizeof(float)), LX_COPY_D2H, r.stream));
+      LX_CHECK(lx_rt_stream_sync(r.stream));
       if (*h_conf_ < min_confidence_) break;
     }
     feed.assign(1, token);
@@ -235,7 +238,7 @@ Draft ModelDrafter::propose(const DraftRequest& r) {
   return d;
 }
 
-void ModelDrafter::observe(int accepted, int32_t, cudaStream_t) {
+void ModelDrafter::observe(int accepted, int32_t, void*) {
   // It ran the context and every proposal but the last; it keeps what the target kept. When every
   // proposal held, the last one is not run yet and goes in with the next round's feed.
   if (accepted < drafted_) {
@@ -263,33 +266,33 @@ SpecDecoder::~SpecDecoder() {
   for (void* p : {static_cast<void*>(logits_), static_cast<void*>(probs_), static_cast<void*>(d_tokens_),
                   static_cast<void*>(d_cu_), static_cast<void*>(d_argmax_), static_cast<void*>(d_out_),
                   static_cast<void*>(d_filters_), static_cast<void*>(d_rng_)})
-    cudaFree(p);
-  cudaFreeHost(h_out_);
+    lx_rt_free(p);
+  lx_rt_host_free(h_out_);
 }
 
 void SpecDecoder::accept(const SpecConfig& config, const std::vector<int32_t>& step, const float* q,
-                         uint64_t position, int& accepted, int32_t& next, cudaStream_t s) {
+                         uint64_t position, int& accepted, int32_t& next, void* s) {
   const int rows = static_cast<int>(step.size());
   const int V = target_.vocab_size();
   const int32_t cu[2] = {0, rows};
-  LX_CHECK(cudaMemcpyAsync(d_tokens_, step.data(), sizeof(int32_t) * rows, cudaMemcpyHostToDevice, s));
-  LX_CHECK(cudaMemcpyAsync(d_cu_, cu, sizeof(cu), cudaMemcpyHostToDevice, s));
+  LX_CHECK(lx_rt_copy(d_tokens_, step.data(), static_cast<int64_t>(sizeof(int32_t) * rows), LX_COPY_H2D, s));
+  LX_CHECK(lx_rt_copy(d_cu_, cu, static_cast<int64_t>(sizeof(cu)), LX_COPY_H2D, s));
   if (!(config.filter.temperature > 0.0f)) {
     LX_CHECK(lx_spec_verify_greedy(logits_, V, d_tokens_, d_cu_, 1, rows, d_argmax_, d_out_, d_out_ + 1, s));
   } else {
     const lx_spec_rng rng{config.seed, position};
-    LX_CHECK(cudaMemcpyAsync(d_rng_, &rng, sizeof(rng), cudaMemcpyHostToDevice, s));
+    LX_CHECK(lx_rt_copy(d_rng_, &rng, static_cast<int64_t>(sizeof(rng)), LX_COPY_H2D, s));
     LX_CHECK(lx_spec_probs(logits_, V, d_filters_, rows, probs_, s));
     LX_CHECK(lx_spec_verify(probs_, q, V, d_tokens_, d_cu_, d_rng_, 1, d_out_, d_out_ + 1, s));
   }
-  LX_CHECK(cudaMemcpyAsync(h_out_, d_out_, 2 * sizeof(int32_t), cudaMemcpyDeviceToHost, s));
-  LX_CHECK(cudaStreamSynchronize(s));
+  LX_CHECK(lx_rt_copy(h_out_, d_out_, static_cast<int64_t>(2 * sizeof(int32_t)), LX_COPY_D2H, s));
+  LX_CHECK(lx_rt_stream_sync(s));
   accepted = h_out_[0];
   next = h_out_[1];
 }
 
 std::vector<int32_t> SpecDecoder::generate(Drafter* drafter, const std::vector<int32_t>& prompt,
-                                           const SpecConfig& config, SpecStats& stats, cudaStream_t s) {
+                                           const SpecConfig& config, SpecStats& stats, void* s) {
   if (prompt.empty()) throw std::runtime_error("empty prompt");
   stats = SpecStats{};
   const int k_cap = drafter ? std::max(0, std::min(config.max_drafts, max_rows_ - 1)) : 0;
@@ -297,7 +300,8 @@ std::vector<int32_t> SpecDecoder::generate(Drafter* drafter, const std::vector<i
   target_.set_feature_taps(drafter ? drafter->feature_taps() : std::vector<FeatureTap>{});
   const int F = target_.feature_dim();
   std::vector<lx_spec_filter> filters(max_rows_, config.filter);
-  LX_CHECK(cudaMemcpyAsync(d_filters_, filters.data(), sizeof(lx_spec_filter) * max_rows_, cudaMemcpyHostToDevice, s));
+  LX_CHECK(lx_rt_copy(d_filters_, filters.data(), static_cast<int64_t>(sizeof(lx_spec_filter) * max_rows_),
+                      LX_COPY_H2D, s));
   auto stops = [&](int32_t t) { return std::find(config.stop_ids.begin(), config.stop_ids.end(), t) != config.stop_ids.end(); };
 
   // the prompt, and the first token from its last row
@@ -366,7 +370,7 @@ std::vector<int32_t> SpecDecoder::generate(Drafter* drafter, const std::vector<i
     }
     if (drafter) drafter->observe(accepted, next, s);
   }
-  LX_CHECK(cudaStreamSynchronize(s));
+  LX_CHECK(lx_rt_stream_sync(s));
   stats.decode_s = std::chrono::duration<double>(Clock::now() - t1).count();
   stats.emitted = static_cast<int>(out.size());
   return out;

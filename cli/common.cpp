@@ -83,9 +83,10 @@ StartedEngine start_engine(const Model& model, int sequences, int context, int w
       return StartedEngine{std::move(plan), std::move(engine)};
     } catch (const std::runtime_error& e) {
       const std::string what = e.what();
-      // cudaErrorMemoryAllocation is error 2: it comes back from cudaMalloc, from a kernel that allocates, or from a copy.
-      const bool memory = what.find("cudaMalloc") != std::string::npos || what.find("out of memory") != std::string::npos ||
-                          what.find("CUDA error 2") != std::string::npos;
+      // Out of memory comes back from a device allocation, a kernel that allocates, or a copy; the message
+      // carries the backend's own text for it.
+      const bool memory = what.find("device allocation") != std::string::npos ||
+                          what.find("out of memory") != std::string::npos;
       if (!memory || attempt >= 4) throw;
       // The retry keeps the format this attempt chose: re-planning could pick one the build cannot load.
       format = static_cast<int>(plan.weights);

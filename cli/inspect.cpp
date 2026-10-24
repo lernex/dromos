@@ -3,8 +3,6 @@
 // Loads the config and the checkpoint, uploads every tensor to the GPU, reads each one back and
 // compares it with the file, then reports what landed. This is the loader's end-to-end check.
 
-#include <cuda_runtime.h>
-
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -17,6 +15,7 @@
 #include "core/config.h"
 #include "core/device.h"
 #include "core/safetensors.h"
+#include "cuda/kernels.h"
 
 namespace {
 
@@ -26,8 +25,8 @@ double seconds_since(Clock::time_point start) {
   return std::chrono::duration<double>(Clock::now() - start).count();
 }
 
-void check(cudaError_t err, const std::string& what) {
-  if (err != cudaSuccess) throw std::runtime_error(what + ": " + cudaGetErrorString(err));
+void check(int status, const std::string& what) {
+  if (status != 0) throw std::runtime_error(what + ": " + lx_rt_error_string(status));
 }
 
 std::string join_ints(const std::vector<int>& values) {
@@ -77,11 +76,11 @@ int cmd_inspect(int argc, char** argv) {
     const std::string dir = argv[1];
     print_config(dir, lx::load_config(dir));
 
-    cudaDeviceProp prop{};
-    check(cudaGetDeviceProperties(&prop, 0), "cudaGetDeviceProperties");
-    size_t free_before = 0, total_device = 0;
-    check(cudaMemGetInfo(&free_before, &total_device), "cudaMemGetInfo");
-    std::printf("gpu      %s, %.2f GB free of %.2f GB\n", prop.name, free_before / 1e9, total_device / 1e9);
+    lx_device_props props{};
+    check(lx_rt_device_props(0, &props), "reading the device properties");
+    int64_t free_before = 0, total_device = 0;
+    check(lx_rt_mem_info(&free_before, &total_device), "reading the device memory");
+    std::printf("gpu      %s, %.2f GB free of %.2f GB\n", props.name, free_before / 1e9, total_device / 1e9);
 
     const auto t_open = Clock::now();
     const lx::SafetensorsSet set = lx::SafetensorsSet::open(dir);
@@ -91,8 +90,8 @@ int cmd_inspect(int argc, char** argv) {
     const auto t_upload = Clock::now();
     const lx::Weights weights = lx::Weights::upload(set);
     const double upload_s = seconds_since(t_upload);
-    size_t free_after = 0;
-    check(cudaMemGetInfo(&free_after, &total_device), "cudaMemGetInfo");
+    int64_t free_after = 0;
+    check(lx_rt_mem_info(&free_after, &total_device), "reading the device memory");
     std::printf("uploaded %.2f GB (%.2f GB with 256-byte alignment) in %.2f s, %.2f GB/s\n",
                 set.total_bytes() / 1e9, weights.device_bytes() / 1e9, upload_s,
                 set.total_bytes() / 1e9 / upload_s);
@@ -107,7 +106,9 @@ int cmd_inspect(int argc, char** argv) {
       const lx::Tensor* t = weights.find(name);
       if (!t) throw std::runtime_error("the upload is missing \"" + name + "\"");
       if (info.bytes == 0) continue;
-      check(cudaMemcpy(host.data(), t->data, info.bytes, cudaMemcpyDeviceToHost), "reading back \"" + name + "\"");
+      check(lx_rt_copy(host.data(), t->data, static_cast<int64_t>(info.bytes), LX_COPY_D2H, nullptr),
+            "reading back \"" + name + "\"");
+      check(lx_rt_stream_sync(nullptr), "reading back \"" + name + "\"");
       if (std::memcmp(host.data(), info.data, info.bytes) != 0)
         throw std::runtime_error("the device copy of \"" + name + "\" differs from the checkpoint");
     }

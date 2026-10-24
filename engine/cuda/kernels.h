@@ -201,6 +201,20 @@ LX_API int lx_moe_experts_w8(const void* latent, const int32_t* ids, const float
                              void* workspace, int T, int L, int I, int top_k, void* stream);
 LX_API int64_t lx_moe_workspace_bytes(int T, int I, int top_k);
 
+// ---- Model glue (glue.cu) -------------------------------------------------------------------
+// Small kernels the Metis forward pass needs between the library kernels. They are specific to how
+// the model wires its pieces together, so they are plain ops that every backend provides.
+// y = a * y + b * x over n f32 elements.
+LX_API int lx_axpby_f32(float* y, const float* x, float a, float b, int64_t n, void* stream);
+// out = a - b over n f32 elements.
+LX_API int lx_sub_f32(const float* a, const float* b, float* out, int64_t n, void* stream);
+// meta[t, col .. col + 3] = mean_k, entropy[t] * inv_log_experts, confidence[t], continuation[t] (bf16),
+// with `ld` the row stride of meta in elements.
+LX_API int lx_meta_scalars(const float* entropy, const float* confidence, const float* continuation, float mean_k,
+                           float inv_log_experts, void* meta, int ld, int col, int T, void* stream);
+// out[i, :] = src[cu[i + 1] - 1, :] for each of n_seq sequences (cu on the device).
+LX_API int lx_gather_last(const float* src, const int32_t* cu, float* out, int n_seq, int D, void* stream);
+
 // ---- Runtime (every backend) ----------------------------------------------------------------
 // The kernels.h ABI is the backend interface: the CUDA, HIP, Metal and CPU backends are each one
 // shared library exporting every lx_* function here, and the model code calls nothing else (no
@@ -211,7 +225,9 @@ LX_API int64_t lx_moe_workspace_bytes(int T, int I, int top_k);
 // (0 success, LX_ERR_NOT_SUPPORTED when a backend lacks a feature, e.g. graph capture).
 #define LX_ERR_NOT_SUPPORTED 801
 typedef enum { LX_BACKEND_CUDA = 0, LX_BACKEND_HIP = 1, LX_BACKEND_METAL = 2, LX_BACKEND_CPU = 3 } lx_backend;
-typedef enum { LX_COPY_H2D = 0, LX_COPY_D2H = 1, LX_COPY_D2D = 2 } lx_copy_kind;
+// LX_COPY_DEFAULT takes the direction from the pointers (unified addressing), for a copy whose ends
+// may each be device or host memory.
+typedef enum { LX_COPY_H2D = 0, LX_COPY_D2H = 1, LX_COPY_D2D = 2, LX_COPY_DEFAULT = 3 } lx_copy_kind;
 
 LX_API int lx_rt_backend(void);
 LX_API int lx_rt_device_count(void);
@@ -237,6 +253,34 @@ LX_API int lx_rt_capture_end(void* stream, void** graph);
 LX_API int lx_rt_graph_launch(void* graph, void* stream);
 LX_API int lx_rt_graph_destroy(void* graph);
 LX_API int lx_rt_last_error(void);  // and clears it
+// Events that can be read back as time: lx_rt_event_elapsed gives the milliseconds between two
+// recorded events (both made by lx_rt_event_create_timed; lx_rt_event_create events do not time).
+LX_API int lx_rt_event_create_timed(void** event);
+LX_API int lx_rt_event_elapsed(void* start, void* stop, float* ms);
+// Waits for all the work on the device, every stream.
+LX_API int lx_rt_device_sync(void);
+// The text of an error code this ABI returned, for messages.
+LX_API const char* lx_rt_error_string(int status);
+// 1 when `ptr` is pinned host memory that the device reads across the bus (lx_rt_host_alloc, or a range
+// registered or mapped for it), else 0. A backend whose memory is all host memory answers 0.
+LX_API int lx_rt_is_host_memory(const void* ptr);
+// One device's properties (ordinal from 0). cc_major / cc_minor are its real compute capability,
+// sms its multiprocessor count, l2_bytes its L2 cache, mem_clock_khz and bus_bits the memory clock
+// and bus width (peak bandwidth is clock * 2 * bus_bits / 8). The versions use the CUDA encoding,
+// 1000 * major + 10 * minor, of the driver and of the runtime; a backend without one reports 0.
+typedef struct {
+  char name[256];
+  int cc_major, cc_minor;
+  int sms;
+  int64_t l2_bytes;
+  int64_t mem_clock_khz;
+  int bus_bits;
+  int driver_version, runtime_version;
+} lx_device_props;
+LX_API int lx_rt_device_props(int ordinal, lx_device_props* props);
+// The device memory this process holds, its context included, summed over the devices, where the driver
+// reports it per process (NVML on CUDA). LX_ERR_NOT_SUPPORTED where the backend cannot tell.
+LX_API int lx_rt_process_memory(int64_t* bytes);
 
 // ---- Weight formats ------------------------------------------------------------------------
 // A projection is held once, in one format, and every kernel that multiplies by it (the decode
@@ -289,7 +333,8 @@ typedef struct {
 typedef enum { LX_MATH_BF16 = 0, LX_MATH_INT8 = 1, LX_MATH_FP8 = 2, LX_MATH_FP4 = 3 } lx_math;
 
 // Decode GEMV on any weight format (generalizes lx_gemv; same contract for x, bias, y, alpha,
-// beta, M <= 8). Weight-only: the weight is expanded in registers, the math is f32.
+// beta, M <= 8). Weight-only: the weight is expanded in registers, the math is f32. LX_W_BF16X
+// weights are run by lx_gemv_bf16x (below), so every format enters through this one call.
 LX_API int lx_gemv_w(const void* x, lx_dtype x_dtype, int ld_x, const lx_weight* w, const void* bias,
                      lx_dtype bias_dtype, void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K, float alpha,
                      float beta, void* stream);
@@ -327,9 +372,9 @@ LX_API int lx_quantize_act(const void* x, lx_dtype x_dtype, int ld_x, lx_math ma
 //                          weight-only, f32 math. Workspace: lx_moe_decode_workspace_bytes.
 //   lx_moe_experts_grouped any T: tokens grouped by expert, a tensor-core grouped GEMM per
 //                          stage with the given math. Workspace: lx_moe_grouped_workspace_bytes.
-//                          The top_k weighted rows of a token are summed with f32 atomics, so the
-//                          last bits of out can differ between calls; LX_MOE_ORDERED=1 sums them in
-//                          a fixed order instead (3 to 25% slower at T >= 1024 on Praxis).
+//                          The top_k weighted rows of a token are summed in a fixed order, so a token's bits
+//                          do not depend on its batch or on the run. LX_MOE_ORDERED=0 sums with f32 atomics
+//                          instead, whose last bits can differ between calls.
 LX_API int lx_moe_experts_decode(const void* latent, const int32_t* ids, const float* weights,
                                  const lx_weight* gate_up, const lx_weight* down, float* out, void* workspace, int T,
                                  int L, int I, int top_k, void* stream);
@@ -345,6 +390,11 @@ LX_API int64_t lx_moe_grouped_workspace_bytes(int T, int L, int I, int E, int to
 // block's e4m3 scale as its absmax / (6 * global), rounded to e4m3. Used when the engine is asked
 // for a format the file is not stored in; checkpoints made with GPTQ are loaded as they are.
 LX_API int lx_quantize_weight(const void* w, lx_weight* out, int64_t rows, int cols, void* stream);
+
+// The reverse: out[r, c] = w[r, c] as bf16 for an [rows, cols] matrix in any format, with its row
+// factor applied (the row scale, or the NVFP4 global). The loader uses it to hold a quantized
+// embedding's bf16 gather table, and the acceptance checks compare dequantized weights with BF16.
+LX_API int lx_dequantize_weight(const lx_weight* w, void* out, int64_t rows, int cols, void* stream);
 
 // ---- Sampling (sampler.cu) ------------------------------------------------------------------
 // One launch draws the next token of every sequence in a batch. Row i reads logits row

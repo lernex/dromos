@@ -46,6 +46,33 @@ if(LX_BACKEND_CPU)
   add_subdirectory(engine/cpu)
 endif()
 
+# The dispatcher: the lx_* stubs the host calls, and the loader that opens one backend library at run time
+# (engine/dispatch). It holds no GPU code, so it builds with or without CUDA, and lernex_core links it in place of
+# liblernex_kernels. tools/gen_dispatch.py writes the stubs and the table from the ABI headers.
+find_package(Python3 COMPONENTS Interpreter)
+if(NOT Python3_Interpreter_FOUND)
+  message(FATAL_ERROR "python3 is needed to generate the backend dispatch table (tools/gen_dispatch.py)")
+endif()
+include(GNUInstallDirs)
+set(LX_INSTALL_LIBDIR "${CMAKE_INSTALL_LIBDIR}")
+if(NOT LX_INSTALL_LIBDIR)
+  set(LX_INSTALL_LIBDIR "lib")
+endif()
+file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/generated")
+set(LX_DISPATCH_GEN "${CMAKE_BINARY_DIR}/generated/lx_dispatch_gen.cpp")
+add_custom_command(
+  OUTPUT "${LX_DISPATCH_GEN}"
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/gen_dispatch.py" "${LX_DISPATCH_GEN}"
+          "${CMAKE_SOURCE_DIR}/engine/cuda/kernels.h" "${CMAKE_SOURCE_DIR}/engine/cuda/tunable.h"
+  DEPENDS "${CMAKE_SOURCE_DIR}/tools/gen_dispatch.py" "${CMAKE_SOURCE_DIR}/engine/cuda/kernels.h"
+          "${CMAKE_SOURCE_DIR}/engine/cuda/tunable.h"
+  COMMENT "Generating the backend dispatch table"
+  VERBATIM)
+add_library(lernex_dispatch STATIC engine/dispatch/dispatch.cpp "${LX_DISPATCH_GEN}")
+target_include_directories(lernex_dispatch PUBLIC engine)
+target_compile_definitions(lernex_dispatch PRIVATE "LX_INSTALL_LIBDIR=\"${LX_INSTALL_LIBDIR}\"")
+target_link_libraries(lernex_dispatch PUBLIC ${CMAKE_DL_LIBS})
+
 if(NOT LX_BACKEND_CUDA)
   return()
 endif()
@@ -65,7 +92,7 @@ target_link_libraries(lernex_kernels PUBLIC CUDA::cudart CUDA::cublasLt)
 
 # The prefix cache snapshots the model's slot state. That needs MetisModel::save_slot and restore_slot,
 # which live in docs/handoff/serving-metis.diff until the lead applies it to engine/model/metis.cpp.
-option(LX_SLOT_STATE "Build the prefix cache on the model's slot state (needs the serving-metis handoff)" OFF)
+option(LX_SLOT_STATE "Build the prefix cache on the model's slot state" ON)
 if(LX_SLOT_STATE)
   add_compile_definitions(LX_SLOT_STATE=1)
 endif()
@@ -76,7 +103,7 @@ file(GLOB LX_CORE_SOURCES CONFIGURE_DEPENDS engine/core/*.cpp engine/model/*.cpp
 if(LX_CORE_SOURCES)
   add_library(lernex_core STATIC ${LX_CORE_SOURCES})
   target_include_directories(lernex_core PUBLIC engine third_party third_party/httplib)
-  target_link_libraries(lernex_core PUBLIC lernex_kernels)
+  target_link_libraries(lernex_core PUBLIC lernex_dispatch)
   # The architectures this build has code for, for the device report. A header, not a definition: nvcc
   # splits a -D value on its commas.
   file(WRITE "${CMAKE_BINARY_DIR}/generated/lx_build_info.h"
@@ -91,6 +118,12 @@ if(LX_CLI_SOURCES AND TARGET lernex_core)
   add_executable(lernex ${LX_CLI_SOURCES})
   target_include_directories(lernex PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(lernex PRIVATE lernex_core)
+  # The backend libraries are opened at run time from next to the executable, so the CLI builds them too.
+  foreach(backend lernex_kernels lernex_cpu)
+    if(TARGET ${backend})
+      add_dependencies(lernex ${backend})
+    endif()
+  endforeach()
 endif()
 
 # The C++ unit tests (doctest): host-side policy, parsing and protocol code, run on the server.

@@ -13,15 +13,13 @@
 #include <list>
 #include <vector>
 
-#include <cuda_runtime.h>
-
 #include "core/device.h"
 
 namespace lx::runtime {
 
 class PrefixCache {
  public:
-  PrefixCache(size_t device_bytes, size_t host_bytes, cudaStream_t stream);
+  PrefixCache(size_t device_bytes, size_t host_bytes, void* stream);
   ~PrefixCache();
   PrefixCache(const PrefixCache&) = delete;
   PrefixCache& operator=(const PrefixCache&) = delete;
@@ -63,7 +61,7 @@ class PrefixCache {
 
   size_t device_budget_, host_budget_;
   size_t device_used_ = 0, host_used_ = 0;
-  cudaStream_t stream_;
+  void* stream_;
   std::list<Entry> entries_;  // most recently used first
 };
 
