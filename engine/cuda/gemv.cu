@@ -1,22 +1,25 @@
-// Decode GEMV (kernels.h, "Decode GEMV"): y[m, n] = alpha * (sum_k x[m, k] * w[n, k] + bias[n]) + beta * y.
+// Decode GEMV (kernels.h, "Decode GEMV" and lx_gemv_w): y[m, n] = alpha * (sum_k x[m, k] * w[n, k] + bias[n]) + beta * y.
 //
 // Decode is memory bound: a token streams the whole weight matrix once, so the lane mapping sets the
-// cost. A warp step covers 32 lanes' words of consecutive k in a row: 4 bf16 or 8 int8 per lane, so
-// 128 or 256 k. Lane l's word is contiguous with its neighbours', and every word is 8 bytes, so a warp
-// load is one contiguous 256 B run. The x loads for those k are contiguous too, and the RG rows a warp
-// owns share them. A lane that owned a whole 16-byte chunk would scatter its x loads 64 B apart across
-// lanes, up to 4x the L1 wavefronts for the same work. Weight loads are cache-streaming so that the x
-// vector stays in L1. The loads for the next KU steps are in flight while the current ones are
-// consumed, and they go before the programmatic-dependent-launch wait, since they do not depend on the
-// previous kernel in the stream: the next GEMV starts streaming while this one finishes.
+// cost. Every format moves one 8-byte word per lane per step (wformat.cuh): 4 bf16, 8 int8 or fp8, or
+// 16 nvfp4 values, so a warp step covers 128, 256 or 512 k and always reads one contiguous 256 B run
+// of weights. NVFP4 adds one e4m3 block scale per lane per step (the 16 values of its word are one
+// block), read as a contiguous 32 B run per warp. The x loads for those k are contiguous too, and the
+// RG rows a warp owns share them. A lane that owned a whole 16-byte chunk would scatter its x loads
+// 64 B apart across lanes, up to 4x the L1 wavefronts for the same work. Weight loads are
+// cache-streaming so that the x vector stays in L1. The loads for the next KU steps are in flight
+// while the current ones are consumed, and they go before the programmatic-dependent-launch wait,
+// since they do not depend on the previous kernel in the stream: the next GEMV starts streaming
+// while this one finishes.
 //
-// Two kernels:
-//   vec    K > 256 with aligned rows: the warps of a row group split the 128-k steps of each row.
+// Two kernels, for every format:
+//   vec    K > 256 with aligned rows: the warps of a row group split the steps of each row.
 //          When N is too small to fill the GPU, S warps split one row group's steps and combine in
 //          shared memory in a fixed order, so split-K is deterministic without atomics.
 //   small  K <= 256, or misaligned x or w: scalar loads. lpr lanes cover one row, and the 32 / lpr
 //          rows of a warp reduce with xor shuffles inside their group.
-// The int8 row scale is applied once per row: sum_k x * (q * s) = s * sum_k x * q.
+// The per-row factor (the int8 / fp8 row scale, the nvfp4 global) is applied once per row:
+// sum_k x * (q * s) = s * sum_k x * q.
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -25,6 +28,8 @@
 
 #include "cuda/common.cuh"
 #include "cuda/kernels.h"
+#include "cuda/tunable.h"
+#include "cuda/wformat.cuh"
 
 namespace {
 
@@ -36,37 +41,16 @@ constexpr int kMaxM = 8;
 constexpr int kSmallK = 256;       // rows this short are cheaper as scalar loads
 constexpr int kWarpTarget = 2048;  // warps wanted before K is split across warps
 
-// A lane's weight word for one step: 8 bytes, so 4 bf16 or 8 int8. The step covers 32 lanes' words.
-template <bool kInt8>
-constexpr int kVal = kInt8 ? 8 : 4;  // values per lane per step
-template <bool kInt8>
-constexpr int kStep = 32 * kVal<kInt8>;  // k per warp step
-template <bool kInt8>
-using WordT = uint2;
+template <int F>
+constexpr int kVal = lx::WordFormat<F>::kValues;  // values per lane per step
+template <int F>
+constexpr int kStep = 32 * kVal<F>;  // k per warp step
 
-// 4 bf16 from 8 bytes. A bf16 is the top half of an f32: the low element is the low half shifted up,
-// the high element is the word with its low half cleared.
-__device__ __forceinline__ void decode4(uint2 v, float* f) {
-  f[0] = __uint_as_float(v.x << 16);
-  f[1] = __uint_as_float(v.x & 0xffff0000u);
-  f[2] = __uint_as_float(v.y << 16);
-  f[3] = __uint_as_float(v.y & 0xffff0000u);
-}
-
-// 8 int8 from 8 bytes.
-__device__ __forceinline__ void decode8_i8(uint2 v, float* f) {
-#pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    f[i] = static_cast<float>(static_cast<int8_t>(v.x >> (8 * i)));
-    f[4 + i] = static_cast<float>(static_cast<int8_t>(v.y >> (8 * i)));
-  }
-}
-
-template <bool kInt8>
-__device__ __forceinline__ void decode_w(uint2 v, float* f) {
-  if constexpr (kInt8) decode8_i8(v, f);
-  else decode4(v, f);
-}
+// A lane's word for one step, and its block scale (NVFP4, decoded to f32; 1 for the other formats).
+struct Lane {
+  uint2 word;
+  float scale;
+};
 
 // The lane's V x values at p as f32, V a multiple of 4. p is 16-byte aligned.
 template <typename TX, int V>
@@ -82,9 +66,16 @@ __device__ __forceinline__ void load_x(const TX* p, float* f) {
       f[4 * i + 3] = t.w;
     }
   } else {
+    // bf16: four values per 8-byte load, the same unpacking the weights use.
     const uint2* q = reinterpret_cast<const uint2*>(p);
 #pragma unroll
-    for (int i = 0; i < V / 4; ++i) decode4(__ldg(q + i), f + 4 * i);
+    for (int i = 0; i < V / 4; ++i) {
+      const uint2 v = __ldg(q + i);
+      f[4 * i] = __uint_as_float(v.x << 16);
+      f[4 * i + 1] = __uint_as_float(v.x & 0xffff0000u);
+      f[4 * i + 2] = __uint_as_float(v.y << 16);
+      f[4 * i + 3] = __uint_as_float(v.y & 0xffff0000u);
+    }
   }
 }
 
@@ -108,37 +99,42 @@ __device__ __forceinline__ void store_y(void* y, bool y_bf16, int64_t idx, float
 
 // ---- vec kernel ------------------------------------------------------------------------------
 
-// Words for the steps u_begin + u (u < KU) of rows first + r (r < RG). Steps past u_end, k past K and
+// Lanes for the steps u_begin + u (u < KU) of rows first + r (r < RG). Steps past u_end, k past K and
 // rows past N read as zero, so the consumer needs no load-side bounds handling.
-template <bool kInt8, int KU, int RG>
-__device__ __forceinline__ void load_steps(const void* w, int64_t first, int N, int K, int lane, int u_begin,
-                                           int u_end, WordT<kInt8> (&raw)[KU][RG]) {
-  using WR = WordT<kInt8>;
-  constexpr int kV = kVal<kInt8>;
-  constexpr int kS = kStep<kInt8>;
-  const WR* words = static_cast<const WR*>(w);
+template <int F, int KU, int RG>
+__device__ __forceinline__ void load_steps(const lx_weight& w, int64_t first, int N, int K, int lane, int u_begin,
+                                           int u_end, Lane (&raw)[KU][RG]) {
+  constexpr int kV = kVal<F>;
+  constexpr int kS = kStep<F>;
+  const uint2* words = static_cast<const uint2*>(w.data);
 #pragma unroll
   for (int u = 0; u < KU; ++u) {
     const int64_t k0 = static_cast<int64_t>(u_begin + u) * kS + kV * lane;
 #pragma unroll
     for (int r = 0; r < RG; ++r) {
-      raw[u][r] = WR{};
+      raw[u][r] = Lane{make_uint2(0, 0), 0.0f};
       // Streamed once per token, so they go evict-first and leave L1 to the x vector they all reuse.
-      if (u_begin + u < u_end && k0 < K && first + r < N)
-        raw[u][r] = __ldcs(words + ((first + r) * K + k0) / kV);
+      if (u_begin + u < u_end && k0 < K && first + r < N) {
+        raw[u][r].word = __ldcs(words + ((first + r) * K + k0) / kV);
+        if constexpr (F == LX_W_NVFP4) {
+          // The lane's word is one 16-value block: its e4m3 scale is the byte at block index k0 / 16.
+          const uint8_t s = __ldcs(static_cast<const uint8_t*>(w.scale) + (first + r) * (K / 16) + k0 / 16);
+          raw[u][r].scale = lx::e4m3_to_f32(s);
+        } else {
+          raw[u][r].scale = 1.0f;
+        }
+      }
     }
   }
 }
 
 // Block b owns kWarps / S row groups of RG rows each. Warp w is part `w % S` of group `w / S`.
-template <bool kInt8, typename TX, int RG, int S, int KU>
+template <int F, typename TX, int RG, int S, int KU>
 __global__ void __launch_bounds__(kThreads)
-gemv_vec_kernel(const TX* __restrict__ x, int ld_x, const void* __restrict__ w, int K,
-                const float* __restrict__ w_scale, const void* __restrict__ bias, bool bias_bf16,
-                void* __restrict__ y, bool y_bf16, int ld_y, int M, int N, float alpha, float beta) {
-  using WR = WordT<kInt8>;
-  constexpr int kV = kVal<kInt8>;
-  constexpr int kS = kStep<kInt8>;
+gemv_vec_kernel(const TX* __restrict__ x, int ld_x, const lx_weight w, int K, const void* __restrict__ bias,
+                bool bias_bf16, void* __restrict__ y, bool y_bf16, int ld_y, int M, int N, float alpha, float beta) {
+  constexpr int kV = kVal<F>;
+  constexpr int kS = kStep<F>;
   constexpr int kGroups = kWarps / S;
   __shared__ float partial[kWarps][RG * kMaxM];  // split-K partial sums, used when S > 1
 
@@ -159,15 +155,15 @@ gemv_vec_kernel(const TX* __restrict__ x, int ld_x, const void* __restrict__ w, 
     for (int m = 0; m < kMaxM; ++m) acc[r][m] = 0.0f;
 
   // The first words go out before the dependency wait; x and y are read after it.
-  WR cur[KU][RG];
-  load_steps<kInt8, KU, RG>(w, first, N, K, lane, u0, u1, cur);
+  Lane cur[KU][RG];
+  load_steps<F, KU, RG>(w, first, N, K, lane, u0, u1, cur);
   cudaGridDependencySynchronize();
 
   // Warp-uniform guard: the whole warp takes the same branch, so the shuffles below stay full-warp.
   if (first < N) {
     for (int j = u0; j < u1; j += KU) {
-      WR nxt[KU][RG];  // the next KU steps are in flight while these are consumed
-      load_steps<kInt8, KU, RG>(w, first, N, K, lane, j + KU, u1, nxt);
+      Lane nxt[KU][RG];  // the next KU steps are in flight while these are consumed
+      load_steps<F, KU, RG>(w, first, N, K, lane, j + KU, u1, nxt);
 #pragma unroll
       for (int u = 0; u < KU; ++u) {
         const int unit = j + u;
@@ -175,7 +171,7 @@ gemv_vec_kernel(const TX* __restrict__ x, int ld_x, const void* __restrict__ w, 
         if (unit < u1 && k0 < K) {
           float wf[RG][kV];
 #pragma unroll
-          for (int r = 0; r < RG; ++r) decode_w<kInt8>(cur[u][r], wf[r]);
+          for (int r = 0; r < RG; ++r) lx::WordFormat<F>::decode(cur[u][r].word, cur[u][r].scale, wf[r]);
 #pragma unroll
           for (int m = 0; m < kMaxM; ++m) {
             if (m < M) {
@@ -208,12 +204,11 @@ gemv_vec_kernel(const TX* __restrict__ x, int ld_x, const void* __restrict__ w, 
       for (int r = 0; r < RG; ++r) {
         const int64_t n = first + r;
         if (n >= N) continue;
-        float scale = 1.0f;
-        if constexpr (kInt8) scale = w_scale[n];
+        const float rf = lx::WordFormat<F>::row_factor(w, n);
         const float b = bias_at(bias, bias_bf16, n);
 #pragma unroll
         for (int m = 0; m < kMaxM; ++m)
-          if (m < M) store_y(y, y_bf16, static_cast<int64_t>(m) * ld_y + n, scale * acc[r][m] + b, alpha, beta);
+          if (m < M) store_y(y, y_bf16, static_cast<int64_t>(m) * ld_y + n, rf * acc[r][m] + b, alpha, beta);
       }
     }
   } else {
@@ -232,10 +227,8 @@ gemv_vec_kernel(const TX* __restrict__ x, int ld_x, const void* __restrict__ w, 
       if (n >= N) continue;
       float sum = 0.0f;
       for (int p = 0; p < S; ++p) sum += partial[g * S + p][r * kMaxM + m];
-      float scale = 1.0f;
-      if constexpr (kInt8) scale = w_scale[n];
-      store_y(y, y_bf16, static_cast<int64_t>(m) * ld_y + n, scale * sum + bias_at(bias, bias_bf16, n), alpha,
-              beta);
+      const float rf = lx::WordFormat<F>::row_factor(w, n);
+      store_y(y, y_bf16, static_cast<int64_t>(m) * ld_y + n, rf * sum + bias_at(bias, bias_bf16, n), alpha, beta);
     }
   }
 }
@@ -244,11 +237,10 @@ gemv_vec_kernel(const TX* __restrict__ x, int ld_x, const void* __restrict__ w, 
 
 // One warp per block. The warp covers 32 / lpr rows: lane c of a row's group of lpr lanes reads the
 // e consecutive inputs starting at c * e. Scalar loads, so any stride or alignment works.
-template <bool kInt8, typename TX>
-__global__ void gemv_small_kernel(const TX* __restrict__ x, int ld_x, const void* __restrict__ w,
-                                  const float* __restrict__ w_scale, const void* __restrict__ bias,
-                                  bool bias_bf16, void* __restrict__ y, bool y_bf16, int ld_y, int M, int N,
-                                  int K, int lpr, int e, float alpha, float beta) {
+template <int F, typename TX>
+__global__ void gemv_small_kernel(const TX* __restrict__ x, int ld_x, const lx_weight w,
+                                  const void* __restrict__ bias, bool bias_bf16, void* __restrict__ y, bool y_bf16,
+                                  int ld_y, int M, int N, int K, int lpr, int e, float alpha, float beta) {
   cudaTriggerProgrammaticLaunchCompletion();
   cudaGridDependencySynchronize();  // x and w may both be written by the previous kernel
   const int lane = threadIdx.x;
@@ -262,9 +254,7 @@ __global__ void gemv_small_kernel(const TX* __restrict__ x, int ld_x, const void
     for (int i = 0; i < e; ++i) {
       const int k = c * e + i;
       if (k >= K) break;
-      float wv;
-      if constexpr (kInt8) wv = static_cast<float>(static_cast<const int8_t*>(w)[n * K + k]);
-      else wv = lx::to_f32(static_cast<const bf16*>(w)[n * K + k]);
+      const float wv = lx::element<F>(w, n, k, K);
 #pragma unroll
       for (int m = 0; m < kMaxM; ++m)
         if (m < M) acc[m] = fmaf(wv, lx::to_f32(x[static_cast<int64_t>(m) * ld_x + k]), acc[m]);
@@ -277,12 +267,11 @@ __global__ void gemv_small_kernel(const TX* __restrict__ x, int ld_x, const void
     for (int m = 0; m < kMaxM; ++m) acc[m] += __shfl_xor_sync(0xffffffffu, acc[m], off);
 
   if (c == 0 && n < N) {
-    float scale = 1.0f;
-    if constexpr (kInt8) scale = w_scale[n];
+    const float rf = lx::WordFormat<F>::row_factor(w, n);
     const float b = bias_at(bias, bias_bf16, n);
 #pragma unroll
     for (int m = 0; m < kMaxM; ++m)
-      if (m < M) store_y(y, y_bf16, static_cast<int64_t>(m) * ld_y + n, scale * acc[m] + b, alpha, beta);
+      if (m < M) store_y(y, y_bf16, static_cast<int64_t>(m) * ld_y + n, rf * acc[m] + b, alpha, beta);
   }
 }
 
@@ -315,8 +304,7 @@ __global__ void quantize_w8_kernel(const bf16* __restrict__ w, int8_t* __restric
 struct Args {
   const void* x;
   int ld_x;
-  const void* w;
-  const float* w_scale;
+  lx_weight w;
   const void* bias;
   bool bias_bf16;
   void* y;
@@ -325,6 +313,7 @@ struct Args {
   int M, N, K;
   float alpha, beta;
   cudaStream_t stream;
+  bool x_bf16;
 };
 
 // Programmatic dependent launch: this kernel may start while the previous one in the stream drains,
@@ -342,7 +331,7 @@ cudaLaunchConfig_t pdl_config(unsigned blocks, int threads, cudaStream_t stream,
   return cfg;
 }
 
-template <bool kInt8, typename TX>
+template <int F, typename TX>
 cudaError_t launch_small(const Args& a) {
   // Lanes per row: the smallest power of two (at most 32) that gives each lane at most 8 inputs.
   int lpr = 1;
@@ -352,41 +341,48 @@ cudaError_t launch_small(const Args& a) {
   const unsigned blocks = static_cast<unsigned>((a.N + rows_per_warp - 1) / rows_per_warp);
   cudaLaunchAttribute attr{};
   const cudaLaunchConfig_t cfg = pdl_config(blocks, 32, a.stream, attr);
-  cudaLaunchKernelEx(&cfg, gemv_small_kernel<kInt8, TX>, static_cast<const TX*>(a.x), a.ld_x, a.w, a.w_scale,
-                     a.bias, a.bias_bf16, a.y, a.y_bf16, a.ld_y, a.M, a.N, a.K, lpr, e, a.alpha, a.beta);
+  cudaLaunchKernelEx(&cfg, gemv_small_kernel<F, TX>, static_cast<const TX*>(a.x), a.ld_x, a.w, a.bias, a.bias_bf16,
+                     a.y, a.y_bf16, a.ld_y, a.M, a.N, a.K, lpr, e, a.alpha, a.beta);
   return cudaGetLastError();
 }
 
-template <bool kInt8, typename TX, int RG, int S, int KU>
+template <int F, typename TX, int RG, int S, int KU>
 cudaError_t run_vec(const Args& a) {
   constexpr int kGroups = kWarps / S;
   const int64_t rows_per_block = static_cast<int64_t>(kGroups) * RG;
   const unsigned blocks = static_cast<unsigned>((a.N + rows_per_block - 1) / rows_per_block);
   cudaLaunchAttribute attr{};
   const cudaLaunchConfig_t cfg = pdl_config(blocks, kThreads, a.stream, attr);
-  cudaLaunchKernelEx(&cfg, gemv_vec_kernel<kInt8, TX, RG, S, KU>, static_cast<const TX*>(a.x), a.ld_x, a.w, a.K,
-                     a.w_scale, a.bias, a.bias_bf16, a.y, a.y_bf16, a.ld_y, a.M, a.N, a.alpha, a.beta);
+  cudaLaunchKernelEx(&cfg, gemv_vec_kernel<F, TX, RG, S, KU>, static_cast<const TX*>(a.x), a.ld_x, a.w, a.K, a.bias,
+                     a.bias_bf16, a.y, a.y_bf16, a.ld_y, a.M, a.N, a.alpha, a.beta);
   return cudaGetLastError();
 }
 
-// The vec kernel's shape for one launch. S warps split each row's steps when N is too small to keep
-// kWarpTarget warps busy. The rest is from the sweep on the 5070 Ti.
+// The vec kernel's shape for one launch: S warps split each row's steps, RG rows share a warp and KU
+// steps' loads are in flight. The heuristic is from the sweep on the 5070 Ti.
 struct VecConfig {
-  int S;   // warps per row group
-  int RG;  // rows per warp
-  int KU;  // steps whose loads are in flight per warp
+  int S;
+  int RG;
+  int KU;
 };
 
-VecConfig choose_vec(int N, int K, int M, bool int8) {
-  const int step = 32 * (int8 ? 8 : 4);
+// Every shape the vec kernel is built for. The autotuner's variant index picks one of these.
+constexpr VecConfig kVariants[] = {{1, 1, 1}, {1, 1, 2}, {1, 1, 4}, {1, 2, 1}, {2, 1, 1},
+                                   {2, 1, 2}, {2, 1, 4}, {4, 1, 1}, {4, 1, 2}, {4, 1, 4},
+                                   {8, 1, 1}, {8, 1, 2}, {8, 1, 4}};
+constexpr int kNumVariants = sizeof(kVariants) / sizeof(kVariants[0]);
+
+VecConfig choose_vec(int N, int K, int M, int F) {
+  const int step = F == LX_W_BF16 ? 128 : (F == LX_W_NVFP4 ? 512 : 256);  // k per warp step
   const int steps = (K + step - 1) / step;
   int S = 1;
   while (S < 8 && static_cast<int64_t>(N) * S < kWarpTarget && steps / (2 * S) >= 1) S *= 2;
   // Rows per warp and steps in flight, from the sweep. At M = 1 a warp that owns the whole row takes
-  // two rows, so one x load serves both; split rows already have enough warps in flight.
+  // two rows, so one x load serves both; split rows already have enough warps in flight. The byte
+  // formats (int8, fp8, nvfp4) share this rule: each moves 256 weight bytes per warp step.
   int RG = 1;
   int KU = 2;
-  if (int8 && M == 1) {
+  if (F != LX_W_BF16 && M == 1) {
     RG = S == 1 ? 2 : 1;
     KU = 1;
   }
@@ -394,11 +390,11 @@ VecConfig choose_vec(int N, int K, int M, bool int8) {
   return VecConfig{S, RG, KU};
 }
 
-// Dispatch to the instantiation for (S, RG, KU). Only these combinations are built.
-template <bool kInt8, typename TX>
+// Dispatch to the instantiation for one VecConfig. Only the variants in kVariants are built.
+template <int F, typename TX>
 cudaError_t dispatch_vec(const Args& a, const VecConfig& c) {
 #define LX_VEC_CASE(S_, RG_, KU_) \
-  if (c.S == S_ && c.RG == RG_ && c.KU == KU_) return run_vec<kInt8, TX, RG_, S_, KU_>(a);
+  if (c.S == S_ && c.RG == RG_ && c.KU == KU_) return run_vec<F, TX, RG_, S_, KU_>(a);
   LX_VEC_CASE(1, 1, 1) LX_VEC_CASE(1, 1, 2) LX_VEC_CASE(1, 1, 4) LX_VEC_CASE(1, 2, 1)
   LX_VEC_CASE(2, 1, 1) LX_VEC_CASE(2, 1, 2) LX_VEC_CASE(2, 1, 4)
   LX_VEC_CASE(4, 1, 1) LX_VEC_CASE(4, 1, 2) LX_VEC_CASE(4, 1, 4)
@@ -407,39 +403,73 @@ cudaError_t dispatch_vec(const Args& a, const VecConfig& c) {
   return cudaErrorInvalidValue;
 }
 
-template <bool kInt8, typename TX>
-cudaError_t launch_vec(const Args& a) {
-  return dispatch_vec<kInt8, TX>(a, choose_vec(a.N, a.K, a.M, kInt8));
+// The tunable kernel name per format: the autotuner keys its table on (name, M bucket, N, K), and a
+// format changes which variant is fastest, so each format has its own entry.
+const char* tune_name(int F) {
+  switch (F) {
+    case LX_W_BF16: return "gemv_w_bf16";
+    case LX_W_INT8: return "gemv_w_int8";
+    case LX_W_FP8: return "gemv_w_fp8";
+    default: return "gemv_w_nvfp4";
+  }
 }
 
-template <bool kInt8, typename TX>
+// The variant names, in kVariants order, for each format.
+#define LX_GEMV_VARIANT_NAMES                                                                          \
+  "s1r1k1", "s1r1k2", "s1r1k4", "s1r2k1", "s2r1k1", "s2r1k2", "s2r1k4", "s4r1k1", "s4r1k2", "s4r1k4", \
+      "s8r1k1", "s8r1k2", "s8r1k4"
+const lx::TunableRegistration kRegBf16("gemv_w_bf16", {LX_GEMV_VARIANT_NAMES});
+const lx::TunableRegistration kRegInt8("gemv_w_int8", {LX_GEMV_VARIANT_NAMES});
+const lx::TunableRegistration kRegFp8("gemv_w_fp8", {LX_GEMV_VARIANT_NAMES});
+const lx::TunableRegistration kRegNvfp4("gemv_w_nvfp4", {LX_GEMV_VARIANT_NAMES});
+
+template <int F, typename TX>
 cudaError_t launch(const Args& a) {
   // Vector loads need 16-byte alignment: the weight base, and the x base and row stride. K must be a
   // multiple of the lane's values per step, so each lane's word is whole within its row.
-  const bool aligned = reinterpret_cast<uintptr_t>(a.w) % 16 == 0 &&
+  const bool aligned = reinterpret_cast<uintptr_t>(a.w.data) % 16 == 0 &&
                        ((reinterpret_cast<uintptr_t>(a.x) | (static_cast<uint64_t>(a.ld_x) * sizeof(TX))) % 16 == 0);
-  if (a.K <= kSmallK || a.K % kVal<kInt8> != 0 || !aligned) return launch_small<kInt8, TX>(a);
-  return launch_vec<kInt8, TX>(a);
+  if (a.K <= kSmallK || a.K % kVal<F> != 0 || !aligned) return launch_small<F, TX>(a);
+  const int tuned = lx_tune_get(tune_name(F), a.M, a.N, a.K);
+  const VecConfig c = tuned >= 0 && tuned < kNumVariants ? kVariants[tuned] : choose_vec(a.N, a.K, a.M, F);
+  return dispatch_vec<F, TX>(a, c);
+}
+
+template <int F>
+cudaError_t launch_format(const Args& a) {
+  return a.x_bf16 ? launch<F, bf16>(a) : launch<F, float>(a);
 }
 
 bool valid_dtype(lx_dtype d) { return d == LX_F32 || d == LX_BF16; }
 
 }  // namespace
 
-extern "C" int lx_gemv(const void* x, lx_dtype x_dtype, int ld_x, const void* w, lx_wtype w_type, const float* w_scale,
-                       const void* bias, lx_dtype bias_dtype, void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K,
-                       float alpha, float beta, void* stream) {
+extern "C" int lx_gemv_w(const void* x, lx_dtype x_dtype, int ld_x, const lx_weight* w, const void* bias,
+                         lx_dtype bias_dtype, void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K, float alpha,
+                         float beta, void* stream) {
   if (M == 0 || N == 0) return 0;
   if (M < 0 || M > kMaxM || K <= 0 || ld_x < K || ld_y < N) return static_cast<int>(cudaErrorInvalidValue);
-  if (!valid_dtype(x_dtype) || !valid_dtype(y_dtype) || !valid_dtype(bias_dtype)) return static_cast<int>(cudaErrorInvalidValue);
-  if (w_type != LX_W_BF16 && w_type != LX_W_INT8) return static_cast<int>(cudaErrorInvalidValue);
-  if (!x || !w || !y || (w_type == LX_W_INT8 && !w_scale)) return static_cast<int>(cudaErrorInvalidValue);
+  if (!valid_dtype(x_dtype) || !valid_dtype(y_dtype) || !valid_dtype(bias_dtype))
+    return static_cast<int>(cudaErrorInvalidValue);
+  if (!w || !w->data || !x || !y) return static_cast<int>(cudaErrorInvalidValue);
+  switch (w->type) {
+    case LX_W_BF16:
+      break;
+    case LX_W_INT8:
+    case LX_W_FP8:
+      if (!w->scale) return static_cast<int>(cudaErrorInvalidValue);
+      break;
+    case LX_W_NVFP4:
+      if (!w->scale || K % 16 != 0) return static_cast<int>(cudaErrorInvalidValue);
+      break;
+    default:
+      return static_cast<int>(cudaErrorInvalidValue);
+  }
 
   const Args a{
       .x = x,
       .ld_x = ld_x,
-      .w = w,
-      .w_scale = w_scale,
+      .w = *w,
       .bias = bias,
       .bias_bf16 = bias_dtype == LX_BF16,
       .y = y,
@@ -451,14 +481,29 @@ extern "C" int lx_gemv(const void* x, lx_dtype x_dtype, int ld_x, const void* w,
       .alpha = alpha,
       .beta = beta,
       .stream = static_cast<cudaStream_t>(stream),
+      .x_bf16 = x_dtype == LX_BF16,
   };
-  cudaError_t e;
-  if (w_type == LX_W_INT8) {
-    e = x_dtype == LX_BF16 ? launch<true, bf16>(a) : launch<true, float>(a);
-  } else {
-    e = x_dtype == LX_BF16 ? launch<false, bf16>(a) : launch<false, float>(a);
+  cudaError_t e = cudaErrorInvalidValue;
+  switch (w->type) {
+    case LX_W_BF16: e = launch_format<LX_W_BF16>(a); break;
+    case LX_W_INT8: e = launch_format<LX_W_INT8>(a); break;
+    case LX_W_FP8: e = launch_format<LX_W_FP8>(a); break;
+    case LX_W_NVFP4: e = launch_format<LX_W_NVFP4>(a); break;
   }
   return static_cast<int>(e);
+}
+
+// The original entry point: a bf16 or int8 weight with a per-row scale (lx_gemv_w with a lx_weight).
+extern "C" int lx_gemv(const void* x, lx_dtype x_dtype, int ld_x, const void* w, lx_wtype w_type, const float* w_scale,
+                       const void* bias, lx_dtype bias_dtype, void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K,
+                       float alpha, float beta, void* stream) {
+  if (w_type != LX_W_BF16 && w_type != LX_W_INT8) return static_cast<int>(cudaErrorInvalidValue);
+  lx_weight lw{};
+  lw.type = w_type;
+  lw.data = w;
+  lw.scale = w_scale;
+  lw.global = 1.0f;
+  return lx_gemv_w(x, x_dtype, ld_x, &lw, bias, bias_dtype, y, y_dtype, ld_y, M, N, K, alpha, beta, stream);
 }
 
 extern "C" int lx_quantize_w8(const void* w, int8_t* q, float* scale, int64_t rows, int cols, void* stream) {

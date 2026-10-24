@@ -217,12 +217,16 @@ LX_API int64_t lx_moe_workspace_bytes(int T, int I, int top_k);
 //               (requires K % 16 == 0; the loader folds a checkpoint's global scale so the
 //               engine always multiplies)
 // Stacked expert weights are [E, N, K] in the same format, every expert laid out as above, one
-// after the other (scales likewise [E, N] or [E, N, K / 16]; global is one value for the stack).
+// after the other (scales likewise [E, N] or [E, N, K / 16]). An NVFP4 stack's experts each have a
+// global scale in the checkpoint (weight_scale_2 is [E]); folding those into the e4m3 block scales
+// would round them twice, so the stack carries them: expert_global is [E] f32 on the device, and
+// null means every expert uses `global`. Consumers of a stack read the expert's own global.
 typedef struct {
   lx_wtype type;
   const void* data;
-  const void* scale;  // f32 [N] for INT8 / FP8, e4m3 [N, K / 16] for NVFP4, null for BF16
-  float global;       // NVFP4 only (1 otherwise)
+  const void* scale;          // f32 [N] for INT8 / FP8, e4m3 [N, K / 16] for NVFP4, null for BF16
+  float global;               // NVFP4 only (1 otherwise)
+  const float* expert_global;  // NVFP4 stacks only: f32 [E] on the device, or null
 } lx_weight;
 
 // How a tensor-core product does its math. Weights are always read in their stored format; this
