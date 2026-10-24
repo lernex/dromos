@@ -1,12 +1,10 @@
-// The autotuner, on a kernel registered for the test: a correct variant, a variant that is wrong, and
-// one this device does not run. The tuner must reject the wrong one and skip the other, whatever their
-// speed. Needs the GPU: the test binary runs on the server.
-#include <cuda_runtime.h>
-
+// The autotuner through the backend ABI alone: the table keys the backend writes, the kernels it registers and
+// their variants, and what the tuner reports for them. Needs the GPU: the test binary runs on the server.
 #include <filesystem>
 #include <string>
 #include <vector>
 
+#include "cuda/kernels.h"
 #include "cuda/tunable.h"
 #include "doctest.h"
 #include "runtime/plan.h"
@@ -14,36 +12,53 @@
 
 namespace {
 
-// out[m, n] = scale * (i % 7 - 3): variant 0 is the reference, variant 1 is off by 10% and so must be
-// rejected, and variant 2 is not supported here and must be skipped. The values are made on the host,
-// so the test needs no device code of its own.
-int run_test_scale(int variant, const lx::TuneProblem& p, float* out, void* stream) {
-  if (variant == 2) return static_cast<int>(cudaErrorNotSupported);
-  std::vector<float> host(static_cast<size_t>(p.M) * p.N);
-  const float scale = variant == 1 ? 2.2f : 2.0f;
-  for (size_t i = 0; i < host.size(); ++i) host[i] = scale * (static_cast<float>(i % 7) - 3.0f);
-  cudaError_t err = cudaMemcpyAsync(out, host.data(), host.size() * sizeof(float), cudaMemcpyHostToDevice,
-                                    static_cast<cudaStream_t>(stream));
-  if (err == cudaSuccess) err = cudaStreamSynchronize(static_cast<cudaStream_t>(stream));
-  return static_cast<int>(err);
+// A problem in the given format, math and expert count, with the default shape.
+lx_tune_problem problem(int weight, int math, int experts) { return lx_tune_problem{1, 1, 1, experts, weight, math}; }
+
+// The table key the backend writes for a problem (lx_tune_key).
+std::string key_of(const char* kernel, const lx_tune_problem& p) {
+  char buf[256] = {};
+  lx_tune_key(kernel, &p, buf, sizeof buf);
+  return buf;
 }
 
-const lx::TunableRegistration reg_test_scale("test_scale", {"exact", "off_by_ten_percent", "unsupported"},
-                                             &run_test_scale);
+// The names of the kernels the backend registered (lx_tune_kernels).
+std::vector<std::string> registered_kernels() {
+  const char* names[256];
+  const int total = lx_tune_kernels(names, 256);
+  std::vector<std::string> out;
+  for (int k = 0; k < total && k < 256; ++k) out.emplace_back(names[k]);
+  return out;
+}
 
 }  // namespace
 
 TEST_CASE("tune keys: the kernel's name, with format, math and experts when they differ") {
-  lx::TuneProblem p;
-  CHECK(lx::tune_key("mhc_read", p) == "mhc_read");
-  p.weight = 2;
-  p.math = 2;
-  CHECK(lx::tune_key("gemm_w", p) == "gemm_w@w2m2");
-  p.experts = 128;
-  CHECK(lx::tune_key("moe", p) == "moe@w2m2@e128");
+  CHECK(key_of("mhc_read", problem(0, 0, 1)) == "mhc_read");
+  CHECK(key_of("gemm_w", problem(2, 2, 1)) == "gemm_w@w2m2");
+  CHECK(key_of("moe", problem(2, 2, 128)) == "moe@w2m2@e128");
 }
 
-TEST_CASE("the tuner never picks a variant that disagrees with variant 0, or one the device does not run") {
+TEST_CASE("an unknown kernel runs nothing and has no variants") {
+  float out[4] = {};
+  const lx_tune_problem p = problem(0, 0, 1);
+  CHECK(lx_tune_runnable("no_such_kernel") == 0);
+  CHECK(lx_tune_variants("no_such_kernel") == 0);
+  CHECK(lx_tune_variant_name("no_such_kernel", 0) == nullptr);
+  CHECK(lx_tune_run("no_such_kernel", 0, &p, out, nullptr) == LX_ERR_NOT_SUPPORTED);
+}
+
+TEST_CASE("the backend registers memory_fuse as a runnable kernel with its two variants") {
+  bool found = false;
+  for (const std::string& name : registered_kernels()) found = found || name == "memory_fuse";
+  REQUIRE(found);
+  CHECK(lx_tune_runnable("memory_fuse") == 1);
+  CHECK(lx_tune_variants("memory_fuse") == 2);
+  CHECK(std::string(lx_tune_variant_name("memory_fuse", 0)) == "block");
+  CHECK(std::string(lx_tune_variant_name("memory_fuse", 1)) == "cluster8");
+}
+
+TEST_CASE("the tuner times the runnable kernels, and each entry names a variant the backend registered") {
   std::vector<lx::TuneProblem> problems;
   for (int m : {1, 8, 64}) {
     lx::TuneProblem p;
@@ -57,17 +72,24 @@ TEST_CASE("the tuner never picks a variant that disagrees with variant 0, or one
   options.repeats = 3;
   options.sample_ms = 0.5;
   const lx::runtime::TuneReport report = lx::runtime::tune(problems, options);
-  CHECK(report.rejected >= 3);  // variant 1, once per problem
-  CHECK(report.skipped >= 3);   // variant 2, once per problem
-  int test_entries = 0;
+
+  const std::vector<std::string> kernels = registered_kernels();
+  int runnable = 0;
+  for (const std::string& name : kernels) runnable += lx_tune_runnable(name.c_str());
+  CHECK(report.kernels == runnable);
   for (const auto& e : report.entries) {
-    if (e.key != "test_scale") continue;
-    ++test_entries;
-    CHECK(e.variant == 0);
-    CHECK(e.variant_name == "exact");
+    // an entry's key is its kernel's name, with the format, math and experts appended when they differ
+    const std::string* kernel = nullptr;
+    for (const std::string& name : kernels)
+      if (e.key == name || e.key.rfind(name + "@", 0) == 0) kernel = &name;
+    REQUIRE(kernel != nullptr);
+    CHECK(e.variant >= 0);
+    CHECK(e.variant < lx_tune_variants(kernel->c_str()));
+    const char* vname = lx_tune_variant_name(kernel->c_str(), e.variant);
+    REQUIRE(vname != nullptr);
+    CHECK(e.variant_name == vname);
     CHECK(e.us > 0);
   }
-  CHECK(test_entries == 3);
 }
 
 TEST_CASE("a table saved and loaded sets the variants the kernels read") {
