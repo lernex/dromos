@@ -1,8 +1,10 @@
 // probe_machine: what the machine can move, measured the way the offload runtime moves it.
 #include <dlfcn.h>
 #include <fcntl.h>
-#include <immintrin.h>
 #include <unistd.h>
+#if defined(__x86_64__)
+#include <immintrin.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -27,6 +29,18 @@ void check(int status, const char* what) {
 }
 
 double since(Clock::time_point t) { return std::chrono::duration<double>(Clock::now() - t).count(); }
+
+// A read-only descriptor that bypasses the page cache: O_DIRECT on Linux, F_NOCACHE where there is no
+// O_DIRECT (macOS).
+int open_direct(const char* path) {
+#if defined(O_DIRECT)
+  return open(path, O_RDONLY | O_DIRECT);
+#else
+  const int fd = open(path, O_RDONLY);
+  if (fd >= 0) fcntl(fd, F_NOCACHE, 1);
+  return fd;
+#endif
+}
 
 std::string format(const char* f, ...) {
   char buf[512];
@@ -54,7 +68,8 @@ double copy_rate(void* host, void* dev, int64_t chunk, int64_t total, bool h2d, 
   return best;
 }
 
-__attribute__((target("avx2"))) uint64_t sum_avx2(const char* p, size_t bytes) {
+#if defined(__x86_64__)
+__attribute__((target("avx2"))) uint64_t sum_wide(const char* p, size_t bytes) {
   __m256i acc = _mm256_setzero_si256(), acc2 = _mm256_setzero_si256();
   for (size_t i = 0; i + 64 <= bytes; i += 64) {
     acc = _mm256_xor_si256(acc, _mm256_load_si256(reinterpret_cast<const __m256i*>(p + i)));
@@ -63,6 +78,18 @@ __attribute__((target("avx2"))) uint64_t sum_avx2(const char* p, size_t bytes) {
   acc = _mm256_xor_si256(acc, acc2);
   return static_cast<uint64_t>(_mm256_extract_epi64(acc, 0) ^ _mm256_extract_epi64(acc, 3));
 }
+#else
+// Elsewhere (ARM): 64-bit words in four lanes, which the compiler turns into vector loads.
+uint64_t sum_wide(const char* p, size_t bytes) {
+  uint64_t acc[4] = {0, 0, 0, 0};
+  for (size_t i = 0; i + 32 <= bytes; i += 32) {
+    uint64_t w[4];
+    std::memcpy(w, p + i, sizeof w);
+    for (int j = 0; j < 4; ++j) acc[j] ^= w[j];
+  }
+  return acc[0] ^ acc[1] ^ acc[2] ^ acc[3];
+}
+#endif
 
 double ram_rate(const char* buf, size_t bytes, int threads) {
   double best = 0;
@@ -72,7 +99,7 @@ double ram_rate(const char* buf, size_t bytes, int threads) {
     const size_t slice = bytes / threads / 64 * 64;
     const auto t0 = Clock::now();
     for (int t = 0; t < threads; ++t)
-      pool.emplace_back([&, t] { sink += sum_avx2(buf + t * slice, slice); });
+      pool.emplace_back([&, t] { sink += sum_wide(buf + t * slice, slice); });
     for (auto& th : pool) th.join();
     best = std::max(best, slice * threads / since(t0) / 1e9);
   }
@@ -80,7 +107,7 @@ double ram_rate(const char* buf, size_t bytes, int threads) {
 }
 
 double nvme_rate(const std::filesystem::path& file, int threads, int64_t request, int64_t total, bool sequential) {
-  const int fd = open(file.c_str(), O_RDONLY | O_DIRECT);
+  const int fd = open_direct(file.c_str());
   if (fd < 0) return 0;
   const int64_t size = lseek(fd, 0, SEEK_END);
   if (size < request * 4) {
@@ -143,7 +170,7 @@ double cufile_rate(const std::filesystem::path& file, int64_t request, int64_t t
     note = format("cuFileDriverOpen error %d", e.err);
     return 0;
   }
-  const int fd = open(file.c_str(), O_RDONLY | O_DIRECT);
+  const int fd = open_direct(file.c_str());
   if (fd < 0) return 0;
   CuFileDescr d{};
   d.type = 1;  // CU_FILE_HANDLE_TYPE_OPAQUE_FD
