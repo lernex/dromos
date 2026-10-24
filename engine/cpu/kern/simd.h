@@ -442,4 +442,114 @@ static inline V vexp(V x) {
 }
 #endif
 
+// a * b + c rounded once, for the scalar tails of the dot tiles: written out, so whether a tail is fused
+// never depends on how the compiler inlined the weight's decoder (the formats must agree to the bit).
+#if LX_ISA_CODE >= 10 && LX_ISA_CODE < 50
+static inline float sfma(float a, float b, float c) {
+  return _mm_cvtss_f32(_mm_fmadd_ss(_mm_set_ss(a), _mm_set_ss(b), _mm_set_ss(c)));
+}
+#else
+static inline float sfma(float a, float b, float c) { return __builtin_fmaf(a, b, c); }
+#endif
+
+// Double accumulators for the exact dots of the quantized maths (kern/isa.cpp, tile_exact): a vector of W
+// f32 products, each exact, is widened in two halves and added to two double vectors. Every partial sum is
+// exact too, so neither the order nor the width changes the result.
+#if LX_ISA_CODE >= 10 && LX_ISA_CODE < 20
+using VD = __m256d;
+static inline VD vd_zero() { return _mm256_setzero_pd(); }
+static inline void vd_acc(VD& lo, VD& hi, V p) {
+  lo = _mm256_add_pd(lo, _mm256_cvtps_pd(_mm256_castps256_ps128(p)));
+  hi = _mm256_add_pd(hi, _mm256_cvtps_pd(_mm256_extractf128_ps(p, 1)));
+}
+static inline double vd_hsum(VD lo, VD hi) {
+  const __m256d s = _mm256_add_pd(lo, hi);
+  const __m128d h = _mm_add_pd(_mm256_castpd256_pd128(s), _mm256_extractf128_pd(s, 1));
+  return _mm_cvtsd_f64(_mm_add_sd(h, _mm_unpackhi_pd(h, h)));
+}
+#elif LX_ISA_CODE >= 20 && LX_ISA_CODE < 50
+using VD = __m512d;
+static inline VD vd_zero() { return _mm512_setzero_pd(); }
+static inline void vd_acc(VD& lo, VD& hi, V p) {
+  lo = _mm512_add_pd(lo, _mm512_cvtps_pd(_mm512_castps512_ps256(p)));
+  hi = _mm512_add_pd(hi, _mm512_cvtps_pd(_mm256_castpd_ps(_mm512_extractf64x4_pd(_mm512_castps_pd(p), 1))));
+}
+static inline double vd_hsum(VD lo, VD hi) {
+  const __m512d s = _mm512_add_pd(lo, hi);
+  const __m256d q = _mm256_add_pd(_mm512_castpd512_pd256(s), _mm512_extractf64x4_pd(s, 1));
+  const __m128d h = _mm_add_pd(_mm256_castpd256_pd128(q), _mm256_extractf128_pd(q, 1));
+  return _mm_cvtsd_f64(_mm_add_sd(h, _mm_unpackhi_pd(h, h)));
+}
+#elif LX_ISA_CODE >= 50
+using VD = float64x2_t;
+static inline VD vd_zero() { return vdupq_n_f64(0.0); }
+static inline void vd_acc(VD& lo, VD& hi, V p) {
+  lo = vaddq_f64(lo, vcvt_f64_f32(vget_low_f32(p)));
+  hi = vaddq_f64(hi, vcvt_high_f64_f32(p));
+}
+static inline double vd_hsum(VD lo, VD hi) { return vaddvq_f64(vaddq_f64(lo, hi)); }
+#else
+struct VD {
+  double v[2];
+};
+static inline VD vd_zero() { return VD{{0.0, 0.0}}; }
+static inline void vd_acc(VD& lo, VD& hi, V p) {
+  lo.v[0] += p.v[0];
+  lo.v[1] += p.v[1];
+  hi.v[0] += p.v[2];
+  hi.v[1] += p.v[3];
+}
+static inline double vd_hsum(VD lo, VD hi) { return (lo.v[0] + hi.v[0]) + (lo.v[1] + hi.v[1]); }
+#endif
+
+// ---- BF16X ---------------------------------------------------------------------------------------------
+// 32 consecutive values of one 128-value block of an LX_W_BF16X row (layout: kern/table.h, bf16x) to their
+// bf16 bits, in k order: sm the values' 32 sign|mantissa bytes, codes the 16 code bytes that cover them,
+// base the block's largest exponent. A bf16's high byte is sign | exponent >> 1 and its low byte
+// (exponent & 1) << 7 | mantissa, so each half is two masks and a shift of the bytes. Patched values come
+// out with the base exponent (their code is 0); the caller writes their exponents in.
+#if LX_ISA_CODE >= 10 && LX_ISA_CODE < 50
+static inline void bf16x_span32(const uint8_t* sm, const uint8_t* codes, uint32_t base, uint16_t* out) {
+  // Code word g holds values 8g .. 8g + 3 in its bytes' low nibbles and 8g + 4 .. 8g + 7 in the high
+  // ones: interleaving the low and high nibble words puts the codes in k order.
+  const __m128i c = _mm_loadu_si128(reinterpret_cast<const __m128i*>(codes));
+  const __m128i nib = _mm_set1_epi8(15);
+  const __m128i lo = _mm_and_si128(c, nib), hi = _mm_and_si128(_mm_srli_epi16(c, 4), nib);
+  const __m256i code = _mm256_set_m128i(_mm_unpackhi_epi32(lo, hi), _mm_unpacklo_epi32(lo, hi));
+  const __m256i e = _mm256_sub_epi8(_mm256_set1_epi8(static_cast<char>(base)), code);
+  const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(sm));
+  const __m256i m80 = _mm256_set1_epi8(static_cast<char>(0x80)), m7f = _mm256_set1_epi8(0x7f);
+  const __m256i hb = _mm256_or_si256(_mm256_and_si256(v, m80), _mm256_and_si256(_mm256_srli_epi16(e, 1), m7f));
+  const __m256i lb = _mm256_or_si256(_mm256_and_si256(v, m7f), _mm256_and_si256(_mm256_slli_epi16(e, 7), m80));
+  const __m256i a = _mm256_unpacklo_epi8(lb, hb);  // values 0-7 | 16-23
+  const __m256i b = _mm256_unpackhi_epi8(lb, hb);  // values 8-15 | 24-31
+  _mm256_storeu_si256(reinterpret_cast<__m256i*>(out), _mm256_permute2x128_si256(a, b, 0x20));
+  _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + 16), _mm256_permute2x128_si256(a, b, 0x31));
+}
+#elif LX_ISA_CODE >= 50
+static inline void bf16x_span32(const uint8_t* sm, const uint8_t* codes, uint32_t base, uint16_t* out) {
+  const uint8x16_t c = vld1q_u8(codes);
+  const uint32x4_t lo = vreinterpretq_u32_u8(vandq_u8(c, vdupq_n_u8(15)));
+  const uint32x4_t hi = vreinterpretq_u32_u8(vshrq_n_u8(c, 4));
+  const uint8x16_t code[2] = {vreinterpretq_u8_u32(vzip1q_u32(lo, hi)), vreinterpretq_u8_u32(vzip2q_u32(lo, hi))};
+  const uint8x16_t b = vdupq_n_u8(static_cast<uint8_t>(base));
+  for (int h = 0; h < 2; ++h) {
+    const uint8x16_t v = vld1q_u8(sm + 16 * h), e = vsubq_u8(b, code[h]);
+    const uint8x16_t hb = vorrq_u8(vandq_u8(v, vdupq_n_u8(0x80)), vshrq_n_u8(e, 1));
+    const uint8x16_t lb = vorrq_u8(vandq_u8(v, vdupq_n_u8(0x7f)), vshlq_n_u8(e, 7));
+    vst1q_u8(reinterpret_cast<uint8_t*>(out + 16 * h), vzip1q_u8(lb, hb));
+    vst1q_u8(reinterpret_cast<uint8_t*>(out + 16 * h + 8), vzip2q_u8(lb, hb));
+  }
+}
+#else
+static inline void bf16x_span32(const uint8_t* sm, const uint8_t* codes, uint32_t base, uint16_t* out) {
+  for (int i = 0; i < 32; ++i) {
+    const uint32_t c = codes[(i >> 3) * 4 + (i & 3)];
+    const uint32_t e = (base - ((i & 4) ? c >> 4 : c & 15u)) & 0xffu;
+    const uint32_t v = sm[i];
+    out[i] = static_cast<uint16_t>(((v & 0x80u) << 8) | (e << 7) | (v & 0x7fu));
+  }
+}
+#endif
+
 }  // namespace lx::cpu::LX_ISA

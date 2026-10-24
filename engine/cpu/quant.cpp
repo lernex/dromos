@@ -188,12 +188,14 @@ void quantize_act_row(const void* x, int x_dtype, int64_t row, int64_t ld_x, int
     }
     const uint8_t s8 = f32_to_e4m3(amax / (6.0f * g));
     block_scale[b] = s8;
+    // Times the block's reciprocal, as the contract has it (the GPU's quantizer multiplies).
     const float d = e4m3_to_f32(s8) * g;
+    const float r = d > 0.0f ? 1.0f / d : 0.0f;
     for (int p = 0; p < 8; ++p) {
       uint32_t lo = 0, hi = 0;
       if (d > 0.0f) {
-        lo = f32_to_e2m1(v[2 * p] / d);
-        hi = f32_to_e2m1(v[2 * p + 1] / d);
+        lo = f32_to_e2m1(v[2 * p] * r);
+        hi = f32_to_e2m1(v[2 * p + 1] * r);
       }
       q[8 * b + p] = static_cast<uint8_t>(lo | (hi << 4));
     }

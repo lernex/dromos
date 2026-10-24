@@ -90,6 +90,73 @@ struct Row<kW_NVFP4> {
   }
 };
 
+// LX_W_BF16X: 32 values at a time (inside one 128-value block) are decoded to their bf16 bits in the row's
+// buffer and patched there, then read exactly as Row<kW_BF16> reads bf16, in its spans. Every value reaches
+// the dot with the checkpoint's bits and in the same lanes, so the sums are the bf16 product's to the last
+// bit, and the tile keeps bf16's register budget. at() decodes one value (the tail) without moving the
+// row's patch cursor.
+template <>
+struct Row<kW_BF16X> {
+  static constexpr int kSpan = kSpanBF16;  // divides 32
+  static constexpr float kPost = 1.0f;
+  const uint8_t* blk;   // the row's first block
+  const uint8_t* base;  // its base exponents
+  const uint32_t* p0;   // its patches, ascending position
+  const uint32_t* pend;
+  mutable const uint32_t* pp;  // the first patch not yet passed
+  mutable int64_t at_k;        // the first value in buf
+  alignas(64) mutable uint16_t buf[32];
+
+  void init(const WeightRef& w, int64_t n, int64_t K) {
+    const uint8_t* rec = static_cast<const uint8_t*>(w.data) + n * bf16x::row_bytes(K);
+    blk = rec + bf16x::header_bytes(K);
+    base = rec + bf16x::base_offset(K);
+    const uint32_t* slots = reinterpret_cast<const uint32_t*>(rec);
+    if (slots[0] != bf16x::kNoPatch && (slots[0] & 0x80000000u)) {
+      // More patches than slots: they live in the row's overflow record (count, then the patches).
+      const uint32_t* r = reinterpret_cast<const uint32_t*>(rec + static_cast<int64_t>(slots[0] & 0x7fffffffu) * 8);
+      p0 = r + 1;
+      pend = p0 + r[0];
+    } else {
+      p0 = slots;  // unused slots are kNoPatch, whose position is past any k
+      pend = slots + bf16x::patch_slots(K);
+    }
+    pp = p0;
+    at_k = -1;
+  }
+  void decode(int64_t k0) const {
+    const int64_t b = k0 >> 7, j = k0 & 127;
+    const uint8_t* bp = blk + b * bf16x::kBlockBytes;
+    bf16x_span32(bp + j, bp + bf16x::kCodes + j / 2, base[b], buf);
+    while (pp < pend && static_cast<int64_t>(*pp >> 8) < k0) ++pp;
+    for (; pp < pend && static_cast<int64_t>(*pp >> 8) < k0 + 32; ++pp) {
+      const int64_t i = static_cast<int64_t>(*pp >> 8) - k0;
+      buf[i] = static_cast<uint16_t>((buf[i] & 0x807fu) | ((*pp & 0xffu) << 7));
+    }
+    at_k = k0;
+  }
+  V load(int64_t k) const {
+    const int64_t k0 = k & ~int64_t{31};
+    if (k0 != at_k) decode(k0);
+    return load_bf16(buf + (k - k0));
+  }
+  void span(int64_t k, V* out) const {
+    const int64_t k0 = k & ~int64_t{31};
+    if (k0 != at_k) decode(k0);
+    span_bf16(buf + (k - k0), out);
+  }
+  float at(int64_t k) const {
+    const int64_t b = k >> 7, i = k & 127;
+    const uint8_t* bp = blk + b * bf16x::kBlockBytes;
+    const uint32_t c = bp[bf16x::kCodes + (i >> 3) * 4 + (i & 3)];
+    uint32_t e = (base[b] - ((i & 4) ? c >> 4 : c & 15u)) & 0xffu;
+    for (const uint32_t* q = p0; q < pend && static_cast<int64_t>(*q >> 8) <= k; ++q)
+      if (static_cast<int64_t>(*q >> 8) == k) e = *q & 0xffu;
+    const uint32_t v = bp[i];
+    return bf16f(static_cast<uint16_t>(((v & 0x80u) << 8) | (e << 7) | (v & 0x7fu)));
+  }
+};
+
 // The W values at k exactly (kPost applied), for decoding rows into a panel.
 template <int F>
 inline V exact(const Row<F>& row, int64_t k) {
@@ -112,7 +179,13 @@ constexpr int kSmallM = 8;  // up to this many rows the weights are streamed in 
 
 // Bytes of a weight row per element, for the streamed path's prefetch (NVFP4's scales ride along).
 template <int F>
-constexpr int kRowBytesX2 = F == kW_F32 ? 8 : F == kW_BF16 ? 4 : F == kW_NVFP4 ? 1 : 2;  // twice the bytes
+constexpr int kRowBytesX2 = F == kW_F32 ? 8 : F == kW_BF16 ? 4 : F == kW_BF16X ? 3 : F == kW_NVFP4 ? 1 : 2;
+// The distance between rows, in bytes.
+template <int F>
+inline int64_t row_stride(int64_t K) {
+  if constexpr (F == kW_BF16X) return bf16x::row_bytes(K);
+  else return K * kRowBytesX2<F> / 2;
+}
 
 // out[m * ld_out + r] = sum_k x[m, k] * row_r[k] for an MR x NR tile. With pf, the tile also pulls
 // the next tile's weight bytes (pf, the rows right after its own) toward the core as it goes, at the
@@ -160,7 +233,7 @@ inline void tile(const float* x, int64_t ld_x, const Row<F>* rows, int64_t K, fl
   for (int m = 0; m < MR; ++m) {
     for (int r = 0; r < NR; ++r) {
       float s = vhsum(acc[m][r]) * Row<F>::kPost;
-      for (int64_t kk = k; kk < K; ++kk) s += x[m * ld_x + kk] * rows[r].at(kk);
+      for (int64_t kk = k; kk < K; ++kk) s = sfma(x[m * ld_x + kk], rows[r].at(kk), s);
       out[m * ld_out + r] = s;
     }
   }
@@ -185,7 +258,7 @@ inline void small_rows(const DotF32& a, int64_t m, int64_t n0, int64_t n1, float
   constexpr int NR = small_nr(MR);
   Row<F> rows[NR];
   // Rows are contiguous, so the next tile's bytes start where this tile's end.
-  const int64_t row_bytes = a.K * kRowBytesX2<F> / 2;
+  const int64_t row_bytes = row_stride<F>(a.K);
   const char* base = static_cast<const char*>(a.w.data);
   for (int64_t n = n0; n < n1; n += NR) {
     const int nr = static_cast<int>(lmin<int64_t>(NR, n1 - n));
@@ -249,9 +322,112 @@ inline void decode_rows(const WeightRef& w, int64_t n, int64_t count, int64_t K,
   }
 }
 
+// ---- exact dot tiles (the FP8 and FP4 maths) -------------------------------------------------------------
+// Both operands are quantized values: an e4m3 (at most 4 significant bits), or an e2m1 times its e4m3 block
+// scale (at most 6). Their products are exact in f32, and summed in double every partial sum stays exact
+// (a multiple of the smallest product, far inside 53 bits), so these dots are the exact ones, the same on
+// every level and in any order. The grouped experts need that: their intermediate is quantized again, to a
+// format coarse enough that a last-bit difference upstream can move a value a whole code.
+
+#if LX_ISA_CODE >= 10 && LX_ISA_CODE < 20
+constexpr int kExMR = 2, kExNR = 2;  // two double accumulators per output, in 16 registers
+#else
+constexpr int kExMR = 4, kExNR = 3;
+#endif
+
+template <int F, int MR, int NR>
+inline void tile_exact(const float* x, int64_t ld_x, const Row<F>* rows, int64_t K, double* out, int64_t ld_out) {
+  VD lo[MR][NR], hi[MR][NR];
+  for (int m = 0; m < MR; ++m)
+    for (int r = 0; r < NR; ++r) lo[m][r] = hi[m][r] = vd_zero();
+  int64_t k = 0;
+  for (; k + W <= K; k += W) {
+    V wv[NR];
+    for (int r = 0; r < NR; ++r) wv[r] = exact(rows[r], k);
+    for (int m = 0; m < MR; ++m) {
+      const V xv = vload(x + m * ld_x + k);
+      for (int r = 0; r < NR; ++r) vd_acc(lo[m][r], hi[m][r], vmul(xv, wv[r]));
+    }
+  }
+  for (int m = 0; m < MR; ++m) {
+    for (int r = 0; r < NR; ++r) {
+      double s = vd_hsum(lo[m][r], hi[m][r]);
+      for (int64_t kk = k; kk < K; ++kk) s += static_cast<double>(x[m * ld_x + kk]) * rows[r].at(kk);
+      out[m * ld_out + r] = s;
+    }
+  }
+}
+
+template <int F, int MR, int NR>
+inline void tile_exact_n(int nr, const float* x, int64_t ld_x, const Row<F>* rows, int64_t K, double* out,
+                         int64_t ld_out) {
+  if constexpr (NR > 1) {
+    if (nr < NR) {
+      tile_exact_n<F, MR, NR - 1>(nr, x, ld_x, rows, K, out, ld_out);
+      return;
+    }
+  }
+  tile_exact<F, MR, NR>(x, ld_x, rows, K, out, ld_out);
+}
+
+template <int F, int MR>
+inline void exact_rows(const float* x, int64_t ld_x, const Row<F>* rows, int nr, int64_t K, double* out,
+                       int64_t ld_out) {
+  tile_exact_n<F, MR, kExNR>(nr, x, ld_x, rows, K, out, ld_out);
+}
+
+// Outputs [m0, m1) x [n0, n1) of an exact dot, with rows read through Row<F> (the weight, or f32 panel rows).
+template <int F>
+inline void exact_block(const DotF32& a, const WeightRef& w, const float* panel, int64_t m0, int64_t m1, int64_t n0,
+                        int64_t n1, double* out) {
+  const int64_t K = a.K;
+  for (int64_t n = n0; n < n1; n += kExNR) {
+    const int nr = static_cast<int>(lmin<int64_t>(kExNR, n1 - n));
+    Row<F> rows[kExNR];
+    for (int r = 0; r < nr; ++r) {
+      if constexpr (F == kW_F32) rows[r].init_panel(panel + (n - n0 + r) * K);
+      else rows[r].init(w, n + r, K);
+    }
+    for (int64_t m = m0; m < m1; m += kExMR) {
+      const int mr = static_cast<int>(lmin<int64_t>(kExMR, m1 - m));
+      const float* x = a.x + m * a.ld_x;
+      double* o = out + (m - m0) * a.ld_out + (n - n0);
+      switch (mr) {
+        case 1: exact_rows<F, 1>(x, a.ld_x, rows, nr, K, o, a.ld_out); break;
+        case 2: exact_rows<F, 2>(x, a.ld_x, rows, nr, K, o, a.ld_out); break;
+        case 3: if constexpr (kExMR >= 3) exact_rows<F, 3>(x, a.ld_x, rows, nr, K, o, a.ld_out); break;
+        default: if constexpr (kExMR >= 4) exact_rows<F, 4>(x, a.ld_x, rows, nr, K, o, a.ld_out); break;
+      }
+    }
+  }
+}
+
+// The exact dot: weight rows streamed for a few x rows, else decoded to f32 panels once (the decode is
+// exact, so both give the same sums).
+template <int F>
+void dot_exact(const DotF32& a, int64_t m0, int64_t m1, int64_t n0, int64_t n1) {
+  const int64_t K = a.K;
+  if (m1 - m0 <= kSmallM || !a.panel || a.panel_floats < K) {
+    exact_block<F>(a, a.w, nullptr, m0, m1, n0, n1, a.out_d);
+    return;
+  }
+  const int64_t nb = lmax<int64_t>(1, a.panel_floats / K);
+  for (int64_t n = n0; n < n1; n += nb) {
+    const int64_t rows = lmin(nb, n1 - n);
+    decode_rows<F>(a.w, n, rows, K, a.panel);
+    exact_block<kW_F32>(a, a.w, a.panel, m0, m1, 0, rows, a.out_d + (n - n0));
+  }
+}
+
 template <int F>
 void dot_f32_fmt(const DotF32& a, int64_t m0, int64_t m1, int64_t n0, int64_t n1) {
   const int64_t K = a.K;
+  if constexpr (F == kW_FP8 || F == kW_NVFP4) {
+    if (a.out_d) {
+      dot_exact<F>(a, m0, m1, n0, n1);
+      return;
+    }
+  }
   const bool panel = F != kW_F32 && m1 - m0 > kSmallM && a.panel && a.panel_floats >= kBigNR * K;
   if (!panel) {
     // Streamed: each weight row is read once per kSmallM activation rows.
@@ -283,6 +459,7 @@ void dot_f32(const DotF32& a, int64_t m0, int64_t m1, int64_t n0, int64_t n1) {
     case kW_INT8: dot_f32_fmt<kW_INT8>(a, m0, m1, n0, n1); break;
     case kW_FP8: dot_f32_fmt<kW_FP8>(a, m0, m1, n0, n1); break;
     case kW_NVFP4: dot_f32_fmt<kW_NVFP4>(a, m0, m1, n0, n1); break;
+    case kW_BF16X: dot_f32_fmt<kW_BF16X>(a, m0, m1, n0, n1); break;
     default: dot_f32_fmt<kW_F32>(a, m0, m1, n0, n1); break;
   }
 }
@@ -701,6 +878,7 @@ void dot_bf16(const DotBF16& a, int64_t m0, int64_t m1, int64_t n0, int64_t n1) 
       switch (a.w.type) {
         case kW_INT8: decode_rows_bf16<kW_INT8>(a.w, nbase, rows, K, p); break;
         case kW_FP8: decode_rows_bf16<kW_FP8>(a.w, nbase, rows, K, p); break;
+        case kW_BF16X: decode_rows_bf16<kW_BF16X>(a.w, nbase, rows, K, p); break;
         default: decode_rows_bf16<kW_NVFP4>(a.w, nbase, rows, K, p); break;
       }
       base = p;
