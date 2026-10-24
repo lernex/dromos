@@ -12,7 +12,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from conftest import DEVICE, close
+from conftest import close
 from formats import FORMATS, W_BF16, W_FP8, W_INT8, W_NVFP4, stack_weight
 
 METIS = (1024, 512, 4)  # L, I, top_k of Praxis
@@ -46,8 +46,8 @@ def run_decode(lx, latent, ids, weights, gu_w, dn_w, I, top_k):
     T, L = latent.shape
     nbytes = workspace_bytes(lx, T, I, top_k)
     assert nbytes >= 2 * T * top_k * I, "workspace smaller than the bf16 intermediates it holds"
-    ws = torch.full((nbytes,), 255, dtype=torch.uint8, device=DEVICE)
-    out = torch.full((T, L), float("nan"), device=DEVICE)
+    ws = torch.full((nbytes,), 255, dtype=torch.uint8, device="cuda")
+    out = torch.full((T, L), float("nan"), device="cuda")
     gu_lx, dn_lx = ctypes.pointer(gu_w.lx()), ctypes.pointer(dn_w.lx())
     lx("moe_experts_decode", latent, ids, weights, gu_lx, dn_lx, out, ws, T, L, I, top_k)
     return out
@@ -63,13 +63,13 @@ def check(lx, latent, ids, weights, gu_w, dn_w, I, top_k):
 
 def make_inputs(T, E, L, I, top_k, seed, pool=None):
     torch.manual_seed(seed)
-    latent = torch.randn(T, L, device=DEVICE).to(torch.bfloat16).contiguous()
+    latent = torch.randn(T, L, device="cuda").to(torch.bfloat16).contiguous()
     if pool is None:
-        ids = torch.rand(T, E, device=DEVICE).argsort(-1)[:, :top_k]
+        ids = torch.rand(T, E, device="cuda").argsort(-1)[:, :top_k]
     else:
-        ids = pool[torch.rand(T, len(pool), device=DEVICE).argsort(-1)[:, :top_k]]
+        ids = pool[torch.rand(T, len(pool), device="cuda").argsort(-1)[:, :top_k]]
     ids = ids.to(torch.int32).contiguous()
-    weights = torch.softmax(torch.randn(T, top_k, device=DEVICE), -1).contiguous()
+    weights = torch.softmax(torch.randn(T, top_k, device="cuda"), -1).contiguous()
     return latent, ids, weights
 
 
@@ -119,7 +119,7 @@ def test_repeated_experts(lx):
     L, I, top_k = METIS
     gu = stack_weight(W_NVFP4, E, 2 * I, L, seed=31)
     dn = stack_weight(W_NVFP4, E, L, I, seed=32)
-    pool = torch.randperm(E, device=DEVICE)[:6]
+    pool = torch.randperm(E, device="cuda")[:6]
     latent, ids, weights = make_inputs(T, E, L, I, top_k, seed=33, pool=pool)
     check(lx, latent, ids, weights, gu, dn, I, top_k)
 
@@ -147,14 +147,14 @@ def test_rejects_more_than_eight_tokens(lx):
     dn = stack_weight(W_BF16, E, L, I, seed=52)
     latent, ids, weights = make_inputs(T, E, L, I, top_k, seed=53)
     nbytes = workspace_bytes(lx, T, I, top_k)
-    ws = torch.empty(nbytes, dtype=torch.uint8, device=DEVICE)
-    out = torch.empty(T, L, device=DEVICE)
+    ws = torch.empty(nbytes, dtype=torch.uint8, device="cuda")
+    out = torch.empty(T, L, device="cuda")
     fn = lx.lib.lx_moe_experts_decode
     fn.restype = ctypes.c_int
     status = fn(
         ctypes.c_void_p(latent.data_ptr()), ctypes.c_void_p(ids.data_ptr()), ctypes.c_void_p(weights.data_ptr()),
         ctypes.pointer(gu.lx()), ctypes.pointer(dn.lx()), ctypes.c_void_p(out.data_ptr()),
-        ctypes.c_void_p(ws.data_ptr()), T, L, I, top_k, lx.stream,
+        ctypes.c_void_p(ws.data_ptr()), T, L, I, top_k, ctypes.c_void_p(torch.cuda.current_stream().cuda_stream),
     )
     assert status != 0  # rejected before any launch
 
@@ -167,10 +167,55 @@ def test_global_is_per_expert(lx):
     gu = stack_weight(W_NVFP4, E, 2 * I, L, seed=61)
     dn = stack_weight(W_NVFP4, E, L, I, seed=62)
     latent, _, _ = make_inputs(T, E, L, I, 2, seed=63)
-    ids = torch.tensor([[1, 3]], dtype=torch.int32, device=DEVICE)
-    weights = torch.tensor([[1.0, 0.0]], device=DEVICE)
+    ids = torch.tensor([[1, 3]], dtype=torch.int32, device="cuda")
+    weights = torch.tensor([[1.0, 0.0]], device="cuda")
     base = run_decode(lx, latent, ids, weights, gu, dn, I, 2)
     dn.expert_global[3] *= 2.0
     assert torch.equal(run_decode(lx, latent, ids, weights, gu, dn, I, 2), base)
     dn.expert_global[1] *= 2.0
     assert torch.equal(run_decode(lx, latent, ids, weights, gu, dn, I, 2), base * 2.0)
+
+
+def test_bf16x_stacks_run_the_lossless_experts(lx):
+    # Both stacks lossless: lx_moe_experts_decode is lx_moe_experts_bf16x bit for bit, and that is the
+    # expert mixture of the bf16 stacks the encodings came from.
+    from test_bf16x import encode
+    from formats import LxWeight, W_BF16X
+
+    T, E, L, I, top_k = 4, 8, 256, 128, 2
+    latent, ids, weights = make_inputs(T, E, L, I, top_k, seed=21)
+    gu = stack_weight(W_BF16, E, 2 * I, L, seed=5)
+    dn = stack_weight(W_BF16, E, L, I, seed=6)
+    gu_enc, dn_enc = encode(lx, gu.data), encode(lx, dn.data)
+    gu_lw = LxWeight(type=W_BF16X, data=gu_enc.data_ptr(), scale=None, global_=1.0, expert_global=None)
+    dn_lw = LxWeight(type=W_BF16X, data=dn_enc.data_ptr(), scale=None, global_=1.0, expert_global=None)
+    nbytes = workspace_bytes(lx, T, I, top_k)
+    ws = torch.full((nbytes,), 255, dtype=torch.uint8, device="cuda")
+    out = torch.full((T, L), float("nan"), device="cuda")
+    lx("moe_experts_decode", latent, ids, weights, ctypes.pointer(gu_lw), ctypes.pointer(dn_lw), out, ws, T, L, I, top_k)
+    direct = torch.full((T, L), float("nan"), device="cuda")
+    ws2 = torch.full((nbytes,), 255, dtype=torch.uint8, device="cuda")
+    lx("moe_experts_bf16x", latent, ids, weights, gu_enc, dn_enc, direct, ws2, T, L, I, top_k)
+    assert torch.equal(out, direct)
+    want = experts_reference(latent, ids, weights, gu.dense, dn.dense)
+    close(out, want.float(), atol=1e-3 * want.abs().max().item(), rtol=1e-3)
+
+
+def test_mixed_lossless_pair_is_refused(lx):
+    # A lossless gate/up stack with a stack of another format has no kernel: the call says so.
+    from test_bf16x import encode
+    from formats import LxWeight, W_BF16X
+
+    T, E, L, I, top_k = 2, 4, 128, 64, 2
+    latent, ids, weights = make_inputs(T, E, L, I, top_k, seed=23)
+    gu = stack_weight(W_BF16, E, 2 * I, L, seed=5)
+    dn = stack_weight(W_BF16, E, L, I, seed=6)
+    gu_enc = encode(lx, gu.data)
+    gu_lw = LxWeight(type=W_BF16X, data=gu_enc.data_ptr(), scale=None, global_=1.0, expert_global=None)
+    ws = torch.zeros(workspace_bytes(lx, T, I, top_k), dtype=torch.uint8, device="cuda")
+    out = torch.zeros(T, L, device="cuda")
+    status = lx.lib.lx_moe_experts_decode(
+        ctypes.c_void_p(latent.data_ptr()), ctypes.c_void_p(ids.data_ptr()), ctypes.c_void_p(weights.data_ptr()),
+        ctypes.pointer(gu_lw), ctypes.pointer(dn.lx()), ctypes.c_void_p(out.data_ptr()),
+        ctypes.c_void_p(ws.data_ptr()), T, L, I, top_k, None)
+    assert status == 801  # cudaErrorNotSupported

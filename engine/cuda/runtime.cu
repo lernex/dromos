@@ -1,6 +1,11 @@
 // The runtime half of the backend ABI (kernels.h, "Runtime"), on the CUDA runtime.
 #include <cuda_runtime.h>
 
+#include <dlfcn.h>
+#include <unistd.h>
+
+#include <cstdio>
+
 #include "cuda/kernels.h"
 
 namespace {
@@ -43,9 +48,10 @@ int lx_rt_memset(void* ptr, int value, int64_t bytes, void* stream) {
 
 int lx_rt_copy(void* dst, const void* src, int64_t bytes, lx_copy_kind kind, void* stream) {
   if (bytes <= 0) return 0;
-  const cudaMemcpyKind k = kind == LX_COPY_H2D   ? cudaMemcpyHostToDevice
-                           : kind == LX_COPY_D2H ? cudaMemcpyDeviceToHost
-                                                 : cudaMemcpyDeviceToDevice;
+  const cudaMemcpyKind k = kind == LX_COPY_H2D      ? cudaMemcpyHostToDevice
+                           : kind == LX_COPY_D2H    ? cudaMemcpyDeviceToHost
+                           : kind == LX_COPY_DEFAULT ? cudaMemcpyDefault
+                                                    : cudaMemcpyDeviceToDevice;
   return status(cudaMemcpyAsync(dst, src, static_cast<size_t>(bytes), k, as_stream(stream)));
 }
 
@@ -93,17 +99,93 @@ int lx_rt_graph_launch(void* graph, void* stream) {
 int lx_rt_graph_destroy(void* graph) { return status(cudaGraphExecDestroy(static_cast<cudaGraphExec_t>(graph))); }
 int lx_rt_last_error(void) { return status(cudaGetLastError()); }
 
-// Device memory is the GPU's own: a mapped checkpoint is copied instead (kernels.h).
-int lx_rt_map_host(void* ptr, int64_t bytes, void** device_ptr) {
-  (void)ptr;
-  (void)bytes;
-  if (device_ptr) *device_ptr = nullptr;
-  return LX_ERR_NOT_SUPPORTED;
+int lx_rt_event_create_timed(void** event) {
+  cudaEvent_t e = nullptr;
+  const int r = status(cudaEventCreate(&e));
+  *event = e;
+  return r;
 }
 
-int lx_rt_unmap_host(void* ptr) {
-  (void)ptr;
-  return LX_ERR_NOT_SUPPORTED;
+int lx_rt_event_elapsed(void* start, void* stop, float* ms) {
+  return status(cudaEventElapsedTime(ms, static_cast<cudaEvent_t>(start), static_cast<cudaEvent_t>(stop)));
+}
+
+int lx_rt_device_sync(void) { return status(cudaDeviceSynchronize()); }
+
+const char* lx_rt_error_string(int code) { return cudaGetErrorString(static_cast<cudaError_t>(code)); }
+
+int lx_rt_is_host_memory(const void* ptr) {
+  cudaPointerAttributes attr{};
+  return cudaPointerGetAttributes(&attr, ptr) == cudaSuccess && attr.type == cudaMemoryTypeHost ? 1 : 0;
+}
+
+int lx_rt_device_props(int ordinal, lx_device_props* props) {
+  cudaDeviceProp prop{};
+  if (cudaError_t e = cudaGetDeviceProperties(&prop, ordinal); e != cudaSuccess) return status(e);
+  std::snprintf(props->name, sizeof(props->name), "%s", prop.name);
+  // The attributes in lx_device_props order: capability major and minor, SMs, L2, memory clock, bus width.
+  const cudaDeviceAttr attrs[6] = {cudaDevAttrComputeCapabilityMajor, cudaDevAttrComputeCapabilityMinor,
+                                   cudaDevAttrMultiProcessorCount,    cudaDevAttrL2CacheSize,
+                                   cudaDevAttrMemoryClockRate,        cudaDevAttrGlobalMemoryBusWidth};
+  int v[6] = {};
+  for (int i = 0; i < 6; ++i)
+    if (cudaError_t e = cudaDeviceGetAttribute(&v[i], attrs[i], ordinal); e != cudaSuccess) return status(e);
+  props->cc_major = v[0];
+  props->cc_minor = v[1];
+  props->sms = v[2];
+  props->l2_bytes = v[3];
+  props->mem_clock_khz = v[4];
+  props->bus_bits = v[5];
+  int driver = 0, runtime = 0;
+  cudaDriverGetVersion(&driver);
+  cudaRuntimeGetVersion(&runtime);
+  props->driver_version = driver;
+  props->runtime_version = runtime;
+  return 0;
+}
+
+int lx_rt_process_memory(int64_t* bytes) {
+  // NVML, loaded by path so nothing links against it: the GPU memory the driver charges this process,
+  // summed over the devices it has a context on.
+  struct ProcessInfo {  // nvmlProcessInfo_v2_st
+    unsigned int pid;
+    unsigned long long used;
+    unsigned int gpu_instance, compute_instance;
+  };
+  using InitFn = int (*)();
+  using CountFn = int (*)(unsigned int*);
+  using HandleFn = int (*)(unsigned int, void**);
+  using ProcsFn = int (*)(void*, unsigned int*, ProcessInfo*);
+  static void* lib = dlopen("libnvidia-ml.so.1", RTLD_NOW | RTLD_LOCAL);
+  if (!lib) return LX_ERR_NOT_SUPPORTED;
+  static const bool ready = [] {
+    auto init = reinterpret_cast<InitFn>(dlsym(lib, "nvmlInit_v2"));
+    return init && init() == 0;
+  }();
+  auto count_fn = reinterpret_cast<CountFn>(dlsym(lib, "nvmlDeviceGetCount_v2"));
+  auto handle_fn = reinterpret_cast<HandleFn>(dlsym(lib, "nvmlDeviceGetHandleByIndex_v2"));
+  auto procs_fn = reinterpret_cast<ProcsFn>(dlsym(lib, "nvmlDeviceGetComputeRunningProcesses_v3"));
+  if (!ready || !count_fn || !handle_fn || !procs_fn) return LX_ERR_NOT_SUPPORTED;
+  unsigned int devices = 0;
+  if (count_fn(&devices) != 0) return LX_ERR_NOT_SUPPORTED;
+  const unsigned int pid = static_cast<unsigned int>(getpid());
+  int64_t total = 0;
+  bool found = false;
+  for (unsigned int d = 0; d < devices; ++d) {
+    void* h = nullptr;
+    if (handle_fn(d, &h) != 0) continue;
+    ProcessInfo info[64];
+    unsigned int n = 64;
+    if (procs_fn(h, &n, info) != 0) continue;
+    for (unsigned int i = 0; i < n; ++i)
+      if (info[i].pid == pid && info[i].used != ~0ull) {  // ~0: NVML_VALUE_NOT_AVAILABLE
+        total += static_cast<int64_t>(info[i].used);
+        found = true;
+      }
+  }
+  if (!found) return LX_ERR_NOT_SUPPORTED;
+  *bytes = total;
+  return 0;
 }
 
 }  // extern "C"

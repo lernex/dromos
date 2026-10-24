@@ -1,12 +1,13 @@
-// The model's glue between the library kernels (kernels.h): small element-wise steps of how Metis wires
-// its pieces together, in the ABI so that every backend provides them.
+// Small kernels the Metis forward pass needs between the library kernels (kernels.h, "Model glue"). They
+// are specific to how the model wires its pieces together; every backend provides them as plain ops.
 #include "cuda/common.cuh"
+#include "cuda/kernels.h"
 
 namespace {
 
-__global__ void axpby_kernel(float* y, const float* x, float alpha, float beta, int64_t n) {
+__global__ void axpby_kernel(float* y, const float* x, float a, float b, int64_t n) {
   const int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
-  if (i < n) y[i] = alpha * y[i] + beta * x[i];
+  if (i < n) y[i] = a * y[i] + b * x[i];
 }
 
 __global__ void sub_kernel(const float* a, const float* b, float* out, int64_t n) {
@@ -40,8 +41,8 @@ int blocks(int64_t n) { return static_cast<int>((n + 255) / 256); }
 
 extern "C" {
 
-int lx_axpby_f32(float* y, const float* x, float alpha, float beta, int64_t n, void* stream) {
-  if (n > 0) axpby_kernel<<<blocks(n), 256, 0, static_cast<cudaStream_t>(stream)>>>(y, x, alpha, beta, n);
+int lx_axpby_f32(float* y, const float* x, float a, float b, int64_t n, void* stream) {
+  if (n > 0) axpby_kernel<<<blocks(n), 256, 0, static_cast<cudaStream_t>(stream)>>>(y, x, a, b, n);
   return lx::launch_status();
 }
 
@@ -58,9 +59,7 @@ int lx_meta_scalars(const float* entropy, const float* confidence, const float* 
   return lx::launch_status();
 }
 
-// T (the rows of src) bounds the reads on backends that need the extent; CUDA does not.
-int lx_gather_last(const float* src, const int32_t* cu, float* out, int n_seq, int D, int T, void* stream) {
-  (void)T;
+int lx_gather_last(const float* src, const int32_t* cu, float* out, int n_seq, int D, void* stream) {
   if (n_seq > 0) gather_last_kernel<<<n_seq, 256, 0, static_cast<cudaStream_t>(stream)>>>(src, cu, out, D);
   return lx::launch_status();
 }

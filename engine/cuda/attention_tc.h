@@ -1,0 +1,18 @@
+// The tensor-core prefill path of lx_attention_varlen (attention_tc.cu), called from attention.cu.
+#pragma once
+
+#include <cuda_runtime.h>
+#include <stdint.h>
+
+namespace lx {
+
+// Sequences with at least this many new tokens are attended on the tensor cores; INT_MAX when the head
+// layout has no tensor-core kernel (Dh other than 64 or 128, or G = H / KVH not dividing 128).
+int attention_tc_min_tokens(int H, int KVH, int Dh);
+
+// lx_attention_varlen's contract for the sequences above, after the step's k and v are in the cache.
+int attention_tc(const float* qkv, int ld_qkv, const void* k_cache, const void* v_cache, const int32_t* slot_ids,
+                 const int32_t* start_pos, const int32_t* cu_seqlens, int n_seq, int capacity, void* out, int H, int KVH,
+                 int Dh, float scale, cudaStream_t s);
+
+}  // namespace lx

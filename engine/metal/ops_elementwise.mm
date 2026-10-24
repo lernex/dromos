@@ -99,10 +99,11 @@ int lx_meta_scalars(const float* entropy, const float* confidence, const float* 
   return k.launch(stream, a, size1(ceil_div(T, kThreads)), size1(kThreads));
 }
 
-int lx_gather_last(const float* src, const int32_t* cu, float* out, int n_seq, int D, int T, void* stream) {
+int lx_gather_last(const float* src, const int32_t* cu, float* out, int n_seq, int D, void* stream) {
   static Kernel k("gather_last");
   if (n_seq <= 0 || D <= 0) return kOk;
-  GatherLastArgs a{addr(stream, src, span(T, D, D, 4)), addr(stream, cu, size_t(n_seq + 1) * 4),
+  // The rows read are on the device (cu), so the extent of src is unknown here.
+  GatherLastArgs a{addr(stream, src, kUnknownExtent), addr(stream, cu, size_t(n_seq + 1) * 4),
                    addr_w(stream, out, span(n_seq, D, D, 4)), D};
   return k.launch(stream, a, size1(n_seq), size1(row_threads(D, 256)));
 }

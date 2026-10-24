@@ -11,8 +11,8 @@ import ctypes
 import pytest
 import torch
 
-from conftest import DEVICE, DTYPE, F32, close
-from formats import LxWeight, W_FP8, W_INT8, W_NVFP4, _e2m1_values, random_weight, stack_weight
+from conftest import DTYPE, F32, close
+from formats import LxWeight, W_BF16, W_BF16X, W_FP8, W_INT8, W_NVFP4, _e2m1_values, random_weight, stack_weight
 
 MIDS = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
 
@@ -65,9 +65,9 @@ def quantize(lx, w, fmt, out_data, out_scale, glob_out):
 @pytest.mark.parametrize("rows,cols", [(1, 8), (7, 2048), (300, 1000), (2048, 1024), (131072, 1024)])
 def test_int8_matches_quantize_w8(lx, rows, cols):
     torch.manual_seed(rows + cols)
-    w = (torch.randn(rows, cols, device=DEVICE) * torch.rand(rows, 1, device=DEVICE) * 4).to(torch.bfloat16)
-    q = torch.empty(rows, cols, dtype=torch.int8, device=DEVICE)
-    scale = torch.empty(rows, dtype=torch.float32, device=DEVICE)
+    w = (torch.randn(rows, cols, device="cuda") * torch.rand(rows, 1, device="cuda") * 4).to(torch.bfloat16)
+    q = torch.empty(rows, cols, dtype=torch.int8, device="cuda")
+    scale = torch.empty(rows, dtype=torch.float32, device="cuda")
     quantize(lx, w, W_INT8, q, scale, None)
     absmax = w.float().abs().amax(-1)
     s_ref = torch.where(absmax > 0, absmax / torch.full_like(absmax, 127.0), torch.ones_like(absmax))
@@ -79,11 +79,11 @@ def test_int8_matches_quantize_w8(lx, rows, cols):
 @pytest.mark.parametrize("rows,cols", [(1, 16), (7, 2048), (300, 1000), (2048, 1024), (131072, 1024)])
 def test_fp8_matches_reference(lx, rows, cols):
     torch.manual_seed(rows * 3 + cols)
-    w = (torch.randn(rows, cols, device=DEVICE) * torch.rand(rows, 1, device=DEVICE) * 40).to(torch.bfloat16)
+    w = (torch.randn(rows, cols, device="cuda") * torch.rand(rows, 1, device="cuda") * 40).to(torch.bfloat16)
     if rows > 2:
         w[0] = 0.0  # an all-zero row keeps scale 1
-    q = torch.empty(rows, cols, dtype=torch.uint8, device=DEVICE)
-    scale = torch.empty(rows, dtype=torch.float32, device=DEVICE)
+    q = torch.empty(rows, cols, dtype=torch.uint8, device="cuda")
+    scale = torch.empty(rows, dtype=torch.float32, device="cuda")
     quantize(lx, w, W_FP8, q, scale, None)
     q_ref, s_ref = ref_fp8(w)
     assert torch.equal(scale, s_ref), "row scales differ from absmax / 448"
@@ -93,10 +93,10 @@ def test_fp8_matches_reference(lx, rows, cols):
 @pytest.mark.parametrize("rows,cols", [(1, 16), (7, 256), (300, 1024), (2048, 2048), (1024, 2048), (4096, 512)])
 def test_nvfp4_matches_reference(lx, rows, cols):
     torch.manual_seed(rows + cols * 7)
-    w = (torch.randn(rows, cols, device=DEVICE) * torch.rand(rows, cols // 16, device=DEVICE).repeat_interleave(16, 1) * 3).to(torch.bfloat16)
+    w = (torch.randn(rows, cols, device="cuda") * torch.rand(rows, cols // 16, device="cuda").repeat_interleave(16, 1) * 3).to(torch.bfloat16)
     w[:, :16] = 0.0  # a block of zeros: block scale 0, codes 0
-    data = torch.empty(rows, cols // 2, dtype=torch.uint8, device=DEVICE)
-    scale = torch.empty(rows, cols // 16, dtype=torch.uint8, device=DEVICE)
+    data = torch.empty(rows, cols // 2, dtype=torch.uint8, device="cuda")
+    scale = torch.empty(rows, cols // 16, dtype=torch.uint8, device="cuda")
     g = quantize(lx, w, W_NVFP4, data, scale, None)
     packed_ref, scale_ref, g_ref = ref_nvfp4(w)
     assert g == float(g_ref), "global differs from max|w| / (448 * 6)"
@@ -108,14 +108,14 @@ def test_nvfp4_ties_and_signs(lx):
     # The block with amax 2688 sets the global to 1. Blocks with amax 12 get scale 2, and their values
     # w / 2 land on midpoints of the e2m1 grid: ties go to the even code (0, 1, 1, 2, 2, 4, 4).
     cols = 16
-    w = torch.zeros(2, cols, device=DEVICE)
+    w = torch.zeros(2, cols, device="cuda")
     w[0, 0] = 2688.0
     w[1, 0] = 12.0
-    w[1, 1:8] = torch.tensor([0.5, 1.5, 2.5, 3.5, 5.0, 7.0, 10.0], device=DEVICE)
-    w[1, 8:15] = -torch.tensor([0.5, 1.5, 2.5, 3.5, 5.0, 7.0, 10.0], device=DEVICE)
+    w[1, 1:8] = torch.tensor([0.5, 1.5, 2.5, 3.5, 5.0, 7.0, 10.0], device="cuda")
+    w[1, 8:15] = -torch.tensor([0.5, 1.5, 2.5, 3.5, 5.0, 7.0, 10.0], device="cuda")
     w = w.to(torch.bfloat16)
-    data = torch.empty(2, 8, dtype=torch.uint8, device=DEVICE)
-    scale = torch.empty(2, 1, dtype=torch.uint8, device=DEVICE)
+    data = torch.empty(2, 8, dtype=torch.uint8, device="cuda")
+    scale = torch.empty(2, 1, dtype=torch.uint8, device="cuda")
     g = quantize(lx, w, W_NVFP4, data, scale, None)
     assert g == 1.0
     codes = torch.stack([data & 15, data >> 4], dim=-1).flatten(-2)
@@ -130,9 +130,9 @@ def test_nvfp4_stack_per_expert_globals(lx):
     # An [E, N, K] stack quantized one expert at a time: each expert has its own global.
     E, N, K = 4, 64, 256
     torch.manual_seed(3)
-    stack = torch.randn(E, N, K, device=DEVICE).to(torch.bfloat16) * torch.tensor([0.1, 1.0, 3.0, 0.3], device=DEVICE)[:, None, None].to(torch.bfloat16)
-    data = torch.empty(E, N, K // 2, dtype=torch.uint8, device=DEVICE)
-    scale = torch.empty(E, N, K // 16, dtype=torch.uint8, device=DEVICE)
+    stack = torch.randn(E, N, K, device="cuda").to(torch.bfloat16) * torch.tensor([0.1, 1.0, 3.0, 0.3], device="cuda")[:, None, None].to(torch.bfloat16)
+    data = torch.empty(E, N, K // 2, dtype=torch.uint8, device="cuda")
+    scale = torch.empty(E, N, K // 16, dtype=torch.uint8, device="cuda")
     globals_ = []
     for e in range(E):
         globals_.append(quantize(lx, stack[e], W_NVFP4, data[e], scale[e], None))
@@ -151,17 +151,17 @@ def test_quantized_weight_gemv_error_is_small(lx, fmt):
     # e2m1 with block scales, ~2% for e4m3).
     N, K, M = 512, 2048, 4
     torch.manual_seed(11)
-    w = (torch.randn(N, K, device=DEVICE) * 0.05).to(torch.bfloat16)
-    x = torch.randn(M, K, device=DEVICE)
+    w = (torch.randn(N, K, device="cuda") * 0.05).to(torch.bfloat16)
+    x = torch.randn(M, K, device="cuda")
     if fmt == W_FP8:
-        data = torch.empty(N, K, dtype=torch.uint8, device=DEVICE)
-        scale = torch.empty(N, dtype=torch.float32, device=DEVICE)
+        data = torch.empty(N, K, dtype=torch.uint8, device="cuda")
+        scale = torch.empty(N, dtype=torch.float32, device="cuda")
     else:
-        data = torch.empty(N, K // 2, dtype=torch.uint8, device=DEVICE)
-        scale = torch.empty(N, K // 16, dtype=torch.uint8, device=DEVICE)
+        data = torch.empty(N, K // 2, dtype=torch.uint8, device="cuda")
+        scale = torch.empty(N, K // 16, dtype=torch.uint8, device="cuda")
     glob = quantize(lx, w, fmt, data, scale, None)
     lw = LxWeight(type=fmt, data=data.data_ptr(), scale=scale.data_ptr(), global_=glob, expert_global=None)
-    y = torch.empty(M, N, dtype=torch.float32, device=DEVICE)
+    y = torch.empty(M, N, dtype=torch.float32, device="cuda")
     lx("gemv_w", x, F32, K, ctypes.pointer(lw), None, F32, y, F32, N, M, N, K, 1.0, 0.0)
     exact = x.double() @ w.double().T
     rel = ((y.double() - exact).norm() / exact.norm()).item()
@@ -173,16 +173,68 @@ def test_random_roundtrip_matches_the_dense_reference(lx):
     # weight built by quantize multiplies exactly like its own dequantized values.
     N, K = 96, 512
     torch.manual_seed(5)
-    w = (torch.randn(N, K, device=DEVICE) * 0.2).to(torch.bfloat16)
-    data = torch.empty(N, K // 2, dtype=torch.uint8, device=DEVICE)
-    scale = torch.empty(N, K // 16, dtype=torch.uint8, device=DEVICE)
+    w = (torch.randn(N, K, device="cuda") * 0.2).to(torch.bfloat16)
+    data = torch.empty(N, K // 2, dtype=torch.uint8, device="cuda")
+    scale = torch.empty(N, K // 16, dtype=torch.uint8, device="cuda")
     glob = quantize(lx, w, W_NVFP4, data, scale, None)
     from formats import _nvfp4_dense
 
     dense = _nvfp4_dense(data, scale, glob)
-    x = torch.randn(3, K, device=DEVICE)
+    x = torch.randn(3, K, device="cuda")
     lw = LxWeight(type=W_NVFP4, data=data.data_ptr(), scale=scale.data_ptr(), global_=glob, expert_global=None)
-    y = torch.empty(3, N, dtype=torch.float32, device=DEVICE)
+    y = torch.empty(3, N, dtype=torch.float32, device="cuda")
     lx("gemv_w", x, F32, K, ctypes.pointer(lw), None, F32, y, F32, N, 3, N, K, 1.0, 0.0)
     want = x.double() @ dense.T
     close(y, want.float(), atol=2e-4 * want.abs().max().item())
+
+
+@pytest.mark.parametrize("fmt", [W_BF16, W_INT8, W_FP8, W_NVFP4])
+@pytest.mark.parametrize("N,K", [(1, 16), (33, 512), (96, 1024)])
+def test_dequantize_matches_the_dense_reference(lx, fmt, N, K):
+    # lx_dequantize_weight writes the values each format encodes, rounded once to bf16: every element
+    # is within half a bf16 ulp of the float64 reference that formats.py builds from the same bytes.
+    w = random_weight(fmt, N, K, seed=11 + fmt + N)
+    out = torch.empty(N, K, dtype=torch.bfloat16, device="cuda")
+    lx("dequantize_weight", ctypes.pointer(w.lx()), out, ctypes.c_int64(N), K)
+    close(out.float(), w.dense.float(), atol=1e-30, rtol=2.0**-8)
+
+
+def test_dequantize_nvfp4_global_multiplies_once(lx):
+    # The global is applied once, in the dequantized values: halving it halves every output exactly.
+    N, K = 64, 256
+    w = random_weight(W_NVFP4, N, K, seed=3)
+    a = torch.empty(N, K, dtype=torch.bfloat16, device="cuda")
+    lx("dequantize_weight", ctypes.pointer(w.lx()), a, ctypes.c_int64(N), K)
+    half = LxWeight(type=W_NVFP4, data=w.data.data_ptr(), scale=w.scale.data_ptr(), global_=w.glob * 0.5,
+                    expert_global=None)
+    b = torch.empty(N, K, dtype=torch.bfloat16, device="cuda")
+    lx("dequantize_weight", ctypes.pointer(half), b, ctypes.c_int64(N), K)
+    assert torch.equal(b.float(), a.float() * 0.5)
+
+
+@pytest.mark.parametrize("rows,cols", [(1, 16), (33, 512), (96, 1024)])
+def test_bf16x_quantize_is_the_lossless_encoding(lx, rows, cols):
+    # lx_quantize_weight to LX_W_BF16X is lx_bf16x_encode: the same bytes, every one written.
+    from test_bf16x import encode
+
+    torch.manual_seed(rows)
+    w = (torch.randn(rows, cols, device="cuda") * 0.3).to(torch.bfloat16)
+    want = encode(lx, w)
+    data = torch.full((want.numel(),), 0xAA, dtype=torch.uint8, device="cuda")
+    lw = LxWeight(type=W_BF16X, data=data.data_ptr(), scale=None, global_=1.0, expert_global=None)
+    lx("quantize_weight", w, ctypes.pointer(lw), ctypes.c_int64(rows), cols)
+    assert torch.equal(data, want)
+
+
+@pytest.mark.parametrize("rows,cols", [(1, 16), (33, 512), (96, 1024)])
+def test_bf16x_dequantize_is_exact(lx, rows, cols):
+    # The lossless format reproduces every bit of the bf16 values it encodes.
+    from test_bf16x import encode
+
+    torch.manual_seed(cols)
+    w = (torch.randn(rows, cols, device="cuda") * 0.3).to(torch.bfloat16)
+    data = encode(lx, w)
+    lw = LxWeight(type=W_BF16X, data=data.data_ptr(), scale=None, global_=1.0, expert_global=None)
+    out = torch.empty(rows, cols, dtype=torch.bfloat16, device="cuda")
+    lx("dequantize_weight", ctypes.pointer(lw), out, ctypes.c_int64(rows), cols)
+    assert torch.equal(out.view(torch.int16), w.view(torch.int16))

@@ -31,6 +31,12 @@ constexpr int kMinStepTokens = 512;
 constexpr int kMaxStepTokens = 2048;
 // What the plan keeps back beyond its own accounting: cuBLASLt's workspace and the allocator's slack.
 constexpr size_t kReserveBytes = 256 * kMiB;
+// Free memory the plan leaves untouched at startup, so another process that grows (or an allocator
+// that needs slack) does not turn a working plan into an out-of-memory failure.
+constexpr size_t kStartupMarginBytes = 1024 * kMiB;
+// The prefix cache's shares: device memory up to a cap, and pinned host memory spilled into.
+constexpr size_t kPrefixDeviceCap = 8192 * kMiB;
+constexpr size_t kPrefixHostBytes = 4096 * kMiB;
 // The per-step expert workspace is sized for this many decode rows (metis.cpp, kGemvRows).
 constexpr int kGemvRows = 8;
 
@@ -385,6 +391,12 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
   p.scratch_bytes = scratch_bytes(c, tokens, p.max_slots);
   p.prefill_chunk = std::max(1, tokens - p.max_slots);
   p.budget_bytes = budget;
+  {
+    const size_t planned = total_with(tokens);
+    const size_t spare = budget > planned + kStartupMarginBytes ? budget - planned - kStartupMarginBytes : 0;
+    p.prefix_device_bytes = std::min(spare, kPrefixDeviceCap);
+    p.prefix_host_bytes = kPrefixHostBytes;
+  }
 
   // The decode ceiling: one stream reads the layers' weights and the routed experts it uses once per
   // pass (the stack runs num_passes times over the same weights), the LM head once, one embedding row
@@ -404,7 +416,7 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
   // Notes, in the order a person reads them.
   auto& n = p.notes;
   if (req.weights >= 0) {
-    n.push_back("Holding the weights as " + format_name(p.weights) + " because you asked for it.");
+    n.push_back("Holding the weights as " + format_name(p.weights) + ", the format this start asked for.");
   } else {
     n.push_back("Holding the weights as " + format_name(p.weights) + ": the widest format that leaves room for " +
                 std::to_string(std::min(useful_slots, p.max_slots)) + "+ sequences at " +

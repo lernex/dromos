@@ -157,7 +157,63 @@ def test_long_prefill_batch(lx):
     check_step(lx, H=32, KVH=8, Dh=64, capacity=512, n_slots=3, seqs=[(2, 0, 300), (0, 77, 129)], seed=300)
 
 
+def reference_fast(qkv, k_ref, v_ref, slots, starts, cu, H, KVH, Dh):
+    """reference() with one masked product per sequence, for long prefills."""
+    G = H // KVH
+    scale = 1.0 / math.sqrt(Dh)
+    qw, kw = H * Dh, KVH * Dh
+    out = torch.empty(qkv.shape[0], H * Dh, device="cuda", dtype=torch.float32)
+    for s, (slot, start) in enumerate(zip(slots, starts)):
+        a, b = cu[s], cu[s + 1]
+        n = b - a
+        if n == 0:
+            continue
+        k_ref[slot, start:start + n] = qkv[a:b, qw:qw + kw].reshape(n, KVH, Dh).to(torch.bfloat16)
+        v_ref[slot, start:start + n] = qkv[a:b, qw + kw:qw + 2 * kw].reshape(n, KVH, Dh).to(torch.bfloat16)
+        L = start + n
+        k, v = k_ref[slot, :L].float(), v_ref[slot, :L].float()
+        q = qkv[a:b, :qw].reshape(n, KVH, G, Dh) * scale
+        scores = torch.einsum("nkgd,lkd->nkgl", q, k)
+        visible = torch.arange(L, device="cuda")[None, :] <= (start + torch.arange(n, device="cuda"))[:, None]
+        p = torch.softmax(scores.masked_fill(~visible[:, None, None, :], float("-inf")), dim=-1)
+        out[a:b] = torch.einsum("nkgl,lkd->nkgd", p, v).reshape(n, -1)
+    return out
+
+
+@pytest.mark.parametrize(
+    "H,KVH,Dh,seqs",
+    [
+        (32, 8, 64, [(0, 0, 1000)]),  # a Praxis prefill
+        (40, 10, 64, [(0, 333, 517)]),  # a Logos continuation of a cached prefix
+        (16, 16, 64, [(1, 0, 130), (0, 0, 15), (2, 64, 1), (3, 7, 77)]),  # G = 1, mixed with SIMT sequences
+        (16, 2, 64, [(0, 5, 300)]),  # G = 8
+        (16, 1, 128, [(0, 0, 200), (1, 50, 19)]),  # G = 16, Dh = 128
+        (8, 4, 128, [(0, 0, 16), (1, 0, 17), (2, 1, 31)]),  # the smallest tensor-core sequences
+    ],
+    ids=["praxis-1000", "logos-continuation", "g1-mixed", "g8", "g16-d128", "edges"],
+)
+def test_prefill_tensor_cores(lx, H, KVH, Dh, seqs):
+    # Sequences of 16 or more new tokens run on the tensor-core kernel, the others on the SIMT kernel
+    # beside it, in one call. q enters as two bf16 halves and P as bf16, so the bound is bf16 rounding.
+    width = (H + 2 * KVH) * Dh
+    lens = [n for _, _, n in seqs]
+    cu = [0, *accumulate(lens)]
+    slot_list, start_list = [s for s, _, _ in seqs], [p for _, p, _ in seqs]
+    capacity = max(p + n for _, p, n in seqs) + 1
+    torch.manual_seed(H * 7 + Dh + len(seqs))
+    qkv = torch.randn(sum(lens), width, device="cuda") * 2
+    k, v = caches(max(slot_list) + 1, capacity, KVH, Dh, seqs)
+    k_ref, v_ref = k.clone(), v.clone()
+    want = reference_fast(qkv, k_ref, v_ref, slot_list, start_list, cu, H, KVH, Dh)
+    t = lambda x: torch.tensor(x, dtype=torch.int32, device="cuda")
+    out = run(lx, qkv, 0, k, v, t(slot_list), t(start_list), t(cu), H, KVH, Dh)
+    close(out, want, atol=1e-2, rtol=1e-2)
+    same_bits(k, k_ref)
+    same_bits(v, v_ref)
+
+
 def test_qkv_column_slice_of_wider_buffer(lx):
     # q | k | v sit at column 7 of a buffer 40 columns wider than the step. Everything around them is NaN.
-    check_step(lx, H=8, KVH=2, Dh=64, capacity=32, n_slots=2, seqs=[(1, 3, 5), (0, 0, 6)], seed=11,
+    # The 20-token sequence takes the tensor-core kernel, whose q rows are then not 8-byte aligned.
+    check_step(lx, H=8, KVH=2, Dh=64, capacity=32, n_slots=2, seqs=[(1, 3, 5), (0, 0, 20)], seed=11,
                col=7, pad=21)

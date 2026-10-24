@@ -28,6 +28,26 @@ LX_API int lx_tune_kernels(const char** names, int capacity);  // returns the to
 LX_API int lx_tune_variants(const char* kernel);               // 0 when unknown
 LX_API const char* lx_tune_variant_name(const char* kernel, int variant);
 
+// The autotuner's entry points, so host code times and stores a kernel's variants through the ABI and
+// never sees the kernels' C++ types. A problem is one timed case: M rows against an N x K weight, or
+// against `experts` such weights, in the weight format `weight` and math `math` (0 for both when the
+// kernel has no such choice). M, N and K are as lx::TuneProblem has them.
+typedef struct {
+  int M, N, K;
+  int experts;
+  int weight;
+  int math;
+} lx_tune_problem;
+// Runs variant `variant` of a registered kernel on the problem and writes its result as f32 to `out`
+// (M * N elements). Returns LX_ERR_NOT_SUPPORTED when the variant or the problem cannot run here.
+LX_API int lx_tune_run(const char* kernel, int variant, const lx_tune_problem* problem, float* out, void* stream);
+// 1 when the kernel registered a runner, so lx_tune_run can time its variants; else 0.
+LX_API int lx_tune_runnable(const char* kernel);
+// The table key of a kernel's problem: the kernel name with the format, math and expert count appended
+// when they are not the defaults. Writes it NUL-terminated to `out` (at most `capacity` bytes) and
+// returns its length.
+LX_API int lx_tune_key(const char* kernel, const lx_tune_problem* problem, char* out, int capacity);
+
 #ifdef __cplusplus
 }
 

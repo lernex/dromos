@@ -56,7 +56,12 @@ struct PlanRequest {
   int weights = -1;   // an lx_wtype, or -1 for automatic (the widest format that fits usefully)
   int context = 0;    // context each sequence is sized for, 0 for automatic
   int sequences = 0;  // concurrent sequences wanted, 0 for automatic
-  double memory_fraction = 0.92;
+  double memory_fraction = 0.92;  // of the free memory at startup; the rest is left for others
+  // Offload (runtime/offload_plan.h): the GPU memory this process may use, 0 for the card
+  // (LX_VRAM_BUDGET_GB), and the pinned RAM the offloaded experts may take, 0 for all of them
+  // (LX_RAM_BUDGET_GB; the rest are read from the checkpoint on NVMe).
+  size_t vram_budget = 0;
+  size_t ram_budget = 0;
 };
 
 // The format of each kind of tensor in a target format (the Formats recipe): dense projections, routed
@@ -81,8 +86,24 @@ struct Plan {
   int max_step_tokens = 0;    // tokens in one step (decode rows and prefill rows together)
   int prefill_chunk = 0;      // prompt tokens a sequence takes per step while it is being prefilled
   size_t weight_bytes = 0, state_bytes = 0, kv_bytes = 0, scratch_bytes = 0, budget_bytes = 0;
+  size_t prefix_device_bytes = 0;  // prefix snapshots kept in device memory (what the model leaves over)
+  size_t prefix_host_bytes = 0;    // and in pinned host memory, when the device share is full
   double decode_ceiling_tps = 0;  // bandwidth / weight bytes: the most tokens per second one stream can make
   std::vector<std::string> notes;  // plain-language lines `lernex` prints (why this format, etc.)
+
+  // Running larger than the GPU (make_offload_plan in runtime/offload_plan.h): every routed expert is
+  // in pinned RAM (or, beyond the RAM budget, on NVMe), and VRAM keeps the ones in use in an LRU cache
+  // the decode step manages on the GPU. weight_bytes then counts the dense weights and the cache.
+  struct Offload {
+    bool enabled = false;
+    size_t expert_cache_bytes = 0;  // VRAM for expert slots
+    size_t ram_expert_bytes = 0;    // pinned RAM holding experts
+    size_t disk_expert_bytes = 0;   // experts the CPU lane reads from the checkpoint on NVMe
+    double resident_fraction = 0;   // share of the experts the cache holds at once
+    double cpu_fraction = 0;        // share of a step's misses the CPU computes from RAM
+    int max_cpu_pairs = 0;          // at most this many pairs per step on the CPU
+    int prefetch = 0;               // next-layer experts copied ahead per token, 0 for none
+  } offload;
 };
 
 // Throws std::runtime_error, saying what is missing, when no format fits the device for the model.

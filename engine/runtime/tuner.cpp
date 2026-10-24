@@ -1,6 +1,6 @@
 #include "runtime/tuner.h"
 
-#include <cuda_runtime.h>
+#include "cuda/kernels.h"
 
 #include <algorithm>
 #include <chrono>
@@ -29,8 +29,28 @@ using Clock = std::chrono::steady_clock;
 // rounding of a value near a rounding boundary), never by this much.
 constexpr double kAgreement = 2e-2;
 
-void check(cudaError_t err, const char* what) {
-  if (err != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(err));
+// Throws when a backend call failed, naming what was being done.
+void check(int status, const std::string& what) {
+  if (status != 0) throw std::runtime_error(what + ": " + lx_rt_error_string(status));
+}
+
+// Copies `count` floats from device memory to the host, then waits for the copy to finish.
+void download(float* host, const float* device, size_t count) {
+  const std::string what = "copy of " + std::to_string(count * sizeof(float)) + " bytes to the host";
+  check(lx_rt_copy(host, device, static_cast<int64_t>(count * sizeof(float)), LX_COPY_D2H, nullptr), what);
+  check(lx_rt_stream_sync(nullptr), what);
+}
+
+// The backend's form of a problem: the same fields, read by the backend's tuner.
+lx_tune_problem to_abi(const TuneProblem& p) {
+  lx_tune_problem cp;
+  cp.M = p.M;
+  cp.N = p.N;
+  cp.K = p.K;
+  cp.experts = p.experts;
+  cp.weight = p.weight;
+  cp.math = p.math;
+  return cp;
 }
 
 // Buckets as lx_tune_get sees them: the smallest power of two that holds M.
@@ -45,58 +65,61 @@ struct Buffer {
   size_t capacity = 0;
   void ensure(size_t n) {
     if (n <= capacity) return;
-    if (data) cudaFree(data);
-    check(cudaMalloc(reinterpret_cast<void**>(&data), n * sizeof(float)), "cudaMalloc");
+    if (data) lx_rt_free(data);
+    check(lx_rt_alloc(reinterpret_cast<void**>(&data), static_cast<int64_t>(n * sizeof(float))),
+          "device allocation of " + std::to_string(n * sizeof(float)) + " bytes");
     capacity = n;
   }
   ~Buffer() {
-    if (data) cudaFree(data);
+    if (data) lx_rt_free(data);
   }
 };
 
-// Runs one variant `count` times on the stream; returns cudaSuccess or the first error.
-cudaError_t run_many(TuneRunner runner, int variant, const TuneProblem& p, float* out, cudaStream_t stream, int count) {
+// Runs one variant `count` times on the stream; returns 0 or the first error.
+int run_many(const char* kernel, int variant, const TuneProblem& p, float* out, void* stream, int count) {
+  const lx_tune_problem cp = to_abi(p);
   for (int i = 0; i < count; ++i) {
-    const cudaError_t err = static_cast<cudaError_t>(runner(variant, p, out, stream));
-    if (err != cudaSuccess) return err;
+    const int status = lx_tune_run(kernel, variant, &cp, out, stream);
+    if (status != 0) return status;
   }
-  return cudaSuccess;
+  return 0;
 }
 
 // Median time per launch, in microseconds, or a negative value when a launch fails.
-double time_variant(TuneRunner runner, int variant, const TuneProblem& p, float* out, cudaStream_t stream,
+double time_variant(const char* kernel, int variant, const TuneProblem& p, float* out, void* stream,
                     const TuneOptions& o) {
-  if (run_many(runner, variant, p, out, stream, o.warmup) != cudaSuccess) return -1;
-  cudaEvent_t start, stop;
-  check(cudaEventCreate(&start), "cudaEventCreate");
-  check(cudaEventCreate(&stop), "cudaEventCreate");
+  if (run_many(kernel, variant, p, out, stream, o.warmup) != 0) return -1;
+  void* start = nullptr;
+  void* stop = nullptr;
+  check(lx_rt_event_create_timed(&start), "timing event creation");
+  check(lx_rt_event_create_timed(&stop), "timing event creation");
   double result = -1;
   do {
     // one launch to size the samples, so each lasts about sample_ms
-    cudaEventRecord(start, stream);
-    if (run_many(runner, variant, p, out, stream, 1) != cudaSuccess) break;
-    cudaEventRecord(stop, stream);
-    if (cudaEventSynchronize(stop) != cudaSuccess) break;
+    lx_rt_event_record(start, stream);
+    if (run_many(kernel, variant, p, out, stream, 1) != 0) break;
+    lx_rt_event_record(stop, stream);
+    if (lx_rt_event_sync(stop) != 0) break;
     float first_ms = 0;
-    cudaEventElapsedTime(&first_ms, start, stop);
+    lx_rt_event_elapsed(start, stop, &first_ms);
     const int count = std::clamp(static_cast<int>(std::ceil(o.sample_ms / std::max(first_ms, 1e-3f))), 1, 100000);
     std::vector<double> samples;
     bool ok = true;
     for (int r = 0; r < o.repeats && ok; ++r) {
-      cudaEventRecord(start, stream);
-      ok = run_many(runner, variant, p, out, stream, count) == cudaSuccess;
-      cudaEventRecord(stop, stream);
-      ok = ok && cudaEventSynchronize(stop) == cudaSuccess;
+      lx_rt_event_record(start, stream);
+      ok = run_many(kernel, variant, p, out, stream, count) == 0;
+      lx_rt_event_record(stop, stream);
+      ok = ok && lx_rt_event_sync(stop) == 0;
       float ms = 0;
-      cudaEventElapsedTime(&ms, start, stop);
+      lx_rt_event_elapsed(start, stop, &ms);
       samples.push_back(static_cast<double>(ms) * 1e3 / count);
     }
     if (!ok || samples.empty()) break;
     std::sort(samples.begin(), samples.end());
     result = samples[samples.size() / 2];
   } while (false);
-  cudaEventDestroy(start);
-  cudaEventDestroy(stop);
+  lx_rt_event_destroy(start);
+  lx_rt_event_destroy(stop);
   return result;
 }
 
@@ -115,6 +138,14 @@ bool agrees(const std::vector<float>& got, const std::vector<float>& want, doubl
 std::string gpu_dir() {
   const char* home = std::getenv("HOME");
   return std::string(home ? home : ".") + "/.cache/lernex/tune";
+}
+
+// The table key of a kernel's problem, as the backend writes it (lx_tune_key), so host and backend agree.
+std::string tune_key(const char* kernel, const TuneProblem& p) {
+  const lx_tune_problem cp = to_abi(p);
+  char key[256];
+  lx_tune_key(kernel, &cp, key, static_cast<int>(sizeof(key)));
+  return key;
 }
 
 }  // namespace
@@ -171,33 +202,33 @@ TuneReport tune(const std::vector<TuneProblem>& problems, const TuneOptions& opt
   const auto t0 = Clock::now();
   TuneReport report;
   report.gpu = query_device(0).slug();
-  cudaStream_t stream = nullptr;
-  check(cudaStreamCreate(&stream), "cudaStreamCreate");
+  void* stream = nullptr;
+  check(lx_rt_stream_create(&stream), "stream creation");
   Buffer out, reference;
 
   const char* names[256];
   const int total = lx_tune_kernels(names, 256);
   for (int k = 0; k < total && k < 256; ++k) {
     const char* kernel = names[k];
-    const TuneRunner runner = tunable_runner(kernel);
-    if (!runner) continue;
+    if (!lx_tune_runnable(kernel)) continue;
     ++report.kernels;
     const int variants = lx_tune_variants(kernel);
     for (const TuneProblem& p : problems) {
+      const lx_tune_problem cp = to_abi(p);
       const size_t elems = static_cast<size_t>(p.M) * p.N;
       out.ensure(elems);
       reference.ensure(elems);
       // variant 0 is the reference every other variant must agree with
-      cudaError_t ref_status = static_cast<cudaError_t>(runner(0, p, reference.data, stream));
-      if (ref_status == cudaErrorNotSupported) continue;  // this kernel does not run this problem
+      const int ref_status = lx_tune_run(kernel, 0, &cp, reference.data, stream);
+      if (ref_status == LX_ERR_NOT_SUPPORTED) continue;  // this kernel does not run this problem
       ++report.problems;
-      if (ref_status != cudaSuccess || cudaStreamSynchronize(stream) != cudaSuccess) {
+      if (ref_status != 0 || lx_rt_stream_sync(stream) != 0) {
         ++report.rejected;
         continue;
       }
       std::vector<float> want(elems);
-      check(cudaMemcpy(want.data(), reference.data, elems * sizeof(float), cudaMemcpyDeviceToHost), "cudaMemcpy");
-      const double ref_us = time_variant(runner, 0, p, reference.data, stream, options);
+      download(want.data(), reference.data, elems);
+      const double ref_us = time_variant(kernel, 0, p, reference.data, stream, options);
       if (ref_us < 0) {
         ++report.rejected;
         continue;
@@ -205,26 +236,26 @@ TuneReport tune(const std::vector<TuneProblem>& problems, const TuneOptions& opt
       int best = 0;
       double best_us = ref_us;
       for (int v = 1; v < variants; ++v) {
-        const cudaError_t status = static_cast<cudaError_t>(runner(v, p, out.data, stream));
-        if (status == cudaErrorNotSupported) {
+        const int status = lx_tune_run(kernel, v, &cp, out.data, stream);
+        if (status == LX_ERR_NOT_SUPPORTED) {
           ++report.skipped;
           continue;
         }
-        if (status != cudaSuccess || cudaStreamSynchronize(stream) != cudaSuccess) {
+        if (status != 0 || lx_rt_stream_sync(stream) != 0) {
           ++report.rejected;
           continue;
         }
         std::vector<float> got(elems);
-        check(cudaMemcpy(got.data(), out.data, elems * sizeof(float), cudaMemcpyDeviceToHost), "cudaMemcpy");
+        download(got.data(), out.data, elems);
         double worst = 0;
         if (!agrees(got, want, worst)) {
           ++report.rejected;
           if (options.log)
-            std::printf("  %-28s M=%-5d variant %d rejected: worst error %.3e\n", tune_key(kernel, p).c_str(), p.M,
-                        v, worst);
+            std::printf("  %-28s M=%-5d variant %d rejected: worst error %.3e\n",
+                        lx::runtime::tune_key(kernel, p).c_str(), p.M, v, worst);
           continue;
         }
-        const double us = time_variant(runner, v, p, out.data, stream, options);
+        const double us = time_variant(kernel, v, p, out.data, stream, options);
         if (us < 0) {
           ++report.rejected;
           continue;
@@ -235,11 +266,11 @@ TuneReport tune(const std::vector<TuneProblem>& problems, const TuneOptions& opt
           best_us = us;
         }
         if (options.log)
-          std::printf("  %-28s M=%-5d %-14s %9.2f us  (reference %9.2f us)\n", tune_key(kernel, p).c_str(), p.M,
-                      lx_tune_variant_name(kernel, v), us, ref_us);
+          std::printf("  %-28s M=%-5d %-14s %9.2f us  (reference %9.2f us)\n",
+                      lx::runtime::tune_key(kernel, p).c_str(), p.M, lx_tune_variant_name(kernel, v), us, ref_us);
       }
       TuneEntry e;
-      e.key = tune_key(kernel, p);
+      e.key = lx::runtime::tune_key(kernel, p);
       e.M = p.M;
       e.N = p.N;
       e.K = p.K;
@@ -251,7 +282,7 @@ TuneReport tune(const std::vector<TuneProblem>& problems, const TuneOptions& opt
       report.entries.push_back(e);
     }
   }
-  cudaStreamDestroy(stream);
+  lx_rt_stream_destroy(stream);
   report.seconds = std::chrono::duration<double>(Clock::now() - t0).count();
   return report;
 }

@@ -34,8 +34,9 @@ add_custom_command(
 
 file(GLOB LX_METAL_HOST CONFIGURE_DEPENDS "${LX_METAL_DIR}/*.mm")
 add_library(lernex_metal SHARED ${LX_METAL_HOST} "${LX_METAL_EMBEDDED}" "${LX_METAL_NAX_EMBEDDED}")
-target_include_directories(lernex_metal PUBLIC "${CMAKE_SOURCE_DIR}/engine")
-target_compile_options(lernex_metal PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc> -fvisibility=hidden -Wall -Wextra
-                       -Wno-unused-parameter)
+# engine/ for quoted includes only: its dispatch/ directory would shadow the SDK's <dispatch/dispatch.h>,
+# which Foundation includes.
+target_compile_options(lernex_metal PRIVATE "SHELL:-iquote ${CMAKE_SOURCE_DIR}/engine"
+                       $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc> -fvisibility=hidden -Wall -Wextra -Wno-unused-parameter)
 target_link_libraries(lernex_metal PUBLIC "-framework Metal" "-framework Foundation")
 set_target_properties(lernex_metal PROPERTIES OBJCXX_STANDARD 20 CXX_STANDARD 20)

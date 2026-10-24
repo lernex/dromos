@@ -18,8 +18,12 @@
 //
 // The C ABI has no token count, so both kernels read T = cu_seqlens[n_seq] on the device and
 // grid-stride over the work. Launch sizes are constants; the grid is a multiple of the cluster size.
+//
+// Sequences with many new tokens (a prefill) go to the tensor-core kernel in attention_tc.cu instead,
+// which runs beside this one; this kernel skips their tokens.
 #include <cuda_pipeline.h>
 
+#include "cuda/attention_tc.h"
 #include "cuda/common.cuh"
 
 namespace {
@@ -94,7 +98,7 @@ __global__ void LX_CLUSTER_DIMS(kSplit) __launch_bounds__(kThreads) attention_ke
     const float* __restrict__ qkv, int ld_qkv, const __nv_bfloat16* __restrict__ k_cache,
     const __nv_bfloat16* __restrict__ v_cache, const int32_t* __restrict__ slot_ids,
     const int32_t* __restrict__ start_pos, const int32_t* __restrict__ cu_seqlens, int n_seq, int capacity,
-    __nv_bfloat16* __restrict__ out, int H, int KVH, int Dh, float scale, int clusters) {
+    __nv_bfloat16* __restrict__ out, int H, int KVH, int Dh, float scale, int clusters, int tc_min) {
   extern __shared__ __align__(16) unsigned char smem_raw[];
   __nv_bfloat16* sK = reinterpret_cast<__nv_bfloat16*>(smem_raw);  // [stage][kBlockN][Dh]
   __nv_bfloat16* sV = sK + kStages * kBlockN * Dh;                 // [stage][kBlockN][Dh]
@@ -128,6 +132,7 @@ __global__ void LX_CLUSTER_DIMS(kSplit) __launch_bounds__(kThreads) attention_ke
   for (int item = first; item < T * KVH; item += stride) {
     const int t = item / KVH, kvh = item % KVH;
     const int s = seq_of_token(cu_seqlens, n_seq, t);
+    if (cu_seqlens[s + 1] - cu_seqlens[s] >= tc_min) continue;  // the tensor-core kernel's (uniform per item)
     const int64_t slot = slot_ids[s];
     const int L = start_pos[s] + (t - cu_seqlens[s]) + 1;  // visible cache positions: 0 .. L - 1
     const int n_tiles = (L + kBlockN - 1) / kBlockN;
@@ -361,18 +366,22 @@ extern "C" int lx_attention_varlen(const float* qkv, int ld_qkv, void* k_cache, 
   auto o = static_cast<__nv_bfloat16*>(out);
   write_kv_kernel<<<kWriteBlocks, kThreads, 0, s>>>(qkv, ld_qkv, kc, vc, slot_ids, start_pos, cu_seqlens,
                                                     n_seq, capacity, H, KVH, Dh);
+  const int tc_min = lx::attention_tc_min_tokens(H, KVH, Dh);
+  if (int e = lx::attention_tc(qkv, ld_qkv, kc, vc, slot_ids, start_pos, cu_seqlens, n_seq, capacity, o, H, KVH, Dh,
+                               scale, s))
+    return e;
   // Three stages of K and V tiles: kStages * 2 * kBlockN * Dh bf16. Above 48 KB needs the opt-in.
   const int smem = kStages * 2 * kBlockN * Dh * static_cast<int>(sizeof(__nv_bfloat16));
   if (Dh <= 64) {
     cudaFuncSetAttribute(attention_kernel<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     attention_kernel<1><<<kAttnBlocks, kThreads, smem, s>>>(qkv, ld_qkv, kc, vc, slot_ids, start_pos,
                                                             cu_seqlens, n_seq, capacity, o, H, KVH, Dh, scale,
-                                                            clusters);
+                                                            clusters, tc_min);
   } else {
     cudaFuncSetAttribute(attention_kernel<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     attention_kernel<2><<<kAttnBlocks, kThreads, smem, s>>>(qkv, ld_qkv, kc, vc, slot_ids, start_pos,
                                                             cu_seqlens, n_seq, capacity, o, H, KVH, Dh, scale,
-                                                            clusters);
+                                                            clusters, tc_min);
   }
   return lx::launch_status();
 }

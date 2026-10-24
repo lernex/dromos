@@ -9,9 +9,7 @@ import ctypes
 
 import torch
 
-from conftest import DEVICE
-
-W_BF16, W_INT8, W_FP8, W_NVFP4 = 0, 1, 2, 3
+W_BF16, W_INT8, W_FP8, W_NVFP4, W_BF16X = 0, 1, 2, 3, 4
 FORMATS = {"bf16": W_BF16, "int8": W_INT8, "fp8": W_FP8, "nvfp4": W_NVFP4}
 E2M1_GRID = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float64)
 
@@ -67,7 +65,7 @@ def _e2m1_values(codes):
     return torch.where((codes & 8) > 0, -mag, mag)
 
 
-def random_weight(fmt, N, K, seed, device=DEVICE, glob=0.0371):
+def random_weight(fmt, N, K, seed, device="cuda", glob=0.0371):
     """A random [N, K] weight in format `fmt` (a W_* code), with a reference of its exact values."""
     g = torch.Generator(device="cpu").manual_seed(seed)
     if fmt == W_BF16:
@@ -99,7 +97,7 @@ def _nvfp4_dense(codes, blocks, glob):
     return vals * scales * float(glob)
 
 
-def stack_weight(fmt, E, N, K, seed, device=DEVICE):
+def stack_weight(fmt, E, N, K, seed, device="cuda"):
     """An [E, N, K] stack in one format. NVFP4 experts each get their own global, as checkpoints carry."""
     parts = []
     for e in range(E):

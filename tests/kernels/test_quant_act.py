@@ -4,16 +4,16 @@ wformats.py, bit for bit: the quantized values, the per-row scales and the FP4 b
 import pytest
 import torch
 
-from conftest import DEVICE, DTYPE
+from conftest import DTYPE
 from wformats import MATH_FP4, MATH_FP8, MATH_INT8, quantize_act
 
 SHAPES = [(1, 2048), (7, 1024), (300, 512), (64, 6400), (5, 4096), (3, 16)]
 
 
 def run(lx, x, ld_x, math, M, K, ld_q, ld_bs):
-    q = torch.full((M, ld_q), 0xA5, dtype=torch.uint8, device=DEVICE)
-    scale = torch.full((M,), float("nan"), device=DEVICE)
-    bs = torch.full((M, max(ld_bs, 1)), 0xA5, dtype=torch.uint8, device=DEVICE)
+    q = torch.full((M, ld_q), 0xA5, dtype=torch.uint8, device="cuda")
+    scale = torch.full((M,), float("nan"), device="cuda")
+    bs = torch.full((M, max(ld_bs, 1)), 0xA5, dtype=torch.uint8, device="cuda")
     lx("quantize_act", x, DTYPE[x.dtype], ld_x, math, q, ld_q, scale, bs if math == MATH_FP4 else None, ld_bs, M, K)
     return q, scale, bs
 
@@ -24,7 +24,7 @@ def run(lx, x, ld_x, math, M, K, ld_q, ld_bs):
 @pytest.mark.parametrize("M,K", SHAPES)
 def test_quantize_act(lx, M, K, math, dtype, pad):
     torch.manual_seed(M * 31 + K + math)
-    x_buf = (torch.randn(M, K + pad, device=DEVICE) * torch.rand(M, 1, device=DEVICE) * 4).to(dtype)
+    x_buf = (torch.randn(M, K + pad, device="cuda") * torch.rand(M, 1, device="cuda") * 4).to(dtype)
     x_buf[0, :K] *= 1e-3  # a quiet row: small scales, subnormal e4m3 block scales for FP4
     if M > 2:
         x_buf[2, :K] = 0  # a zero row
@@ -49,7 +49,7 @@ def test_quantize_act_odd_k(lx, math):
     # K not a multiple of 16, and a misaligned row stride: the scalar tail path.
     torch.manual_seed(5)
     M, K = 9, 1001
-    x_buf = torch.randn(M, K + 3, device=DEVICE)
+    x_buf = torch.randn(M, K + 3, device="cuda")
     q, scale, _ = run(lx, x_buf, K + 3, math, M, K, K + 7, 0)
     rq, rscale, _ = quantize_act(x_buf[:, :K], math)
     assert torch.equal(q[:, :K], rq)
@@ -59,12 +59,12 @@ def test_quantize_act_odd_k(lx, math):
 def test_quantize_act_fp4_extremes(lx):
     # Ties of the e2m1 rounding, saturation, and blocks whose scale underflows to an e4m3 subnormal.
     M, K = 4, 64
-    x = torch.zeros(M, K, device=DEVICE)
+    x = torch.zeros(M, K, device="cuda")
     ties = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 6.0, -0.25, -0.75, -2.5, -5.0, 0.1, 7.0, -7.0, 3.0])
-    x[0, :16] = ties.to(DEVICE)  # block absmax 7 relative to the row: values land on the e2m1 grid's midpoints
+    x[0, :16] = ties.cuda()  # block absmax 7 relative to the row: values land on the e2m1 grid's midpoints
     x[1, :16] = 1.0
     x[1, 16:32] = 1e-6  # a block 10^6 below the row max: its scale underflows
-    x[2] = torch.linspace(-3, 3, K, device=DEVICE)
+    x[2] = torch.linspace(-3, 3, K, device="cuda")
     q, scale, bs = run(lx, x, K, MATH_FP4, M, K, K // 2, K // 16)
     rq, rscale, rbs = quantize_act(x, MATH_FP4)
     assert torch.equal(q, rq)

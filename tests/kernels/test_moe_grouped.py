@@ -16,7 +16,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from conftest import BACKEND, DEVICE, close
+from conftest import BACKEND, close
 from wformats import (
     MATH_BF16,
     MATH_FP4,
@@ -45,7 +45,7 @@ PAIRS = [
     ("w4a8", W_NVFP4, MATH_FP8, 120),
     ("fp4", W_NVFP4, MATH_FP4, 120),
 ]
-ARCHS = [0, 89, 80]
+ARCHS = [0, 89, 80] if BACKEND == "cuda" else [0]
 # (T, L, I, E, top_k)
 SHAPES = [
     (5, 256, 256, 8, 2),
@@ -62,7 +62,8 @@ def set_arch(lx, arch):
 
 def native_arch(lx):
     set_arch(lx, 0)
-    return lx.lib.lx_arch()
+    # The GPU families gate the pairs; every other backend runs every pair.
+    return lx.lib.lx_arch() if BACKEND == "cuda" else 1000
 
 
 def workspace_bytes(lx, T, L, I, E, top_k, math):
@@ -76,8 +77,8 @@ def call_grouped(lx, latent, ids, weights, gu, dn, math, out, ws, T, L, I, E, to
     fn.restype = ctypes.c_int
     p = lambda t: ctypes.c_void_p(t.data_ptr())
     status = fn(p(latent), p(ids), p(weights), ctypes.byref(gu.struct), ctypes.byref(dn.struct), math, p(out), p(ws),
-                T, L, I, E, top_k, lx.stream)
-    lx.sync()
+                T, L, I, E, top_k, ctypes.c_void_p(torch.cuda.current_stream().cuda_stream))
+    torch.cuda.synchronize()
     return status
 
 
@@ -111,26 +112,26 @@ def reference(latent, ids, weights, gu, dn, math):
 
 def make_case(T, L, I, E, top_k, wtype, seed, skew=False):
     torch.manual_seed(seed)
-    latent = torch.randn(T, L, device=DEVICE).to(torch.bfloat16)
+    latent = torch.randn(T, L, device="cuda").to(torch.bfloat16)
     if skew:
         # Most tokens on the same few experts: experts with several tiles of rows next to empty ones.
-        hot = torch.randperm(E, device=DEVICE)[: max(top_k, 3)]
-        noise = torch.rand(T, E, device=DEVICE)
-        noise[:, hot] += 10.0 * (torch.rand(T, 1, device=DEVICE) < 0.9)
+        hot = torch.randperm(E, device="cuda")[: max(top_k, 3)]
+        noise = torch.rand(T, E, device="cuda")
+        noise[:, hot] += 10.0 * (torch.rand(T, 1, device="cuda") < 0.9)
         ids = noise.argsort(-1, descending=True)[:, :top_k]
     else:
-        ids = torch.rand(T, E, device=DEVICE).argsort(-1)[:, :top_k]
+        ids = torch.rand(T, E, device="cuda").argsort(-1)[:, :top_k]
     ids = ids.to(torch.int32).contiguous()
-    weights = torch.softmax(torch.randn(T, top_k, device=DEVICE), -1).contiguous()
-    gu = quantize_weight(torch.randn(E, 2 * I, L, device=DEVICE) / L**0.5, wtype)
-    dn = quantize_weight(torch.randn(E, L, I, device=DEVICE) / I**0.5, wtype)
+    weights = torch.softmax(torch.randn(T, top_k, device="cuda"), -1).contiguous()
+    gu = quantize_weight(torch.randn(E, 2 * I, L, device="cuda") / L**0.5, wtype)
+    dn = quantize_weight(torch.randn(E, L, I, device="cuda") / I**0.5, wtype)
     return latent, ids, weights, gu, dn
 
 
 def run(lx, case, math, T, L, I, E, top_k):
     latent, ids, weights, gu, dn = case
-    out = torch.full((T, L), float("nan"), device=DEVICE)
-    ws = torch.full((max(workspace_bytes(lx, T, L, I, E, top_k, math), 1),), 0xFF, dtype=torch.uint8, device=DEVICE)
+    out = torch.full((T, L), float("nan"), device="cuda")
+    ws = torch.full((max(workspace_bytes(lx, T, L, I, E, top_k, math), 1),), 0xFF, dtype=torch.uint8, device="cuda")
     return call_grouped(lx, latent, ids, weights, gu, dn, math, out, ws, T, L, I, E, top_k), out
 
 
@@ -186,21 +187,24 @@ def test_moe_grouped_routing_is_stable(lx):
 def test_moe_grouped_empty_and_invalid(lx):
     case = make_case(4, 256, 256, 8, 2, W_BF16, seed=1)
     latent, ids, weights, gu, dn = case
-    out = torch.zeros(4, 256, device=DEVICE)
-    ws = torch.zeros(workspace_bytes(lx, 4, 256, 256, 8, 2, MATH_BF16), dtype=torch.uint8, device=DEVICE)
+    out = torch.zeros(4, 256, device="cuda")
+    ws = torch.zeros(workspace_bytes(lx, 4, 256, 256, 8, 2, MATH_BF16), dtype=torch.uint8, device="cuda")
     assert call_grouped(lx, latent, ids, weights, gu, dn, MATH_BF16, out, ws, 0, 256, 256, 8, 2) == 0
     assert workspace_bytes(lx, 0, 256, 256, 8, 2, MATH_BF16) == 0
     # I not a multiple of 8, and FP4 math with K not a whole number of its 256-wide K tiles
+    if BACKEND != "cuda":
+        return  # the tile-shape limits below are the CUDA kernels'
     assert call_grouped(lx, latent, ids, weights, gu, dn, MATH_BF16, out, ws, 4, 256, 252, 8, 2) == NOT_SUPPORTED
-    if BACKEND == "cuda" and native_arch(lx) >= 120:  # the CUDA FP4 path's 256-wide K tiles; Metal takes any K % 16
-        g4 = quantize_weight(torch.randn(8, 2 * 128, 256, device=DEVICE), W_NVFP4)
-        d4 = quantize_weight(torch.randn(8, 256, 128, device=DEVICE), W_NVFP4)
-        ws4 = torch.zeros(workspace_bytes(lx, 4, 256, 128, 8, 2, MATH_FP4), dtype=torch.uint8, device=DEVICE)
+    if native_arch(lx) >= 120:
+        g4 = quantize_weight(torch.randn(8, 2 * 128, 256, device="cuda"), W_NVFP4)
+        d4 = quantize_weight(torch.randn(8, 256, 128, device="cuda"), W_NVFP4)
+        ws4 = torch.zeros(workspace_bytes(lx, 4, 256, 128, 8, 2, MATH_FP4), dtype=torch.uint8, device="cuda")
         assert call_grouped(lx, latent, ids, weights, g4, d4, MATH_FP4, out, ws4, 4, 256, 128, 8, 2) == NOT_SUPPORTED
 
 
-@pytest.mark.skipif(BACKEND != "cuda", reason="the CUDA kernel families and their tile variants")
 def test_moe_grouped_tuned_variants(lx):
+    if BACKEND != "cuda":
+        pytest.skip("the tile variants are the CUDA kernels'")
     # Every registered tile variant of every family, picked through the tuner for both stages.
     names = (ctypes.c_char_p * 256)()
     lx.lib.lx_tune_kernels.restype = ctypes.c_int

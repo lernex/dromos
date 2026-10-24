@@ -1,0 +1,56 @@
+--- a/tunable.cu
++++ b/tunable.cu
+@@ -5,6 +5,7 @@
+ #include "lx_hip.h"
+ 
+ #include <cstdlib>
++#include <cstring>
+ #include <map>
+ #include <mutex>
+ #include <string>
+@@ -20,12 +21,32 @@
+ 
+ int g_override = -1;  // -1: not read from the environment yet
+ 
++// The architecture of the current device, as major * 10 + minor. On NVIDIA that is the compute
++// capability (120 for an RTX 50). On AMD it is the gfx target family: gfx1100 -> 110 (RDNA 3),
++// gfx1201 -> 120 (RDNA 4), gfx942 -> 94 (CDNA 3), gfx90a -> 90 (CDNA 2). Those numbers name the
++// family only; the HIP kernels dispatch on the wavefront size, not on the number.
++int gfx_family(const char* name) {
++  if (std::strncmp(name, "gfx", 3) != 0) return 0;
++  int d = 0;
++  for (const char* p = name + 3; *p >= '0' && *p <= '9'; ++p) d = d * 10 + (*p - '0');
++  if (d >= 100) return (d / 100) * 10 + (d / 10) % 10;  // gfx1100, gfx1201, gfx942, gfx906
++  return (d / 10) * 10 + d % 10;                        // gfx90a, gfx90c
++}
++
+ int device_arch() {
+-  int dev = 0, major = 0, minor = 0;
+-  hipGetDevice(&dev);
+-  hipDeviceGetAttribute(&major, hipDevAttrComputeCapabilityMajor, dev);
+-  hipDeviceGetAttribute(&minor, hipDevAttrComputeCapabilityMinor, dev);
++  int dev = 0;
++  if (hipGetDevice(&dev) != hipSuccess) return 0;
++#if defined(LX_NVIDIA_SHIM)
++  int major = 0, minor = 0;
++  if (hipDeviceGetAttribute(&major, hipDevAttrComputeCapabilityMajor, dev) != hipSuccess ||
++      hipDeviceGetAttribute(&minor, hipDevAttrComputeCapabilityMinor, dev) != hipSuccess)
++    return 0;
+   return major * 10 + minor;
++#else
++  hipDeviceProp_t prop{};
++  if (hipGetDeviceProperties(&prop, dev) != hipSuccess) return 0;
++  return gfx_family(prop.gcnArchName);
++#endif
+ }
+ 
+ std::map<std::string, std::vector<std::string>>& registry() {
+@@ -52,7 +73,7 @@
+ int lx_arch(void) {
+   static thread_local int cached_dev = -1, cached_real = 0;
+   int dev = 0;
+-  hipGetDevice(&dev);
++  if (hipGetDevice(&dev) != hipSuccess) return 0;
+   if (dev != cached_dev) {
+     cached_dev = dev;
+     cached_real = device_arch();
