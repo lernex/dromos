@@ -4,6 +4,8 @@
 // A simdgroup owns R consecutive output rows and walks K in 16-byte chunks of each row, lane l taking
 // chunks l, l + 32, ... (or, when S simdgroups share the rows, every S * 32-th chunk from its part's
 // start). The R chunks of one step are loaded before any is used, so each lane keeps R loads in flight.
+// A row's sum runs in an order that S alone sets (R and the number of x rows only change how the loads
+// are issued), so with S fixed per shape a row's bits do not depend on the batch.
 // x is read from the cache: for each of the M <= 8 rows, the chunk's values once per step, shared by
 // the R weight rows. The math is f32; the per-row factor is applied once, after the reduction.
 //
@@ -146,7 +148,18 @@ inline void dot_core(const thread dptr* rows, const thread dptr* scales,
       for (int r = 0; r < NR; ++r) acc[r] = dot_chunk<F>(w[r], s0[r], s1[r], xv, acc[r]);
       continue;
     }
-    // Several x rows: decode each weight chunk once (block scales applied), then one dot per row.
+    if (F == W_FP8 || F == W_NVFP4) {
+      // These formats' single-row dot sums a chunk (FP8) or a scale block (NVFP4) on its own before adding
+      // it in. Several rows do exactly the same per row, so a row's bits do not depend on M.
+      for (int m = 0; m < MM; ++m) {
+        if (m >= M) break;
+        float xv[V];
+        load_x<V, XB, XV>(xrows[m], k0, xv);
+        for (int r = 0; r < NR; ++r) acc[r * MM + m] = dot_chunk<F>(w[r], s0[r], s1[r], xv, acc[r * MM + m]);
+      }
+      continue;
+    }
+    // Several x rows: decode each weight chunk once, then one dot per row, in the single-row dot's order.
     float wv[NR][V];
     for (int r = 0; r < NR; ++r) decode_chunk<F>(w[r], s0[r] * (F == W_NVFP4 ? 1.0f / 16384.0f : 1.0f),
                                                  s1[r] * (F == W_NVFP4 ? 1.0f / 16384.0f : 1.0f), wv[r]);

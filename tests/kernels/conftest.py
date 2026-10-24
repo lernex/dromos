@@ -8,7 +8,8 @@ liblernex_cpu.so) runs them on CPU tensors: every tensor the tests create on "cu
 CPU instead, torch.cuda's stream and synchronize calls become the backend's (the CPU's streams are
 synchronous), and the kernels get host pointers. The tests themselves are unchanged. LX_BACKEND=metal
 (liblernex_metal.dylib) runs the same way: Metal reads host memory in place (unified memory), and
-every call is followed by a stream sync. Without LX_BACKEND, the library's name picks the backend.
+every call is followed by a stream sync (torch.cuda.synchronize waits for the device). Without LX_BACKEND,
+the library's name picks the backend.
 """
 
 import ctypes
@@ -39,15 +40,24 @@ if DEVICE == "cpu":
                 args = tuple(_host(a) if isinstance(a, (str, torch.device)) else a for a in args)
             return func(*args, **kwargs)
 
+    _sync_lib = []
+
+    def _device_sync(*a, **k):
+        """The CPU's streams are synchronous; Metal's are not, so a sync there waits for the device."""
+        if BACKEND == "metal":
+            if not _sync_lib:
+                _sync_lib.append(ctypes.CDLL(os.environ["LX_KERNELS"]))
+            assert _sync_lib[0].lx_rt_device_sync() == 0
+
     class _HostStream:
         cuda_stream = 0
 
         def synchronize(self):
-            pass
+            _device_sync()
 
     _CudaOnHost().__enter__()
     torch.cuda.current_stream = lambda *a, **k: _HostStream()
-    torch.cuda.synchronize = lambda *a, **k: None
+    torch.cuda.synchronize = _device_sync
     torch.Tensor.cuda = lambda self, *a, **k: self
 
 F32, BF16 = 0, 1

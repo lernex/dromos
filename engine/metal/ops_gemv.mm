@@ -31,7 +31,25 @@ std::string gemv_name(int i) {
 }
 KernelSet<120> g_gemv(gemv_name);  // the four formats, then f32 weights (format 4)
 
-const lx::TunableRegistration reg_gemv("gemv", {"s1", "s2", "s4"});
+// The split S (simdgroups per row group) is a shape's order class: one while the row groups alone fill
+// the GPU, more for short outputs. It depends on N alone, so every batch size of a shape shares it.
+int order_class(int N) { return N >= 2048 ? 1 : N >= 768 ? 2 : 4; }
+
+// Variants by split, named s<S> as CUDA's are; the tuner may only choose a shape's class.
+constexpr int kSplits[] = {1, 2, 4};
+bool admits(int variant, int M, int N, int K) { return kSplits[variant] == order_class(N); }
+const char* tune_name(int f) {
+  switch (f) {
+    case LX_W_BF16: return "gemv_w_bf16";
+    case LX_W_INT8: return "gemv_w_int8";
+    case LX_W_FP8: return "gemv_w_fp8";
+    default: return "gemv_w_nvfp4";
+  }
+}
+const lx::TunableRegistration reg_bf16("gemv_w_bf16", {"s1", "s2", "s4"}, &admits);
+const lx::TunableRegistration reg_int8("gemv_w_int8", {"s1", "s2", "s4"}, &admits);
+const lx::TunableRegistration reg_fp8("gemv_w_fp8", {"s1", "s2", "s4"}, &admits);
+const lx::TunableRegistration reg_nvfp4("gemv_w_nvfp4", {"s1", "s2", "s4"}, &admits);
 
 // One launch over format f (0 .. 3 the lx_wtype, 4 f32 weights) once the arguments are checked.
 int launch(int f, const void* data, const void* scale, float global, const void* x, lx_dtype x_dtype, int ld_x,
@@ -45,10 +63,8 @@ int launch(int f, const void* data, const void* scale, float global, const void*
   const bool xv = (reinterpret_cast<uintptr_t>(x) & 15) == 0 && (size_t(ld_x) * xs) % 16 == 0;
   const int mm = M == 1 ? 1 : M <= 4 ? 4 : 8;
 
-  // Simdgroups per row group: one while the row groups alone fill the GPU, more for short outputs.
-  int s = lx_tune_get("gemv", M, N, K);
-  if (s < 0) s = N >= 2048 ? 0 : N >= 768 ? 1 : 2;
-  const int S = 1 << s;
+  const int v = f == kWeightF32 ? -1 : lx_tune_get(tune_name(f), M, N, K);
+  const int S = v >= 0 && v < 3 ? kSplits[v] : order_class(N);
 
   const size_t data_bytes = f == kWeightF32 ? size_t(N) * K * 4 : weight_data_bytes(lx_wtype(f), N, K);
   const size_t scale_bytes = f == kWeightF32 ? 0 : weight_scale_bytes(lx_wtype(f), N, K);
