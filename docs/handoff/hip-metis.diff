@@ -1,0 +1,525 @@
+--- a/engine/core/device.h
++++ b/engine/core/device.h
+@@ -12,7 +12,7 @@
+ 
+ namespace lx {
+ 
+-// Move-only owner of one cudaMalloc'd block. A zero-byte buffer owns nothing.
++// Move-only owner of one device block. A zero-byte buffer owns nothing.
+ class DeviceBuffer {
+  public:
+   DeviceBuffer() noexcept = default;
+--- a/engine/core/device.cpp
++++ b/engine/core/device.cpp
+@@ -1,6 +1,6 @@
+ #include "core/device.h"
+ 
+-#include <cuda_runtime.h>
++#include "cuda/kernels.h"
+ 
+ #include <algorithm>
+ #include <span>
+@@ -13,8 +13,8 @@
+ // Tensors start on this boundary so every one can feed a vectorized kernel directly.
+ constexpr size_t kAlignment = 256;
+ 
+-void check(cudaError_t err, const std::string& what) {
+-  if (err != cudaSuccess) throw std::runtime_error(what + ": " + cudaGetErrorString(err));
++void check(int status, const std::string& what) {
++  if (status != 0) throw std::runtime_error(what + ": lx_rt status " + std::to_string(status));
+ }
+ 
+ size_t align_up(size_t n) { return (n + kAlignment - 1) / kAlignment * kAlignment; }
+@@ -33,7 +33,7 @@
+ DeviceBuffer::DeviceBuffer(size_t bytes) {
+   if (bytes == 0) return;
+   void* p = nullptr;
+-  check(cudaMalloc(&p, bytes), "cudaMalloc of " + std::to_string(bytes) + " bytes");
++  check(lx_rt_alloc(&p, static_cast<int64_t>(bytes)), "device allocation of " + std::to_string(bytes) + " bytes");
+   ptr_ = p;
+   bytes_ = bytes;
+ }
+@@ -43,7 +43,7 @@
+ 
+ DeviceBuffer& DeviceBuffer::operator=(DeviceBuffer&& other) noexcept {
+   if (this != &other) {
+-    if (ptr_) cudaFree(ptr_);
++    if (ptr_) lx_rt_free(ptr_);
+     ptr_ = std::exchange(other.ptr_, nullptr);
+     bytes_ = std::exchange(other.bytes_, 0);
+   }
+@@ -51,7 +51,7 @@
+ }
+ 
+ DeviceBuffer::~DeviceBuffer() {
+-  if (ptr_) cudaFree(ptr_);
++  if (ptr_) lx_rt_free(ptr_);
+ }
+ 
+ int64_t Tensor::numel() const noexcept {
+@@ -82,7 +82,7 @@
+   for (size_t i = 0; i < order.size(); ++i) {
+     const TensorInfo& t = *order[i];
+     void* dst = base + offsets[i];
+-    if (t.bytes) check(cudaMemcpy(dst, t.data, t.bytes, cudaMemcpyHostToDevice), "uploading \"" + t.name + "\"");
++    if (t.bytes) check(lx_rt_copy(dst, t.data, static_cast<int64_t>(t.bytes), LX_COPY_H2D, nullptr), "uploading \"" + t.name + "\"");
+     w.tensors_.emplace(t.name, Tensor{t.name, t.dtype, t.shape, t.bytes, dst});
+   }
+   return w;
+--- a/engine/model/metis.h
++++ b/engine/model/metis.h
+@@ -1,8 +1,6 @@
+ // The Metis forward pass (Metis-1.6 Logos and Praxis), built from the kernel library.
+ #pragma once
+ 
+-#include <cuda_runtime.h>
+-
+ #include <functional>
+ #include <string>
+ #include <vector>
+@@ -41,7 +39,7 @@
+ 
+   // Runs one step. Writes f32 logits to `logits` (device): every token's row [T, V] when
+   // all_rows, otherwise each sequence's last row [n_seq, V].
+-  void forward(const StepBatch& batch, float* logits, bool all_rows, cudaStream_t stream);
++  void forward(const StepBatch& batch, float* logits, bool all_rows, void* stream);
+ 
+   int vocab_size() const { return cfg_.vocab_size; }
+   const MetisConfig& config() const { return cfg_; }
+@@ -50,7 +48,7 @@
+   struct Impl;
+ 
+  private:
+-  void run(int T, int n_seq, bool all_rows, float* logits, cudaStream_t stream);
++  void run(int T, int n_seq, bool all_rows, float* logits, void* stream);
+ 
+   MetisConfig cfg_;
+   std::vector<int> slot_len_;
+--- a/engine/model/metis.cpp
++++ b/engine/model/metis.cpp
+@@ -16,7 +16,7 @@
+ namespace {
+ 
+ void check(int status, const char* what) {
+-  if (status != 0) throw std::runtime_error(std::string(what) + " failed with CUDA error " + std::to_string(status));
++  if (status != 0) throw std::runtime_error(std::string(what) + " failed with status " + std::to_string(status));
+ }
+ #define LX_CHECK(expr) check((expr), #expr)
+ 
+@@ -43,10 +43,10 @@
+   for (auto d : w.shape) n *= d;
+   std::vector<float> out(n);
+   if (w.dtype == LX_F32) {
+-    check(static_cast<int>(cudaMemcpy(out.data(), w.data, n * 4, cudaMemcpyDeviceToHost)), "cudaMemcpy");
++    check(lx_rt_copy(out.data(), w.data, n * 4, LX_COPY_D2H, nullptr), "lx_rt_copy");
+   } else {
+     std::vector<uint16_t> raw(n);
+-    check(static_cast<int>(cudaMemcpy(raw.data(), w.data, n * 2, cudaMemcpyDeviceToHost)), "cudaMemcpy");
++    check(lx_rt_copy(raw.data(), w.data, n * 2, LX_COPY_D2H, nullptr), "lx_rt_copy");
+     for (int64_t i = 0; i < n; ++i) out[i] = bf16_to_float(raw[i]);
+   }
+   return out;
+@@ -114,13 +114,13 @@
+   int32_t *route_ids, *d_meta, *d_tokens, *d_cu, *d_slots, *d_has_state, *d_start_pos;
+   int32_t* h_meta = nullptr;  // pinned staging for d_meta, so the upload is one async copy
+   size_t meta_count = 0;
+-  cudaEvent_t meta_copied = nullptr;
++  void* meta_copied = nullptr;
+   float* last_rows = nullptr;
+   // Decode steps (one token per sequence) replay a captured graph: the first step of a shape runs
+   // eagerly (which also warms cuBLASLt up), the second captures, every later one replays.
+   using GraphKey = std::tuple<int, int, bool, float*>;
+   std::set<GraphKey> seen;
+-  std::map<GraphKey, cudaGraphExec_t> graphs;
++  std::map<GraphKey, void*> graphs;
+   bool use_graphs = true;
+   // decode-sized products (at most this many rows) run as GEMVs; larger ones on cuBLASLt
+   static constexpr int kGemvRows = 8;
+@@ -134,16 +134,15 @@
+   template <typename T>
+   T* alloc(size_t count, size_t elem = sizeof(T)) {
+     void* p = nullptr;
+-    check(static_cast<int>(cudaMalloc(&p, count * elem)), "cudaMalloc");
+-    check(static_cast<int>(cudaMemset(p, 0, count * elem)), "cudaMemset");
++    check(lx_rt_alloc(&p, static_cast<int64_t>(count * elem)), "lx_rt_alloc");
+     allocations.push_back(p);
+     return static_cast<T*>(p);
+   }
+   ~Impl() {
+-    for (auto& [key, exec] : graphs) cudaGraphExecDestroy(exec);
+-    if (meta_copied) cudaEventDestroy(meta_copied);
+-    if (h_meta) cudaFreeHost(h_meta);
+-    for (void* p : allocations) cudaFree(p);
++    for (auto& [key, exec] : graphs) lx_rt_graph_destroy(exec);
++    if (meta_copied) lx_rt_event_destroy(meta_copied);
++    if (h_meta) lx_rt_host_free(h_meta);
++    for (void* p : allocations) lx_rt_free(p);
+   }
+ };
+ 
+@@ -244,7 +243,7 @@
+     softmax(write_logits, S * S + S, dst + S * S + S);
+   }
+   float* d = m.alloc<float>(params.size());
+-  check(static_cast<int>(cudaMemcpy(d, params.data(), params.size() * 4, cudaMemcpyHostToDevice)), "cudaMemcpy");
++  check(lx_rt_copy(d, params.data(), params.size() * 4, LX_COPY_H2D, nullptr), "lx_rt_copy");
+   return d;
+ }
+ 
+@@ -441,8 +440,10 @@
+   m.d_slots = m.d_cu + max_slots + 1;
+   m.d_has_state = m.d_slots + max_slots;
+   m.d_start_pos = m.d_has_state + max_slots;
+-  check(static_cast<int>(cudaMallocHost(&m.h_meta, m.meta_count * 4)), "cudaMallocHost");
+-  check(static_cast<int>(cudaEventCreateWithFlags(&m.meta_copied, cudaEventDisableTiming)), "cudaEventCreate");
++  void* h_meta = nullptr;
++  check(lx_rt_host_alloc(&h_meta, static_cast<int64_t>(m.meta_count * 4)), "lx_rt_host_alloc");
++  m.h_meta = static_cast<int32_t*>(h_meta);
++  check(lx_rt_event_create(&m.meta_copied), "lx_rt_event_create");
+   m.use_graphs = std::getenv("LX_NO_GRAPHS") == nullptr;
+ }
+ 
+@@ -456,7 +457,7 @@
+ // as GEMVs on the int8 copy when there is one, reading x as it is; larger ones go to cuBLASLt on
+ // the bf16 weight, through a bf16 copy of x when x is f32.
+ void linear(Impl& m, const Linear& l, const void* x, lx_dtype x_dtype, int ld_x, void* y, lx_dtype y_dtype, int ld_y,
+-            int M, cudaStream_t s, float alpha = 1.0f, float beta = 0.0f) {
++            int M, void* s, float alpha = 1.0f, float beta = 0.0f) {
+   if (M <= Impl::kGemvRows) {
+     LX_CHECK(lx_gemv(x, x_dtype, ld_x, l.q ? static_cast<const void*>(l.q) : l.w, l.q ? LX_W_INT8 : LX_W_BF16, l.scale,
+                      l.bias, LX_BF16, y, y_dtype, ld_y, M, l.N, l.K, alpha, beta, s));
+@@ -471,20 +472,20 @@
+   LX_CHECK(lx_gemm_bf16(x, ld_x, l.w, l.bias, y, y_dtype, ld_y, M, l.N, l.K, alpha, beta, s));
+ }
+ 
+-void to_bf16(const float* src, int ld_src, void* dst, int ld_dst, int rows, int cols, cudaStream_t s) {
++void to_bf16(const float* src, int ld_src, void* dst, int ld_dst, int rows, int cols, void* s) {
+   LX_CHECK(lx_copy2d(src, LX_F32, ld_src, dst, LX_BF16, ld_dst, rows, cols, s));
+ }
+ 
+-void copy_f32(const float* src, int ld_src, float* dst, int ld_dst, int rows, int cols, cudaStream_t s) {
++void copy_f32(const float* src, int ld_src, float* dst, int ld_dst, int rows, int cols, void* s) {
+   LX_CHECK(lx_copy2d(src, LX_F32, ld_src, dst, LX_F32, ld_dst, rows, cols, s));
+ }
+ 
+ // Depth-memory read: attend over the token's bank and gate the result into the streams. Leaves
+ // the mean retrieved vector in mem_summary (zeros while the bank is empty).
+-void memory_retrieve(Impl& m, int T, int n_entries, cudaStream_t s) {
++void memory_retrieve(Impl& m, int T, int n_entries, void* s) {
+   const int S = m.S, D = m.D, Mm = m.M;
+   if (n_entries == 0) {
+-    cudaMemsetAsync(m.mem_summary, 0, sizeof(float) * T * D, s);
++    lx_rt_memset(m.mem_summary, 0, sizeof(float) * T * D, s);
+     return;
+   }
+   linear(m, m.m_query, m.streams, LX_F32, D, m.q, LX_F32, Mm, T * S, s);
+@@ -495,7 +496,7 @@
+ 
+ // [a | b | c | d] into one row per token, as bf16 (for a GEMM) or f32.
+ void concat4(Impl& m, const float* a, const float* b, const float* c, const float* d, void* out, lx_dtype dtype,
+-             int T, cudaStream_t s) {
++             int T, void* s) {
+   const int D = m.D, R = m.R, ld = 3 * D + R;
+   const size_t es = dtype == LX_F32 ? 4 : 2;
+   char* o = static_cast<char*>(out);
+@@ -506,14 +507,14 @@
+ }
+ 
+ // Routing features: tanh(route_projection([state, retrieved, difference, history])).
+-void routing_features(Impl& m, int T, cudaStream_t s) {
++void routing_features(Impl& m, int T, void* s) {
+   concat4(m, m.state, m.mem_summary, m.difference, m.history, m.feat_in_bf, LX_BF16, T, s);
+   linear(m, m.m_route, m.feat_in_bf, LX_BF16, 3 * m.D + m.R, m.features, LX_F32, m.R, T, s);
+   LX_CHECK(lx_activate_f32(m.features, static_cast<int64_t>(T) * m.R, 0, s));
+ }
+ 
+ // A new memory entry from the streams and the last MoE's routing; stores its key and value.
+-void memory_write(Impl& m, const MetisConfig& c, int T, int pass, int anchor, int& n_entries, cudaStream_t s) {
++void memory_write(Impl& m, const MetisConfig& c, int T, int pass, int anchor, int& n_entries, void* s) {
+   const int D = m.D, R = m.R, Mm = m.M;
+   LX_CHECK(lx_stream_mean(m.streams, m.state, T, m.S, D, s));
+   linear(m, m.m_state, m.state, LX_F32, D, m.entry, LX_F32, Mm, T, s);
+@@ -532,7 +533,7 @@
+ 
+ }  // namespace
+ 
+-void MetisModel::forward(const StepBatch& b, float* logits, bool all_rows, cudaStream_t s) {
++void MetisModel::forward(const StepBatch& b, float* logits, bool all_rows, void* s) {
+   Impl& m = *impl_;
+   const int T = static_cast<int>(b.tokens.size());
+   const int n_seq = static_cast<int>(b.slots.size());
+@@ -542,7 +543,7 @@
+     throw std::runtime_error("bad step batch");
+ 
+   // stage the step's metadata (wait until the previous step's copy has left the staging buffer)
+-  cudaEventSynchronize(m.meta_copied);
++  lx_rt_event_sync(m.meta_copied);
+   int32_t* tokens = m.h_meta;
+   int32_t* cu = tokens + (m.d_cu - m.d_tokens);
+   int32_t* slots = tokens + (m.d_slots - m.d_tokens);
+@@ -558,25 +559,22 @@
+     if (start_pos[i] + b.cu_seqlens[i + 1] - b.cu_seqlens[i] > m.kv_capacity)
+       throw std::runtime_error("sequence longer than the KV capacity");
+   }
+-  cudaMemcpyAsync(m.d_meta, m.h_meta, m.meta_count * 4, cudaMemcpyHostToDevice, s);
+-  cudaEventRecord(m.meta_copied, s);
++  lx_rt_copy(m.d_meta, m.h_meta, static_cast<int64_t>(m.meta_count * 4), LX_COPY_H2D, s);
++  lx_rt_event_record(m.meta_copied, s);
+ 
+   const bool decode = T == n_seq;
+   const Impl::GraphKey key{T, n_seq, all_rows, logits};
+   if (m.use_graphs && decode) {
+     auto it = m.graphs.find(key);
+     if (it == m.graphs.end() && m.seen.count(key)) {
+-      cudaGraph_t graph;
+-      check(static_cast<int>(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal)), "cudaStreamBeginCapture");
++      check(lx_rt_capture_begin(s), "lx_rt_capture_begin");
+       run(T, n_seq, all_rows, logits, s);
+-      check(static_cast<int>(cudaStreamEndCapture(s, &graph)), "cudaStreamEndCapture");
+-      cudaGraphExec_t exec;
+-      check(static_cast<int>(cudaGraphInstantiate(&exec, graph, 0)), "cudaGraphInstantiate");
+-      cudaGraphDestroy(graph);
++      void* exec = nullptr;
++      check(lx_rt_capture_end(s, &exec), "lx_rt_capture_end");
+       it = m.graphs.emplace(key, exec).first;
+     }
+     if (it != m.graphs.end()) {
+-      check(static_cast<int>(cudaGraphLaunch(it->second, s)), "cudaGraphLaunch");
++      check(lx_rt_graph_launch(it->second, s), "lx_rt_graph_launch");
+     } else {
+       run(T, n_seq, all_rows, logits, s);
+       m.seen.insert(key);
+@@ -589,15 +587,15 @@
+ 
+ // The step's device work, from the token ids in d_meta to the logits. Everything it decides on the
+ // host depends only on (T, n_seq, all_rows), which is what makes it capturable.
+-void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, cudaStream_t s) {
++void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, void* s) {
+   Impl& m = *impl_;
+   const MetisConfig& c = cfg_;
+   const int S = m.S, D = m.D, R = m.R, Lat = m.Lat, E = m.E;
+ 
+   LX_CHECK(lx_embed_streams(m.embedding, m.d_tokens, m.stream_emb, m.streams, T, S, D, s));
+   LX_CHECK(lx_stream_mean(m.streams, m.previous, T, S, D, s));
+-  cudaMemsetAsync(m.history, 0, sizeof(float) * T * R, s);
+-  cudaMemsetAsync(m.continuation, 0, sizeof(float) * T, s);
++  lx_rt_memset(m.history, 0, sizeof(float) * T * R, s);
++  lx_rt_memset(m.continuation, 0, sizeof(float) * T, s);
+   int n_entries = 0;
+ 
+   for (int pass = 0; pass < m.P_passes; ++pass) {
+--- a/engine/model/glue.h
++++ b/engine/model/glue.h
+@@ -1,19 +1,18 @@
+ #pragma once
+ 
+-#include <cuda_runtime.h>
+ #include <stdint.h>
+ 
+ namespace lx::glue {
+ 
+ // y = a * y + b * x over n f32 elements.
+-int axpby(float* y, const float* x, float a, float b, int64_t n, cudaStream_t s);
++int axpby(float* y, const float* x, float a, float b, int64_t n, void* s);
+ // out = a - b over n f32 elements.
+-int sub(const float* a, const float* b, float* out, int64_t n, cudaStream_t s);
++int sub(const float* a, const float* b, float* out, int64_t n, void* s);
+ // meta[t, col .. col + 3] = mean_k, entropy[t] * inv_log_experts, confidence[t], continuation[t] (bf16).
+ int meta_scalars(const float* entropy, const float* confidence, const float* continuation, float mean_k,
+-                 float inv_log_experts, void* meta, int ld, int col, int T, cudaStream_t s);
++                 float inv_log_experts, void* meta, int ld, int col, int T, void* s);
+ 
+ // out[i, :] = src[cu[i + 1] - 1, :] for each of n_seq sequences (cu on the device).
+-int gather_last(const float* src, const int32_t* cu, float* out, int n_seq, int D, cudaStream_t s);
++int gather_last(const float* src, const int32_t* cu, float* out, int n_seq, int D, void* s);
+ 
+ }  // namespace lx::glue
+--- a/engine/model/glue.cu
++++ b/engine/model/glue.cu
+@@ -2,7 +2,7 @@
+ // how the model wires its pieces together, so they live with the model rather than in the ABI.
+ #include "model/glue.h"
+ 
+-#include "cuda/common.cuh"
++#include "common.cuh"
+ 
+ namespace {
+ 
+@@ -18,15 +18,15 @@
+ 
+ // The four scalar columns of a memory entry's metadata, after the expert summary.
+ __global__ void meta_scalars_kernel(const float* entropy, const float* confidence, const float* continuation,
+-                                    float mean_k, float inv_log_experts, __nv_bfloat16* meta, int ld, int col,
++                                    float mean_k, float inv_log_experts, __hip_bfloat16* meta, int ld, int col,
+                                     int T) {
+   const int t = blockIdx.x * blockDim.x + threadIdx.x;
+   if (t >= T) return;
+-  __nv_bfloat16* row = meta + static_cast<int64_t>(t) * ld + col;
+-  row[0] = __float2bfloat16_rn(mean_k);
+-  row[1] = __float2bfloat16_rn(entropy[t] * inv_log_experts);
+-  row[2] = __float2bfloat16_rn(confidence[t]);
+-  row[3] = __float2bfloat16_rn(continuation[t]);
++  __hip_bfloat16* row = meta + static_cast<int64_t>(t) * ld + col;
++  row[0] = __float2bfloat16(mean_k);
++  row[1] = __float2bfloat16(entropy[t] * inv_log_experts);
++  row[2] = __float2bfloat16(confidence[t]);
++  row[3] = __float2bfloat16(continuation[t]);
+ }
+ 
+ // out[i, :] = src[cu[i + 1] - 1, :]: each sequence's last token, read on the device so a captured
+@@ -42,26 +42,26 @@
+ 
+ namespace lx::glue {
+ 
+-int axpby(float* y, const float* x, float a, float b, int64_t n, cudaStream_t s) {
+-  if (n > 0) axpby_kernel<<<blocks(n), 256, 0, s>>>(y, x, a, b, n);
++int axpby(float* y, const float* x, float a, float b, int64_t n, void* s) {
++  if (n > 0) axpby_kernel<<<blocks(n), 256, 0, static_cast<hipStream_t>(s)>>>(y, x, a, b, n);
+   return launch_status();
+ }
+ 
+-int sub(const float* a, const float* b, float* out, int64_t n, cudaStream_t s) {
+-  if (n > 0) sub_kernel<<<blocks(n), 256, 0, s>>>(a, b, out, n);
++int sub(const float* a, const float* b, float* out, int64_t n, void* s) {
++  if (n > 0) sub_kernel<<<blocks(n), 256, 0, static_cast<hipStream_t>(s)>>>(a, b, out, n);
+   return launch_status();
+ }
+ 
+ int meta_scalars(const float* entropy, const float* confidence, const float* continuation, float mean_k,
+-                 float inv_log_experts, void* meta, int ld, int col, int T, cudaStream_t s) {
++                 float inv_log_experts, void* meta, int ld, int col, int T, void* s) {
+   if (T > 0)
+-    meta_scalars_kernel<<<blocks(T), 256, 0, s>>>(entropy, confidence, continuation, mean_k, inv_log_experts,
+-                                                  static_cast<__nv_bfloat16*>(meta), ld, col, T);
++    meta_scalars_kernel<<<blocks(T), 256, 0, static_cast<hipStream_t>(s)>>>(entropy, confidence, continuation, mean_k, inv_log_experts,
++                                                  static_cast<__hip_bfloat16*>(meta), ld, col, T);
+   return launch_status();
+ }
+ 
+-int gather_last(const float* src, const int32_t* cu, float* out, int n_seq, int D, cudaStream_t s) {
+-  if (n_seq > 0) gather_last_kernel<<<n_seq, 256, 0, s>>>(src, cu, out, D);
++int gather_last(const float* src, const int32_t* cu, float* out, int n_seq, int D, void* s) {
++  if (n_seq > 0) gather_last_kernel<<<n_seq, 256, 0, static_cast<hipStream_t>(s)>>>(src, cu, out, D);
+   return launch_status();
+ }
+ 
+--- a/cli/eval.cpp
++++ b/cli/eval.cpp
+@@ -1,8 +1,6 @@
+ // lernex eval: run reference prompts through the model and write every position's logits, for
+ // tools/compare.py. With a split point N the first N tokens go in as one prefill and the rest as
+ // single-token decode steps, which checks that the caches carry a sequence exactly.
+-#include <cuda_runtime.h>
+-
+ #include <chrono>
+ #include <cstdio>
+ #include <filesystem>
+@@ -57,10 +55,11 @@
+     lx::MetisModel model(config, lookup_for(weights), 1, 4096, static_cast<int>(longest));
+ 
+     const int V = config.vocab_size;
+-    float* d_logits = nullptr;
+-    if (cudaMalloc(&d_logits, sizeof(float) * longest * V) != cudaSuccess) throw std::runtime_error("cudaMalloc");
+-    cudaStream_t stream;
+-    cudaStreamCreate(&stream);
++    void* logits_dev = nullptr;
++    if (lx_rt_alloc(&logits_dev, sizeof(float) * longest * V) != 0) throw std::runtime_error("device allocation");
++    float* d_logits = static_cast<float*>(logits_dev);
++    void* stream = nullptr;
++    lx_rt_stream_create(&stream);
+ 
+     for (auto& [name, ids_json] : prompts.items()) {
+       const std::vector<int32_t> ids = ids_json.get<std::vector<int32_t>>();
+@@ -72,27 +71,27 @@
+       // the prefill
+       lx::StepBatch step{{ids.begin(), ids.begin() + first}, {0, first}, {0}};
+       model.forward(step, d_logits, true, stream);
+-      cudaMemcpyAsync(logits.data(), d_logits, sizeof(float) * first * V, cudaMemcpyDeviceToHost, stream);
+-      cudaStreamSynchronize(stream);
++      lx_rt_copy(logits.data(), d_logits, sizeof(float) * first * V, LX_COPY_D2H, stream);
++      lx_rt_stream_sync(stream);
+       const double prefill_s = std::chrono::duration<double>(Clock::now() - t0).count();
+       // then one token at a time
+       const auto t1 = Clock::now();
+       for (int t = first; t < T; ++t) {
+         lx::StepBatch one{{ids[t]}, {0, 1}, {0}};
+         model.forward(one, d_logits, true, stream);
+-        cudaMemcpyAsync(logits.data() + static_cast<size_t>(t) * V, d_logits, sizeof(float) * V,
+-                        cudaMemcpyDeviceToHost, stream);
++        lx_rt_copy(logits.data() + static_cast<size_t>(t) * V, d_logits, sizeof(float) * V,
++                        LX_COPY_D2H, stream);
+       }
+-      cudaStreamSynchronize(stream);
++      lx_rt_stream_sync(stream);
+       const double decode_s = std::chrono::duration<double>(Clock::now() - t1).count();
+-      if (cudaGetLastError() != cudaSuccess) throw std::runtime_error("CUDA error during the run");
++      if (lx_rt_last_error() != 0) throw std::runtime_error("device error during the run");
+       std::ofstream(out_dir / (name + ".f32"), std::ios::binary)
+           .write(reinterpret_cast<const char*>(logits.data()), logits.size() * sizeof(float));
+       std::printf("%-20s %4d tokens: prefill %d in %.1f ms", name.c_str(), T, first, prefill_s * 1e3);
+       if (first < T) std::printf(", decode %d in %.1f ms (%.1f tok/s)", T - first, decode_s * 1e3, (T - first) / decode_s);
+       std::printf("\n");
+     }
+-    cudaFree(d_logits);
++    lx_rt_free(d_logits);
+   } catch (const std::exception& e) {
+     std::fprintf(stderr, "error: %s\n", e.what());
+     return 1;
+--- a/cli/inspect.cpp
++++ b/cli/inspect.cpp
+@@ -3,7 +3,7 @@
+ // Loads the config and the checkpoint, uploads every tensor to the GPU, reads each one back and
+ // compares it with the file, then reports what landed. This is the loader's end-to-end check.
+ 
+-#include <cuda_runtime.h>
++#include "cuda/kernels.h"
+ 
+ #include <algorithm>
+ #include <chrono>
+@@ -26,8 +26,8 @@
+   return std::chrono::duration<double>(Clock::now() - start).count();
+ }
+ 
+-void check(cudaError_t err, const std::string& what) {
+-  if (err != cudaSuccess) throw std::runtime_error(what + ": " + cudaGetErrorString(err));
++void check(int status, const std::string& what) {
++  if (status != 0) throw std::runtime_error(what + ": lx_rt status " + std::to_string(status));
+ }
+ 
+ std::string join_ints(const std::vector<int>& values) {
+@@ -77,11 +77,7 @@
+     const std::string dir = argv[1];
+     print_config(dir, lx::load_config(dir));
+ 
+-    cudaDeviceProp prop{};
+-    check(cudaGetDeviceProperties(&prop, 0), "cudaGetDeviceProperties");
+-    size_t free_before = 0, total_device = 0;
+-    check(cudaMemGetInfo(&free_before, &total_device), "cudaMemGetInfo");
+-    std::printf("gpu      %s, %.2f GB free of %.2f GB\n", prop.name, free_before / 1e9, total_device / 1e9);
++    std::printf("gpu      %d device(s), backend %d\n", lx_rt_device_count(), lx_rt_backend());
+ 
+     const auto t_open = Clock::now();
+     const lx::SafetensorsSet set = lx::SafetensorsSet::open(dir);
+@@ -91,12 +87,10 @@
+     const auto t_upload = Clock::now();
+     const lx::Weights weights = lx::Weights::upload(set);
+     const double upload_s = seconds_since(t_upload);
+-    size_t free_after = 0;
+-    check(cudaMemGetInfo(&free_after, &total_device), "cudaMemGetInfo");
+     std::printf("uploaded %.2f GB (%.2f GB with 256-byte alignment) in %.2f s, %.2f GB/s\n",
+                 set.total_bytes() / 1e9, weights.device_bytes() / 1e9, upload_s,
+                 set.total_bytes() / 1e9 / upload_s);
+-    std::printf("device   %.2f GB in use by the weights\n", (free_before - free_after) / 1e9);
++    std::printf("device   %.2f GB in use by the weights\n", weights.device_bytes() / 1e9);
+ 
+     // Every tensor read back from the device must match the file, byte for byte.
+     const auto t_verify = Clock::now();
+@@ -107,7 +101,7 @@
+       const lx::Tensor* t = weights.find(name);
+       if (!t) throw std::runtime_error("the upload is missing \"" + name + "\"");
+       if (info.bytes == 0) continue;
+-      check(cudaMemcpy(host.data(), t->data, info.bytes, cudaMemcpyDeviceToHost), "reading back \"" + name + "\"");
++      check(lx_rt_copy(host.data(), t->data, info.bytes, LX_COPY_D2H, nullptr), "reading back \"" + name + "\"");
+       if (std::memcmp(host.data(), info.data, info.bytes) != 0)
+         throw std::runtime_error("the device copy of \"" + name + "\" differs from the checkpoint");
+     }
