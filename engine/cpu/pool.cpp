@@ -7,11 +7,16 @@
 // idle engine still leaves the machine alone. Chunks are claimed dynamically, which balances the
 // performance and efficiency cores of a hybrid CPU without knowing which is which.
 //
-// Claims are a compare-and-swap on a cursor that carries the job's generation next to the chunk index,
-// so a worker that wakes up late can never claim a chunk of a newer job with the old job's function.
+// Claims are one fetch-add on a cursor that carries the job's generation next to the chunk index (no
+// retry loop when fourteen threads claim at once). The claim says which job the chunk belongs to, and
+// jobs alternate between two descriptors, so a worker that wakes up late runs a chunk with the right
+// job's function: the descriptor of job g cannot be reused by job g + 2 before job g's last claimed
+// chunk is done.
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include <algorithm>
 #include <chrono>
 #include <mutex>
 #include <thread>
@@ -115,39 +120,38 @@ class Pool {
       return;
     }
     std::lock_guard<std::mutex> lock(submit_);
-    fn_.store(fn, std::memory_order_relaxed);
-    ctx_.store(ctx, std::memory_order_relaxed);
-    n_items_.store(n, std::memory_order_relaxed);
-    grain_.store(grain, std::memory_order_relaxed);
-    chunks_.store(chunks, std::memory_order_relaxed);
-    done_.store(0, std::memory_order_relaxed);
     const uint64_t gen = generation_.load(std::memory_order_relaxed) + 1;
-    cursor_.store(gen << 32, std::memory_order_relaxed);
+    Job& job = jobs_[gen & 1];
+    job.fn = fn;
+    job.ctx = ctx;
+    job.n = n;
+    job.grain = grain;
+    job.done.store(0, std::memory_order_relaxed);
+    job.tag.store((gen << 32) | static_cast<uint64_t>(chunks), std::memory_order_release);
+    cursor_.store(gen << 32, std::memory_order_release);
     generation_.store(gen, std::memory_order_seq_cst);
     if (sleepers_.load(std::memory_order_seq_cst) > 0) generation_.notify_all();
     t_in_job = true;
-    work(gen);
+    work();
     t_in_job = false;
-    while (done_.load(std::memory_order_acquire) < chunks) cpu_relax();
+    while (job.done.load(std::memory_order_acquire) < chunks) cpu_relax();
   }
 
  private:
-  // Claims and runs chunks of job `gen` until none are left.
-  void work(uint64_t gen) {
-    // A worker that woke late may read a newer job's fields here; its claims then fail on the cursor's
-    // generation, so it never runs them.
-    const RangeFn fn = fn_.load(std::memory_order_relaxed);
-    void* const ctx = ctx_.load(std::memory_order_relaxed);
-    const int64_t n = n_items_.load(std::memory_order_relaxed), grain = grain_.load(std::memory_order_relaxed),
-                  chunks = chunks_.load(std::memory_order_relaxed);
-    uint64_t c = cursor_.load(std::memory_order_relaxed);
-    while ((c >> 32) == gen && static_cast<int64_t>(c & 0xffffffffu) < chunks) {
-      if (!cursor_.compare_exchange_weak(c, c + 1, std::memory_order_acq_rel, std::memory_order_relaxed)) continue;
+  // Claims and runs chunks of the current job until a claim comes back past its end.
+  void work() {
+    for (;;) {
+      const uint64_t c = cursor_.fetch_add(1, std::memory_order_acquire);
+      Job& job = jobs_[(c >> 32) & 1];
+      // The descriptor's tag names its job and chunk count in one atomic word. A claim from a job that
+      // is over (its descriptor reused, or every chunk handed out) touches nothing else; a claim in
+      // range holds its job open, so the rest of the descriptor stays put while the chunk runs.
+      const uint64_t tag = job.tag.load(std::memory_order_acquire);
       const int64_t i = static_cast<int64_t>(c & 0xffffffffu);
-      const int64_t b = i * grain, e = b + grain < n ? b + grain : n;
-      fn(ctx, b, e);
-      done_.fetch_add(1, std::memory_order_release);
-      c = cursor_.load(std::memory_order_relaxed);
+      if ((tag >> 32) != (c >> 32) || i >= static_cast<int64_t>(tag & 0xffffffffu)) return;
+      const int64_t b = i * job.grain, e = b + job.grain < job.n ? b + job.grain : job.n;
+      job.fn(job.ctx, b, e);
+      job.done.fetch_add(1, std::memory_order_release);
     }
   }
 
@@ -185,7 +189,7 @@ class Pool {
         }
       }
       seen = gen;
-      work(gen);
+      work();
     }
   }
 
@@ -193,13 +197,18 @@ class Pool {
   int64_t spin_ns_ = 0;
   std::vector<std::thread> workers_;
   std::mutex submit_;
-  // The job. Written by the caller before the generation is published, read by workers after.
-  std::atomic<RangeFn> fn_{nullptr};
-  std::atomic<void*> ctx_{nullptr};
-  std::atomic<int64_t> n_items_{0}, grain_{1}, chunks_{0};
+  // The jobs, alternating by generation. Written by the caller before the cursor and the generation
+  // are published (release), read by a worker after its claim (acquire).
+  struct alignas(64) Job {
+    std::atomic<uint64_t> tag{0};  // generation << 32 | chunks
+    RangeFn fn = nullptr;
+    void* ctx = nullptr;
+    int64_t n = 0, grain = 1;
+    alignas(64) std::atomic<int64_t> done{0};
+  };
+  Job jobs_[2];
   alignas(64) std::atomic<uint64_t> generation_{0};
   alignas(64) std::atomic<uint64_t> cursor_{0};
-  alignas(64) std::atomic<int64_t> done_{0};
   alignas(64) std::atomic<int> sleepers_{0};
 };
 
@@ -214,6 +223,62 @@ Pool& pool() {
 int threads() { return pool().size(); }
 
 void run_parallel(int64_t n, int64_t grain, RangeFn fn, void* ctx) { pool().run(n, grain, fn, ctx); }
+
+// ---- Profile --------------------------------------------------------------------------------------------
+
+namespace {
+struct ProfEntry {
+  int64_t calls = 0, ns = 0;
+};
+struct Profile {
+  std::mutex mu;
+  std::vector<std::pair<const char*, ProfEntry>> ops;
+  const char* level = "";
+  int n_threads = 0;
+  ~Profile() {
+    if (ops.empty()) return;
+    std::sort(ops.begin(), ops.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+    int64_t total = 0;
+    for (const auto& [name, e] : ops) total += e.ns;
+    fprintf(stderr, "lernex_cpu profile (%s, %d threads): %.1f ms in ops\n", level, n_threads, total / 1e6);
+    for (const auto& [name, e] : ops)
+      fprintf(stderr, "  %-22s %8lld calls %10.2f ms %6.1f%% %9.2f us/call\n", name, static_cast<long long>(e.calls),
+              e.ns / 1e6, 100.0 * e.ns / total, e.ns / 1e3 / e.calls);
+  }
+};
+Profile& profile() {
+  static Profile p;
+  return p;
+}
+}  // namespace
+
+bool g_profile = [] {
+  const char* v = getenv("LX_CPU_PROFILE");
+  if (v && *v && *v != '0') profile();  // constructed first, so it is destroyed (and prints) last
+  return v && *v && *v != '0';
+}();
+
+int64_t ProfScope::now_ns() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+void ProfScope::record(const char* name, int64_t ns) {
+  Profile& p = profile();
+  std::lock_guard<std::mutex> g(p.mu);
+  for (auto& [n, e] : p.ops) {
+    if (n == name || strcmp(n, name) == 0) {
+      ++e.calls;
+      e.ns += ns;
+      return;
+    }
+  }
+  if (p.ops.empty()) {
+    p.level = kern().name;
+    p.n_threads = threads();
+  }
+  p.ops.push_back({name, ProfEntry{1, ns}});
+}
 
 // ---- Scratch --------------------------------------------------------------------------------------------
 

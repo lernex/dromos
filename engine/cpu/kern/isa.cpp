@@ -19,7 +19,9 @@ namespace {
 
 // ---- Weight rows -------------------------------------------------------------------------------------
 // One row of a weight in its format: load(k) gives the W values at k (a multiple of W) as f32, with any
-// block scale applied; at(k) one value, for the tail of a row whose length is not a multiple of W.
+// block scale applied, times 1 / kPost (a power of two, so a sum of them times kPost is exact);
+// span(k, out) the kSpan values at k (a multiple of kSpan) the same way, decoded together; at(k) one
+// value, exactly, for the tail of a row whose length is not a multiple of W.
 
 template <int F>
 struct Row;
@@ -29,7 +31,10 @@ struct Row<kW_F32> {
   const float* p;
   void init(const WeightRef& w, int64_t n, int64_t K) { p = static_cast<const float*>(w.data) + n * K; }
   void init_panel(const float* row) { p = row; }
+  static constexpr int kSpan = W;
+  static constexpr float kPost = 1.0f;
   V load(int64_t k) const { return vload(p + k); }
+  void span(int64_t k, V* out) const { out[0] = vload(p + k); }
   float at(int64_t k) const { return p[k]; }
 };
 
@@ -37,7 +42,10 @@ template <>
 struct Row<kW_BF16> {
   const uint16_t* p;
   void init(const WeightRef& w, int64_t n, int64_t K) { p = static_cast<const uint16_t*>(w.data) + n * K; }
+  static constexpr int kSpan = kSpanBF16;
+  static constexpr float kPost = 1.0f;
   V load(int64_t k) const { return load_bf16(p + k); }
+  void span(int64_t k, V* out) const { span_bf16(p + k, out); }
   float at(int64_t k) const { return bf16f(p[k]); }
 };
 
@@ -45,7 +53,10 @@ template <>
 struct Row<kW_INT8> {
   const int8_t* p;
   void init(const WeightRef& w, int64_t n, int64_t K) { p = static_cast<const int8_t*>(w.data) + n * K; }
+  static constexpr int kSpan = kSpanI8;
+  static constexpr float kPost = 1.0f;
   V load(int64_t k) const { return load_i8(p + k); }
+  void span(int64_t k, V* out) const { span_i8(p + k, out); }
   float at(int64_t k) const { return static_cast<float>(p[k]); }
 };
 
@@ -53,7 +64,10 @@ template <>
 struct Row<kW_FP8> {
   const uint8_t* p;
   void init(const WeightRef& w, int64_t n, int64_t K) { p = static_cast<const uint8_t*>(w.data) + n * K; }
+  static constexpr int kSpan = kSpanE4m3;
+  static constexpr float kPost = kE4m3Post;
   V load(int64_t k) const { return load_e4m3(p + k); }
+  void span(int64_t k, V* out) const { span_e4m3(p + k, out); }
   float at(int64_t k) const { return e4m3f(p[k]); }
 };
 
@@ -66,12 +80,22 @@ struct Row<kW_NVFP4> {
     p = static_cast<const uint8_t*>(w.data) + n * (K / 2);
     s = static_cast<const uint8_t*>(w.scale) + n * (K / 16);
   }
-  V load(int64_t k) const { return load_e2m1(p + k / 2, e4m3f(s[k >> 4])); }
+  static constexpr int kSpan = kSpanE2m1;  // at most one scale block
+  static constexpr float kPost = 1.0f;
+  V load(int64_t k) const { return load_e2m1(p + k / 2, kE4m3Tab.v[s[k >> 4]]); }
+  void span(int64_t k, V* out) const { span_e2m1(p + k / 2, kE4m3Tab.v[s[k >> 4]], out); }
   float at(int64_t k) const {
     const uint8_t b = p[k >> 1];
-    return e2m1f((k & 1) ? (b >> 4) : (b & 15u)) * e4m3f(s[k >> 4]);
+    return e2m1f((k & 1) ? (b >> 4) : (b & 15u)) * kE4m3Tab.v[s[k >> 4]];
   }
 };
+
+// The W values at k exactly (kPost applied), for decoding rows into a panel.
+template <int F>
+inline V exact(const Row<F>& row, int64_t k) {
+  if constexpr (Row<F>::kPost == 1.0f) return row.load(k);
+  else return vmul(row.load(k), vset1(Row<F>::kPost));
+}
 
 // ---- f32 dot tiles -----------------------------------------------------------------------------------
 
@@ -86,14 +110,46 @@ constexpr int small_nr(int mr) { return mr == 1 ? 8 : mr == 2 ? 6 : mr == 3 ? 5 
 #endif
 constexpr int kSmallM = 8;  // up to this many rows the weights are streamed in their format
 
-// out[m * ld_out + r] = sum_k x[m, k] * row_r[k] for an MR x NR tile.
+// Bytes of a weight row per element, for the streamed path's prefetch (NVFP4's scales ride along).
+template <int F>
+constexpr int kRowBytesX2 = F == kW_F32 ? 8 : F == kW_BF16 ? 4 : F == kW_NVFP4 ? 1 : 2;  // twice the bytes
+
+// out[m * ld_out + r] = sum_k x[m, k] * row_r[k] for an MR x NR tile. With pf, the tile also pulls
+// the next tile's weight bytes (pf, the rows right after its own) toward the core as it goes, at the
+// rate it consumes its own, so when it moves on the next rows are arriving instead of starting cold.
 template <int F, int MR, int NR>
-inline void tile(const float* x, int64_t ld_x, const Row<F>* rows, int64_t K, float* out, int64_t ld_out) {
+inline void tile(const float* x, int64_t ld_x, const Row<F>* rows, int64_t K, float* out, int64_t ld_out,
+                 const char* pf = nullptr, const char* pf_end = nullptr) {
+  constexpr int kLines = (W * NR * kRowBytesX2<F> / 2 + 63) / 64;
   V acc[MR][NR];
   for (int m = 0; m < MR; ++m)
     for (int r = 0; r < NR; ++r) acc[m][r] = vzero();
   int64_t k = 0;
+  // Wide decodes for decode-sized tiles (a few rows of x, so the span's x vectors fit beside the
+  // accumulators). Each accumulator still takes its k in order, so the sums are the narrow loop's.
+  constexpr int SV = Row<F>::kSpan / W;
+  if constexpr (SV > 1 && MR <= 2) {
+    for (; k + Row<F>::kSpan <= K; k += Row<F>::kSpan) {
+      if (pf && pf < pf_end) {
+        for (int l = 0; l < SV * kLines; ++l) __builtin_prefetch(pf + 64 * l, 0, 3);
+        pf += 64 * SV * kLines;
+      }
+      V xv[MR][SV];
+      for (int m = 0; m < MR; ++m)
+        for (int j = 0; j < SV; ++j) xv[m][j] = vload(x + m * ld_x + k + j * W);
+      for (int r = 0; r < NR; ++r) {
+        V wv[SV];
+        rows[r].span(k, wv);
+        for (int j = 0; j < SV; ++j)
+          for (int m = 0; m < MR; ++m) acc[m][r] = vfma(xv[m][j], wv[j], acc[m][r]);
+      }
+    }
+  }
   for (; k + W <= K; k += W) {
+    if (pf && pf < pf_end) {
+      for (int l = 0; l < kLines; ++l) __builtin_prefetch(pf + 64 * l, 0, 3);
+      pf += 64 * kLines;
+    }
     V wv[NR];
     for (int r = 0; r < NR; ++r) wv[r] = rows[r].load(k);
     for (int m = 0; m < MR; ++m) {
@@ -103,7 +159,7 @@ inline void tile(const float* x, int64_t ld_x, const Row<F>* rows, int64_t K, fl
   }
   for (int m = 0; m < MR; ++m) {
     for (int r = 0; r < NR; ++r) {
-      float s = vhsum(acc[m][r]);
+      float s = vhsum(acc[m][r]) * Row<F>::kPost;
       for (int64_t kk = k; kk < K; ++kk) s += x[m * ld_x + kk] * rows[r].at(kk);
       out[m * ld_out + r] = s;
     }
@@ -111,14 +167,15 @@ inline void tile(const float* x, int64_t ld_x, const Row<F>* rows, int64_t K, fl
 }
 
 template <int F, int MR, int NR>
-inline void tile_n(int nr, const float* x, int64_t ld_x, const Row<F>* rows, int64_t K, float* out, int64_t ld_out) {
+inline void tile_n(int nr, const float* x, int64_t ld_x, const Row<F>* rows, int64_t K, float* out, int64_t ld_out,
+                   const char* pf = nullptr, const char* pf_end = nullptr) {
   if constexpr (NR > 1) {
     if (nr < NR) {
-      tile_n<F, MR, NR - 1>(nr, x, ld_x, rows, K, out, ld_out);
+      tile_n<F, MR, NR - 1>(nr, x, ld_x, rows, K, out, ld_out, pf, pf_end);
       return;
     }
   }
-  tile<F, MR, NR>(x, ld_x, rows, K, out, ld_out);
+  tile<F, MR, NR>(x, ld_x, rows, K, out, ld_out, pf, pf_end);
 }
 
 // Rows [n0, n1) of the weight against x rows [m0, m1), m1 - m0 <= kSmallM, streamed in their format.
@@ -127,10 +184,16 @@ template <int F, int MR>
 inline void small_rows(const DotF32& a, int64_t m, int64_t n0, int64_t n1, float* out) {
   constexpr int NR = small_nr(MR);
   Row<F> rows[NR];
+  // Rows are contiguous, so the next tile's bytes start where this tile's end.
+  const int64_t row_bytes = a.K * kRowBytesX2<F> / 2;
+  const char* base = static_cast<const char*>(a.w.data);
   for (int64_t n = n0; n < n1; n += NR) {
     const int nr = static_cast<int>(lmin<int64_t>(NR, n1 - n));
     for (int r = 0; r < nr; ++r) rows[r].init(a.w, n + r, a.K);
-    tile_n<F, MR, NR>(nr, a.x + m * a.ld_x, a.ld_x, rows, a.K, out + (n - n0), a.ld_out);
+    const int64_t next = n + nr, next_end = lmin<int64_t>(n1, next + NR);
+    const char* pf = next < n1 ? base + next * row_bytes : nullptr;
+    tile_n<F, MR, NR>(nr, a.x + m * a.ld_x, a.ld_x, rows, a.K, out + (n - n0), a.ld_out, pf,
+                      base + next_end * row_bytes);
   }
 }
 
@@ -181,7 +244,7 @@ inline void decode_rows(const WeightRef& w, int64_t n, int64_t count, int64_t K,
     row.init(w, n + r, K);
     float* d = dst + r * K;
     int64_t k = 0;
-    for (; k + W <= K; k += W) vstore(d + k, row.load(k));
+    for (; k + W <= K; k += W) vstore(d + k, exact(row, k));
     for (; k < K; ++k) d[k] = row.at(k);
   }
 }
@@ -386,8 +449,84 @@ inline int32_t i8_row_sum(const int8_t* w, int64_t K) {
   return kI8Biased ? i8_hsum(acc) : 0;
 }
 
+#if LX_ISA_CODE == 52
+// I8MM: SMMLA multiplies two rows of x by two rows of w, 8 k at a time (a 2x8 by 8x2 product, 32 MACs,
+// twice SDOT's), into a 2x2 block of int32 sums: lanes (0,0) (0,1) (1,0) (1,1). Rows are paired with
+// a 64-bit zip of two 16-byte loads. Integer sums are exact, so the results are the SDOT tiles' bit for
+// bit. Rows past the end are duplicates of the last one, computed and dropped.
+constexpr int kMmMP = 3, kMmNP = 4;  // pairs: a 6 x 8 tile, 12 accumulators
+
+inline int8x16_t zip_lo(int8x16_t a, int8x16_t b) {
+  return vreinterpretq_s8_s64(vzip1q_s64(vreinterpretq_s64_s8(a), vreinterpretq_s64_s8(b)));
+}
+inline int8x16_t zip_hi(int8x16_t a, int8x16_t b) {
+  return vreinterpretq_s8_s64(vzip2q_s64(vreinterpretq_s64_s8(a), vreinterpretq_s64_s8(b)));
+}
+
+void i8mm_tile(const int8_t* const* x, const int8_t* const* w, int64_t K, int32_t (*sums)[2 * kMmNP]) {
+  int32x4_t acc[kMmMP][kMmNP];
+  for (int i = 0; i < kMmMP; ++i)
+    for (int j = 0; j < kMmNP; ++j) acc[i][j] = vdupq_n_s32(0);
+  int64_t k = 0;
+  for (; k + 16 <= K; k += 16) {
+    int8x16_t av[kMmMP][2], bv[kMmNP][2];
+    for (int i = 0; i < kMmMP; ++i) {
+      const int8x16_t r0 = vld1q_s8(x[2 * i] + k), r1 = vld1q_s8(x[2 * i + 1] + k);
+      av[i][0] = zip_lo(r0, r1);
+      av[i][1] = zip_hi(r0, r1);
+    }
+    for (int j = 0; j < kMmNP; ++j) {
+      const int8x16_t r0 = vld1q_s8(w[2 * j] + k), r1 = vld1q_s8(w[2 * j + 1] + k);
+      bv[j][0] = zip_lo(r0, r1);
+      bv[j][1] = zip_hi(r0, r1);
+    }
+    for (int h = 0; h < 2; ++h)
+      for (int i = 0; i < kMmMP; ++i)
+        for (int j = 0; j < kMmNP; ++j) acc[i][j] = vmmlaq_s32(acc[i][j], av[i][h], bv[j][h]);
+  }
+  for (int i = 0; i < kMmMP; ++i) {
+    for (int j = 0; j < kMmNP; ++j) {
+      int32_t v[4];
+      vst1q_s32(v, acc[i][j]);
+      for (int q = 0; q < 4; ++q) {
+        const int mi = 2 * i + (q >> 1), nj = 2 * j + (q & 1);
+        int32_t t = v[q];
+        for (int64_t kk = k; kk < K; ++kk) t += static_cast<int32_t>(x[mi][kk]) * w[nj][kk];
+        sums[mi][nj] = t;
+      }
+    }
+  }
+}
+
+void dot_i8_mm(const DotI8& a, int64_t m0, int64_t m1, int64_t n0, int64_t n1) {
+  constexpr int TM = 2 * kMmMP, TN = 2 * kMmNP;
+  const int64_t K = a.K;
+  for (int64_t n = n0; n < n1; n += TN) {
+    const int nr = static_cast<int>(lmin<int64_t>(TN, n1 - n));
+    const int8_t* w[TN];
+    for (int r = 0; r < TN; ++r) w[r] = a.w + (n + lmin(r, nr - 1)) * K;
+    for (int64_t m = m0; m < m1; m += TM) {
+      const int mr = static_cast<int>(lmin<int64_t>(TM, m1 - m));
+      const int8_t* x[TM];
+      for (int r = 0; r < TM; ++r) x[r] = a.x + (m + lmin(r, mr - 1)) * a.ld_x;
+      int32_t sums[TM][TN];
+      i8mm_tile(x, w, K, sums);
+      for (int i = 0; i < mr; ++i)
+        for (int j = 0; j < nr; ++j) a.out[(m - m0 + i) * a.ld_out + (n - n0) + j] = static_cast<float>(sums[i][j]);
+    }
+  }
+}
+#endif
+
 void dot_i8(const DotI8& a, int64_t m0, int64_t m1, int64_t n0, int64_t n1) {
   const int64_t K = a.K;
+#if LX_ISA_CODE == 52
+  // A prefill-sized block goes to SMMLA; a decode step's few rows would waste its row pairs.
+  if (m1 - m0 >= 4) {
+    dot_i8_mm(a, m0, m1, n0, n1);
+    return;
+  }
+#endif
   for (int64_t n = n0; n < n1; n += kI8NR) {
     const int nr = static_cast<int>(lmin<int64_t>(kI8NR, n1 - n));
     const int8_t* w[kI8NR];
@@ -474,12 +613,78 @@ inline void decode_rows_bf16(const WeightRef& wr, int64_t n, int64_t count, int6
     float tmp[W];
     int64_t k = 0;
     for (; k + W <= K; k += W) {
-      vstore(tmp, row.load(k));
+      vstore(tmp, exact(row, k));
       for (int i = 0; i < W; ++i) d[k + i] = f32_bf16(tmp[i]);
     }
     for (; k < K; ++k) d[k] = f32_bf16(row.at(k));
   }
 }
+
+#if LX_ISA_CODE == 52
+// BFMMLA: two rows of x by two rows of w, 4 k at a time (a 2x4 by 4x2 bf16 product, 16 MACs, twice
+// BFDOT's), into a 2x2 block of f32 sums, paired like the int8 tiles.
+inline bfloat16x8_t bzip_lo(uint16x8_t a, uint16x8_t b) {
+  return vreinterpretq_bf16_u64(vzip1q_u64(vreinterpretq_u64_u16(a), vreinterpretq_u64_u16(b)));
+}
+inline bfloat16x8_t bzip_hi(uint16x8_t a, uint16x8_t b) {
+  return vreinterpretq_bf16_u64(vzip2q_u64(vreinterpretq_u64_u16(a), vreinterpretq_u64_u16(b)));
+}
+
+void bfmm_tile(const uint16_t* const* x, const uint16_t* const* w, int64_t K, float (*sums)[2 * kMmNP]) {
+  float32x4_t acc[kMmMP][kMmNP];
+  for (int i = 0; i < kMmMP; ++i)
+    for (int j = 0; j < kMmNP; ++j) acc[i][j] = vdupq_n_f32(0.0f);
+  int64_t k = 0;
+  for (; k + 8 <= K; k += 8) {
+    bfloat16x8_t av[kMmMP][2], bv[kMmNP][2];
+    for (int i = 0; i < kMmMP; ++i) {
+      const uint16x8_t r0 = vld1q_u16(x[2 * i] + k), r1 = vld1q_u16(x[2 * i + 1] + k);
+      av[i][0] = bzip_lo(r0, r1);
+      av[i][1] = bzip_hi(r0, r1);
+    }
+    for (int j = 0; j < kMmNP; ++j) {
+      const uint16x8_t r0 = vld1q_u16(w[2 * j] + k), r1 = vld1q_u16(w[2 * j + 1] + k);
+      bv[j][0] = bzip_lo(r0, r1);
+      bv[j][1] = bzip_hi(r0, r1);
+    }
+    for (int h = 0; h < 2; ++h)
+      for (int i = 0; i < kMmMP; ++i)
+        for (int j = 0; j < kMmNP; ++j) acc[i][j] = vbfmmlaq_f32(acc[i][j], av[i][h], bv[j][h]);
+  }
+  for (int i = 0; i < kMmMP; ++i) {
+    for (int j = 0; j < kMmNP; ++j) {
+      float v[4];
+      vst1q_f32(v, acc[i][j]);
+      for (int q = 0; q < 4; ++q) {
+        const int mi = 2 * i + (q >> 1), nj = 2 * j + (q & 1);
+        float t = v[q];
+        for (int64_t kk = k; kk < K; ++kk) t += bf16f(x[mi][kk]) * bf16f(w[nj][kk]);
+        sums[mi][nj] = t;
+      }
+    }
+  }
+}
+
+// Rows [n0, n1) of `base` (bf16, K-contiguous) against x rows [m0, m1), m1 - m0 >= 2.
+void bf16_mm_block(const DotBF16& a, const uint16_t* base, int64_t rows, int64_t m0, int64_t m1, float* out0) {
+  constexpr int TM = 2 * kMmMP, TN = 2 * kMmNP;
+  const int64_t K = a.K;
+  for (int64_t n = 0; n < rows; n += TN) {
+    const int nr = static_cast<int>(lmin<int64_t>(TN, rows - n));
+    const uint16_t* w[TN];
+    for (int r = 0; r < TN; ++r) w[r] = base + (n + lmin(r, nr - 1)) * K;
+    for (int64_t m = m0; m < m1; m += TM) {
+      const int mr = static_cast<int>(lmin<int64_t>(TM, m1 - m));
+      const uint16_t* x[TM];
+      for (int r = 0; r < TM; ++r) x[r] = a.x + (m + lmin(r, mr - 1)) * a.ld_x;
+      float sums[TM][TN];
+      bfmm_tile(x, w, K, sums);
+      for (int i = 0; i < mr; ++i)
+        for (int j = 0; j < nr; ++j) out0[(m - m0 + i) * a.ld_out + n + j] = sums[i][j];
+    }
+  }
+}
+#endif
 
 void dot_bf16(const DotBF16& a, int64_t m0, int64_t m1, int64_t n0, int64_t n1) {
   const int64_t K = a.K;
@@ -500,6 +705,12 @@ void dot_bf16(const DotBF16& a, int64_t m0, int64_t m1, int64_t n0, int64_t n1) 
       }
       base = p;
     }
+#if LX_ISA_CODE == 52
+    if (m1 - m0 >= 2) {
+      bf16_mm_block(a, base, rows, m0, m1, a.out + (nbase - n0));
+      continue;
+    }
+#endif
     for (int64_t m = m0; m < m1; m += kBMR) {
       const int mr = static_cast<int>(lmin<int64_t>(kBMR, m1 - m));
       for (int64_t r = 0; r < rows; r += kBNR) {

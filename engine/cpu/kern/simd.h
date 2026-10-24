@@ -5,8 +5,12 @@
 //   V       a vector of W floats
 //   vload / vstore / vset1 / vzero / vfma(a, b, c) = a * b + c / vadd / vsub / vmul / vmax / vmin
 //   vhsum   the horizontal sum, in one fixed order per level (results are deterministic)
-//   load_bf16(p)  W bf16 values as f32; load_i8(p) W int8; load_e4m3(p) W e4m3; load_e2m1(p, s) W e2m1
-//                 codes from W / 2 bytes (low nibble first) times s
+//   load_bf16(p)  W bf16 values as f32; load_i8(p) W int8; load_e4m3(p) W e4m3 times 1 / kE4m3Post (an
+//                 exact power of two the caller multiplies a whole sum by); load_e2m1(p, s) W e2m1 codes
+//                 from W / 2 bytes (low nibble first) times s
+//   span_*(p, out)  kSpan* values (a multiple of W) at once into kSpan* / W vectors, the same values as the
+//                 load_* of each W, decoded together where the ISA converts wider than one vector
+//   kE4m3Tab      the 256 e4m3 values (a compile-time table: block scales cost one load)
 //   vexp    exp, within 2 ulp on [-87.3, 88.3], clamped outside
 #pragma once
 
@@ -47,6 +51,25 @@ static inline float e2m1f(uint32_t code) {
   const float v = kGrid[code & 7u];
   return (code & 8u) ? -v : v;
 }
+// e4m3 as e4m3f decodes it (the codes the "fn" format calls NaN decode as 480 here; no valid weight
+// or scale holds one), built at compile time so no code runs at load in a per-ISA object.
+constexpr float e4m3_value(int b) {
+  const int e = (b >> 3) & 15, m = b & 7;
+  float v = e == 0 ? static_cast<float>(m) / 512.0f : 1.0f + static_cast<float>(m) / 8.0f;
+  for (int i = 7; e > 0 && i < e; ++i) v *= 2.0f;
+  for (int i = e; e > 0 && i < 7; ++i) v *= 0.5f;
+  return (b & 0x80) ? -v : v;
+}
+struct E4m3Table {
+  float v[256];
+};
+constexpr E4m3Table make_e4m3_table() {
+  E4m3Table t{};
+  for (int i = 0; i < 256; ++i) t.v[i] = e4m3_value(i);
+  return t;
+}
+alignas(64) static constexpr E4m3Table kE4m3Tab = make_e4m3_table();
+
 template <class T>
 static inline T lmin(T a, T b) {
   return a < b ? a : b;
@@ -137,6 +160,12 @@ static inline V vexp(V a) {
   for (int i = 0; i < 4; ++i) a.v[i] = sexp(a.v[i]);
   return a;
 }
+constexpr float kE4m3Post = 1.0f;
+constexpr int kSpanBF16 = W, kSpanI8 = W, kSpanE4m3 = W, kSpanE2m1 = W;
+static inline void span_bf16(const uint16_t* p, V* out) { out[0] = load_bf16(p); }
+static inline void span_i8(const int8_t* p, V* out) { out[0] = load_i8(p); }
+static inline void span_e4m3(const uint8_t* p, V* out) { out[0] = load_e4m3(p); }
+static inline void span_e2m1(const uint8_t* p, float s, V* out) { out[0] = load_e2m1(p, s); }
 
 #elif LX_ISA_CODE >= 10 && LX_ISA_CODE < 20
 // ---- AVX2 + FMA (and AVX-VNNI, which only changes the int8 kernels) ----------------------------------
@@ -172,19 +201,26 @@ static inline V load_bf16(const uint16_t* p) {
 static inline V load_i8(const int8_t* p) {
   return _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(p))));
 }
-// e4m3 without touching f32 denormals: normal codes rebase the exponent with an integer add (bias 7 to
-// 127), subnormal codes (magnitude < 8) are m * 2^-9 from an integer conversion.
-static inline V e4m3_lanes(__m256i b) {
-  const __m256i mag = _mm256_and_si256(b, _mm256_set1_epi32(0x7f));
-  const __m256i sign = _mm256_slli_epi32(_mm256_and_si256(b, _mm256_set1_epi32(0x80)), 24);
-  const __m256i normal = _mm256_add_epi32(_mm256_slli_epi32(mag, 20), _mm256_set1_epi32(120 << 23));
-  const __m256 sub = _mm256_mul_ps(_mm256_cvtepi32_ps(mag), _mm256_set1_ps(0x1p-9f));
-  const __m256i is_sub = _mm256_cmpgt_epi32(_mm256_set1_epi32(8), mag);
-  const __m256 v = _mm256_blendv_ps(_mm256_castsi256_ps(normal), sub, _mm256_castsi256_ps(is_sub));
-  return _mm256_or_ps(v, _mm256_castsi256_ps(sign));
+// e4m3 through f16 (F16C): the byte's exponent and mantissa placed in an f16 (bias 15 against 7) give
+// 2^-8 of the value, subnormals included, and the conversion is exact. kE4m3Post puts the 2^8 back,
+// once per sum. 16-bit lanes hold the bytes.
+constexpr float kE4m3Post = 256.0f;
+static inline __m128i e4m3_half(__m128i b) {
+  return _mm_or_si128(_mm_slli_epi16(_mm_and_si128(b, _mm_set1_epi16(0x7f)), 7),
+                      _mm_slli_epi16(_mm_and_si128(b, _mm_set1_epi16(0x80)), 8));
 }
 static inline V load_e4m3(const uint8_t* p) {
-  return e4m3_lanes(_mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(p))));
+  return _mm256_cvtph_ps(e4m3_half(_mm_cvtepu8_epi16(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(p)))));
+}
+constexpr int kSpanBF16 = W, kSpanI8 = W, kSpanE4m3 = 2 * W, kSpanE2m1 = 2 * W;
+static inline void span_bf16(const uint16_t* p, V* out) { out[0] = load_bf16(p); }
+static inline void span_i8(const int8_t* p, V* out) { out[0] = load_i8(p); }
+static inline void span_e4m3(const uint8_t* p, V* out) {
+  const __m256i b = _mm256_cvtepu8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
+  const __m256i h = _mm256_or_si256(_mm256_slli_epi16(_mm256_and_si256(b, _mm256_set1_epi16(0x7f)), 7),
+                                    _mm256_slli_epi16(_mm256_and_si256(b, _mm256_set1_epi16(0x80)), 8));
+  out[0] = _mm256_cvtph_ps(_mm256_castsi256_si128(h));
+  out[1] = _mm256_cvtph_ps(_mm256_extracti128_si256(h, 1));
 }
 // Twice the e2m1 value of each code, as int8: a 16-entry table for pshufb.
 static inline __m128i e2m1_table() { return _mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12); }
@@ -197,6 +233,16 @@ static inline V load_e2m1(const uint8_t* p, float s) {
   const __m128i codes = _mm_unpacklo_epi8(lo, hi);
   const __m128i v2 = _mm_shuffle_epi8(e2m1_table(), codes);
   return _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(v2)), _mm256_set1_ps(0.5f * s));
+}
+// One 16-value scale block from 8 bytes.
+static inline void span_e2m1(const uint8_t* p, float s, V* out) {
+  const __m128i b = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p));
+  const __m128i lo = _mm_and_si128(b, _mm_set1_epi8(15));
+  const __m128i hi = _mm_and_si128(_mm_srli_epi16(b, 4), _mm_set1_epi8(15));
+  const __m128i v2 = _mm_shuffle_epi8(e2m1_table(), _mm_unpacklo_epi8(lo, hi));
+  const __m256 hs = _mm256_set1_ps(0.5f * s);
+  out[0] = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(v2)), hs);
+  out[1] = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_unpackhi_epi64(v2, v2))), hs);
 }
 static inline V vexp(V x) {
   x = _mm256_min_ps(_mm256_max_ps(x, _mm256_set1_ps(kExpLo)), _mm256_set1_ps(kExpHi));
@@ -247,15 +293,13 @@ static inline V load_bf16(const uint16_t* p) {
 static inline V load_i8(const int8_t* p) {
   return _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p))));
 }
+// e4m3 through f16, as on AVX2: 2^-8 of the value, exact; kE4m3Post restores it once per sum.
+constexpr float kE4m3Post = 256.0f;
 static inline V load_e4m3(const uint8_t* p) {
-  const __m512i b = _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
-  const __m512i mag = _mm512_and_si512(b, _mm512_set1_epi32(0x7f));
-  const __m512i sign = _mm512_slli_epi32(_mm512_and_si512(b, _mm512_set1_epi32(0x80)), 24);
-  const __m512i normal = _mm512_add_epi32(_mm512_slli_epi32(mag, 20), _mm512_set1_epi32(120 << 23));
-  const __m512 sub = _mm512_mul_ps(_mm512_cvtepi32_ps(mag), _mm512_set1_ps(0x1p-9f));
-  const __mmask16 is_sub = _mm512_cmplt_epi32_mask(mag, _mm512_set1_epi32(8));
-  const __m512 v = _mm512_mask_blend_ps(is_sub, _mm512_castsi512_ps(normal), sub);
-  return _mm512_or_ps(v, _mm512_castsi512_ps(sign));
+  const __m256i b = _mm256_cvtepu8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
+  const __m256i h = _mm256_or_si256(_mm256_slli_epi16(_mm256_and_si256(b, _mm256_set1_epi16(0x7f)), 7),
+                                    _mm256_slli_epi16(_mm256_and_si256(b, _mm256_set1_epi16(0x80)), 8));
+  return _mm512_cvtph_ps(h);
 }
 static inline __m128i e2m1_table() { return _mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12); }
 static inline V load_e2m1(const uint8_t* p, float s) {
@@ -266,6 +310,11 @@ static inline V load_e2m1(const uint8_t* p, float s) {
   const __m128i v2 = _mm_shuffle_epi8(e2m1_table(), codes);
   return _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(v2)), _mm512_set1_ps(0.5f * s));
 }
+constexpr int kSpanBF16 = W, kSpanI8 = W, kSpanE4m3 = W, kSpanE2m1 = W;
+static inline void span_bf16(const uint16_t* p, V* out) { out[0] = load_bf16(p); }
+static inline void span_i8(const int8_t* p, V* out) { out[0] = load_i8(p); }
+static inline void span_e4m3(const uint8_t* p, V* out) { out[0] = load_e4m3(p); }
+static inline void span_e2m1(const uint8_t* p, float s, V* out) { out[0] = load_e2m1(p, s); }
 static inline V vexp(V x) {
   x = _mm512_min_ps(_mm512_max_ps(x, _mm512_set1_ps(kExpLo)), _mm512_set1_ps(kExpHi));
   const __m512 fx = _mm512_roundscale_ps(_mm512_mul_ps(x, _mm512_set1_ps(kLog2e)), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
@@ -310,10 +359,11 @@ static inline V load_i8(const int8_t* p) {
   return vcvtq_f32_s32(vmovl_s16(vget_low_s16(w)));
 }
 // e4m3 through f16: the byte's exponent and mantissa placed in an f16 (bias 15) give 2^-8 of the value,
-// subnormals included, and the f16 to f32 conversion is exact.
+// subnormals included, and the f16 to f32 conversion is exact. kE4m3Post restores the 2^8 once per sum.
+constexpr float kE4m3Post = 256.0f;
 static inline V e4m3_half4(uint16x4_t b) {
   const uint16x4_t h = vorr_u16(vshl_n_u16(vand_u16(b, vdup_n_u16(0x7f)), 7), vshl_n_u16(vand_u16(b, vdup_n_u16(0x80)), 8));
-  return vmulq_n_f32(vcvt_f32_f16(vreinterpret_f16_u16(h)), 256.0f);
+  return vcvt_f32_f16(vreinterpret_f16_u16(h));
 }
 static inline V load_e4m3(const uint8_t* p) {
   int32_t raw;
@@ -332,6 +382,47 @@ static inline V load_e2m1(const uint8_t* p, float s) {
   const uint8x8_t codes = vzip1_u8(vand_u8(b, vdup_n_u8(15)), vshr_n_u8(b, 4));
   const int8x8_t v2 = vqtbl1_s8(e2m1_table(), codes);
   return vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(vmovl_s8(v2)))), 0.5f * s);
+}
+// Sixteen values at a time: one load and wide conversions instead of four narrow ones.
+constexpr int kSpanBF16 = 4 * W, kSpanI8 = 4 * W, kSpanE4m3 = 4 * W, kSpanE2m1 = 4 * W;
+static inline void span_bf16(const uint16_t* p, V* out) {
+  const uint16x8_t a = vld1q_u16(p), b = vld1q_u16(p + 8);
+  out[0] = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(a), 16));
+  out[1] = vreinterpretq_f32_u32(vshll_high_n_u16(a, 16));
+  out[2] = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(b), 16));
+  out[3] = vreinterpretq_f32_u32(vshll_high_n_u16(b, 16));
+}
+static inline void span_i8(const int8_t* p, V* out) {
+  const int8x16_t v = vld1q_s8(p);
+  const int16x8_t lo = vmovl_s8(vget_low_s8(v)), hi = vmovl_high_s8(v);
+  out[0] = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo)));
+  out[1] = vcvtq_f32_s32(vmovl_high_s16(lo));
+  out[2] = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi)));
+  out[3] = vcvtq_f32_s32(vmovl_high_s16(hi));
+}
+static inline float16x8_t e4m3_half8(uint16x8_t b) {
+  return vreinterpretq_f16_u16(
+      vorrq_u16(vshlq_n_u16(vandq_u16(b, vdupq_n_u16(0x7f)), 7), vshlq_n_u16(vandq_u16(b, vdupq_n_u16(0x80)), 8)));
+}
+static inline void span_e4m3(const uint8_t* p, V* out) {
+  const uint8x16_t v = vld1q_u8(p);
+  const float16x8_t lo = e4m3_half8(vmovl_u8(vget_low_u8(v))), hi = e4m3_half8(vmovl_high_u8(v));
+  out[0] = vcvt_f32_f16(vget_low_f16(lo));
+  out[1] = vcvt_high_f32_f16(lo);
+  out[2] = vcvt_f32_f16(vget_low_f16(hi));
+  out[3] = vcvt_high_f32_f16(hi);
+}
+// One 16-value scale block from 8 bytes.
+static inline void span_e2m1(const uint8_t* p, float s, V* out) {
+  const uint8x8_t b = vld1_u8(p);
+  const uint8x8_t lo = vand_u8(b, vdup_n_u8(15)), hi = vshr_n_u8(b, 4);
+  const int8x16_t v2 = vqtbl1q_s8(e2m1_table(), vcombine_u8(vzip1_u8(lo, hi), vzip2_u8(lo, hi)));
+  const int16x8_t a = vmovl_s8(vget_low_s8(v2)), c = vmovl_high_s8(v2);
+  const float hs = 0.5f * s;
+  out[0] = vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(a))), hs);
+  out[1] = vmulq_n_f32(vcvtq_f32_s32(vmovl_high_s16(a)), hs);
+  out[2] = vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(c))), hs);
+  out[3] = vmulq_n_f32(vcvtq_f32_s32(vmovl_high_s16(c)), hs);
 }
 static inline V vexp(V x) {
   x = vminq_f32(vmaxq_f32(x, vdupq_n_f32(kExpLo)), vdupq_n_f32(kExpHi));

@@ -207,6 +207,7 @@ using namespace lx::cpu;
 extern "C" {
 
 int lx_quantize_w8(const void* w, int8_t* q, float* scale, int64_t rows, int cols, void* stream) {
+  LX_PROFILE("quantize_w8");
   (void)stream;
   if (rows <= 0) return kOk;
   if (cols <= 0 || !w || !q || !scale) return fail(kInvalid);
@@ -214,6 +215,7 @@ int lx_quantize_w8(const void* w, int8_t* q, float* scale, int64_t rows, int col
 }
 
 int lx_quantize_weight(const void* w, lx_weight* out, int64_t rows, int cols, void* stream) {
+  LX_PROFILE("quantize_weight");
   (void)stream;
   if (!out || !w) return fail(kInvalid);
   if (rows <= 0) return kOk;
@@ -237,6 +239,7 @@ int lx_quantize_weight(const void* w, lx_weight* out, int64_t rows, int cols, vo
 }
 
 int lx_dequantize_weight(const lx_weight* w, void* out, int64_t rows, int cols, void* stream) {
+  LX_PROFILE("dequantize_weight");
   if (!w || !w->data || !out) return fail(kInvalid);
   if (rows <= 0) return kOk;
   if (cols <= 0) return fail(kInvalid);
@@ -258,6 +261,7 @@ int lx_dequantize_weight(const lx_weight* w, void* out, int64_t rows, int cols, 
 
 int lx_quantize_act(const void* x, lx_dtype x_dtype, int ld_x, lx_math math, void* q, int ld_q, float* scale,
                     void* block_scale, int ld_bs, int M, int K, void* stream) {
+  LX_PROFILE("quantize_act");
   (void)stream;
   if (M <= 0) return kOk;
   if (!x || !q || !scale || K <= 0 || !valid_dtype(x_dtype) || (M > 1 && ld_x < K)) return fail(kInvalid);

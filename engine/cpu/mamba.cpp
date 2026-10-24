@@ -21,6 +21,7 @@ extern "C" {
 int lx_conv1d_varlen(const float* x, int ld_x, const void* w, const void* bias, float* conv_state,
                      const int32_t* slot_ids, const int32_t* has_state, const int32_t* cu_seqlens, int n_seq, float* out,
                      int C, int W, void* stream) {
+  LX_PROFILE("conv1d_varlen");
   (void)stream;
   if (n_seq <= 0) return kOk;
   if (C <= 0 || W < 1 || ld_x < C || !x || !w || !bias || !conv_state || !slot_ids || !has_state || !cu_seqlens || !out)
@@ -32,8 +33,9 @@ int lx_conv1d_varlen(const float* x, int ld_x, const void* w, const void* bias, 
   const int64_t T = cu_seqlens[n_seq];
   const Kern& k = kern();
   // A work item is one (sequence, channel block): its outputs read the old state, then it writes the
-  // block's new state. Sequences own distinct slots, so items never share state.
-  const int64_t grain = T * C < 64 * 1024 ? items : 1;
+  // block's new state. Sequences own distinct slots, so items never share state. A decode step's
+  // thousands of channels are worth spreading too (the taps are strided, so a channel is slow alone).
+  const int64_t grain = T * C < 4096 ? items : 1;
   parallel_for(items, grain, [&](int64_t i0, int64_t i1) {
     float* acc = static_cast<float*>(scratch(sizeof(float) * 2 * kConvBlock));
     float* e = acc + kConvBlock;
@@ -86,6 +88,7 @@ int lx_ssm_scan_varlen(const float* x, int ld_x, const float* dt_raw, int ld_dt,
                        int ld_bc, const float* A_log, const float* D, const float* dt_bias, float* ssm_state,
                        const int32_t* slot_ids, const int32_t* has_state, const int32_t* cu_seqlens, int n_seq, float* y,
                        int H, int P, int G, int N, void* stream) {
+  LX_PROFILE("ssm_scan_varlen");
   (void)stream;
   if (n_seq <= 0) return kOk;
   if (H <= 0 || G <= 0 || H % G != 0 || P < 1 || N < 1) return fail(kInvalid);
@@ -126,6 +129,7 @@ int lx_ssm_scan_varlen(const float* x, int ld_x, const float* dt_raw, int ld_dt,
 
 int lx_gated_rmsnorm(const float* y, const float* z, int ld_z, const void* w, void* out, int T, int I, int groups,
                      float eps, void* stream) {
+  LX_PROFILE("gated_rmsnorm");
   (void)stream;
   if (T <= 0) return kOk;
   if (I <= 0 || groups <= 0 || I % groups != 0 || ld_z < I || !y || !z || !w || !out) return fail(kInvalid);
@@ -133,27 +137,29 @@ int lx_gated_rmsnorm(const float* y, const float* z, int ld_z, const void* w, vo
   const uint16_t* wb = static_cast<const uint16_t*>(w);
   uint16_t* ob = static_cast<uint16_t*>(out);
   const Kern& k = kern();
-  const int64_t per = (32 * 1024 + I - 1) / I;
-  parallel_for(T, grain_for(T, per < 1 ? 1 : per), [&](int64_t t0, int64_t t1) {
-    float* v = static_cast<float*>(scratch(sizeof(float) * I));
-    for (int64_t t = t0; t < t1; ++t) {
-      const float* yr = y + t * I;
-      const float* zr = z + t * ld_z;
-      for (int i = 0; i < I; ++i) v[i] = -zr[i];
-      k.exp_f32(v, v, I);
-      for (int i = 0; i < I; ++i) v[i] = yr[i] * (zr[i] / (1.0f + v[i]));
-      for (int g = 0; g < groups; ++g) {
-        const float* vg = v + g * K;
-        float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-        int i = 0;
-        for (; i + 8 <= K; i += 8)
-          for (int j = 0; j < 8; ++j) acc[j] += vg[i + j] * vg[i + j];
-        float sum = ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7]));
-        for (; i < K; ++i) sum += vg[i] * vg[i];
-        const float scale = 1.0f / std::sqrt(sum / K + eps);
-        uint16_t* o = ob + t * I + g * K;
-        for (i = 0; i < K; ++i) o[i] = f32_to_bf16(vg[i] * scale * bf16_to_f32(wb[g * K + i]));
-      }
+  // Groups normalize independently, so a work item is one (token, group): a decode step's one token
+  // still spreads over the pool.
+  const int64_t items = static_cast<int64_t>(T) * groups;
+  const int64_t per = (16 * 1024 + K - 1) / K;
+  parallel_for(items, grain_for(items, per < 1 ? 1 : per), [&](int64_t i0, int64_t i1) {
+    float* v = static_cast<float*>(scratch(sizeof(float) * K));
+    for (int64_t item = i0; item < i1; ++item) {
+      const int64_t t = item / groups;
+      const int g = static_cast<int>(item % groups);
+      const float* yr = y + t * I + g * K;
+      const float* zr = z + t * ld_z + g * K;
+      for (int i = 0; i < K; ++i) v[i] = -zr[i];
+      k.exp_f32(v, v, K);
+      for (int i = 0; i < K; ++i) v[i] = yr[i] * (zr[i] / (1.0f + v[i]));
+      float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+      int i = 0;
+      for (; i + 8 <= K; i += 8)
+        for (int j = 0; j < 8; ++j) acc[j] += v[i + j] * v[i + j];
+      float sum = ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7]));
+      for (; i < K; ++i) sum += v[i] * v[i];
+      const float scale = 1.0f / std::sqrt(sum / K + eps);
+      uint16_t* o = ob + t * I + g * K;
+      for (i = 0; i < K; ++i) o[i] = f32_to_bf16(v[i] * scale * bf16_to_f32(wb[g * K + i]));
     }
   });
   return kOk;

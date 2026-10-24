@@ -276,6 +276,7 @@ extern "C" {
 
 int lx_gemm_bf16(const void* x, int ld_x, const void* w, const void* bias, void* y, lx_dtype y_dtype, int ld_y, int M,
                  int N, int K, float alpha, float beta, void* stream) {
+  LX_PROFILE("gemm_bf16");
   (void)stream;
   if (y_dtype != LX_F32 && y_dtype != LX_BF16) return fail(kInvalid);
   if (M < 0 || N < 0 || K <= 0 || ld_x < K || ld_y < N) return fail(kInvalid);
@@ -287,6 +288,7 @@ int lx_gemm_bf16(const void* x, int ld_x, const void* w, const void* bias, void*
 
 int lx_gemm_f32(const float* x, int ld_x, const float* w, const float* bias, float* y, int ld_y, int M, int N, int K,
                 void* stream) {
+  LX_PROFILE("gemm_f32");
   (void)stream;
   if (M < 0 || N < 0 || K <= 0 || ld_x < K || ld_y < N) return fail(kInvalid);
   if (M == 0 || N == 0) return kOk;
@@ -310,6 +312,7 @@ int lx_gemm_f32(const float* x, int ld_x, const float* w, const float* bias, flo
 int lx_gemv(const void* x, lx_dtype x_dtype, int ld_x, const void* w, lx_wtype w_type, const float* w_scale, const void* bias,
             lx_dtype bias_dtype, void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K, float alpha, float beta,
             void* stream) {
+  LX_PROFILE("gemv");
   (void)stream;
   if (w_type != LX_W_BF16 && w_type != LX_W_INT8) return fail(kInvalid);
   if (w_type == LX_W_INT8 && !w_scale && M > 0 && N > 0) return fail(kInvalid);
@@ -319,6 +322,7 @@ int lx_gemv(const void* x, lx_dtype x_dtype, int ld_x, const void* w, lx_wtype w
 
 int lx_gemv_w(const void* x, lx_dtype x_dtype, int ld_x, const lx_weight* w, const void* bias, lx_dtype bias_dtype,
               void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K, float alpha, float beta, void* stream) {
+  LX_PROFILE("gemv_w");
   (void)stream;
   if (!w) return fail(kInvalid);
   return gemv_any(x, x_dtype, ld_x, *w, bias, bias_dtype, y, y_dtype, ld_y, M, N, K, alpha, beta);
@@ -327,6 +331,7 @@ int lx_gemv_w(const void* x, lx_dtype x_dtype, int ld_x, const lx_weight* w, con
 int lx_gemm_w(const void* x, lx_dtype x_dtype, int ld_x, const lx_weight* w, lx_math math, const void* bias,
               lx_dtype bias_dtype, void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K, float alpha, float beta,
               void* workspace, void* stream) {
+  LX_PROFILE("gemm_w");
   (void)stream;
   if (!w) return fail(kInvalid);
   return gemm_any(x, x_dtype, ld_x, *w, math, bias, bias_dtype, y, y_dtype, ld_y, M, N, K, alpha, beta, workspace);

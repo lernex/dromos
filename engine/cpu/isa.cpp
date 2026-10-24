@@ -184,6 +184,19 @@ const Kern* select() {
     g_override = env ? atoi(env) : 0;
   }
   const Kern* k = find_level(effective(g_override))->table();
+#if defined(__APPLE__) && defined(__aarch64__)
+  // Apple's cores run BFDOT and BFMMLA slower than converting to f32 and using FMA (measured on an M5,
+  // one thread, a 512 x 2048 x 2048 BF16 product: 67 and 62 GFLOP/s against 103), so on a Mac the bf16
+  // products take the f32 path. Other Arm cores keep the bf16 instructions. LX_CPU_BF16_DOT=1 keeps them
+  // here too (to test them).
+  const char* keep = getenv("LX_CPU_BF16_DOT");
+  if (k->dot_bf16 && !(keep && *keep == '1')) {
+    static Kern apple;
+    apple = *k;
+    apple.dot_bf16 = nullptr;
+    k = &apple;
+  }
+#endif
   g_kern.store(k, std::memory_order_release);
   return k;
 }

@@ -218,9 +218,18 @@ int run(const Job& j) {
 
   // Gate/up: items are (expert, block of intermediate rows); a block covers gate rows [i0, i1) and the
   // matching up rows [I + i0, I + i1).
-  const int64_t rb = std::max<int64_t>(8, std::min<int64_t>(64, I));
+  // Blocks small enough that the pool gets several items per thread even when a decode step picks only
+  // a few experts (4 experts x 64-row blocks is fewer items than threads on a desktop).
+  const int64_t n_exp = static_cast<int64_t>(experts.size());
+  const int64_t want = static_cast<int64_t>(threads()) * 4;
+  auto block_rows = [&](int64_t rows) {
+    int64_t b = (rows * n_exp + want - 1) / want;
+    b = (b + 7) / 8 * 8;
+    return std::max<int64_t>(8, std::min<int64_t>({64, b, rows}));
+  };
+  const int64_t rb = block_rows(I);
   const int64_t blocks1 = (I + rb - 1) / rb;
-  const int64_t items1 = static_cast<int64_t>(experts.size()) * blocks1;
+  const int64_t items1 = n_exp * blocks1;
   parallel_for(items1, 1, [&](int64_t a0, int64_t a1) {
     for (int64_t it = a0; it < a1; ++it) {
       const int e = experts[it / blocks1];
@@ -258,9 +267,9 @@ int run(const Job& j) {
   }
 
   // Down: items are (expert, block of output rows).
-  const int64_t lb = std::max<int64_t>(8, std::min<int64_t>(64, L));
+  const int64_t lb = block_rows(L);
   const int64_t blocks2 = (L + lb - 1) / lb;
-  const int64_t items2 = static_cast<int64_t>(experts.size()) * blocks2;
+  const int64_t items2 = n_exp * blocks2;
   parallel_for(items2, 1, [&](int64_t a0, int64_t a1) {
     for (int64_t it = a0; it < a1; ++it) {
       const int e = experts[it / blocks2];
@@ -308,6 +317,7 @@ extern "C" {
 
 int lx_moe_route(const float* logits, const float* selection_bias, int32_t* ids, float* weights, float* entropy,
                  float* confidence, int T, int E, int top_k, void* stream) {
+  LX_PROFILE("moe_route");
   (void)stream;
   if (T <= 0) return kOk;
   if (top_k < 1 || top_k > 64 || top_k > E || !logits || !ids || !weights || !entropy || !confidence)
@@ -363,6 +373,7 @@ int lx_moe_route(const float* logits, const float* selection_bias, int32_t* ids,
 
 int lx_moe_summary(const int32_t* ids, const float* weights, const void* expert_emb, float* summary, int T, int R,
                    int top_k, void* stream) {
+  LX_PROFILE("moe_summary");
   (void)stream;
   if (T <= 0 || R <= 0) return kOk;
   if (!ids || !weights || !expert_emb || !summary || top_k < 1) return fail(kInvalid);
@@ -383,6 +394,7 @@ int lx_moe_summary(const int32_t* ids, const float* weights, const void* expert_
 
 int lx_moe_experts(const void* latent, const int32_t* ids, const float* weights, const void* gate_up, const void* down,
                    float* out, int T, int L, int I, int top_k, void* stream) {
+  LX_PROFILE("moe_experts");
   (void)stream;
   if (T <= 0) return kOk;
   if (int e = check_common(latent, ids, weights, out, L, I, top_k)) return e;
@@ -399,6 +411,7 @@ int lx_moe_experts(const void* latent, const int32_t* ids, const float* weights,
 int lx_moe_experts_w8(const void* latent, const int32_t* ids, const float* weights, const int8_t* gate_up,
                       const float* gate_up_scale, const int8_t* down, const float* down_scale, float* out,
                       void* workspace, int T, int L, int I, int top_k, void* stream) {
+  LX_PROFILE("moe_experts_w8");
   (void)stream;
   (void)workspace;  // the intermediates live in internal scratch, sized with L, which the size query lacks
   if (T <= 0) return kOk;
@@ -424,6 +437,7 @@ int64_t lx_moe_workspace_bytes(int T, int I, int top_k) {
 int lx_moe_experts_decode(const void* latent, const int32_t* ids, const float* weights, const lx_weight* gate_up,
                           const lx_weight* down, float* out, void* workspace, int T, int L, int I, int top_k,
                           void* stream) {
+  LX_PROFILE("moe_experts_decode");
   (void)stream;
   (void)workspace;
   if (T <= 0) return kOk;
@@ -444,6 +458,7 @@ int64_t lx_moe_decode_workspace_bytes(int T, int I, int top_k) {
 int lx_moe_experts_grouped(const void* latent, const int32_t* ids, const float* weights, const lx_weight* gate_up,
                            const lx_weight* down, lx_math math, float* out, void* workspace, int T, int L, int I, int E,
                            int top_k, void* stream) {
+  LX_PROFILE("moe_experts_grouped");
   (void)stream;
   (void)workspace;
   if (T <= 0) return kOk;

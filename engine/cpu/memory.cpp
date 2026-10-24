@@ -31,6 +31,7 @@ extern "C" {
 
 int lx_memory_attend(const float* q, const float* bank_k, const float* bank_v, int n_entries, int max_entries, void* out,
                      int T, int S, int M, void* stream) {
+  LX_PROFILE("memory_attend");
   (void)stream;
   if (n_entries < 1 || n_entries > max_entries || n_entries > kMaxEntries) return fail(kInvalid);
   if (T <= 0 || S <= 0 || M <= 0) return kOk;
@@ -74,6 +75,7 @@ int lx_memory_attend(const float* q, const float* bank_k, const float* bank_v, i
 
 int lx_memory_fuse(float* streams, const float* projected, const void* gate, const void* gate_bias, float* summary,
                    int T, int S, int D, void* stream) {
+  LX_PROFILE("memory_fuse");
   (void)stream;
   if (T <= 0 || S <= 0 || D <= 0) return kOk;
   if (!streams || !projected || !gate || !gate_bias || !summary) return fail(kInvalid);
@@ -105,6 +107,7 @@ int lx_memory_fuse(float* streams, const float* projected, const void* gate, con
 
 int lx_continuation_finish(const float* logit, const float* state, const float* difference, float limit, float* out,
                            int T, int D, void* stream) {
+  LX_PROFILE("continuation_finish");
   (void)stream;
   if (T <= 0 || D <= 0) return kOk;
   if (!logit || !state || !difference || !out) return fail(kInvalid);

@@ -112,6 +112,23 @@ inline int64_t grain_for(int64_t n, int64_t min_grain, int per_thread = 4) {
   return g < min_grain ? min_grain : g;
 }
 
+// ---- Profile ---------------------------------------------------------------------------------------
+
+// LX_CPU_PROFILE=1: every op's calls and wall time, totalled per op and printed to stderr at exit. Off,
+// a scope costs one predictable branch.
+extern bool g_profile;
+struct ProfScope {
+  const char* name;
+  int64_t t0;
+  explicit ProfScope(const char* n) : name(n), t0(g_profile ? now_ns() : 0) {}
+  ~ProfScope() {
+    if (t0) record(name, now_ns() - t0);
+  }
+  static int64_t now_ns();
+  static void record(const char* name, int64_t ns);
+};
+#define LX_PROFILE(name) ::lx::cpu::ProfScope lx_profile_scope_(name)
+
 // ---- Scratch -------------------------------------------------------------------------------------
 
 // A per-thread scratch buffer of at least `bytes`, 64-byte aligned, kept between calls (grown, never

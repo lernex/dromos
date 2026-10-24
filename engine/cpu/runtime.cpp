@@ -171,9 +171,11 @@ int lx_rt_event_sync(void* event) {
   return kOk;
 }
 
+// Declining a capture is the answer to a question the model asks, not a failure, so it does not set
+// lx_rt_last_error (the model checks that after a run).
 int lx_rt_capture_begin(void* stream) {
   (void)stream;
-  return fail(kNotSupported);
+  return kNotSupported;
 }
 int lx_rt_capture_end(void* stream, void** graph) {
   (void)stream;

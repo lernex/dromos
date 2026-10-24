@@ -1,6 +1,6 @@
 // How fast liblernex_cpu.so runs on this machine, against what the machine can do.
 //
-//   lx_cpu_bench [bandwidth|gemv|experts|gemm|all] [--mib N] [--reps N]
+//   lx_cpu_bench [bandwidth|gemv|experts|gemm|overhead|all] [--mib N] [--reps N]
 //
 // bandwidth  a multithreaded read of a large buffer (the ceiling for decode, which reads every weight
 //            once per token), at 1 thread, at the pool's size, and at each count in between that is a
@@ -9,6 +9,7 @@
 //            second as a fraction of the measured read bandwidth
 // experts    Praxis' routed experts for one decode token (4 of 128) in every format, the same way
 // gemm       a prefill-sized product (512 tokens) in every math, in GFLOP/s
+// overhead   what a small op costs per call (decode makes hundreds of them per token)
 //
 // Times are the median of --reps runs after a warm-up; buffers are larger than the last-level cache, and
 // rotate between calls where one copy would fit in it.
@@ -301,6 +302,32 @@ void gemm() {
   }
 }
 
+// ---- Per-call overhead ------------------------------------------------------------------------------------
+
+// Decode makes a few hundred calls per token, most of them small: what one costs when the work is tiny.
+void overhead() {
+  printf("per-call cost of small ops (median, us)\n");
+  std::vector<float> f(1 << 16, 0.5f), g(1 << 16);
+  auto report = [](const char* what, double t) { printf("  %-44s %8.2f us\n", what, t * 1e6); };
+  report("activate_f32, 256 values", median_time([&] { lx_activate_f32(f.data(), 256, 0, nullptr); }, 2001));
+  report("stream_mean, 1 token x 4 streams x 2048", median_time([&] { lx_stream_mean(f.data(), g.data(), 1, 4, 2048, nullptr); }, 2001));
+  for (int type : {LX_W_BF16, LX_W_INT8}) {
+    for (int N : {64, 256, 1024}) {
+      const int K = 2048;
+      Weights w = make(type, N, K);
+      std::vector<uint16_t> x(K, 0x3f80);
+      std::vector<float> y(N);
+      const lx_weight v = w.view();
+      char what[96];
+      snprintf(what, sizeof(what), "gemv %s, %d x %d (%.0f KB)", fmt_name(type), N, K, w.bytes(N) / 1024.0);
+      report(what, median_time([&] {
+               lx_gemv_w(x.data(), LX_BF16, K, &v, nullptr, LX_F32, y.data(), LX_F32, N, 1, N, K, 1.0f, 0.0f, nullptr);
+             }, 2001));
+      release(w);
+    }
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -315,5 +342,6 @@ int main(int argc, char** argv) {
   if (what == "gemv" || what == "all") gemv();
   if (what == "experts" || what == "all") experts();
   if (what == "gemm" || what == "all") gemm();
+  if (what == "overhead" || what == "all") overhead();
   return 0;
 }

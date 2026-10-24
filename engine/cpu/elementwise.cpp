@@ -50,6 +50,7 @@ extern "C" {
 
 int lx_rmsnorm(const void* x, lx_dtype x_dtype, const void* w, void* y, lx_dtype y_dtype, int rows, int dim, float eps,
                void* stream) {
+  LX_PROFILE("rmsnorm");
   (void)stream;
   if (rows <= 0) return kOk;
   if (dim <= 0 || !x || !w || !y || !valid_dtype(x_dtype) || !valid_dtype(y_dtype)) return fail(kInvalid);
@@ -69,6 +70,7 @@ int lx_rmsnorm(const void* x, lx_dtype x_dtype, const void* w, void* y, lx_dtype
 
 int lx_copy2d(const void* src, lx_dtype src_dtype, int ld_src, void* dst, lx_dtype dst_dtype, int ld_dst, int rows,
               int cols, void* stream) {
+  LX_PROFILE("copy2d");
   (void)stream;
   if (rows <= 0 || cols <= 0) return kOk;
   if (!valid_dtype(src_dtype) || !valid_dtype(dst_dtype) || !src || !dst) return fail(kInvalid);
@@ -95,6 +97,7 @@ int lx_copy2d(const void* src, lx_dtype src_dtype, int ld_src, void* dst, lx_dty
 }
 
 int lx_activate_f32(float* y, int64_t n, int act, void* stream) {
+  LX_PROFILE("activate_f32");
   (void)stream;
   if (n <= 0) return kOk;
   if (act < 0 || act > 2 || !y) return fail(kInvalid);
@@ -121,6 +124,7 @@ int lx_activate_f32(float* y, int64_t n, int act, void* stream) {
 }
 
 int lx_silu_mul(const float* x, int ld_x, void* out, lx_dtype out_dtype, int rows, int cols, void* stream) {
+  LX_PROFILE("silu_mul");
   (void)stream;
   if (rows <= 0 || cols <= 0) return kOk;
   if (ld_x < 2 * cols || !x || !out || !valid_dtype(out_dtype)) return fail(kInvalid);
@@ -139,6 +143,7 @@ int lx_silu_mul(const float* x, int ld_x, void* out, lx_dtype out_dtype, int row
 }
 
 int lx_add_row_bf16(float* y, const void* row, int rows, int cols, void* stream) {
+  LX_PROFILE("add_row_bf16");
   (void)stream;
   if (rows <= 0 || cols <= 0) return kOk;
   if (!y || !row) return fail(kInvalid);
@@ -154,6 +159,7 @@ int lx_add_row_bf16(float* y, const void* row, int rows, int cols, void* stream)
 
 int lx_embed_streams(const void* table, const int32_t* ids, const void* stream_emb, float* streams, int T, int S, int D,
                      void* stream) {
+  LX_PROFILE("embed_streams");
   (void)stream;
   if (T <= 0 || S <= 0 || D <= 0) return kOk;
   if (!table || !ids || !stream_emb || !streams) return fail(kInvalid);
@@ -171,6 +177,7 @@ int lx_embed_streams(const void* table, const int32_t* ids, const void* stream_e
 }
 
 int lx_stream_mean(const float* streams, float* mean, int T, int S, int D, void* stream) {
+  LX_PROFILE("stream_mean");
   (void)stream;
   if (T <= 0 || S <= 0 || D <= 0) return kOk;
   if (!streams || !mean) return fail(kInvalid);
@@ -189,6 +196,7 @@ int lx_stream_mean(const float* streams, float* mean, int T, int S, int D, void*
 
 int lx_mhc_read(const float* streams, const float* matrix, const float* read, const void* norm_w, float eps,
                 float* mixed, void* h, int T, int S, int D, void* stream) {
+  LX_PROFILE("mhc_read");
   (void)stream;
   if (T <= 0 || S <= 0 || D <= 0) return kOk;
   if (!streams || !matrix || !read || !norm_w || !mixed || !h) return fail(kInvalid);
@@ -226,6 +234,7 @@ int lx_mhc_read(const float* streams, const float* matrix, const float* read, co
 
 int lx_mhc_write(const float* mixed, const float* write, const float* update, float* streams, int T, int S, int D,
                  void* stream) {
+  LX_PROFILE("mhc_write");
   (void)stream;
   if (T <= 0 || S <= 0 || D <= 0) return kOk;
   if (!mixed || !write || !update || !streams) return fail(kInvalid);

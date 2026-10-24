@@ -19,6 +19,7 @@ using namespace lx::cpu;
 extern "C" int lx_attention_varlen(const float* qkv, int ld_qkv, void* k_cache, void* v_cache, const int32_t* slot_ids,
                                    const int32_t* start_pos, const int32_t* cu_seqlens, int n_seq, int capacity,
                                    void* out, int H, int KVH, int Dh, float scale, void* stream) {
+  LX_PROFILE("attention_varlen");
   (void)stream;
   if (n_seq <= 0 || capacity <= 0 || KVH <= 0 || H <= 0 || H % KVH != 0 || Dh <= 0 || Dh > kMaxDh ||
       H / KVH > kMaxG || ld_qkv < (H + 2 * KVH) * Dh)
