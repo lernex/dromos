@@ -190,6 +190,37 @@ def test_tools_and_tool_results_are_accepted(client):
     assert none.choices[0].message.tool_calls is None
 
 
+def test_tool_round_trip(client):
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get the current weather for a city.",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+            },
+        }
+    ]
+    messages = [{"role": "user", "content": "What is the weather in Paris right now? Use the tool."}]
+    first = client.chat.completions.create(model="praxis", messages=messages, tools=tools, max_tokens=600, temperature=0)
+    assert first.choices[0].finish_reason == "tool_calls"
+    call = first.choices[0].message.tool_calls[0]
+    assert call.function.name == "get_weather" and json.loads(call.function.arguments)["city"] == "Paris"
+    messages.append(
+        {
+            "role": "assistant",
+            "content": first.choices[0].message.content or "",
+            "tool_calls": [
+                {"id": call.id, "type": "function", "function": {"name": call.function.name, "arguments": call.function.arguments}}
+            ],
+        }
+    )
+    messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps({"city": "Paris", "temp_c": 18})})
+    second = client.chat.completions.create(model="praxis", messages=messages, tools=tools, max_tokens=400, temperature=0)
+    assert second.choices[0].finish_reason == "stop"
+    assert "18" in (second.choices[0].message.content or "")
+
+
 def test_errors_are_clear(server):
     base, _ = server
     url = base + "/v1/chat/completions"

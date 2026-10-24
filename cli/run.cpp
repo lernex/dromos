@@ -175,6 +175,7 @@ class Chat {
   void reply(const std::string& text) {
     history_.push_back(lx::text::Message{"user", text, "", {}, "", ""});
     lx::text::ChatOptions options;
+    options.model_dir = model_.dir.string();
     options.thinking = thinking_;
     const std::string rendered = lx::text::render_chat(history_, options);
 
