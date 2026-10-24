@@ -260,28 +260,26 @@ void ExpertOffload::add_expert(int layer, int expert, const ExpertSource& src, c
   loaded_[id] = 1;
 }
 
-void ExpertOffload::finalize(const RoutingStats& stats, int64_t vram_cache_bytes) {
-  options_.vram_cache_bytes = vram_cache_bytes;
-  Device& d = *dev_;
-  const int Lr = shape_.n_layers, E = shape_.n_experts, LE = Lr * E;
-  for (int i = 0; i < LE; ++i)
-    if (!loaded_[i]) throw std::runtime_error("offload: expert " + std::to_string(i % E) + " of layer " +
-                                              std::to_string(i / E) + " was never added");
-  const int64_t eb = shape_.expert_bytes();
+SlotLayout layout_slots(int Lr, int E, int C, const RoutingStats& stats, double dynamic_fraction) {
+  const int LE = Lr * E;
+  C = std::clamp(C, 0, LE);
   const bool have_stats = static_cast<int>(stats.frequency.size()) == LE;
-  int C = static_cast<int>(std::min<int64_t>(LE, std::max<int64_t>(0, options_.vram_cache_bytes / eb)));
-
-  // Slots per layer, the pinned (static) part and the initial contents.
-  std::vector<int> n_slots(Lr, 0), n_pinned(Lr, 0);
-  std::vector<std::vector<int>> contents(Lr);  // per layer, experts in slot order (pinned first)
-  std::vector<uint8_t> cpu_first(LE, 0);
+  SlotLayout out;
+  out.slots.assign(Lr, 0);
+  out.pinned.assign(Lr, 0);
+  out.contents.assign(Lr, {});
+  out.cpu_first.assign(LE, 0);
+  std::vector<int>& n_slots = out.slots;
+  std::vector<int>& n_pinned = out.pinned;
+  std::vector<std::vector<int>>& contents = out.contents;
+  std::vector<uint8_t>& cpu_first = out.cpu_first;
   if (C == LE) {
     for (int l = 0; l < Lr; ++l) {
       n_slots[l] = n_pinned[l] = E;
       for (int e = 0; e < E; ++e) contents[l].push_back(e);
     }
   } else if (have_stats) {
-    const int n_static = static_cast<int>(C * (1.0 - options_.dynamic_fraction));
+    const int n_static = static_cast<int>(C * (1.0 - dynamic_fraction));
     std::vector<int> order(LE);
     std::iota(order.begin(), order.end(), 0);
     std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return stats.frequency[a] > stats.frequency[b]; });
@@ -332,6 +330,25 @@ void ExpertOffload::finalize(const RoutingStats& stats, int64_t vram_cache_bytes
       for (int e = 0; e < n_slots[l]; ++e) contents[l].push_back(e);
     }
   }
+  return out;
+}
+
+void ExpertOffload::finalize(const RoutingStats& stats, int64_t vram_cache_bytes) {
+  options_.vram_cache_bytes = vram_cache_bytes;
+  Device& d = *dev_;
+  const int Lr = shape_.n_layers, E = shape_.n_experts, LE = Lr * E;
+  for (int i = 0; i < LE; ++i)
+    if (!loaded_[i]) throw std::runtime_error("offload: expert " + std::to_string(i % E) + " of layer " +
+                                              std::to_string(i / E) + " was never added");
+  const int64_t eb = shape_.expert_bytes();
+  const bool have_stats = static_cast<int>(stats.frequency.size()) == LE;
+  int C = static_cast<int>(std::min<int64_t>(LE, std::max<int64_t>(0, options_.vram_cache_bytes / eb)));
+
+  const SlotLayout layout = layout_slots(Lr, E, C, have_stats ? stats : RoutingStats{}, options_.dynamic_fraction);
+  const std::vector<int>& n_slots = layout.slots;
+  const std::vector<int>& n_pinned = layout.pinned;
+  const std::vector<std::vector<int>>& contents = layout.contents;
+  const std::vector<uint8_t>& cpu_first = layout.cpu_first;
   C = std::accumulate(n_slots.begin(), n_slots.end(), 0);
   n_slots_ = C;
 

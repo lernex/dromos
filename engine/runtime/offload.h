@@ -75,6 +75,19 @@ struct RoutingStats {
   bool empty() const { return frequency.empty(); }
 };
 
+// The VRAM slots of each layer and what they hold at load (finalize uses it; pure, so it is tested
+// on its own). capacity slots in all. With routing statistics, the share of slots given by
+// 1 - dynamic_fraction is pinned to the hottest experts over all layers, and each layer gets dynamic
+// slots in proportion to the routing mass its pinned set leaves uncovered, filled with its next
+// hottest experts; the experts left out start cold (the CPU lane takes their misses first). Without
+// statistics every layer gets an equal share holding its first experts.
+struct SlotLayout {
+  std::vector<int> slots, pinned;          // per layer
+  std::vector<std::vector<int>> contents;  // per layer, experts in slot order, the pinned ones first
+  std::vector<uint8_t> cpu_first;          // [n_layers * n_experts]
+};
+SlotLayout layout_slots(int n_layers, int n_experts, int capacity, const RoutingStats& stats, double dynamic_fraction);
+
 // How to split the experts across the tiers. Zero / negative fields are filled by plan_placement.
 struct OffloadOptions {
   int64_t vram_cache_bytes = 0;   // VRAM for expert slots
