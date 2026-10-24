@@ -139,7 +139,7 @@ gemv_vec_kernel(const TX* __restrict__ x, int ld_x, const lx_weight w, int K, co
   __shared__ float partial[kWarps][RG * kMaxM];  // split-K partial sums, used when S > 1
 
   // Let the next kernel in the stream start its weight loads while this one runs.
-  cudaTriggerProgrammaticLaunchCompletion();
+  lx::pdl_trigger();
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int group = warp / S, part = warp % S;
   const int64_t first = (static_cast<int64_t>(blockIdx.x) * kGroups + group) * RG;
@@ -157,7 +157,7 @@ gemv_vec_kernel(const TX* __restrict__ x, int ld_x, const lx_weight w, int K, co
   // The first words go out before the dependency wait; x and y are read after it.
   Lane cur[KU][RG];
   load_steps<F, KU, RG>(w, first, N, K, lane, u0, u1, cur);
-  cudaGridDependencySynchronize();
+  lx::pdl_wait();
 
   // Warp-uniform guard: the whole warp takes the same branch, so the shuffles below stay full-warp.
   if (first < N) {
@@ -241,8 +241,8 @@ template <int F, typename TX>
 __global__ void gemv_small_kernel(const TX* __restrict__ x, int ld_x, const lx_weight w,
                                   const void* __restrict__ bias, bool bias_bf16, void* __restrict__ y, bool y_bf16,
                                   int ld_y, int M, int N, int K, int lpr, int e, float alpha, float beta) {
-  cudaTriggerProgrammaticLaunchCompletion();
-  cudaGridDependencySynchronize();  // x and w may both be written by the previous kernel
+  lx::pdl_trigger();
+  lx::pdl_wait();  // x and w may both be written by the previous kernel
   const int lane = threadIdx.x;
   const int slot = lane / lpr, c = lane % lpr;
   const int64_t n = static_cast<int64_t>(blockIdx.x) * (32 / lpr) + slot;
@@ -327,7 +327,7 @@ cudaLaunchConfig_t pdl_config(unsigned blocks, int threads, cudaStream_t stream,
   attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attr.val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = &attr;
-  cfg.numAttrs = 1;
+  cfg.numAttrs = lx::pdl_available() ? 1 : 0;  // below sm_90 the launch is an ordinary one, in stream order
   return cfg;
 }
 

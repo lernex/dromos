@@ -183,7 +183,7 @@ LX_API int lx_moe_summary(const int32_t* ids, const float* weights, const void* 
 //   y[m, n] = alpha * (sum_k x[m, k] * w[n, k] + bias[n]) + beta * y[m, n]
 // x: [M, K] (x_dtype, row stride ld_x); bias: [N] (bias_dtype, or null); y: [M, N] (y_dtype,
 // row stride ld_y; read only when beta != 0). Accumulation in f32. Deterministic (no atomics).
-typedef enum { LX_W_BF16 = 0, LX_W_INT8 = 1, LX_W_FP8 = 2, LX_W_NVFP4 = 3 } lx_wtype;
+typedef enum { LX_W_BF16 = 0, LX_W_INT8 = 1, LX_W_FP8 = 2, LX_W_NVFP4 = 3, LX_W_BF16X = 4 } lx_wtype;
 LX_API int lx_gemv(const void* x, lx_dtype x_dtype, int ld_x, const void* w, lx_wtype w_type, const float* w_scale,
                    const void* bias, lx_dtype bias_dtype, void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K,
                    float alpha, float beta, void* stream);
@@ -201,6 +201,43 @@ LX_API int lx_moe_experts_w8(const void* latent, const int32_t* ids, const float
                              void* workspace, int T, int L, int I, int top_k, void* stream);
 LX_API int64_t lx_moe_workspace_bytes(int T, int I, int top_k);
 
+// ---- Runtime (every backend) ----------------------------------------------------------------
+// The kernels.h ABI is the backend interface: the CUDA, HIP, Metal and CPU backends are each one
+// shared library exporting every lx_* function here, and the model code calls nothing else (no
+// CUDA runtime calls), so one model implementation runs on all of them. "Device memory" is what
+// the backend's kernels read: VRAM on CUDA/HIP, shared MTLBuffers on Metal (pointers are their
+// contents addresses), host memory on the CPU. A stream orders work (a CUDA/HIP stream, a Metal
+// command queue, a CPU work queue); null is the backend's default. Errors use the CUDA codes
+// (0 success, LX_ERR_NOT_SUPPORTED when a backend lacks a feature, e.g. graph capture).
+#define LX_ERR_NOT_SUPPORTED 801
+typedef enum { LX_BACKEND_CUDA = 0, LX_BACKEND_HIP = 1, LX_BACKEND_METAL = 2, LX_BACKEND_CPU = 3 } lx_backend;
+typedef enum { LX_COPY_H2D = 0, LX_COPY_D2H = 1, LX_COPY_D2D = 2 } lx_copy_kind;
+
+LX_API int lx_rt_backend(void);
+LX_API int lx_rt_device_count(void);
+LX_API int lx_rt_set_device(int ordinal);
+LX_API int lx_rt_alloc(void** ptr, int64_t bytes);  // zeroed
+LX_API int lx_rt_free(void* ptr);
+LX_API int lx_rt_host_alloc(void** ptr, int64_t bytes);  // pinned / page-locked host memory where it exists
+LX_API int lx_rt_host_free(void* ptr);
+LX_API int lx_rt_memset(void* ptr, int value, int64_t bytes, void* stream);
+LX_API int lx_rt_copy(void* dst, const void* src, int64_t bytes, lx_copy_kind kind, void* stream);
+LX_API int lx_rt_stream_create(void** stream);
+LX_API int lx_rt_stream_destroy(void* stream);
+LX_API int lx_rt_stream_sync(void* stream);
+// Events: record on a stream, wait for on the host.
+LX_API int lx_rt_event_create(void** event);
+LX_API int lx_rt_event_destroy(void* event);
+LX_API int lx_rt_event_record(void* event, void* stream);
+LX_API int lx_rt_event_sync(void* event);
+// Capture the work issued on a stream into a replayable graph (CUDA graphs, HIP graphs; a backend
+// without it returns LX_ERR_NOT_SUPPORTED from capture_begin and the model runs eagerly).
+LX_API int lx_rt_capture_begin(void* stream);
+LX_API int lx_rt_capture_end(void* stream, void** graph);
+LX_API int lx_rt_graph_launch(void* graph, void* stream);
+LX_API int lx_rt_graph_destroy(void* graph);
+LX_API int lx_rt_last_error(void);  // and clears it
+
 // ---- Weight formats ------------------------------------------------------------------------
 // A projection is held once, in one format, and every kernel that multiplies by it (the decode
 // GEMV, the tensor-core GEMM for prefill and batches, the expert kernels) reads that one copy.
@@ -216,11 +253,19 @@ LX_API int64_t lx_moe_workspace_bytes(int T, int I, int top_k);
 //                                                     w[n, k] = e2m1[n, k] * scale[n, k / 16] * global
 //               (requires K % 16 == 0; the loader folds a checkpoint's global scale so the
 //               engine always multiplies)
+//   LX_W_BF16X  lossless compressed bf16: exactly the checkpoint's bf16 values in ~12.1 to 12.3 bits
+//               each. data is a sequence of N fixed-size rows of lx_bf16x_row_bytes(K) bytes (then
+//               rarely an overflow area); scale unused. Each row: u32 patch slots (at least 2 + K /
+//               2048), one base exponent byte per 128 k, padding to 8 bytes, then per 128 k a 192-byte block:
+//               128 bytes of sign << 7 | mantissa, then 64 bytes of 4-bit codes (exponent = base -
+//               code). Values further than 15 binades below their block's base are listed in the
+//               row's patch slots as (k << 8 | exponent). Full layout: cuda/bf16x.cuh.
 // Stacked expert weights are [E, N, K] in the same format, every expert laid out as above, one
 // after the other (scales likewise [E, N] or [E, N, K / 16]). An NVFP4 stack's experts each have a
 // global scale in the checkpoint (weight_scale_2 is [E]); folding those into the e4m3 block scales
 // would round them twice, so the stack carries them: expert_global is [E] f32 on the device, and
 // null means every expert uses `global`. Consumers of a stack read the expert's own global.
+// For LX_W_BF16X a stack is simply E * N rows.
 typedef struct {
   lx_wtype type;
   const void* data;
@@ -295,6 +340,94 @@ LX_API int64_t lx_moe_grouped_workspace_bytes(int T, int L, int I, int E, int to
 // block's e4m3 scale as its absmax / (6 * global), rounded to e4m3. Used when the engine is asked
 // for a format the file is not stored in; checkpoints made with GPTQ are loaded as they are.
 LX_API int lx_quantize_weight(const void* w, lx_weight* out, int64_t rows, int cols, void* stream);
+
+// ---- Sampling (sampler.cu) ------------------------------------------------------------------
+// One launch draws the next token of every sequence in a batch. Row i reads logits row
+// params[i].row ([*, V] f32, the model's output) and its sequence's penalty counts at
+// params[i].slot. Per row, in order:
+//   penalties on the raw logits: repetition (a token seen in the prompt or the output is divided by
+//     the penalty when positive, multiplied when negative), then presence and frequency over the
+//     output only: x -= frequency * count + presence when count > 0;
+//   greedy when temperature <= 0: the argmax (ties to the lower index);
+//   otherwise scaled by 1 / temperature, then the tokens that survive top-k, top-p (the smallest
+//     set, of the top-k distribution, holding top_p of its mass) and min-p (scaled logit >=
+//     max + log(min_p)) are drawn with the Gumbel-max trick: argmax of logit + Gumbel noise, the
+//     noise Philox keyed by (seed, position, token id). Same seed and position, same token.
+// The chosen token then counts once in seen and out_counts. token_logprob (may be null) gets the
+// chosen token's log-probability under the raw softmax; top_tokens / top_logprobs ([n, top_n], may
+// be null when top_n is 0) get the top_n most likely tokens of the same distribution, in order.
+// work: f32 [n, V] scratch. seen, out_counts: int32 [slots, V], one row per sequence slot.
+typedef struct {
+  uint64_t seed;             // the request's seed (the Philox key)
+  uint64_t position;         // index of the output token being drawn (the Philox counter)
+  int32_t slot;              // the sequence's row in seen and out_counts
+  int32_t row;               // the row of the logits to sample
+  float temperature;         // <= 0 is greedy
+  float top_p;               // in (0, 1]; 1 disables
+  int32_t top_k;             // keeps that many (1 .. V - 1); 0, or V or more, disables
+  float min_p;               // in [0, 1]; 0 disables
+  float repetition_penalty;  // > 0; 1 disables
+  float presence_penalty;    // 0 disables
+  float frequency_penalty;   // 0 disables
+} lx_sampling;
+
+LX_API int lx_sample(const float* logits, int V, const lx_sampling* params, int n, int32_t* seen,
+                     int32_t* out_counts, float* work, int32_t* tokens, float* token_logprob, int top_n,
+                     int32_t* top_tokens, float* top_logprobs, void* stream);
+
+// Forgets a slot's counts (a new sequence starts in it).
+LX_API int lx_sampler_reset(int32_t* seen, int32_t* out_counts, int slot, int V, void* stream);
+
+// Counts tokens into a slot: the prompt (is_output 0, repetition only) or generated output (is_output 1,
+// which also feeds presence and frequency).
+LX_API int lx_sampler_observe(int32_t* seen, int32_t* out_counts, int slot, int V, const int32_t* tokens, int n,
+                              int is_output, void* stream);
+
+// ---- Lossless BF16 (bf16x.cu) ---------------------------------------------------------------
+// LX_W_BF16X: the checkpoint's bf16 weights in 12.1 to 12.3 bits each, reproducing every bit, so a
+// decode product reads ~1.3x fewer bytes with no change at all to its result. The products below are
+// bit-identical to the bf16 kernels they stand in for (same lane mapping, split and summation order):
+// a model that swaps them in produces the same logits to the last bit.
+
+// Bytes of one encoded row of K values (-1 for K out of range: 0 < K < 2^23).
+LX_API int64_t lx_bf16x_row_bytes(int K);
+// Bytes the encoding of w (bf16 [rows, K], row-major; a stack [E, N, K] is E * N rows) needs: rows *
+// lx_bf16x_row_bytes(K), plus overflow records for rows with more patches than their slots (none in
+// Praxis). Synchronizes the stream; scratch from cudaMallocAsync. Returns -(CUDA error) on failure.
+LX_API int64_t lx_bf16x_bytes(const void* w, int64_t rows, int K, void* stream);
+// Encodes w into out (8-byte aligned, out_bytes >= lx_bf16x_bytes). Deterministic: the same weights
+// always give the same bytes. Synchronizes the stream once; for load time, not for graph capture.
+LX_API int lx_bf16x_encode(const void* w, int64_t rows, int K, void* out, int64_t out_bytes, void* stream);
+// Decodes an encoding back to bf16 [rows, K] (for tests and for checking a load).
+LX_API int lx_bf16x_decode(const void* data, int64_t rows, int K, void* w, void* stream);
+
+// lx_gemv for LX_W_BF16X weights w ([N, K] encoded, 8-byte aligned): the same contract (x, bias, y,
+// alpha, beta, M <= 8, f32 accumulation, deterministic, programmatic dependent launch), and y equal
+// bit for bit to lx_gemv on the bf16 weights the encoding came from.
+LX_API int lx_gemv_bf16x(const void* x, lx_dtype x_dtype, int ld_x, const void* w, const void* bias,
+                         lx_dtype bias_dtype, void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K, float alpha,
+                         float beta, void* stream);
+// The same kernel on plain bf16 weights ([N, K], 16-byte aligned for the vector path): the
+// like-for-like baseline the format is measured against, and itself bit-identical to lx_gemv. Built
+// per M bucket, it is faster than lx_gemv at M = 1 on every Praxis shape, not at M = 8.
+LX_API int lx_gemv_decode_bf16(const void* x, lx_dtype x_dtype, int ld_x, const void* w, const void* bias,
+                               lx_dtype bias_dtype, void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K,
+                               float alpha, float beta, void* stream);
+
+// Routed experts on LX_W_BF16X stacks, for decode (few tokens): the contract of lx_moe_experts with
+// gate_up the encoding of [E, 2I, L] and down of [E, L, I] (16-byte aligned), a caller-owned
+// workspace (16-byte aligned, at least lx_moe_bf16x_workspace_bytes(T, I, top_k)), and top_k <= 8.
+// out equals lx_moe_experts on the bf16 stacks bit for bit. Nothing is allocated, so the call can be
+// captured in a CUDA graph.
+LX_API int lx_moe_experts_bf16x(const void* latent, const int32_t* ids, const float* weights, const void* gate_up,
+                                const void* down, float* out, void* workspace, int T, int L, int I, int top_k,
+                                void* stream);
+// The same kernels on plain bf16 stacks: the baseline the format is measured against, and a
+// drop-in decode replacement for lx_moe_experts (bit-identical to it, graph-capturable).
+LX_API int lx_moe_experts_decode_bf16(const void* latent, const int32_t* ids, const float* weights,
+                                      const void* gate_up, const void* down, float* out, void* workspace, int T,
+                                      int L, int I, int top_k, void* stream);
+LX_API int64_t lx_moe_bf16x_workspace_bytes(int T, int I, int top_k);
 
 #ifdef __cplusplus
 }

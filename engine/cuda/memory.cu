@@ -2,13 +2,12 @@
 // depth head's last step. Keys and values are projected when an entry is written, so a read only
 // attends. At decode (T <= kDecodeTokens) attend loads each row's vectors up front, and fuse splits a
 // token over a cluster of blocks, so one token uses several SMs rather than one.
-#include <cooperative_groups.h>
-
 #include <algorithm>
+#include <cmath>
+#include <random>
+#include <vector>
 
 #include "cuda/common.cuh"
-
-namespace cg = cooperative_groups;
 
 namespace {
 
@@ -201,14 +200,13 @@ __global__ void memory_fuse_kernel(float* streams, const float* projected, const
 // peer. After the cluster barrier each block sums the shares in rank order, so all blocks get the
 // same totals, then gates and updates only its own columns. The dots read the streams as they were:
 // each column is read and written by its one owning thread, and nothing is written before the barrier.
-__global__ void __launch_bounds__(kClusterThreads) __cluster_dims__(kCluster, 1, 1)
+__global__ void __launch_bounds__(kClusterThreads) LX_CLUSTER_DIMS(kCluster)
 memory_fuse_cluster_kernel(float* streams, const float* projected, const __nv_bfloat16* gate,
                            const __nv_bfloat16* gate_bias, float* summary, int S, int D, int W) {
   __shared__ float warp_dots[32][kMaxStreams];
   __shared__ float parts[kCluster][kMaxStreams];  // the cluster's shares, [rank][stream]
 
-  cg::cluster_group cluster = cg::this_cluster();
-  const int rank = static_cast<int>(cluster.block_rank());
+  const int rank = static_cast<int>(lx::cluster_block_rank());
   const int t = blockIdx.x / kCluster;
   const int d = rank * W + threadIdx.x;
   const bool own = threadIdx.x < W && d < D;
@@ -246,9 +244,9 @@ memory_fuse_cluster_kernel(float* streams, const float* projected, const __nv_bf
     const int k = i / S;
     float share = 0.0f;
     for (int w = 0; w < warps; ++w) share += warp_dots[w][s];
-    *cluster.map_shared_rank(&parts[rank][s], k) = share;
+    *lx::cluster_peer(&parts[rank][s], k) = share;
   }
-  cluster.sync();
+  lx::cluster_sync();
 
   // Every share is now in this block's parts. Sum them in rank order: all blocks get identical totals.
   float total[kMaxStreams];
@@ -318,21 +316,87 @@ extern "C" int lx_memory_attend(const float* q, const float* bank_k, const float
   return lx::launch_status();
 }
 
+namespace {
+
+constexpr int kFuseCluster = 1;  // the variant index of the cluster path ("cluster8"); 0 is "block"
+
+// Whether the decode fuse's cluster path can run for this step.
+bool fuse_cluster_ok(int T, int S, int D) {
+  return T <= kDecodeTokens && S <= kMaxStreams && slice_width(D) <= kClusterThreads && lx_arch() >= lx::kClusterArch;
+}
+
+int launch_memory_fuse(bool cluster, float* streams, const float* projected, const void* gate, const void* gate_bias,
+                       float* summary, int T, int S, int D, cudaStream_t s) {
+  if (cluster) {
+    const int W = slice_width(D);
+    const int threads = (W + 31) / 32 * 32;  // one thread per owned column
+    memory_fuse_cluster_kernel<<<T * kCluster, threads, 0, s>>>(streams, projected,
+                                                                static_cast<const __nv_bfloat16*>(gate),
+                                                                static_cast<const __nv_bfloat16*>(gate_bias), summary,
+                                                                S, D, W);
+    return lx::launch_status();
+  }
+  memory_fuse_kernel<<<T, row_threads(D), 0, s>>>(streams, projected, static_cast<const __nv_bfloat16*>(gate),
+                                                  static_cast<const __nv_bfloat16*>(gate_bias), summary, S, D);
+  return lx::launch_status();
+}
+
+// The autotuner's runner: both paths on fixed random inputs. The summary is the output the tuner
+// compares; it reads only `projected`, so it does not change as the streams are updated run to run.
+struct FuseInputs {
+  int T = 0, S = 0, D = 0;
+  float *streams = nullptr, *projected = nullptr;
+  void *gate = nullptr, *gate_bias = nullptr;
+  void reset() {
+    for (void* p : {static_cast<void*>(streams), static_cast<void*>(projected), gate, gate_bias})
+      if (p) cudaFree(p);
+    *this = FuseInputs{};
+  }
+};
+
+int tune_memory_fuse(int variant, const lx::TuneProblem& p, float* out, void* stream) {
+  const int T = p.M, D = p.N, S = p.K;
+  if (S <= 0 || S > kMaxStreams) return static_cast<int>(cudaErrorNotSupported);
+  if (variant == kFuseCluster && !fuse_cluster_ok(T, S, D)) return static_cast<int>(cudaErrorNotSupported);
+  static FuseInputs in;
+  if (in.T != T || in.S != S || in.D != D) {
+    in.reset();
+    in.T = T;
+    in.S = S;
+    in.D = D;
+    std::mt19937 rng(11);
+    std::normal_distribution<float> normal;
+    std::vector<float> host(static_cast<size_t>(T) * S * D);
+    for (float& v : host) v = normal(rng);
+    cudaMalloc(reinterpret_cast<void**>(&in.streams), host.size() * sizeof(float));
+    cudaMemcpy(in.streams, host.data(), host.size() * sizeof(float), cudaMemcpyHostToDevice);
+    for (float& v : host) v = normal(rng);
+    cudaMalloc(reinterpret_cast<void**>(&in.projected), host.size() * sizeof(float));
+    cudaMemcpy(in.projected, host.data(), host.size() * sizeof(float), cudaMemcpyHostToDevice);
+    std::vector<__nv_bfloat16> gate(static_cast<size_t>(S) * D), bias(S);
+    for (auto& v : gate) v = __float2bfloat16(normal(rng) * 0.1f);
+    for (auto& v : bias) v = __float2bfloat16(normal(rng) * 0.1f);
+    cudaMalloc(&in.gate, gate.size() * 2);
+    cudaMemcpy(in.gate, gate.data(), gate.size() * 2, cudaMemcpyHostToDevice);
+    cudaMalloc(&in.gate_bias, bias.size() * 2);
+    cudaMemcpy(in.gate_bias, bias.data(), bias.size() * 2, cudaMemcpyHostToDevice);
+  }
+  return launch_memory_fuse(variant == kFuseCluster, in.streams, in.projected, in.gate, in.gate_bias, out, T, S, D,
+                            static_cast<cudaStream_t>(stream));
+}
+
+const lx::TunableRegistration reg_memory_fuse("memory_fuse", {"block", "cluster8"}, &tune_memory_fuse);
+
+}  // namespace
+
 extern "C" int lx_memory_fuse(float* streams, const float* projected, const void* gate, const void* gate_bias,
                               float* summary, int T, int S, int D, void* stream) {
   if (T <= 0 || S <= 0 || D <= 0) return 0;
-  if (T <= kDecodeTokens && S <= kMaxStreams && slice_width(D) <= kClusterThreads) {
-    const int W = slice_width(D);
-    const int threads = (W + 31) / 32 * 32;  // one thread per owned column
-    memory_fuse_cluster_kernel<<<T * kCluster, threads, 0, static_cast<cudaStream_t>(stream)>>>(
-        streams, projected, static_cast<const __nv_bfloat16*>(gate), static_cast<const __nv_bfloat16*>(gate_bias),
-        summary, S, D, W);
-    return lx::launch_status();
-  }
-  memory_fuse_kernel<<<T, row_threads(D), 0, static_cast<cudaStream_t>(stream)>>>(
-      streams, projected, static_cast<const __nv_bfloat16*>(gate), static_cast<const __nv_bfloat16*>(gate_bias),
-      summary, S, D);
-  return lx::launch_status();
+  // The table's choice for this shape when the autotuner measured one; otherwise clusters where they run.
+  const int tuned = lx_tune_get("memory_fuse", T, D, S);
+  const bool cluster = fuse_cluster_ok(T, S, D) && (tuned < 0 || tuned == kFuseCluster);
+  return launch_memory_fuse(cluster, streams, projected, gate, gate_bias, summary, T, S, D,
+                            static_cast<cudaStream_t>(stream));
 }
 
 extern "C" int lx_continuation_finish(const float* logit, const float* state, const float* difference, float limit,

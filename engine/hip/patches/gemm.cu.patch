@@ -1,0 +1,37 @@
+--- a/gemm.cu
++++ b/gemm.cu
+@@ -152,10 +152,20 @@
+   hipblasLtMatmulPreference_t pref = nullptr;
+   if (auto st = hipblasLtMatmulPreferenceCreate(&pref); st != HIPBLAS_STATUS_SUCCESS) return st;
+   hipblasStatus_t st = set_pref_attr(pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, kWorkspaceBytes);
++#if defined(HIPBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES)
+   if (st == HIPBLAS_STATUS_SUCCESS) st = set_pref_attr(pref, HIPBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, k.align_a);
+   if (st == HIPBLAS_STATUS_SUCCESS) st = set_pref_attr(pref, HIPBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES, k.align_b);
+   if (st == HIPBLAS_STATUS_SUCCESS) st = set_pref_attr(pref, HIPBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES, k.align_c);
+   if (st == HIPBLAS_STATUS_SUCCESS) st = set_pref_attr(pref, HIPBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES, k.align_c);
++#else
++  // hipBLASLt 7.2.4 has no minimum-alignment preference, so its heuristic is not told the operands'
++  // alignment. An operand narrower than 16 bytes is refused rather than handed to a kernel that might
++  // read it misaligned. The 16-byte bound is a guess to revisit on AMD hardware (see README.md).
++  if (k.align_a < 16 || k.align_b < 16 || k.align_c < 16) {
++    hipblasLtMatmulPreferenceDestroy(pref);
++    return HIPBLAS_STATUS_NOT_SUPPORTED;
++  }
++#endif
+ 
+   hipblasLtMatmulHeuristicResult_t best{};
+   int found = 0;
+@@ -175,9 +185,12 @@
+ 
+ hipError_t ensure_scratch(DeviceState& s, size_t bytes) {
+   if (s.bias_scratch_bytes >= bytes) return hipSuccess;
+-  if (s.bias_scratch) hipFree(s.bias_scratch);
++  void* old = s.bias_scratch;
+   s.bias_scratch = nullptr;
+   s.bias_scratch_bytes = 0;
++  if (old) {
++    if (hipError_t e = hipFree(old); e != hipSuccess) return e;
++  }
+   // Round up so a slowly growing N does not reallocate on every new shape.
+   const size_t want = std::bit_ceil(bytes);
+   void* p = nullptr;

@@ -31,6 +31,11 @@ std::map<std::string, std::vector<std::string>>& registry() {
   return r;
 }
 
+std::map<std::string, lx::TuneRunner>& runners() {
+  static std::map<std::string, lx::TuneRunner> r;
+  return r;
+}
+
 using Key = std::tuple<std::string, int, int, int>;
 std::map<Key, int>& table() {
   static std::map<Key, int> t;
@@ -118,11 +123,31 @@ const char* lx_tune_variant_name(const char* kernel, int variant) {
 
 namespace lx {
 
+std::string tune_key(const char* kernel, const TuneProblem& p) {
+  std::string key = kernel;
+  if (p.weight != 0 || p.math != 0) key += "@w" + std::to_string(p.weight) + "m" + std::to_string(p.math);
+  if (p.experts != 1) key += "@e" + std::to_string(p.experts);
+  return key;
+}
+
+TuneRunner tunable_runner(const char* kernel) {
+  std::lock_guard<std::mutex> g(lock());
+  auto it = runners().find(kernel);
+  return it == runners().end() ? nullptr : it->second;
+}
+
 TunableRegistration::TunableRegistration(const char* kernel, std::initializer_list<const char*> variants) {
   std::lock_guard<std::mutex> g(lock());
   auto& v = registry()[kernel];
   v.clear();
   for (const char* name : variants) v.emplace_back(name);
+}
+
+TunableRegistration::TunableRegistration(const char* kernel, std::initializer_list<const char*> variants,
+                                         TuneRunner runner)
+    : TunableRegistration(kernel, variants) {
+  std::lock_guard<std::mutex> g(lock());
+  runners()[kernel] = runner;
 }
 
 }  // namespace lx

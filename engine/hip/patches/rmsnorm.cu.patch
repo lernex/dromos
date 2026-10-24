@@ -1,0 +1,12 @@
+--- a/rmsnorm.cu
++++ b/rmsnorm.cu
+@@ -26,7 +26,8 @@
+ extern "C" int lx_rmsnorm(const void* x, lx_dtype x_dtype, const void* w, void* y, lx_dtype y_dtype,
+                           int rows, int dim, float eps, void* stream) {
+   if (rows <= 0) return 0;
+-  const int threads = dim >= 1024 ? 1024 : ((dim + 31) / 32) * 32;
++  const int wave = lx_warp_size();  // whole wavefronts: block_sum reads every lane of a wave
++  const int threads = dim >= 1024 ? 1024 : ((dim + wave - 1) / wave) * wave;
+   auto s = static_cast<hipStream_t>(stream);
+   LX_DISPATCH_DTYPE(x_dtype, TIn, LX_DISPATCH_DTYPE(y_dtype, TOut,
+     rmsnorm_kernel<TIn, TOut><<<rows, threads, 0, s>>>(

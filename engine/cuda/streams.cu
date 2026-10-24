@@ -3,13 +3,13 @@
 // prefill, but at decode (T <= kDecodeTokens) one block walks a whole row in serial memory round
 // trips while the rest of the GPU idles. The decode kernels spread each row over the SMs instead:
 // mhc_read splits a row over a cluster of blocks, and mhc_write splits it over column blocks.
-#include <cooperative_groups.h>
-
 #include <algorithm>
+#include <cmath>
+#include <random>
+#include <utility>
+#include <vector>
 
 #include "cuda/common.cuh"
-
-namespace cg = cooperative_groups;
 
 namespace {
 
@@ -112,7 +112,7 @@ __global__ void mhc_read_kernel(const float* streams, const float* matrix, const
 // thread. The RMSNorm needs the whole row's sum of squares: each block pushes its slice's sum into
 // every peer, and after the cluster barrier every block adds the kCluster sums in rank order, so all
 // blocks get the same total.
-__global__ void __launch_bounds__(kClusterThreads) __cluster_dims__(kCluster, 1, 1)
+__global__ void __launch_bounds__(kClusterThreads) LX_CLUSTER_DIMS(kCluster)
 mhc_read_cluster_kernel(const float* streams, const float* matrix, const float* read_weights,
                         const __nv_bfloat16* norm_w, float eps, float* mixed, __nv_bfloat16* h, int S, int D,
                         int W) {
@@ -121,8 +121,7 @@ mhc_read_cluster_kernel(const float* streams, const float* matrix, const float* 
   __shared__ float parts[kCluster];    // the cluster's sums of squares, by rank, filled by the peers
   __shared__ float scratch[32];
 
-  cg::cluster_group cluster = cg::this_cluster();
-  const int rank = static_cast<int>(cluster.block_rank());
+  const int rank = static_cast<int>(lx::cluster_block_rank());
   const int t = blockIdx.x / kCluster;
   const int d = rank * W + threadIdx.x;
   const bool own = threadIdx.x < W && d < D;
@@ -160,8 +159,8 @@ mhc_read_cluster_kernel(const float* streams, const float* matrix, const float* 
   // barrier each slot is filled, and each block reads only its own shared memory, so no block can
   // exit while a peer still reads it.
   const float block_sq = lx::block_sum(own ? src * src : 0.0f, scratch);
-  if (threadIdx.x < kCluster) *cluster.map_shared_rank(&parts[rank], threadIdx.x) = block_sq;
-  cluster.sync();
+  if (threadIdx.x < kCluster) *lx::cluster_peer(&parts[rank], threadIdx.x) = block_sq;
+  lx::cluster_sync();
 
   float total = 0.0f;
   for (int k = 0; k < kCluster; ++k) total += parts[k];
@@ -215,27 +214,105 @@ extern "C" int lx_stream_mean(const float* streams, float* mean, int T, int S, i
   return lx::launch_status();
 }
 
-extern "C" int lx_mhc_read(const float* streams, const float* matrix, const float* read, const void* norm_w,
-                           float eps, float* mixed, void* h, int T, int S, int D, void* stream) {
-  if (T <= 0 || S <= 0 || D <= 0) return 0;
-  if (S > kMaxStreams) return static_cast<int>(cudaErrorInvalidValue);
-  if (T <= kDecodeTokens && slice_width(D) <= kClusterThreads) {
+// The cluster path's variant index (the autotuner's names are "block" and "cluster8"; "block" is 0).
+constexpr int kMhcCluster = 1;
+
+namespace {
+
+// Whether the decode token's cluster path can run: a short decode step, a slice that fits the block,
+// and a device with clusters.
+bool mhc_cluster_ok(int T, int D) {
+  return T <= kDecodeTokens && slice_width(D) <= kClusterThreads && lx_arch() >= lx::kClusterArch;
+}
+
+int launch_mhc_read(bool cluster, const float* streams, const float* matrix, const float* read, const void* norm_w,
+                    float eps, float* mixed, void* h, int T, int S, int D, cudaStream_t s) {
+  if (cluster) {
     const int W = slice_width(D);
     const int threads = (W + 31) / 32 * 32;  // one thread per owned column
-    mhc_read_cluster_kernel<<<T * kCluster, threads, 0, static_cast<cudaStream_t>(stream)>>>(
-        streams, matrix, read, static_cast<const __nv_bfloat16*>(norm_w), eps, mixed,
-        static_cast<__nv_bfloat16*>(h), S, D, W);
+    mhc_read_cluster_kernel<<<T * kCluster, threads, 0, s>>>(streams, matrix, read,
+                                                             static_cast<const __nv_bfloat16*>(norm_w), eps, mixed,
+                                                             static_cast<__nv_bfloat16*>(h), S, D, W);
     return lx::launch_status();
   }
   // Dynamic shared memory: the mix, the read weights and one source row. Stays under the default
   // 48 KB per block for every width this engine uses (Praxis 2048, Logos 2560).
   const size_t smem = (static_cast<size_t>(S) * S + S + D) * sizeof(float);
   if (smem > 48 * 1024) return static_cast<int>(cudaErrorInvalidValue);
-  mhc_read_kernel<<<T, row_threads(D), smem, static_cast<cudaStream_t>(stream)>>>(
-      streams, matrix, read, static_cast<const __nv_bfloat16*>(norm_w), eps, mixed,
-      static_cast<__nv_bfloat16*>(h), S, D);
+  mhc_read_kernel<<<T, row_threads(D), smem, s>>>(streams, matrix, read,
+                                                  static_cast<const __nv_bfloat16*>(norm_w), eps, mixed,
+                                                  static_cast<__nv_bfloat16*>(h), S, D);
   return lx::launch_status();
 }
+
+}  // namespace
+
+extern "C" int lx_mhc_read(const float* streams, const float* matrix, const float* read, const void* norm_w,
+                           float eps, float* mixed, void* h, int T, int S, int D, void* stream) {
+  if (T <= 0 || S <= 0 || D <= 0) return 0;
+  if (S > kMaxStreams) return static_cast<int>(cudaErrorInvalidValue);
+  // The table's choice for this shape, when the autotuner measured one; otherwise clusters where they run.
+  const int tuned = lx_tune_get("mhc_read", T, D, S);
+  const bool cluster = mhc_cluster_ok(T, D) && (tuned < 0 || tuned == kMhcCluster);
+  return launch_mhc_read(cluster, streams, matrix, read, norm_w, eps, mixed, h, T, S, D,
+                         static_cast<cudaStream_t>(stream));
+}
+
+// The autotuner's runner for mhc_read: both paths on fixed random inputs, the normalized rows written
+// to `out` as f32. The inputs for the last problem are kept, since the tuner runs every variant on one.
+namespace {
+
+// The inputs of the last problem; freed when the next problem replaces them.
+struct MhcInputs {
+  int T = 0, S = 0, D = 0;
+  float *streams = nullptr, *matrix = nullptr, *read = nullptr, *mixed = nullptr;
+  void *norm_w = nullptr, *h = nullptr;
+  void reset() {
+    for (void* p : {static_cast<void*>(streams), static_cast<void*>(matrix), static_cast<void*>(read),
+                    static_cast<void*>(mixed), norm_w, h})
+      if (p) cudaFree(p);
+    *this = MhcInputs{};
+  }
+};
+
+int tune_mhc_read(int variant, const lx::TuneProblem& p, float* out, void* stream) {
+  const int T = p.M, D = p.N, S = p.K;
+  if (S <= 0 || S > kMaxStreams) return static_cast<int>(cudaErrorNotSupported);
+  if (variant == kMhcCluster && !mhc_cluster_ok(T, D)) return static_cast<int>(cudaErrorNotSupported);
+  static MhcInputs in;
+  if (in.T != T || in.S != S || in.D != D) {
+    in.reset();
+    in.T = T;
+    in.S = S;
+    in.D = D;
+    std::mt19937 rng(7);
+    std::normal_distribution<float> normal;
+    std::vector<float> host(static_cast<size_t>(T) * S * D);
+    for (float& v : host) v = normal(rng);
+    cudaMalloc(reinterpret_cast<void**>(&in.streams), host.size() * sizeof(float));
+    cudaMemcpy(in.streams, host.data(), host.size() * sizeof(float), cudaMemcpyHostToDevice);
+    host.assign(static_cast<size_t>(S) * S + S, 0.0f);
+    for (float& v : host) v = normal(rng);
+    cudaMalloc(reinterpret_cast<void**>(&in.matrix), static_cast<size_t>(S) * S * sizeof(float));
+    cudaMalloc(reinterpret_cast<void**>(&in.read), static_cast<size_t>(S) * sizeof(float));
+    cudaMemcpy(in.matrix, host.data(), static_cast<size_t>(S) * S * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(in.read, host.data() + S * S, static_cast<size_t>(S) * sizeof(float), cudaMemcpyHostToDevice);
+    std::vector<__nv_bfloat16> w(D);
+    for (auto& v : w) v = __float2bfloat16(0.5f + std::abs(normal(rng)));
+    cudaMalloc(&in.norm_w, static_cast<size_t>(D) * 2);
+    cudaMemcpy(in.norm_w, w.data(), static_cast<size_t>(D) * 2, cudaMemcpyHostToDevice);
+    cudaMalloc(reinterpret_cast<void**>(&in.mixed), static_cast<size_t>(T) * S * D * sizeof(float));
+    cudaMalloc(&in.h, static_cast<size_t>(T) * D * 2);
+  }
+  const int status = launch_mhc_read(variant == kMhcCluster, in.streams, in.matrix, in.read, in.norm_w, 1e-6f,
+                                     in.mixed, in.h, T, S, D, static_cast<cudaStream_t>(stream));
+  if (status != 0) return status;
+  return lx_copy2d(in.h, LX_BF16, D, out, LX_F32, D, T, D, stream);
+}
+
+const lx::TunableRegistration reg_mhc_read("mhc_read", {"block", "cluster8"}, &tune_mhc_read);
+
+}  // namespace
 
 extern "C" int lx_mhc_write(const float* mixed, const float* write, const float* update, float* streams, int T,
                             int S, int D, void* stream) {

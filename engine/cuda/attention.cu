@@ -12,22 +12,21 @@
 // takes cache tiles r, r + 8, ... and the 8 partial softmax states are merged through distributed
 // shared memory, so a single decode token runs on 8 SMs per kv head instead of one. Many items, as
 // in prefill: each block takes whole items and the cluster never synchronizes. The choice depends
-// on T, which is device data, so every block of a cluster makes the same one.
+// on T, which is device data, so every block of a cluster makes the same one. Below sm_90 there are
+// no clusters: the host passes clusters = 0 and every block takes whole items, which is the same
+// result (the split only changes which SM does which tile).
 //
 // The C ABI has no token count, so both kernels read T = cu_seqlens[n_seq] on the device and
 // grid-stride over the work. Launch sizes are constants; the grid is a multiple of the cluster size.
 //
 // Sequences with many new tokens (a prefill) go to the tensor-core kernel in attention_tc.cu instead,
 // which runs beside this one; this kernel skips their tokens.
-#include <cooperative_groups.h>
 #include <cuda_pipeline.h>
 
 #include "cuda/attention_tc.h"
 #include "cuda/common.cuh"
 
 namespace {
-
-namespace cg = cooperative_groups;
 
 constexpr int kThreads = 256;                              // 8 warps
 constexpr int kWarps = kThreads / 32;
@@ -95,11 +94,11 @@ __global__ void write_kv_kernel(const float* __restrict__ qkv, int ld_qkv,
 // NPL is the number of 8-dim chunks each lane owns: ceil(Dh / 64). The cluster size in the
 // attribute below is kSplit; split mode shares each item across the cluster (see the file comment).
 template <int NPL>
-__global__ void __cluster_dims__(8, 1, 1) __launch_bounds__(kThreads) attention_kernel(
+__global__ void LX_CLUSTER_DIMS(kSplit) __launch_bounds__(kThreads) attention_kernel(
     const float* __restrict__ qkv, int ld_qkv, const __nv_bfloat16* __restrict__ k_cache,
     const __nv_bfloat16* __restrict__ v_cache, const int32_t* __restrict__ slot_ids,
     const int32_t* __restrict__ start_pos, const int32_t* __restrict__ cu_seqlens, int n_seq, int capacity,
-    __nv_bfloat16* __restrict__ out, int H, int KVH, int Dh, float scale, int tc_min) {
+    __nv_bfloat16* __restrict__ out, int H, int KVH, int Dh, float scale, int clusters, int tc_min) {
   extern __shared__ __align__(16) unsigned char smem_raw[];
   __nv_bfloat16* sK = reinterpret_cast<__nv_bfloat16*>(smem_raw);  // [stage][kBlockN][Dh]
   __nv_bfloat16* sV = sK + kStages * kBlockN * Dh;                 // [stage][kBlockN][Dh]
@@ -112,8 +111,7 @@ __global__ void __cluster_dims__(8, 1, 1) __launch_bounds__(kThreads) attention_
   float* sBlkM = sBlk + kTile * Dh;   // [kTile]
   float* sBlkL = sBlkM + kTile;       // [kTile]
 
-  const cg::cluster_group cluster = cg::this_cluster();
-  const int rank = static_cast<int>(cluster.block_rank());
+  const int rank = static_cast<int>(lx::cluster_block_rank());
   const int tid = threadIdx.x;
   const int lane = tid & 31;
   const int warp = tid >> 5;
@@ -125,7 +123,7 @@ __global__ void __cluster_dims__(8, 1, 1) __launch_bounds__(kThreads) attention_
 
   // Split mode: the cluster's blocks share each item; block `rank` takes tiles rank, rank + S, ...
   // Otherwise each block takes whole items and tiles 0, 1, ... Uniform across the cluster.
-  const bool split = T * KVH < kSplitBelow;
+  const bool split = clusters && T * KVH < kSplitBelow;
   const int S = split ? kSplit : 1;
   const int r0 = split ? rank : 0;
   const int first = split ? blockIdx.x / kSplit : blockIdx.x;
@@ -325,24 +323,24 @@ __global__ void __cluster_dims__(8, 1, 1) __launch_bounds__(kThreads) attention_
       }
 
       if (split) {
-        cluster.sync();  // every block's state is in its shared memory
+        lx::cluster_sync();  // every block's state is in its shared memory
         // Cluster merge: block `rank` writes a strided share of the (head, dim) outputs, reading
         // every block's state across the cluster.
         for (int idx = rank * kThreads + tid; idx < nh * Dh; idx += kSplit * kThreads) {
           const int g = idx / Dh, d = idx % Dh;
           float M = -INFINITY;
-          for (int r2 = 0; r2 < kSplit; ++r2) M = fmaxf(M, cluster.map_shared_rank(sBlkM, r2)[g]);
+          for (int r2 = 0; r2 < kSplit; ++r2) M = fmaxf(M, lx::cluster_peer(sBlkM, r2)[g]);
           float Z = 0.f, A = 0.f;
           for (int r2 = 0; r2 < kSplit; ++r2) {
-            const float mr = cluster.map_shared_rank(sBlkM, r2)[g];
+            const float mr = lx::cluster_peer(sBlkM, r2)[g];
             if (mr == -INFINITY) continue;  // this block had no tiles of the item
             const float wt = __expf(mr - M);
-            Z += cluster.map_shared_rank(sBlkL, r2)[g] * wt;
-            A += cluster.map_shared_rank(sBlk, r2)[g * Dh + d] * wt;
+            Z += lx::cluster_peer(sBlkL, r2)[g] * wt;
+            A += lx::cluster_peer(sBlk, r2)[g * Dh + d] * wt;
           }
           out[static_cast<int64_t>(t) * H * Dh + (hq0 + g) * Dh + d] = lx::from_f32<__nv_bfloat16>(A / Z);
         }
-        cluster.sync();  // nobody leaves, or restages its stages, while another block still reads them
+        lx::cluster_sync();  // nobody leaves, or restages its stages, while another block still reads them
       } else {
         __syncthreads();  // the next pass stages into the same shared memory
       }
@@ -356,6 +354,7 @@ extern "C" int lx_attention_varlen(const float* qkv, int ld_qkv, void* k_cache, 
                                    const int32_t* slot_ids, const int32_t* start_pos, const int32_t* cu_seqlens,
                                    int n_seq, int capacity, void* out, int H, int KVH, int Dh, float scale,
                                    void* stream) {
+  const int clusters = lx_arch() >= lx::kClusterArch ? 1 : 0;
   // Rows of the cache are read as 16-byte chunks, and a row fits the 8-lane key layout at up to
   // 128 dims. Anything else is a bad call, not a case to round around.
   if (n_seq <= 0 || capacity <= 0 || KVH <= 0 || H <= 0 || H % KVH != 0 || Dh <= 0 || Dh % 8 != 0 ||
@@ -376,11 +375,13 @@ extern "C" int lx_attention_varlen(const float* qkv, int ld_qkv, void* k_cache, 
   if (Dh <= 64) {
     cudaFuncSetAttribute(attention_kernel<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     attention_kernel<1><<<kAttnBlocks, kThreads, smem, s>>>(qkv, ld_qkv, kc, vc, slot_ids, start_pos,
-                                                            cu_seqlens, n_seq, capacity, o, H, KVH, Dh, scale, tc_min);
+                                                            cu_seqlens, n_seq, capacity, o, H, KVH, Dh, scale,
+                                                            clusters, tc_min);
   } else {
     cudaFuncSetAttribute(attention_kernel<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     attention_kernel<2><<<kAttnBlocks, kThreads, smem, s>>>(qkv, ld_qkv, kc, vc, slot_ids, start_pos,
-                                                            cu_seqlens, n_seq, capacity, o, H, KVH, Dh, scale, tc_min);
+                                                            cu_seqlens, n_seq, capacity, o, H, KVH, Dh, scale,
+                                                            clusters, tc_min);
   }
   return lx::launch_status();
 }

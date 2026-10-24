@@ -43,12 +43,31 @@ class Kernels:
         torch.cuda.synchronize()
 
 
+def pytest_addoption(parser):
+    parser.addoption(
+        "--lx-arch",
+        type=int,
+        default=0,
+        help="run the suite as this architecture (80, 86, 89, 90, ...): the kernels take their fallback "
+        "paths, as they would on that card. Only lowers; see lx_set_arch_override.",
+    )
+
+
 @pytest.fixture(scope="session")
-def lx():
+def lx(request):
     path = os.environ.get("LX_KERNELS")
     if not path or not os.path.exists(path):
         pytest.skip("LX_KERNELS is not set to a built liblernex_kernels.so")
-    return Kernels(path)
+    kernels = Kernels(path)
+    arch = request.config.getoption("--lx-arch")
+    if arch:
+        lib = kernels.lib
+        lib.lx_set_arch_override.restype = ctypes.c_int
+        lib.lx_set_arch_override.argtypes = [ctypes.c_int]
+        real = lib.lx_set_arch_override(0)
+        effective = lib.lx_set_arch_override(arch)
+        assert effective == min(arch, real), f"--lx-arch={arch} did not take effect (the card is sm_{real})"
+    return kernels
 
 
 def close(actual, expected, atol, rtol=0.0):
