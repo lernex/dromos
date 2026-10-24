@@ -21,6 +21,7 @@ namespace lx {
 
 struct LoadOptions {
   lx_wtype target = LX_W_BF16;  // the format the large projections are held in
+  bool skip_experts = false;    // leave the routed expert stacks out (the offload runtime holds them)
 };
 
 class ModelWeights {

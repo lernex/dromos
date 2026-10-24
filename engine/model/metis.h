@@ -38,6 +38,14 @@ struct FeatureTap {
   int layer = -1;
 };
 
+// The formats a model runs in, as the plan decides them: the format of each kind of tensor (WeightRecipe), the
+// math each product multiplies in, and whether decode reads the lossless BF16X copy of the bf16 projections.
+struct ModelFormats {
+  lx_wtype dense = LX_W_BF16, experts = LX_W_BF16, latent_up = LX_W_BF16;
+  lx_math prefill_math = LX_MATH_BF16, expert_math = LX_MATH_BF16;
+  bool bf16x_decode = false;
+};
+
 class MetisModel {
  public:
   // With `experts`, the routed experts are not looked up: every MoE layer runs them through the
