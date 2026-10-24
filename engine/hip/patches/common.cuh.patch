@@ -1,0 +1,35 @@
+--- a/common.cuh
++++ b/common.cuh
+@@ -22,24 +22,26 @@
+ __device__ __forceinline__ float silu(float v) { return v / (1.0f + __expf(-v)); }
+ __device__ __forceinline__ float softplus(float v) { return v > 20.0f ? v : log1pf(__expf(v)); }
+ 
+-// Sum over a warp, every lane gets the result.
++// Sum over a wavefront (LX_WARP lanes: 32 on RDNA, 64 on CDNA), every lane gets the result.
+ __device__ __forceinline__ float warp_sum(float v) {
+-  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
++  for (int o = LX_WARP / 2; o > 0; o >>= 1) v += __shfl_xor_sync(LX_FULL_MASK, v, o);
+   return v;
+ }
+ __device__ __forceinline__ float warp_max(float v) {
+-  for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
++  for (int o = LX_WARP / 2; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(LX_FULL_MASK, v, o));
+   return v;
+ }
+ 
+-// Sum over a block of up to 1024 threads; every thread gets the result. `scratch` holds 32 floats.
++// Sum over a block of up to 1024 threads; every thread gets the result. `scratch` holds 32 floats:
++// one per wavefront, at most 32 of them. The block is a whole number of wavefronts (the host rounds
++// block sizes to lx_warp_size()), so every shuffle reads live lanes.
+ __device__ __forceinline__ float block_sum(float v, float* scratch) {
+-  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++  const int lane = threadIdx.x & (LX_WARP - 1), warp = threadIdx.x / LX_WARP;
+   v = warp_sum(v);
+   __syncthreads();
+   if (lane == 0) scratch[warp] = v;
+   __syncthreads();
+-  const int warps = (blockDim.x + 31) >> 5;
++  const int warps = (blockDim.x + LX_WARP - 1) / LX_WARP;
+   v = lane < warps ? scratch[lane] : 0.0f;
+   return warp_sum(v);
+ }

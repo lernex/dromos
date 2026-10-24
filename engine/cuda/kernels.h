@@ -313,6 +313,48 @@ LX_API int64_t lx_moe_grouped_workspace_bytes(int T, int L, int I, int E, int to
 // for a format the file is not stored in; checkpoints made with GPTQ are loaded as they are.
 LX_API int lx_quantize_weight(const void* w, lx_weight* out, int64_t rows, int cols, void* stream);
 
+// ---- Sampling (sampler.cu) ------------------------------------------------------------------
+// One launch draws the next token of every sequence in a batch. Row i reads logits row
+// params[i].row ([*, V] f32, the model's output) and its sequence's penalty counts at
+// params[i].slot. Per row, in order:
+//   penalties on the raw logits: repetition (a token seen in the prompt or the output is divided by
+//     the penalty when positive, multiplied when negative), then presence and frequency over the
+//     output only: x -= frequency * count + presence when count > 0;
+//   greedy when temperature <= 0: the argmax (ties to the lower index);
+//   otherwise scaled by 1 / temperature, then the tokens that survive top-k, top-p (the smallest
+//     set, of the top-k distribution, holding top_p of its mass) and min-p (scaled logit >=
+//     max + log(min_p)) are drawn with the Gumbel-max trick: argmax of logit + Gumbel noise, the
+//     noise Philox keyed by (seed, position, token id). Same seed and position, same token.
+// The chosen token then counts once in seen and out_counts. token_logprob (may be null) gets the
+// chosen token's log-probability under the raw softmax; top_tokens / top_logprobs ([n, top_n], may
+// be null when top_n is 0) get the top_n most likely tokens of the same distribution, in order.
+// work: f32 [n, V] scratch. seen, out_counts: int32 [slots, V], one row per sequence slot.
+typedef struct {
+  uint64_t seed;             // the request's seed (the Philox key)
+  uint64_t position;         // index of the output token being drawn (the Philox counter)
+  int32_t slot;              // the sequence's row in seen and out_counts
+  int32_t row;               // the row of the logits to sample
+  float temperature;         // <= 0 is greedy
+  float top_p;               // in (0, 1]; 1 disables
+  int32_t top_k;             // keeps that many (1 .. V - 1); 0, or V or more, disables
+  float min_p;               // in [0, 1]; 0 disables
+  float repetition_penalty;  // > 0; 1 disables
+  float presence_penalty;    // 0 disables
+  float frequency_penalty;   // 0 disables
+} lx_sampling;
+
+LX_API int lx_sample(const float* logits, int V, const lx_sampling* params, int n, int32_t* seen,
+                     int32_t* out_counts, float* work, int32_t* tokens, float* token_logprob, int top_n,
+                     int32_t* top_tokens, float* top_logprobs, void* stream);
+
+// Forgets a slot's counts (a new sequence starts in it).
+LX_API int lx_sampler_reset(int32_t* seen, int32_t* out_counts, int slot, int V, void* stream);
+
+// Counts tokens into a slot: the prompt (is_output 0, repetition only) or generated output (is_output 1,
+// which also feeds presence and frequency).
+LX_API int lx_sampler_observe(int32_t* seen, int32_t* out_counts, int slot, int V, const int32_t* tokens, int n,
+                              int is_output, void* stream);
+
 // ---- Offload (offload.cu; the runtime half is engine/runtime/offload.h) ---------------------
 // A model larger than VRAM runs from every memory the machine has at once: the dense weights and
 // the experts the routing uses most in VRAM, every expert in pinned host memory (read by the GPU
