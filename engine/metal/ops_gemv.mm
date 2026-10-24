@@ -40,7 +40,8 @@ int launch(int f, const void* data, const void* scale, float global, const void*
   const bool xb = x_dtype == LX_BF16;
   const size_t xs = dtype_size(x_dtype);
   const int values = f == LX_W_BF16 ? 8 : f == LX_W_NVFP4 ? 32 : f == kWeightF32 ? 4 : 16;
-  const bool scalar = K % values != 0 || (reinterpret_cast<uintptr_t>(data) & 15) != 0;
+  const bool scalar = K % values != 0 || (reinterpret_cast<uintptr_t>(data) & 15) != 0 ||
+                      (f == LX_W_NVFP4 && (reinterpret_cast<uintptr_t>(scale) & 1) != 0);
   const bool xv = (reinterpret_cast<uintptr_t>(x) & 15) == 0 && (size_t(ld_x) * xs) % 16 == 0;
   const int mm = M == 1 ? 1 : M <= 4 ? 4 : 8;
 

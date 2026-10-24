@@ -33,7 +33,8 @@ bool aligned16(const void* p) { return (reinterpret_cast<uintptr_t>(p) & 15) == 
 
 // The variant for rows of K values of w, against x rows at x of K bf16 values.
 int expert_variant(const lx_weight* w, int K, const void* x) {
-  const bool scalar = K % values_per_chunk(w->type) != 0 || !aligned16(w->data);
+  const bool scalar = K % values_per_chunk(w->type) != 0 || !aligned16(w->data) ||
+                      (w->type == LX_W_NVFP4 && (reinterpret_cast<uintptr_t>(w->scale) & 1) != 0);
   if (scalar) return int(w->type) * 3 + 2;
   const bool xv = aligned16(x) && K % 8 == 0;
   return int(w->type) * 3 + (xv ? 1 : 0);

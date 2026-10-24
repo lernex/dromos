@@ -130,8 +130,11 @@ inline void dot_core(const thread dptr* rows, const thread dptr* scales,
     for (int r = 0; r < NR; ++r) {
       w[r] = *(const device uint4*)(rows[r] + off);
       if (F == W_NVFP4) {
-        s0[r] = e4m3(scales[r][k0 / 16]) * 16384.0f;
-        s1[r] = e4m3(scales[r][k0 / 16 + 1]) * 16384.0f;
+        // The chunk's two block scales are adjacent: one 2-byte load (rows of K % 32 == 0 values from an
+        // even scale address, which the host checks for this path).
+        const uint sc = *(const device ushort*)(scales[r] + k0 / 16);
+        s0[r] = e4m3(sc & 0xffu) * 16384.0f;
+        s1[r] = e4m3(sc >> 8) * 16384.0f;
       } else {
         s0[r] = 1.0f;
         s1[r] = 1.0f;
