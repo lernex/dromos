@@ -431,7 +431,7 @@ gemv_vec_kernel(const TX* __restrict__ x, const __grid_constant__ Offsets off, c
   __shared__ float partial[S > 1 ? kWarps : 1][kOut];  // split-K partial sums, used when S > 1
 
   // Let the next kernel in the stream start its weight loads while this one runs.
-  cudaTriggerProgrammaticLaunchCompletion();
+  lx::pdl_trigger();
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int group = warp / S, part = warp % S;
   const int64_t first = (static_cast<int64_t>(blockIdx.x) * kGroups + group) * RG;
@@ -453,7 +453,7 @@ gemv_vec_kernel(const TX* __restrict__ x, const __grid_constant__ Offsets off, c
   static_for<D>([&](auto d) { load_step<F, RG, d>(src, off, u0 + d < lim, ring[d]); });
 
   const TX* xl = x + lane_k + u0 * kStepK;
-  cudaGridDependencySynchronize();
+  lx::pdl_wait();
 
   float acc[RG][MT];
 #pragma unroll
@@ -540,8 +540,8 @@ template <int F, typename TX>
 __global__ void gemv_small_kernel(const TX* __restrict__ x, int ld_x, const lx_weight w,
                                   const void* __restrict__ bias, bool bias_bf16, void* __restrict__ y, bool y_bf16,
                                   int ld_y, int M, int N, int K, int lpr, int e, float alpha, float beta) {
-  cudaTriggerProgrammaticLaunchCompletion();
-  cudaGridDependencySynchronize();  // x and w may both be written by the previous kernel
+  lx::pdl_trigger();
+  lx::pdl_wait();  // x and w may both be written by the previous kernel
   const int lane = threadIdx.x;
   const int slot = lane / lpr, c = lane % lpr;
   const int64_t n = static_cast<int64_t>(blockIdx.x) * (32 / lpr) + slot;
@@ -626,7 +626,7 @@ cudaLaunchConfig_t pdl_config(unsigned blocks, int threads, cudaStream_t stream,
   attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attr.val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = &attr;
-  cfg.numAttrs = 1;
+  cfg.numAttrs = lx::pdl_available() ? 1 : 0;  // below sm_90 the launch is an ordinary one, in stream order
   return cfg;
 }
 
@@ -932,6 +932,7 @@ extern "C" int lx_gemv_w(const void* x, lx_dtype x_dtype, int ld_x, const lx_wei
   if (!w || !w->data || !x || !y) return static_cast<int>(cudaErrorInvalidValue);
   switch (w->type) {
     case LX_W_BF16:
+    case LX_W_BF16X:  // no scale: the encoding carries every value
       break;
     case LX_W_INT8:
     case LX_W_FP8:
@@ -942,6 +943,11 @@ extern "C" int lx_gemv_w(const void* x, lx_dtype x_dtype, int ld_x, const lx_wei
       break;
     default:
       return static_cast<int>(cudaErrorInvalidValue);
+  }
+
+  if (w->type == LX_W_BF16X) {
+    // Lossless bf16 (bf16x.cu): the same contract, y equal bit for bit to the bf16 weights it encodes.
+    return lx_gemv_bf16x(x, x_dtype, ld_x, w->data, bias, bias_dtype, y, y_dtype, ld_y, M, N, K, alpha, beta, stream);
   }
 
   const Args a{

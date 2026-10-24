@@ -11,6 +11,10 @@
 
 namespace lx {
 
+namespace offload {
+class ExpertOffload;
+}
+
 // A weight as the model needs it: a device pointer, its dtype and shape. The model checks both.
 struct WeightView {
   const void* data = nullptr;
@@ -29,8 +33,10 @@ struct StepBatch {
 
 class MetisModel {
  public:
+  // With `experts`, the routed experts are not looked up: every MoE layer runs them through the
+  // offload runtime (engine/runtime/offload.h), wherever they live.
   MetisModel(const MetisConfig& config, const WeightLookup& weights, int max_slots, int kv_capacity,
-             int max_tokens);
+             int max_tokens, offload::ExpertOffload* experts = nullptr);
   ~MetisModel();
   MetisModel(const MetisModel&) = delete;
   MetisModel& operator=(const MetisModel&) = delete;

@@ -9,7 +9,7 @@ import ctypes
 
 import torch
 
-W_BF16, W_INT8, W_FP8, W_NVFP4 = 0, 1, 2, 3
+W_BF16, W_INT8, W_FP8, W_NVFP4, W_BF16X = 0, 1, 2, 3, 4
 FORMATS = {"bf16": W_BF16, "int8": W_INT8, "fp8": W_FP8, "nvfp4": W_NVFP4}
 E2M1_GRID = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float64)
 

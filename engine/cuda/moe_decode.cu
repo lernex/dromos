@@ -12,6 +12,8 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
+
 #include "cuda/common.cuh"
 #include "cuda/kernels.h"
 #include "cuda/wformat.cuh"
@@ -173,6 +175,12 @@ extern "C" int lx_moe_experts_decode(const void* latent, const int32_t* ids, con
   if (T > kMaxT || top_k < 1 || top_k > kMaxTopK || L <= 0 || I <= 0) return static_cast<int>(cudaErrorInvalidValue);
   if (!latent || !ids || !weights || !gate_up || !down || !out || !workspace) return static_cast<int>(cudaErrorInvalidValue);
   if (!gate_up->data || !down->data) return static_cast<int>(cudaErrorInvalidValue);
+  if (gate_up->type == LX_W_BF16X || down->type == LX_W_BF16X) {
+    // Lossless stacks (bf16x.cu) run their own kernels; both stacks must be encoded, a mixed pair has none.
+    if (gate_up->type != LX_W_BF16X || down->type != LX_W_BF16X) return static_cast<int>(cudaErrorNotSupported);
+    return lx_moe_experts_bf16x(latent, ids, weights, gate_up->data, down->data, out, workspace, T, L, I, top_k,
+                                stream);
+  }
   if (!whole_words(*gate_up, L) || !whole_words(*down, I)) return static_cast<int>(cudaErrorInvalidValue);
   if ((reinterpret_cast<uintptr_t>(workspace) & 15) != 0) return static_cast<int>(cudaErrorInvalidValue);
 
@@ -203,5 +211,6 @@ extern "C" int lx_moe_experts_decode(const void* latent, const int32_t* ids, con
 extern "C" int64_t lx_moe_decode_workspace_bytes(int T, int I, int top_k) {
   if (T <= 0 || I <= 0 || top_k <= 0) return 0;
   const int64_t bytes = 2 * static_cast<int64_t>(T) * top_k * I;
-  return (bytes + 255) / 256 * 256;
+  const int64_t lossless = lx_moe_bf16x_workspace_bytes(T, I, top_k);  // the same caller buffer serves both
+  return std::max((bytes + 255) / 256 * 256, lossless);
 }
