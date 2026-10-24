@@ -43,6 +43,18 @@ add_library(lernex_kernels SHARED ${LX_CUDA_SOURCES})
 target_include_directories(lernex_kernels PUBLIC engine)
 target_link_libraries(lernex_kernels PUBLIC CUDA::cudart CUDA::cublasLt)
 
+# The CPU backend's kernels (engine/cpu), a library of their own: they export the same lx_* names as
+# the GPU backends, so the offload runtime loads this one by path (dlopen) for its CPU lane. No
+# -march: the vector paths are compiled per function and chosen at run time.
+file(GLOB LX_CPU_SOURCES CONFIGURE_DEPENDS engine/cpu/*.cpp)
+if(LX_CPU_SOURCES)
+  find_package(Threads REQUIRED)
+  add_library(lernex_cpu SHARED ${LX_CPU_SOURCES})
+  target_include_directories(lernex_cpu PUBLIC engine)
+  target_compile_options(lernex_cpu PRIVATE -O3)
+  target_link_libraries(lernex_cpu PRIVATE Threads::Threads)
+endif()
+
 # The runtime: config, weights, the Metis model, caches, the plan and the tuner.
 file(GLOB LX_CORE_SOURCES CONFIGURE_DEPENDS engine/core/*.cpp engine/model/*.cpp engine/model/*.cu engine/runtime/*.cpp
      engine/runtime/*.cu engine/text/*.cpp engine/server/*.cpp)

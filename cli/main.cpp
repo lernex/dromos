@@ -12,6 +12,7 @@ int cmd_run(int argc, char** argv);
 int cmd_serve(int argc, char** argv);
 int cmd_pull(int argc, char** argv);
 int cmd_list(int argc, char** argv);
+int cmd_offload(int argc, char** argv);
 
 namespace {
 
@@ -30,7 +31,8 @@ void usage() {
                "  tune MODEL_DIR [--out PATH] [--log]       time the kernel variants on this GPU, keep the winners\n"
                "  inspect MODEL_DIR                         load a model and describe it\n"
                "  eval MODEL_DIR PROMPTS_JSON OUT_DIR [N]   logits for reference prompts; with N, the\n"
-               "                                            first N tokens at once and the rest one by one\n");
+               "                                            first N tokens at once and the rest one by one\n"
+               "  offload probe|eval|bench ...              run larger than the GPU (lernex offload for help)\n");
 }
 
 }  // namespace
@@ -51,6 +53,7 @@ int main(int argc, char** argv) {
     if (!std::strcmp(cmd, "serve")) return cmd_serve(argc - 1, argv + 1);
     if (!std::strcmp(cmd, "pull")) return cmd_pull(argc - 1, argv + 1);
     if (!std::strcmp(cmd, "list")) return cmd_list(argc - 1, argv + 1);
+    if (!std::strcmp(cmd, "offload")) return cmd_offload(argc - 1, argv + 1);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "lernex: %s\n", e.what());
     return 1;
