@@ -55,7 +55,15 @@ if DEVICE == "cpu":
         def synchronize(self):
             _device_sync()
 
+    class _HostGenerator(torch.Generator):
+        """torch.Generator(device="cuda") is a constructor, which the function mode does not see."""
+
+        def __new__(cls, device=None):
+            device = _host(device)
+            return super().__new__(cls) if device is None else super().__new__(cls, device)
+
     _CudaOnHost().__enter__()
+    torch.Generator = _HostGenerator
     torch.cuda.current_stream = lambda *a, **k: _HostStream()
     torch.cuda.synchronize = _device_sync
     torch.Tensor.cuda = lambda self, *a, **k: self

@@ -359,3 +359,99 @@ struct MaskLogitsArgs {
   LX_CPTR(uint) bits;
   int V, words;
 };
+struct SpecConvArgs {
+  LX_CPTR(float) x;
+  LX_CPTR(ushort) w;
+  LX_CPTR(ushort) bias;
+  LX_PTR(float) state;
+  LX_PTR(float) hist;
+  LX_CPTR(int) slot_ids;
+  LX_CPTR(int) has_state;
+  LX_CPTR(int) fold;
+  LX_CPTR(int) keep;
+  LX_CPTR(int) cu;
+  LX_PTR(float) out;
+  int ld_x, C, W;
+};
+struct SpecScanArgs {
+  LX_CPTR(float) x;
+  LX_CPTR(float) dt_raw;
+  LX_CPTR(float) B;
+  LX_CPTR(float) C;
+  LX_CPTR(float) A_log;
+  LX_CPTR(float) D;
+  LX_CPTR(float) dt_bias;
+  LX_PTR(float) state;
+  LX_PTR(float) hist;
+  LX_CPTR(int) slot_ids;
+  LX_CPTR(int) has_state;
+  LX_CPTR(int) fold;
+  LX_CPTR(int) keep;
+  LX_CPTR(int) cu;
+  LX_PTR(float) y;
+  int ld_x, ld_dt, ld_bc, H, P, G, N;
+};
+// lx_spec_filter and lx_spec_rng, field for field.
+struct SpecFilter {
+  float temperature, top_p;
+  int top_k;
+  float min_p;
+};
+struct SpecRng {
+  lx_u64 seed;
+  lx_u64 position;
+};
+struct SpecProbsArgs {
+  LX_CPTR(float) logits;
+  LX_CPTR(SpecFilter) filters;
+  LX_PTR(float) probs;
+  int V;
+};
+struct SpecVerifyArgs {
+  LX_CPTR(float) p;
+  LX_CPTR(float) q;  // 0: the drafter proposes tokens outright
+  LX_CPTR(int) tokens;
+  LX_CPTR(int) cu;
+  LX_CPTR(SpecRng) rng;
+  LX_PTR(int) accepted;
+  LX_PTR(int) next;
+  int V;
+};
+struct SpecGreedyArgs {
+  LX_CPTR(float) logits;
+  LX_CPTR(int) tokens;
+  LX_CPTR(int) cu;
+  LX_PTR(int) argmax;
+  LX_PTR(int) accepted;
+  LX_PTR(int) next;
+  int V, n_seq;
+};
+struct SpecSampleArgs {
+  LX_CPTR(float) probs;
+  LX_CPTR(int) rows;  // 0: row i
+  LX_CPTR(SpecRng) rng;
+  LX_PTR(int) tokens;
+  int V;
+  uint domain;
+};
+// The rotation frequencies theta^(-2i / Dh), i < Dh / 2, as float pairs (hi + lo) from the host's doubles.
+struct SpecRopeArgs {
+  LX_PTR(float) x;
+  LX_CPTR(ushort) w;  // 0: no norm
+  int ld_x, rows, heads, Dh;
+  float eps;
+  int pos0;
+  float inv_hi[128];
+  float inv_lo[128];
+};
+struct SpecBlockAttnArgs {
+  LX_CPTR(float) q;
+  LX_CPTR(float) k_ctx;
+  LX_CPTR(float) v_ctx;
+  LX_CPTR(float) k_blk;
+  LX_CPTR(float) v_blk;
+  LX_PTR(float) out;
+  int ld_q, n_ctx, ld_blk, ld_out, B, H, KVH, Dh;
+  int chunk;  // keys whose scores share threadgroup memory at once
+  float scale;
+};

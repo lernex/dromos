@@ -126,7 +126,7 @@ inline void dot_core(const thread dptr* rows, const thread dptr* scales,
   const int chunks = K / V;
   for (int c = first; c < chunks; c += stride) {
     const int k0 = c * V;
-    const long off = SHIFT >= 0 ? (long(k0) << SHIFT) : (long(k0) >> 1);
+    const long off = SHIFT >= 0 ? (long(k0) << max(SHIFT, 0)) : (long(k0) >> 1);
     uint4 w[NR];
     float s0[NR], s1[NR];
     for (int r = 0; r < NR; ++r) {
