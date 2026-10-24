@@ -132,6 +132,18 @@ struct MetisModel::Impl {
   void* moe_workspace = nullptr;
   offload::ExpertOffload* offload = nullptr;  // the routed experts, when they run offloaded
   FILE* route_trace = nullptr;                // LX_ROUTE_TRACE: every layer's routing, for the placement stats
+  // With the trace: the next layer's routing predicted from the streams as they leave this layer
+  // (the next layer's MoE read, latent_down and router applied early, with this layer's features).
+  float *pred_mixed = nullptr, *pred_latent = nullptr, *pred_router_in = nullptr, *pred_logits = nullptr,
+        *pred_w = nullptr, *pred_entropy = nullptr, *pred_confidence = nullptr;
+  void* pred_h = nullptr;
+  int32_t* pred_ids = nullptr;
+  static constexpr int kPredicted = 8;
+  // LX_OFFLOAD_PREFETCH=n: in offloaded decode steps, a graph branch predicts the next layer's routing
+  // the same way and copies the top n predicted experts that are not in VRAM ahead of the layer.
+  int prefetch = 0;
+  cudaStream_t side = nullptr;
+  std::vector<cudaEvent_t> fork_events, join_events;  // per (pass, layer)
   std::string w8_keep;  // LX_W8_KEEP: comma-separated name fragments that stay bf16 for decode
   void *streams_bf, *retrieved_bf, *feat_in_bf, *h_bf, *normed_bf, *lora_bf, *att_bf, *latent_bf, *shared_bf,
       *routed_bf, *entry_bf, *meta_bf, *out_bf;
@@ -146,6 +158,9 @@ struct MetisModel::Impl {
   }
   ~Impl() {
     if (route_trace) std::fclose(route_trace);
+    for (cudaEvent_t e : fork_events) cudaEventDestroy(e);
+    for (cudaEvent_t e : join_events) cudaEventDestroy(e);
+    if (side) cudaStreamDestroy(side);
     for (auto& [key, exec] : graphs) cudaGraphExecDestroy(exec);
     if (meta_copied) cudaEventDestroy(meta_copied);
     if (h_meta) cudaFreeHost(h_meta);
@@ -456,6 +471,28 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
   m.d_start_pos = m.d_has_state + max_slots;
   check(static_cast<int>(cudaMallocHost(&m.h_meta, m.meta_count * 4)), "cudaMallocHost");
   check(static_cast<int>(cudaEventCreateWithFlags(&m.meta_copied, cudaEventDisableTiming)), "cudaEventCreate");
+  if (m.offload && std::getenv("LX_OFFLOAD_PREFETCH")) m.prefetch = std::atoi(std::getenv("LX_OFFLOAD_PREFETCH"));
+  if (m.route_trace || m.prefetch > 0) {
+    m.pred_mixed = m.alloc<float>(TS * D);
+    m.pred_h = m.alloc<uint16_t>(T * D);
+    m.pred_latent = m.alloc<float>(T * Lat);
+    m.pred_router_in = m.alloc<float>(T * (Lat + R));
+    m.pred_logits = m.alloc<float>(T * E);
+    m.pred_ids = m.alloc<int32_t>(T * Impl::kPredicted);
+    m.pred_w = m.alloc<float>(T * Impl::kPredicted);
+    m.pred_entropy = m.alloc<float>(T);
+    m.pred_confidence = m.alloc<float>(T);
+  }
+  if (m.prefetch > 0) {
+    check(static_cast<int>(cudaStreamCreateWithFlags(&m.side, cudaStreamNonBlocking)), "cudaStreamCreate");
+    for (int k = 0; k < m.P_passes * m.L_layers; ++k) {
+      cudaEvent_t a, b;
+      check(static_cast<int>(cudaEventCreateWithFlags(&a, cudaEventDisableTiming)), "cudaEventCreate");
+      check(static_cast<int>(cudaEventCreateWithFlags(&b, cudaEventDisableTiming)), "cudaEventCreate");
+      m.fork_events.push_back(a);
+      m.join_events.push_back(b);
+    }
+  }
   m.use_graphs = std::getenv("LX_NO_GRAPHS") == nullptr && !m.route_trace;
 }
 
@@ -674,7 +711,10 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, cudaStream_
         std::fwrite(head, 4, 3, m.route_trace);
         std::fwrite(ids.data(), 4, ids.size(), m.route_trace);
       }
+      const bool prefetching = m.prefetch > 0 && T <= Impl::kGemvRows;
       if (m.offload) {
+        if (prefetching && i > 0)  // the branch that prefetched this layer's experts must be done
+          check(static_cast<int>(cudaStreamWaitEvent(s, m.join_events[slot_index - 1], 0)), "cudaStreamWaitEvent");
         if (T <= Impl::kGemvRows)
           m.offload->decode(i, m.route_ids, m.route_w, m.latent_bf, m.routed, T, s);
         else
@@ -691,6 +731,49 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, cudaStream_
       linear(m, layer.latent_up, m.routed, LX_F32, Lat, m.update, LX_F32, D, T, s);
       LX_CHECK(lx_moe_summary(m.route_ids, m.route_w, layer.expert_emb, m.summary, T, R, m.K, s));
       LX_CHECK(lx_mhc_write(m.mixed, ec + S * S + S, m.update, m.streams, T, S, D, s));
+
+      if (prefetching && i + 1 < m.L_layers) {
+        // On this stream, the inputs the branch needs, so nothing it reads changes under it: the next
+        // layer's MoE read of the streams, and this layer's routing features. Then the branch: the
+        // next layer's latent_down and router, the top n experts, and their copies into VRAM.
+        const Impl::Layer& nx = m.layers[i + 1];
+        const float* nc = nx.moe_conn.params + pass * params;
+        LX_CHECK(lx_mhc_read(m.streams, nc, nc + S * S, nx.moe_conn.norm, c.rms_norm_eps, m.pred_mixed, m.pred_h, T, S,
+                             D, s));
+        copy_f32(m.features, R, m.pred_router_in + Lat, Lat + R, T, R, s);
+        check(static_cast<int>(cudaEventRecord(m.fork_events[slot_index], s)), "cudaEventRecord");
+        cudaStream_t b = m.side;
+        check(static_cast<int>(cudaStreamWaitEvent(b, m.fork_events[slot_index], 0)), "cudaStreamWaitEvent");
+        linear(m, nx.latent_down, m.pred_h, LX_BF16, D, m.pred_latent, LX_F32, Lat, T, b);
+        copy_f32(m.pred_latent, Lat, m.pred_router_in, Lat + R, T, Lat, b);
+        LX_CHECK(lx_gemm_f32(m.pred_router_in, Lat + R, nx.router_w, nx.router_b, m.pred_logits, E, T, E, Lat + R, b));
+        LX_CHECK(lx_moe_route(m.pred_logits, nx.selection_bias, m.pred_ids, m.pred_w, m.pred_entropy, m.pred_confidence,
+                              T, E, Impl::kPredicted, b));
+        // one token: its top n; several: the first n of the flattened [T, 8] (each token's best first
+        // would need a reorder; a decode batch of one is what this is for)
+        m.offload->prefetch(i + 1, m.pred_ids, std::min(m.prefetch, T * Impl::kPredicted), b);
+        check(static_cast<int>(cudaEventRecord(m.join_events[slot_index], b)), "cudaEventRecord");
+      }
+
+      if (m.route_trace && i + 1 < m.L_layers) {  // record: pass | 0x10000, layer, T, then T * 8 ids
+        const Impl::Layer& nx = m.layers[i + 1];
+        const float* nc = nx.moe_conn.params + pass * params;
+        LX_CHECK(lx_mhc_read(m.streams, nc, nc + S * S, nx.moe_conn.norm, c.rms_norm_eps, m.pred_mixed, m.pred_h, T, S,
+                             D, s));
+        linear(m, nx.latent_down, m.pred_h, LX_BF16, D, m.pred_latent, LX_F32, Lat, T, s);
+        copy_f32(m.pred_latent, Lat, m.pred_router_in, Lat + R, T, Lat, s);
+        copy_f32(m.features, R, m.pred_router_in + Lat, Lat + R, T, R, s);
+        LX_CHECK(lx_gemm_f32(m.pred_router_in, Lat + R, nx.router_w, nx.router_b, m.pred_logits, E, T, E, Lat + R, s));
+        LX_CHECK(lx_moe_route(m.pred_logits, nx.selection_bias, m.pred_ids, m.pred_w, m.pred_entropy, m.pred_confidence,
+                              T, E, Impl::kPredicted, s));
+        std::vector<int32_t> ids(static_cast<size_t>(T) * Impl::kPredicted);
+        check(static_cast<int>(cudaMemcpyAsync(ids.data(), m.pred_ids, ids.size() * 4, cudaMemcpyDeviceToHost, s)),
+              "cudaMemcpyAsync");
+        check(static_cast<int>(cudaStreamSynchronize(s)), "cudaStreamSynchronize");
+        const int32_t head[3] = {pass | 0x10000, i + 1, T};
+        std::fwrite(head, 4, 3, m.route_trace);
+        std::fwrite(ids.data(), 4, ids.size(), m.route_trace);
+      }
 
       LX_CHECK(glue::axpby(m.history, m.summary, 0.5f, 0.5f, static_cast<int64_t>(T) * R, s));
       if (layer.attention) memory_write(m, c, T, pass, anchor++, n_entries, s);

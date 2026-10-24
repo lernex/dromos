@@ -79,7 +79,7 @@ struct RoutingStats {
 struct OffloadOptions {
   int64_t vram_cache_bytes = 0;   // VRAM for expert slots
   int64_t ram_bytes = -1;         // host RAM for experts, -1 for all of them
-  double dynamic_fraction = 0.25; // share of each layer's slots kept for the replacement policy
+  double dynamic_fraction = 1.0;  // share of each layer's slots under LRU (the rest pinned by frequency)
   double cpu_fraction = 0;        // share of a step's misses the CPU takes
   int max_cpu_pairs = 0;          // per step; 0 disables the CPU lane (unless experts are on disk)
   bool fill = true;               // write GPU misses into VRAM slots

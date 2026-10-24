@@ -1,7 +1,8 @@
 // lernex offload: run a model larger than the GPU, and measure what offloading has to work with.
 //
 //   lernex offload probe [FILE]                       the machine's bandwidths (PCIe, RAM, NVMe, CPU experts)
-//   lernex offload eval MODEL PROMPTS OUT [N]         like `lernex eval`, with the experts offloaded
+//   lernex offload eval MODEL PROMPTS OUT [N]         like `lernex eval`, with the experts offloaded (OUT "-"
+//                                                     writes nothing: for LX_ROUTE_TRACE runs)
 //   lernex offload bench MODEL PROMPTS [N] [REPEAT]   single-stream decode speed: prefill N tokens of each
 //                                                     prompt, then decode the rest one token at a time
 //
@@ -11,7 +12,8 @@
 //   LX_EXPERTS          bf16 | int8 | fp8 (default: the checkpoint's format; int8 converts from BF16)
 //   LX_ROUTING_STATS    per-layer expert frequencies (tools/routing_stats.py); placement uses them
 //   LX_OFFLOAD_DENSE_HOST=1   bf16 projections decode reads as int8 stay in RAM (read by prefill)
-//   LX_OFFLOAD_DYNAMIC  share of the VRAM slots under the replacement policy (default 0.25)
+//   LX_OFFLOAD_DYNAMIC  share of the VRAM slots under LRU, the rest pinned by frequency (default 1: on
+//                       held-out routing LRU beats any pinned share, see tools/routing_stats.py)
 //   LX_OFFLOAD_CPU_FRACTION, LX_OFFLOAD_CPU_PAIRS   the CPU lane's share of misses, pairs per step
 //   LX_OFFLOAD_FILL=0   GPU misses are not written into VRAM
 #include <cuda_runtime.h>
@@ -56,7 +58,7 @@ off::OffloadLoadOptions options_from_env() {
   if (const char* p = std::getenv("LX_ROUTING_STATS")) o.routing_stats = p;
   o.dense_prefill_on_host = env_double("LX_OFFLOAD_DENSE_HOST", 0) != 0;
   o.w8_decode = std::getenv("LX_NO_W8") == nullptr;
-  o.policy.dynamic_fraction = env_double("LX_OFFLOAD_DYNAMIC", 0.25);
+  o.policy.dynamic_fraction = env_double("LX_OFFLOAD_DYNAMIC", 1.0);
   o.policy.cpu_fraction = env_double("LX_OFFLOAD_CPU_FRACTION", 0);
   o.policy.max_cpu_pairs = static_cast<int>(env_double("LX_OFFLOAD_CPU_PAIRS", 0));
   o.policy.fill = env_double("LX_OFFLOAD_FILL", 1) != 0;
@@ -115,7 +117,8 @@ int cmd_eval(int argc, char** argv) {
   const std::string dir = argv[1];
   const int split = argc == 5 ? std::stoi(argv[4]) : 0;
   const std::filesystem::path out_dir = argv[3];
-  std::filesystem::create_directories(out_dir);
+  const bool write = out_dir != "-";  // "-": run for the trace or the counters only
+  if (write) std::filesystem::create_directories(out_dir);
   nlohmann::json prompts;
   std::ifstream(argv[2]) >> prompts;
   size_t longest = 1;
@@ -150,8 +153,9 @@ int cmd_eval(int argc, char** argv) {
     const double decode_s = seconds_since(t1);
     if (cudaGetLastError() != cudaSuccess) throw std::runtime_error("CUDA error during the run");
     if (l.weights->experts().error()) throw std::runtime_error("the CPU lane stopped answering");
-    std::ofstream(out_dir / (name + ".f32"), std::ios::binary)
-        .write(reinterpret_cast<const char*>(logits.data()), logits.size() * sizeof(float));
+    if (write)
+      std::ofstream(out_dir / (name + ".f32"), std::ios::binary)
+          .write(reinterpret_cast<const char*>(logits.data()), logits.size() * sizeof(float));
     std::printf("%-20s %4d tokens: prefill %d in %.1f ms", name.c_str(), T, first, prefill_s * 1e3);
     if (first < T) std::printf(", decode %d in %.1f ms (%.1f tok/s)", T - first, decode_s * 1e3, (T - first) / decode_s);
     std::printf("\n");

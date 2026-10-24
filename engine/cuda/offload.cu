@@ -11,8 +11,9 @@
 // in flight to cover the latency of a read that crosses PCIe (about a microsecond).
 //
 // A pair with a fill destination writes what it reads into that VRAM slot: a miss costs one trip
-// across the bus and is a hit the next time (pass 2 of the same token reuses most of pass 1's
-// experts). The plan kernel picks the slots so that no slot a pair reads in this step is filled.
+// across the bus and is a hit the next time (routing has strong temporal locality: two thirds of a
+// Logos token's experts were used by one of the 16 tokens before it). The plan kernel picks the slots
+// so that no slot a pair reads in this step is filled.
 //
 // The CPU lane is a mailbox in mapped host memory: the plan posts the job and the latent rows,
 // fences at system scope and rings the doorbell; the runtime's CPU worker computes and sets `done`;
