@@ -11,6 +11,7 @@ namespace {
 
 constexpr int kScanChunk = 8;
 constexpr int kAttnGroups = 512;  // fixed grid for the attention kernels (they read T on the device)
+constexpr int kFlashRows = 64;    // query rows per flash threadgroup (nax/attention.metal)
 constexpr int kAttnSplits = 16;   // threadgroups per item in the decode form
 constexpr int kSplitBelow = 64;   // items (T * KVH) below which the decode form runs; as in the kernel
 
@@ -97,6 +98,7 @@ int lx_attention_varlen(const float* qkv, int ld_qkv, void* k_cache, void* v_cac
                         const int32_t* start_pos, const int32_t* cu_seqlens, int n_seq, int capacity, void* out, int H,
                         int KVH, int Dh, float scale, void* stream) {
   static Kernel write_kv("attn_write_kv"), attn("attention"), combine("attn_combine");
+  static KernelSet<1> flash([](int) { return std::string("attention_flash"); }, true);
   if (n_seq <= 0 || capacity <= 0 || KVH <= 0 || H <= 0 || H % KVH != 0 || Dh <= 0 || Dh % 8 != 0 || Dh > 128 ||
       ld_qkv < (H + 2 * KVH) * Dh)
     return kInvalidValue;
@@ -113,13 +115,22 @@ int lx_attention_varlen(const float* qkv, int ld_qkv, void* k_cache, void* v_cac
              addr_w(stream, v_cache, kUnknownExtent), addr(stream, slot_ids, size_t(n_seq) * 4),
              addr(stream, start_pos, size_t(n_seq) * 4), addr(stream, cu_seqlens, size_t(n_seq + 1) * 4),
              addr_w(stream, out, kUnknownExtent), addr_w(stream, partial, size_t(kSplitBelow) * splits * G * (Dh + 2) * 4),
-             ld_qkv, n_seq, capacity, H, KVH, Dh, scale, splits, 32};
+             ld_qkv, n_seq, capacity, H, KVH, Dh, scale, splits, 32, 0};
+  // Prefill items go to the flash kernel on the neural accelerators (nax/attention.metal): head size
+  // 64, and the G query heads of a kv head dividing its 64 query rows.
+  a.flash = Device::get().nax() && Dh == 64 && kFlashRows % G == 0 ? 1 : 0;
   if (int e = write_kv.launch(stream, a, size1(256), size1(128))) return e;
   const size_t smem = 2 * 32 * size_t(Dh + 2) * 2 + 4 * size_t(Dh) * 4;
   // In the split form the grid is a multiple of the split count, so every item gets all its parts.
   const NSUInteger groups = splits > 1 ? NSUInteger(kAttnGroups / splits * splits) : NSUInteger(kAttnGroups);
   stream_of(stream)->again();
   if (int e = attn.launch(stream, a, size1(groups), size1(128), smem)) return e;
+  if (a.flash) {
+    // Q (64 x 64) and the K, V tiles (32 x 64) in bf16, the scores (64 x 32) f32 and P bf16, two rows of 64.
+    constexpr NSUInteger kFlashSmem = (64 * 64 + 2 * 32 * 64) * 2 + 64 * 32 * 4 + 64 * 32 * 2 + 2 * 64 * 4;
+    stream_of(stream)->again();
+    if (int e = flash.launch(0, stream, a, size1(kAttnGroups), size1(128), kFlashSmem)) return e;
+  }
   stream_of(stream)->again();
   if (splits > 1) return combine.launch(stream, a, size1(64), size1(256));
   stream_of(stream)->drop_pending();

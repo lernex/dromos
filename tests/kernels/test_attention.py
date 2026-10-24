@@ -151,6 +151,12 @@ def test_long_context(lx, start, n):
     check_step(lx, H=32, KVH=8, Dh=64, capacity=start + n + 1, n_slots=1, seqs=[(0, start, n)], seed=start)
 
 
+def test_long_prefill_batch(lx):
+    # Prefill sizes: a fresh sequence of 300 tokens and one continuing its cache, over many cache tiles
+    # and query blocks per sequence.
+    check_step(lx, H=32, KVH=8, Dh=64, capacity=512, n_slots=3, seqs=[(2, 0, 300), (0, 77, 129)], seed=300)
+
+
 def test_qkv_column_slice_of_wider_buffer(lx):
     # q | k | v sit at column 7 of a buffer 40 columns wider than the step. Everything around them is NaN.
     check_step(lx, H=8, KVH=2, Dh=64, capacity=32, n_slots=2, seqs=[(1, 3, 5), (0, 0, 6)], seed=11,

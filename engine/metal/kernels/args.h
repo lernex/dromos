@@ -190,6 +190,7 @@ struct AttnArgs {
   float scale;
   int splits;  // threadgroups per (token, kv head); 1 for whole items
   int tile;    // cache positions per split
+  int flash;   // nax/attention.metal takes the prefill items (see flash_takes)
 };
 
 // ---- experts and routing --------------------------------------------------------------------

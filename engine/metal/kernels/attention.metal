@@ -11,11 +11,19 @@
 // splits, ...; parts write their softmax state (max, sum, accumulator) to a scratch buffer and
 // attn_combine merges them. Many items (prefill): whole items, written directly. T is device data (the
 // ABI passes cu_seqlens, not a count), so both kernels read T = cu[n_seq] and grid-stride over the
-// work, and every threadgroup makes the same choice.
+// work, and every threadgroup makes the same choice. On GPUs with neural accelerators, prefill items
+// go to the flash kernel in nax/attention.metal instead (attn_flash_takes).
 
 constant constexpr int kAttnTile = 32;
 constant constexpr int kAttnHeads = 4;  // query heads per pass: one per simdgroup
 constant constexpr int kSplitBelow = 64;
+
+// Whether the whole items go to the flash kernel on the neural accelerators (nax/attention.metal, which
+// makes the same choice): the host allows it, the items are not split, and the sequences carry enough
+// tokens each to fill its query blocks.
+inline bool attn_flash_takes(constant AttnArgs& a, int T) {
+  return a.flash != 0 && !(a.splits > 1 && T * a.KVH < kSplitBelow) && T >= 4 * a.n_seq;
+}
 
 inline int seq_of_token(const device int* cu, int n_seq, int t) {
   int lo = 1, hi = n_seq;
@@ -58,6 +66,7 @@ kernel void attention(constant AttnArgs& a [[buffer(0)]], threadgroup uchar* sme
   threadgroup ushort* sV = sK + kAttnTile * RS;
   threadgroup float* sQ = (threadgroup float*)(sV + kAttnTile * RS);
   const int T = a.cu[a.n_seq];
+  if (attn_flash_takes(a, T)) return;
   const bool split = a.splits > 1 && T * KVH < kSplitBelow;
   const int S = split ? a.splits : 1;
   const int part = split ? int(g) % S : 0;
