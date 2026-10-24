@@ -69,6 +69,7 @@ int64_t lx_gemm_workspace_bytes(int M, int K, lx_math math) { return quantized_r
 int lx_gemm_w(const void* x, lx_dtype x_dtype, int ld_x, const lx_weight* w, lx_math math, const void* bias,
               lx_dtype bias_dtype, void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K, float alpha, float beta,
               void* workspace, void* stream) {
+  if (w && w->type == LX_W_BF16X) return kNotSupported;
   if (!w || !w->data || w->type < LX_W_BF16 || w->type > LX_W_NVFP4) return kInvalidValue;
   if (M <= 0 || N <= 0 || K <= 0) return M == 0 || N == 0 ? kOk : kInvalidValue;
   if (ld_x < K || ld_y < N || !valid_dtype(x_dtype) || !valid_dtype(y_dtype) || (bias && !valid_dtype(bias_dtype)))

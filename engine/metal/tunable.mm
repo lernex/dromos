@@ -5,7 +5,9 @@
 // table is the same as CUDA's.
 #include "cuda/tunable.h"
 
+#include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <string>
@@ -43,6 +45,17 @@ int bucket(int m) {
   int b = 1;
   while (b < m) b <<= 1;
   return b;
+}
+
+lx::TuneProblem to_problem(const lx_tune_problem& p) {
+  lx::TuneProblem q;
+  q.M = p.M;
+  q.N = p.N;
+  q.K = p.K;
+  q.experts = p.experts;
+  q.weight = p.weight;
+  q.math = p.math;
+  return q;
 }
 
 }  // namespace
@@ -108,6 +121,25 @@ const char* lx_tune_variant_name(const char* kernel, int variant) {
   auto it = registry().find(kernel);
   if (it == registry().end() || variant < 0 || variant >= static_cast<int>(it->second.size())) return nullptr;
   return it->second[variant].c_str();
+}
+
+int lx_tune_run(const char* kernel, int variant, const lx_tune_problem* problem, float* out, void* stream) {
+  const lx::TuneRunner runner = lx::tunable_runner(kernel);
+  if (!runner || !problem) return LX_ERR_NOT_SUPPORTED;
+  return runner(variant, to_problem(*problem), out, stream);
+}
+
+int lx_tune_runnable(const char* kernel) { return lx::tunable_runner(kernel) ? 1 : 0; }
+
+int lx_tune_key(const char* kernel, const lx_tune_problem* problem, char* out, int capacity) {
+  if (!kernel || !problem) return -1;
+  const std::string key = lx::tune_key(kernel, to_problem(*problem));
+  if (out && capacity > 0) {
+    const size_t n = std::min(key.size(), static_cast<size_t>(capacity - 1));
+    std::memcpy(out, key.data(), n);
+    out[n] = '\0';
+  }
+  return static_cast<int>(key.size());
 }
 
 }  // extern "C"

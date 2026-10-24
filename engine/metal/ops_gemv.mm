@@ -93,6 +93,7 @@ int lx_gemv_w(const void* x, lx_dtype x_dtype, int ld_x, const lx_weight* w, con
               void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K, float alpha, float beta, void* stream) {
   if (!w || M < 1 || M > kMaxM || N <= 0 || K <= 0 || ld_x < K || ld_y < N) return kInvalidValue;
   if (!valid_dtype(x_dtype) || !valid_dtype(y_dtype) || (bias && !valid_dtype(bias_dtype))) return kInvalidValue;
+  if (w->type == LX_W_BF16X) return kNotSupported;
   if (w->type < LX_W_BF16 || w->type > LX_W_NVFP4 || !w->data) return kInvalidValue;
   if (w->type != LX_W_BF16 && !w->scale) return kInvalidValue;
   if (w->type == LX_W_NVFP4 && K % 16 != 0) return kInvalidValue;

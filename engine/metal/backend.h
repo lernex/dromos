@@ -87,6 +87,11 @@ class Stream {
   int wait(uint64_t value = 0);
   uint64_t committed() const { return committed_; }
   bool done(uint64_t value) const;
+  // The stream's timeline, which other streams wait on, and the command buffer committed last (for timing).
+  id<MTLSharedEvent> timeline() const { return timeline_; }
+  id<MTLCommandBuffer> last_buffer() const { return last_cb_; }
+  // Work issued after this call waits until `event` reaches `value` (lx_rt_stream_wait).
+  int wait_for(id<MTLSharedEvent> event, uint64_t value);
 
   // Host to device copy in stream order: the source is staged now (so the caller may reuse it), and a
   // kernel moves it into place when the stream gets there.
@@ -122,6 +127,8 @@ class Stream {
   id<MTLCommandQueue> queue_;
   id<MTLSharedEvent> timeline_;
   id<MTLCommandBuffer> cb_ = nil;
+  id<MTLCommandBuffer> last_cb_ = nil;
+  std::vector<std::pair<id<MTLSharedEvent>, uint64_t>> waits_;  // for the next command buffer to wait on
   id<MTLComputeCommandEncoder> enc_ = nil;
   id<MTLComputePipelineState> bound_ = nil;
   uint64_t committed_ = 0;  // timeline value of the last committed command buffer
@@ -171,6 +178,8 @@ class Device {
 
   Stream* default_stream();
   id<MTLCommandQueue> new_queue();
+  // Waits for every stream's work (lx_rt_device_sync); the first error any of them reports.
+  int sync_all();
   void add_stream(Stream* s);
   void remove_stream(Stream* s);
 

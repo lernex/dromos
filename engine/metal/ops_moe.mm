@@ -190,6 +190,7 @@ int lx_moe_experts_decode(const void* latent, const int32_t* ids, const float* w
                           void* stream) {
   if (T <= 0) return kOk;
   if (T > kDecodeTokens || top_k < 1 || !workspace) return kInvalidValue;
+  if ((gate_up && gate_up->type == LX_W_BF16X) || (down && down->type == LX_W_BF16X)) return kNotSupported;
   if (!valid_stack(gate_up, 2 * I, L) || !valid_stack(down, L, I)) return kInvalidValue;
   return decode_experts(latent, ids, weights, gate_up, down, out, workspace, T, L, I, top_k, stream);
 }
@@ -226,6 +227,7 @@ int lx_moe_experts_grouped(const void* latent, const int32_t* ids, const float* 
   static Kernel group_k("moe_group"), combine_k("moe_combine");
   if (T <= 0) return kOk;
   if (L <= 0 || I <= 0 || E <= 0 || top_k < 1 || top_k > E || !workspace) return kInvalidValue;
+  if ((gate_up && gate_up->type == LX_W_BF16X) || (down && down->type == LX_W_BF16X)) return kNotSupported;
   if (!valid_stack(gate_up, 2 * I, L) || !valid_stack(down, L, I)) return kInvalidValue;
   if (math < LX_MATH_BF16 || math > LX_MATH_FP4) return kInvalidValue;
   // As on CUDA: the intermediate's width is a whole number of 8-wide steps.

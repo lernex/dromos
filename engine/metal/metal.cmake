@@ -38,5 +38,5 @@ add_library(lernex_metal SHARED ${LX_METAL_HOST} "${LX_METAL_EMBEDDED}" "${LX_ME
 # which Foundation includes.
 target_compile_options(lernex_metal PRIVATE "SHELL:-iquote ${CMAKE_SOURCE_DIR}/engine"
                        $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc> -fvisibility=hidden -Wall -Wextra -Wno-unused-parameter)
-target_link_libraries(lernex_metal PUBLIC "-framework Metal" "-framework Foundation")
+target_link_libraries(lernex_metal PUBLIC "-framework Metal" "-framework Foundation" "-framework IOKit")
 set_target_properties(lernex_metal PROPERTIES OBJCXX_STANDARD 20 CXX_STANDARD 20)

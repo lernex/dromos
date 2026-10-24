@@ -3,6 +3,7 @@
 #include "cuda/tunable.h"
 #include "metal/backend.h"
 
+#include <IOKit/IOKitLib.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <sys/mman.h>
@@ -365,6 +366,20 @@ int Device::unmap_host(void* ptr) {
   return release(reinterpret_cast<uintptr_t>(ptr) & ~(page_size() - 1), false);
 }
 
+int Device::sync_all() {
+  std::vector<Stream*> streams;
+  {
+    std::lock_guard<std::mutex> g(mu_);
+    streams = streams_;
+  }
+  int first = kOk;
+  for (Stream* s : streams) {
+    const int e = s->capturing() ? kOk : s->wait();
+    if (first == kOk) first = e;
+  }
+  return first;
+}
+
 void Device::add_stream(Stream* s) {
   std::lock_guard<std::mutex> g(mu_);
   streams_.push_back(s);
@@ -398,6 +413,7 @@ size_t weight_data_bytes(lx_wtype type, int64_t N, int64_t K) {
     case LX_W_INT8:
     case LX_W_FP8: return static_cast<size_t>(N * K);
     case LX_W_NVFP4: return static_cast<size_t>(N * (K / 2));
+    case LX_W_BF16X: break;  // not run on Metal
   }
   return 0;
 }
@@ -408,6 +424,7 @@ size_t weight_scale_bytes(lx_wtype type, int64_t N, int64_t K) {
     case LX_W_INT8:
     case LX_W_FP8: return static_cast<size_t>(N * 4);
     case LX_W_NVFP4: return static_cast<size_t>(N * (K / 16));
+    case LX_W_BF16X: break;
   }
   return 0;
 }
@@ -430,6 +447,8 @@ void Stream::open() {
   cb_ = [queue_ commandBufferWithUnretainedReferences];
   // Untracked buffers: nothing orders this command buffer after the previous one but this wait.
   if (committed_ > 0) [cb_ encodeWaitForEvent:timeline_ value:committed_];
+  for (const auto& [event, value] : waits_) [cb_ encodeWaitForEvent:event value:value];
+  waits_.clear();
   enc_ = [cb_ computeCommandEncoderWithDispatchType:serial() ? MTLDispatchTypeSerial : MTLDispatchTypeConcurrent];
   bound_ = nil;
   // A new command buffer starts after the last one finished, so nothing before it is a hazard.
@@ -620,6 +639,7 @@ uint64_t Stream::flush() {
   if (!wraps_.empty()) retiring_.emplace_back(value, std::move(wraps_));
   wraps_.clear();
   if (ring_) ring_marks_.emplace_back(value, ring_head_);
+  last_cb_ = cb_;
   cb_ = nil;
   enc_ = nil;
   bound_ = nil;
@@ -628,6 +648,15 @@ uint64_t Stream::flush() {
 }
 
 bool Stream::done(uint64_t value) const { return timeline_.signaledValue >= value; }
+
+int Stream::wait_for(id<MTLSharedEvent> event, uint64_t value) {
+  if (event == timeline_ || value == 0 || event.signaledValue >= value) return kOk;  // already ordered, or done
+  if (graph_) return note(kNotSupported);  // a recording is one stream's work
+  // The work so far goes now; the next command buffer, which holds whatever comes after, waits.
+  flush();
+  waits_.emplace_back(event, value);
+  return kOk;
+}
 
 int Stream::wait(uint64_t value) {
   if (value == 0) value = flush();
@@ -745,7 +774,52 @@ namespace {
 struct Event {
   Stream* stream = nullptr;
   uint64_t value = 0;
+  // Timed events (lx_rt_event_create_timed): the command buffer committed with the event, whose GPU end
+  // time is when the stream reached it.
+  bool timed = false;
+  id<MTLCommandBuffer> buffer = nil;
 };
+
+// The number of GPU cores, from the GPU's IORegistry entry (0 when it does not say).
+int gpu_cores() {
+  int cores = 0;
+  io_service_t gpu = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AGXAccelerator"));
+  if (!gpu) return 0;
+  if (CFTypeRef v = IORegistryEntryCreateCFProperty(gpu, CFSTR("gpu-core-count"), kCFAllocatorDefault, 0)) {
+    if (CFGetTypeID(v) == CFNumberGetTypeID()) CFNumberGetValue(static_cast<CFNumberRef>(v), kCFNumberIntType, &cores);
+    CFRelease(v);
+  }
+  IOObjectRelease(gpu);
+  return cores;
+}
+
+// The memory of Apple's chips, which no API reports: transfers per second (MT/s) and bus width, by chip
+// name, and for the Max chips whose bus width follows their GPU's size, by core count. Unknown chips get
+// zeros (the bandwidth is then reported as unknown).
+void chip_memory(const std::string& name, int cores, int64_t* mts, int* bus_bits) {
+  struct Chip {
+    const char* name;
+    int min_cores;  // the row applies from this many GPU cores up
+    int64_t mts;
+    int bus;
+  };
+  static const Chip chips[] = {
+      {"Apple M1", 0, 4266, 128},          {"Apple M1 Pro", 0, 6400, 256},     {"Apple M1 Max", 0, 6400, 512},
+      {"Apple M1 Ultra", 0, 6400, 1024},   {"Apple M2", 0, 6400, 128},         {"Apple M2 Pro", 0, 6400, 256},
+      {"Apple M2 Max", 0, 6400, 512},      {"Apple M2 Ultra", 0, 6400, 1024},  {"Apple M3", 0, 6400, 128},
+      {"Apple M3 Pro", 0, 6400, 192},      {"Apple M3 Max", 0, 6400, 384},     {"Apple M3 Max", 40, 6400, 512},
+      {"Apple M3 Ultra", 0, 6400, 1024},   {"Apple M4", 0, 7500, 128},         {"Apple M4 Pro", 0, 8533, 256},
+      {"Apple M4 Max", 0, 8533, 384},      {"Apple M4 Max", 40, 8533, 512},    {"Apple M5", 0, 9600, 128},
+  };
+  *mts = 0;
+  *bus_bits = 0;
+  for (const Chip& c : chips) {
+    if (name == c.name && cores >= c.min_cores) {
+      *mts = c.mts;
+      *bus_bits = c.bus;
+    }
+  }
+}
 
 }  // namespace
 
@@ -794,6 +868,14 @@ int lx_rt_copy(void* dst, const void* src, int64_t bytes, lx_copy_kind kind, voi
       CopyArgs a{s->address(src, static_cast<size_t>(bytes)), s->address(dst, static_cast<size_t>(bytes), true), bytes};
       return note(copy_kernel.launch(s, a, size1(ceil_div((bytes + 15) / 16, 256)), size1(256)));
     }
+    case LX_COPY_DEFAULT: {
+      // Device memory is what the registry holds; anything else is host memory.
+      uintptr_t base = 0;
+      const bool dst_device = Device::get().lookup(dst, static_cast<size_t>(bytes), &base) != nil;
+      const bool src_device = Device::get().lookup(src, static_cast<size_t>(bytes), &base) != nil;
+      const lx_copy_kind k = !dst_device ? LX_COPY_D2H : src_device ? LX_COPY_D2D : LX_COPY_H2D;
+      return lx_rt_copy(dst, src, bytes, k, stream);
+    }
   }
   return note(kInvalidValue);
 }
@@ -829,9 +911,20 @@ int lx_rt_event_destroy(void* event) {
 }
 
 int lx_rt_event_record(void* event, void* stream) {
+  static Kernel mark("fill_bytes");
   auto* e = static_cast<Event*>(event);
   if (!e) return note(kInvalidValue);
   e->stream = stream_of(stream);
+  e->buffer = nil;
+  if (e->timed && !e->stream->capturing()) {
+    // An empty fill goes in the command buffer the event closes, so there is one even on an idle stream:
+    // its end on the GPU's clock is the event's time.
+    FillArgs a{0, 0, 0};
+    if (int err = mark.launch(e->stream, a, size1(1), size1(1))) return note(err);
+    e->value = e->stream->flush();
+    e->buffer = e->stream->last_buffer();
+    return kOk;
+  }
   e->value = e->stream->flush();
   return kOk;
 }
@@ -872,16 +965,108 @@ int lx_rt_last_error(void) {
   return e;
 }
 
-int lx_rt_map_host(void* ptr, int64_t bytes, void** device_ptr) {
-  if (!device_ptr) return note(kInvalidValue);
-  *device_ptr = nullptr;
-  if (bytes <= 0) return note(kInvalidValue);
-  if (int e = Device::get().map_host(ptr, static_cast<size_t>(bytes))) return note(e);
-  *device_ptr = ptr;  // unified memory: kernels read the mapping where it is
+int lx_rt_event_create_timed(void** event) {
+  if (!event) return note(kInvalidValue);
+  auto* e = new Event();
+  e->timed = true;
+  *event = e;
   return kOk;
 }
 
-int lx_rt_unmap_host(void* ptr) { return note(Device::get().unmap_host(ptr)); }
+int lx_rt_event_elapsed(void* start, void* stop, float* ms) {
+  auto* a = static_cast<Event*>(start);
+  auto* b = static_cast<Event*>(stop);
+  if (!a || !b || !ms || !a->buffer || !b->buffer) return note(kInvalidValue);
+  if (int e = lx_rt_event_sync(a)) return e;
+  if (int e = lx_rt_event_sync(b)) return e;
+  // The timeline is signalled from inside the buffer, a little before the buffer has its times.
+  [a->buffer waitUntilCompleted];
+  [b->buffer waitUntilCompleted];
+  *ms = static_cast<float>((b->buffer.GPUEndTime - a->buffer.GPUEndTime) * 1e3);
+  return kOk;
+}
+
+int lx_rt_device_sync(void) { return note(Device::get().sync_all()); }
+
+const char* lx_rt_error_string(int status) {
+  switch (status) {
+    case kOk: return "no error";
+    case kInvalidValue: return "invalid argument";
+    case kOutOfMemory: return "out of memory";
+    case kNotSupported: return "operation not supported on Metal";
+    case kLaunchFailure: return "a command buffer failed on the GPU";
+  }
+  thread_local char text[48];
+  std::snprintf(text, sizeof text, "error %d", status);
+  return text;
+}
+
+// Unified memory: nothing the GPU reads is across a bus.
+int lx_rt_is_host_memory(const void* ptr) { return 0; }
+
+int lx_rt_device_props(int ordinal, lx_device_props* props) {
+  id<MTLDevice> d = Device::get().mtl();
+  if (!props || ordinal != 0 || !d) return note(kInvalidValue);
+  *props = lx_device_props{};
+  std::snprintf(props->name, sizeof props->name, "%s", d.name.UTF8String);
+  const int arch = 1000 + Device::get().family();  // lx_arch without an override
+  props->cc_major = arch / 10;
+  props->cc_minor = arch % 10;
+  props->sms = gpu_cores();
+  props->l2_bytes = 0;  // not published for Apple GPUs
+  int64_t mts = 0;
+  chip_memory(d.name.UTF8String, props->sms, &mts, &props->bus_bits);
+  props->mem_clock_khz = mts * 1000 / 2;  // two transfers per clock
+  // The driver ships with the OS: its version. The runtime: the Metal version the GPU supports.
+  const NSOperatingSystemVersion os = NSProcessInfo.processInfo.operatingSystemVersion;
+  props->driver_version = static_cast<int>(1000 * os.majorVersion + 10 * os.minorVersion);
+  props->runtime_version = [d supportsFamily:MTLGPUFamilyMetal4] ? 4000 : 3020;
+  return kOk;
+}
+
+// The GPU's working set: what Metal recommends this process keep resident, less what it holds.
+int lx_rt_mem_info(int64_t* free_bytes, int64_t* total_bytes) {
+  id<MTLDevice> d = Device::get().mtl();
+  if (!free_bytes || !total_bytes || !d) return note(kInvalidValue);
+  const auto total = static_cast<int64_t>(d.recommendedMaxWorkingSetSize);
+  const auto held = static_cast<int64_t>(d.currentAllocatedSize);
+  *total_bytes = total;
+  *free_bytes = std::max<int64_t>(0, total - held);
+  return kOk;
+}
+
+int lx_rt_process_memory(int64_t* bytes) {
+  id<MTLDevice> d = Device::get().mtl();
+  if (!bytes || !d) return note(kInvalidValue);
+  *bytes = static_cast<int64_t>(d.currentAllocatedSize);
+  return kOk;
+}
+
+int lx_rt_host_alloc_mapped(void** host, void** device, int64_t bytes) {
+  if (!host || !device) return note(kInvalidValue);
+  *device = nullptr;
+  if (int e = lx_rt_alloc(host, bytes)) return e;
+  *device = *host;  // unified memory: kernels read it where it is
+  return kOk;
+}
+
+int lx_rt_host_register(void* host, int64_t bytes, void** device) {
+  if (!device) return note(kInvalidValue);
+  *device = nullptr;
+  if (bytes <= 0) return note(kInvalidValue);
+  if (int e = Device::get().map_host(host, static_cast<size_t>(bytes))) return note(e);
+  *device = host;
+  return kOk;
+}
+
+int lx_rt_host_unregister(void* host) { return note(Device::get().unmap_host(host)); }
+
+int lx_rt_stream_wait(void* stream, void* event) {
+  auto* e = static_cast<Event*>(event);
+  if (!e) return note(kInvalidValue);
+  if (!e->stream) return kOk;  // never recorded: nothing to wait for
+  return stream_of(stream)->wait_for(e->stream->timeline(), e->value);
+}
 
 }  // extern "C"
 
