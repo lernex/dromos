@@ -259,3 +259,76 @@ def test_moe_grouped_rows_do_not_depend_on_the_batch(lx, name, wtype, math, olde
         assert status == 0, f"lx_moe_experts_grouped returned CUDA error {status}"
         for t in range(T):
             assert torch.equal(out[t], alone[t]), f"{name}: token {t} of a T={T} batch differs from the token alone"
+
+
+def native_family(lx, name):
+    """The variant family that runs pair `name` on this card, as moe_grouped.cu dispatches it."""
+    kind = {"bf16": "bf16", "w8a16_int8": "w8i8", "w8a16_fp8": "w8f8", "w4a16": "w4a16", "int8": "i8", "fp8": "f8",
+            "w4a8": "w4a8", "fp4": "f4"}[name]
+    names = (ctypes.c_char_p * 256)()
+    lx.lib.lx_tune_kernels.restype = ctypes.c_int
+    count = lx.lib.lx_tune_kernels(names, 256)
+    fams = [names[i].decode() for i in range(min(count, 256)) if names[i].decode().startswith(f"moe_grouped.{kind}.sm")]
+    have = native_arch(lx)
+    return max((f for f in fams if int(f.split(".sm")[1]) <= have), key=lambda f: int(f.split(".sm")[1])).encode()
+
+
+@pytest.mark.parametrize("skew", [False, True])
+@pytest.mark.parametrize("name,wtype,math,oldest", PAIRS)
+def test_moe_grouped_repeats_bit_for_bit(lx, name, wtype, math, oldest, skew):
+    # The engine rule, run to run: five calls at a prefill size with Praxis's widest routing (top 8) give the
+    # same bits, each from a fresh workspace full of garbage. Thousands of tiles write a token's pair rows in
+    # whatever order the GPU runs them; the sum over them must not show it.
+    if native_arch(lx) < oldest:
+        pytest.skip("not on this GPU")
+    T, L, I, E, top_k = 1024, 1024, 512, 128, 8
+    case = make_case(T, L, I, E, top_k, wtype, seed=91 + math, skew=skew)
+    status, first = run(lx, case, math, T, L, I, E, top_k)
+    assert status == 0, f"lx_moe_experts_grouped returned CUDA error {status}"
+    for _ in range(4):
+        status, out = run(lx, case, math, T, L, I, E, top_k)
+        assert status == 0, f"lx_moe_experts_grouped returned CUDA error {status}"
+        assert torch.equal(out, first), f"{name}: a repeated call gave different bits"
+
+
+@pytest.mark.parametrize("name,wtype,math,oldest", PAIRS)
+def test_moe_grouped_rows_do_not_depend_on_a_prefill_batch(lx, name, wtype, math, oldest):
+    # The engine rule at prefill sizes: a token's row is the same bits whether it shares the launch with 63 or
+    # with 511 other tokens, and whichever tile variant of its family runs the 64 (another tile height and
+    # other tile tables; every tile adds the K steps in one order).
+    if native_arch(lx) < oldest:
+        pytest.skip("not on this GPU")
+    T, L, I, E, top_k = 512, 1024, 512, 128, 4
+    case = make_case(T, L, I, E, top_k, wtype, seed=123 + math)
+    status, big = run(lx, case, math, T, L, I, E, top_k)
+    assert status == 0, f"lx_moe_experts_grouped returned CUDA error {status}"
+    small = tuple(x[:64].contiguous() for x in case[:3]) + case[3:]
+    fam = native_family(lx, name)
+    lx.lib.lx_tune_variant_name.restype = ctypes.c_char_p
+    for v in range(lx.lib.lx_tune_variants(fam)):
+        lx.lib.lx_tune_force(fam, 64 * top_k, 2 * I, L, v)
+        lx.lib.lx_tune_force(fam, 64 * top_k, L, I, v)
+        try:
+            status, out = run(lx, small, math, 64, L, I, E, top_k)
+        finally:
+            lx.lib.lx_tune_clear()
+        label = f"{name}, variant {lx.lib.lx_tune_variant_name(fam, v).decode()}"
+        assert status == 0, f"{label} returned CUDA error {status}"
+        assert torch.equal(out, big[:64]), f"{label}: the first 64 tokens differ from their rows in a batch of 512"
+
+
+@pytest.mark.parametrize("name,wtype,math,oldest", [PAIRS[0], PAIRS[4], PAIRS[7]])
+def test_moe_grouped_expert_chosen_twice(lx, name, wtype, math, oldest):
+    # A token routed to the same expert in two slots: its two rows sit side by side in one expert's run, often
+    # in one tile, and both count towards the token's sum like any other pair.
+    if native_arch(lx) < oldest:
+        pytest.skip("not on this GPU")
+    T, L, I, E, top_k = 300, 512, 256, 16, 4
+    latent, ids, weights, gu, dn = make_case(T, L, I, E, top_k, wtype, seed=7)
+    ids[::3, 2] = ids[::3, 0]
+    case = (latent, ids.contiguous(), weights, gu, dn)
+    status, a = run(lx, case, math, T, L, I, E, top_k)
+    assert status == 0, f"lx_moe_experts_grouped returned CUDA error {status}"
+    status, b = run(lx, case, math, T, L, I, E, top_k)
+    assert torch.equal(a, b)
+    check(a, case, math)
