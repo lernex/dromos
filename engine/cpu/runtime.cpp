@@ -5,13 +5,25 @@
 // ones come from the heap. Every op runs to completion on the calling thread (with the pool), so a
 // stream is an in-order queue whose work is always already done: syncs and events have nothing to wait
 // for, and the order of calls is the order of execution. Graph capture has no meaning here and returns
-// LX_ERR_NOT_SUPPORTED, so the model runs eagerly.
+// LX_ERR_NOT_SUPPORTED, so the model runs eagerly. A timed event records the clock when it is recorded,
+// which is when the work issued before it finished.
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
+#include <chrono>
 #include <mutex>
 #include <unordered_map>
+
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <sys/sysctl.h>
+#endif
+#if defined(__x86_64__) || defined(_M_X64)
+#include <cpuid.h>
+#endif
 
 #include "cpu/cpu.h"
 
@@ -80,8 +92,73 @@ struct Stream {
   int id;
 };
 struct Event {
-  int id;
+  bool timed = false;     // made by lx_rt_event_create_timed
+  bool recorded = false;  // recorded at least once
+  std::chrono::steady_clock::time_point at;
 };
+
+// The processor's name: the brand string on x86 and macOS, the first "model name" (or "Hardware") line of
+// /proc/cpuinfo elsewhere on Linux, else "CPU".
+void cpu_name(char* out, size_t capacity) {
+  snprintf(out, capacity, "CPU");
+#if defined(__x86_64__) || defined(_M_X64)
+  unsigned regs[12] = {};
+  if (__get_cpuid_max(0x80000000u, nullptr) >= 0x80000004u) {
+    for (unsigned i = 0; i < 3; ++i)
+      __get_cpuid(0x80000002u + i, &regs[4 * i], &regs[4 * i + 1], &regs[4 * i + 2], &regs[4 * i + 3]);
+    char brand[49] = {};
+    memcpy(brand, regs, 48);
+    const char* b = brand;
+    while (*b == ' ') ++b;
+    if (*b) snprintf(out, capacity, "%s", b);
+  }
+#elif defined(__APPLE__)
+  char brand[256] = {};
+  size_t len = sizeof brand;
+  if (sysctlbyname("machdep.cpu.brand_string", brand, &len, nullptr, 0) == 0 && brand[0])
+    snprintf(out, capacity, "%s", brand);
+#elif defined(__linux__)
+  FILE* f = fopen("/proc/cpuinfo", "r");
+  if (!f) return;
+  char line[512];
+  while (fgets(line, sizeof line, f)) {
+    if (strncmp(line, "model name", 10) != 0 && strncmp(line, "Hardware", 8) != 0) continue;
+    const char* v = strchr(line, ':');
+    if (!v) continue;
+    ++v;
+    while (*v == ' ' || *v == '\t') ++v;
+    snprintf(out, capacity, "%s", v);
+    out[strcspn(out, "\n")] = 0;
+    break;
+  }
+  fclose(f);
+#endif
+}
+
+// The L2 cache of one core, in bytes, or 0 where the system does not say.
+int64_t l2_bytes() {
+#if defined(__APPLE__)
+  // The performance cores' L2 (shared by a cluster), where the system lists levels; hw.l2cachesize else.
+  for (const char* name : {"hw.perflevel0.l2cachesize", "hw.l2cachesize"}) {
+    int64_t v = 0;
+    size_t len = sizeof v;
+    if (sysctlbyname(name, &v, &len, nullptr, 0) == 0 && v > 0) return v;
+  }
+  return 0;
+#elif defined(_SC_LEVEL2_CACHE_SIZE)
+  const long v = sysconf(_SC_LEVEL2_CACHE_SIZE);
+  if (v > 0) return v;
+  FILE* f = fopen("/sys/devices/system/cpu/cpu0/cache/index2/size", "r");
+  if (!f) return 0;
+  long kb = 0;
+  char unit = 0;
+  const int n = fscanf(f, "%ld%c", &kb, &unit);
+  fclose(f);
+  return n >= 1 ? static_cast<int64_t>(kb) * (unit == 'M' ? 1 << 20 : 1 << 10) : 0;
+#else
+  return 0;
+#endif
+}
 
 }  // namespace
 
@@ -105,6 +182,27 @@ int lx_rt_free(void* ptr) { return release(ptr); }
 int lx_rt_host_alloc(void** ptr, int64_t bytes) { return alloc(ptr, bytes); }
 int lx_rt_host_free(void* ptr) { return release(ptr); }
 
+// Host memory is device memory here, so a mapped block is one ordinary allocation whose address serves
+// as both the host and the device pointer.
+int lx_rt_host_alloc_mapped(void** host, void** device, int64_t bytes) {
+  if (!device) return fail(kInvalid);
+  *device = nullptr;
+  if (const int status = alloc(host, bytes); status != kOk) return status;
+  *device = *host;
+  return kOk;
+}
+
+// Nothing to pin: the range is already where the kernels read it, so registering cannot fail.
+int lx_rt_host_register(void* host, int64_t bytes, void** device) {
+  if (!device || (!host && bytes > 0)) return fail(kInvalid);
+  *device = host;
+  return kOk;
+}
+int lx_rt_host_unregister(void* host) {
+  (void)host;
+  return kOk;
+}
+
 int lx_rt_memset(void* ptr, int value, int64_t bytes, void* stream) {
   (void)stream;
   if (bytes <= 0) return kOk;
@@ -118,11 +216,11 @@ int lx_rt_memset(void* ptr, int value, int64_t bytes, void* stream) {
   return kOk;
 }
 
+// Every direction is the same copy here: host and device memory are one memory.
 int lx_rt_copy(void* dst, const void* src, int64_t bytes, lx_copy_kind kind, void* stream) {
-  (void)kind;
   (void)stream;
   if (bytes <= 0) return kOk;
-  if (!dst || !src) return fail(kInvalid);
+  if (!dst || !src || kind < LX_COPY_H2D || kind > LX_COPY_DEFAULT) return fail(kInvalid);
   char* d = static_cast<char*>(dst);
   const char* s = static_cast<const char*>(src);
   if (bytes < kParallelBytes) {
@@ -154,7 +252,14 @@ int lx_rt_stream_sync(void* stream) {
 
 int lx_rt_event_create(void** event) {
   if (!event) return fail(kInvalid);
-  *event = new Event{0};
+  *event = new Event;
+  return kOk;
+}
+int lx_rt_event_create_timed(void** event) {
+  if (!event) return fail(kInvalid);
+  Event* e = new Event;
+  e->timed = true;
+  *event = e;
   return kOk;
 }
 int lx_rt_event_destroy(void* event) {
@@ -162,14 +267,35 @@ int lx_rt_event_destroy(void* event) {
   return kOk;
 }
 int lx_rt_event_record(void* event, void* stream) {
-  (void)event;
   (void)stream;
+  if (!event) return fail(kBadHandle);
+  Event* e = static_cast<Event*>(event);
+  e->recorded = true;
+  if (e->timed) e->at = std::chrono::steady_clock::now();
+  return kOk;
+}
+// As on CUDA: both events must be timed and recorded.
+int lx_rt_event_elapsed(void* start, void* stop, float* ms) {
+  if (!ms) return fail(kInvalid);
+  const Event* a = static_cast<const Event*>(start);
+  const Event* b = static_cast<const Event*>(stop);
+  if (!a || !b || !a->timed || !b->timed || !a->recorded || !b->recorded) return fail(kBadHandle);
+  *ms = std::chrono::duration<float, std::milli>(b->at - a->at).count();
   return kOk;
 }
 int lx_rt_event_sync(void* event) {
   (void)event;
   return kOk;
 }
+// Streams are synchronous, so the event has already happened by the time anything waits on it.
+int lx_rt_stream_wait(void* stream, void* event) {
+  (void)stream;
+  (void)event;
+  return kOk;
+}
+
+// Every op has finished by the time it returns, on every stream.
+int lx_rt_device_sync(void) { return kOk; }
 
 // Declining a capture is the answer to a question the model asks, not a failure, so it does not set
 // lx_rt_last_error (the model checks that after a run).
@@ -190,6 +316,105 @@ int lx_rt_graph_launch(void* graph, void* stream) {
 int lx_rt_graph_destroy(void* graph) {
   (void)graph;
   return kOk;
+}
+
+// Free and total memory of the machine, in bytes: what the offload planner sizes RAM tiers from. Free is
+// the memory the kernel can hand out without reclaiming (MemAvailable on Linux, free pages on macOS).
+int lx_rt_mem_info(int64_t* free_bytes, int64_t* total_bytes) {
+  if (!free_bytes || !total_bytes) return fail(kInvalid);
+#if defined(__APPLE__)
+  uint64_t total = 0;
+  size_t len = sizeof total;
+  if (sysctlbyname("hw.memsize", &total, &len, nullptr, 0) != 0) return fail(kNotSupported);
+  vm_statistics64_data_t vm{};
+  mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+  if (host_statistics64(mach_host_self(), HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&vm), &count) !=
+      KERN_SUCCESS)
+    return fail(kNotSupported);
+  *free_bytes = static_cast<int64_t>(vm.free_count) * static_cast<int64_t>(sysconf(_SC_PAGESIZE));
+  *total_bytes = static_cast<int64_t>(total);
+  return kOk;
+#elif defined(__linux__)
+  FILE* f = fopen("/proc/meminfo", "r");
+  if (!f) return fail(kNotSupported);
+  unsigned long long total_kb = 0, avail_kb = 0;
+  int found = 0;
+  char line[256];
+  while (found < 2 && fgets(line, sizeof line, f)) {
+    if (sscanf(line, "MemTotal: %llu kB", &total_kb) == 1) ++found;
+    else if (sscanf(line, "MemAvailable: %llu kB", &avail_kb) == 1) ++found;
+  }
+  fclose(f);
+  if (found < 2) return fail(kNotSupported);
+  *free_bytes = static_cast<int64_t>(avail_kb) * 1024;
+  *total_bytes = static_cast<int64_t>(total_kb) * 1024;
+  return kOk;
+#else
+  return fail(kNotSupported);
+#endif
+}
+
+// One device: this machine. Its compute capability is the ISA level (lx_arch's code before any override,
+// major * 10 + minor), its multiprocessors the threads the kernels run on. The memory clock and bus width
+// are not something a process can read, so they are 0 (and the host shows no peak bandwidth), as are the
+// driver and runtime versions, which do not exist here.
+int lx_rt_device_props(int ordinal, lx_device_props* props) {
+  if (!props) return fail(kInvalid);
+  if (ordinal != 0) return fail(kBadDevice);
+  memset(props, 0, sizeof *props);
+  cpu_name(props->name, sizeof props->name);
+  const int level = real_level();
+  props->cc_major = level / 10;
+  props->cc_minor = level % 10;
+  props->sms = threads();
+  props->l2_bytes = l2_bytes();
+  return kOk;
+}
+
+// Device memory is host memory, so what this process holds is its resident memory: the physical footprint
+// on macOS (what Activity Monitor shows), the resident set on Linux.
+int lx_rt_process_memory(int64_t* bytes) {
+  if (!bytes) return fail(kInvalid);
+#if defined(__APPLE__)
+  task_vm_info_data_t info{};
+  mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+  if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&info), &count) != KERN_SUCCESS)
+    return fail(kNotSupported);
+  *bytes = static_cast<int64_t>(info.phys_footprint);
+  return kOk;
+#elif defined(__linux__)
+  FILE* f = fopen("/proc/self/statm", "r");
+  if (!f) return fail(kNotSupported);
+  unsigned long long size = 0, resident = 0;
+  const int n = fscanf(f, "%llu %llu", &size, &resident);
+  fclose(f);
+  if (n != 2) return fail(kNotSupported);
+  *bytes = static_cast<int64_t>(resident) * static_cast<int64_t>(sysconf(_SC_PAGESIZE));
+  return kOk;
+#else
+  return fail(kNotSupported);
+#endif
+}
+
+// Nothing here is memory the device reads across a bus: the kernels read host memory directly.
+int lx_rt_is_host_memory(const void* ptr) {
+  (void)ptr;
+  return 0;
+}
+
+// The CUDA runtime's text for the codes this library returns, and the tuner's two.
+const char* lx_rt_error_string(int status) {
+  switch (status) {
+    case kOk: return "no error";
+    case kInvalid: return "invalid argument";
+    case kNoMemory: return "out of memory";
+    case kBadDevice: return "invalid device ordinal";
+    case kBadHandle: return "invalid resource handle";
+    case kNotSupported: return "operation not supported";
+    case LX_ERR_TUNE_REJECTED: return "the variant is outside the shape's order class";
+    case LX_ERR_TUNE_VARIANT: return "the kernel has no such variant";
+  }
+  return "unrecognized error code";
 }
 
 int lx_rt_last_error(void) {

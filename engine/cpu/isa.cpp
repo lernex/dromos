@@ -158,13 +158,6 @@ const Level* find_level(int code) {
   return nullptr;
 }
 
-int real_level() {
-  int best = 1;
-  for (const Level& l : kLevels)
-    if (supported(l.code) && l.table() && l.code > best) best = l.code;
-  return best;
-}
-
 std::mutex g_mu;
 std::atomic<const Kern*> g_kern{nullptr};
 int g_override = -1;  // -1: not read from the environment yet; 0: none
@@ -202,6 +195,13 @@ const Kern* select() {
 }
 
 }  // namespace
+
+int real_level() {
+  int best = 1;
+  for (const Level& l : kLevels)
+    if (supported(l.code) && l.table() && l.code > best) best = l.code;
+  return best;
+}
 
 const Kern& kern() {
   const Kern* k = g_kern.load(std::memory_order_acquire);
