@@ -455,3 +455,14 @@ struct SpecBlockAttnArgs {
   int chunk;  // keys whose scores share threadgroup memory at once
   float scale;
 };
+
+// ---- lossless bf16 ------------------------------------------------------------------------------
+struct Bf16xArgs {
+  LX_CPTR(ushort) w;        // bf16 [rows, K]
+  LX_PTR(uchar) data;       // the encoding (encode writes it, decode reads it)
+  LX_PTR(uint) counts;      // patches per row
+  LX_CPTR(lx_i64) offsets;  // each overflowing row's record, from the end of the rows
+  LX_PTR(ushort) out;       // decode: bf16 [rows, K]
+  lx_i64 rows;
+  int K;
+};

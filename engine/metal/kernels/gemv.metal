@@ -8,6 +8,8 @@
 // are issued), so with S fixed per shape a row's bits do not depend on the batch.
 // x is read from the cache: for each of the M <= 8 rows, the chunk's values once per step, shared by
 // the R weight rows. The math is f32; the per-row factor is applied once, after the reduction.
+// Lossless bf16 rows (W_BF16X) are expanded chunk by chunk into the plain matrix's bytes and then run
+// as bf16, so their sums are the bf16 kernel's to the bit.
 //
 // The dot core is shared with the few-token expert kernels (moe.metal), which feed it gathered rows.
 
@@ -117,20 +119,24 @@ template <> inline float dot_chunk<W_NVFP4>(uint4 w, float s0, float s1, const t
 // Lane-partial dot products of NR weight rows with up to MM x rows (M of them live), over the
 // chunks c = first, first + stride, ... below K / V. acc[r * MM + m] accumulates row r with x row m.
 // Rows hold K values of format F from rows[r]; NVFP4 block scales from scales[r].
-template <int F, bool XB, bool XV, int NR, int MM>
+template <int F0, bool XB, bool XV, int NR, int MM>
 inline void dot_core(const thread dptr* rows, const thread dptr* scales,
                      const thread dptr* xrows, int M, int K, int first, int stride,
                      thread float* acc) {
+  constexpr int F = F0 == W_BF16X ? W_BF16 : F0;  // the format of the chunks once loaded
   constexpr int V = chunk_values<F>();
   constexpr int SHIFT = F == W_BF16 ? 1 : F == W_NVFP4 ? -1 : F == W_F32 ? 2 : 0;  // bytes = k << SHIFT
   const int chunks = K / V;
+  Bf16xPatches pc[NR];
+  if (F0 == W_BF16X)
+    for (int r = 0; r < NR; ++r) pc[r].start(rows[r], K);
   for (int c = first; c < chunks; c += stride) {
     const int k0 = c * V;
     const long off = SHIFT >= 0 ? (long(k0) << max(SHIFT, 0)) : (long(k0) >> 1);
     uint4 w[NR];
     float s0[NR], s1[NR];
     for (int r = 0; r < NR; ++r) {
-      w[r] = *(const device uint4*)(rows[r] + off);
+      w[r] = F0 == W_BF16X ? bf16x_chunk(rows[r], K, k0, pc[r]) : *(const device uint4*)(rows[r] + off);
       if (F == W_NVFP4) {
         // The chunk's two block scales are adjacent: one 2-byte load (rows of K % 32 == 0 values from an
         // even scale address, which the host checks for this path).
@@ -181,9 +187,13 @@ template <int F, bool XB, int NR, int MM>
 inline void dot_scalar(const thread dptr* rows, const thread dptr* scales,
                        const thread dptr* xrows, int M, int K, int first, int stride,
                        thread float* acc) {
+  Bf16xPatches pc[NR];
+  if (F == W_BF16X)
+    for (int r = 0; r < NR; ++r) pc[r].start(rows[r], K);
   for (int k = first; k < K; k += stride) {
     float wv[NR];
-    for (int r = 0; r < NR; ++r) wv[r] = element<F>(rows[r], scales[r], 0, k, K);
+    for (int r = 0; r < NR; ++r)
+      wv[r] = F == W_BF16X ? bf(bf16x_value(rows[r], K, k, pc[r])) : element<F>(rows[r], scales[r], 0, k, K);
     for (int m = 0; m < MM; ++m) {
       if (MM > 1 && m >= M) break;
       const float xv = XB ? bf(((const device ushort*)xrows[m])[k]) : ((const device float*)xrows[m])[k];
@@ -272,3 +282,4 @@ LX_GEMV_F(1)
 LX_GEMV_F(2)
 LX_GEMV_F(3)
 LX_GEMV_F(4)  // f32 weights: lx_gemm_f32 on a few rows
+LX_GEMV_F(5)  // lossless bf16

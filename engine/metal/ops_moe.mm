@@ -17,7 +17,8 @@ constexpr int kExpertRows = 2;
 constexpr int kExpertGroups = 4;
 constexpr int kDecodeTokens = 8;
 
-// Variant index: format, then x vector loads / scalar (0: vector, unaligned x; 1: vector; 2: scalar).
+// Variant index: the kernels' format (lossless bf16 is 5), then x vector loads / scalar (0: vector,
+// unaligned x; 1: vector; 2: scalar).
 std::string up_name(int i) {
   static const char* tail[3] = {"00", "10", "01"};
   return std::string("expert_up_") + std::to_string(i / 3) + "_" + tail[i % 3];
@@ -26,22 +27,26 @@ std::string down_name(int i) {
   static const char* tail[3] = {"00", "10", "01"};
   return std::string("expert_down_") + std::to_string(i / 3) + "_" + tail[i % 3];
 }
-KernelSet<12> g_up(up_name), g_down(down_name);
+KernelSet<18> g_up(up_name), g_down(down_name);
 
-int values_per_chunk(lx_wtype t) { return t == LX_W_BF16 ? 8 : t == LX_W_NVFP4 ? 32 : 16; }
+int values_per_chunk(lx_wtype t) { return t == LX_W_BF16 || t == LX_W_BF16X ? 8 : t == LX_W_NVFP4 ? 32 : 16; }
 bool aligned16(const void* p) { return (reinterpret_cast<uintptr_t>(p) & 15) == 0; }
 
-// The variant for rows of K values of w, against x rows at x of K bf16 values.
+// The variant for rows of K values of w, against x rows at x of K bf16 values. Lossless bf16 takes the
+// choice of the (aligned) bf16 stack it encodes, so its results are that stack's to the bit.
 int expert_variant(const lx_weight* w, int K, const void* x) {
-  const bool scalar = K % values_per_chunk(w->type) != 0 || !aligned16(w->data) ||
+  const bool lossless = w->type == LX_W_BF16X;
+  const int f = lossless ? kWeightBF16X : int(w->type);
+  const bool scalar = K % values_per_chunk(w->type) != 0 || (!lossless && !aligned16(w->data)) ||
                       (w->type == LX_W_NVFP4 && (reinterpret_cast<uintptr_t>(w->scale) & 1) != 0);
-  if (scalar) return int(w->type) * 3 + 2;
+  if (scalar) return f * 3 + 2;
   const bool xv = aligned16(x) && K % 8 == 0;
-  return int(w->type) * 3 + (xv ? 1 : 0);
+  return f * 3 + (xv ? 1 : 0);
 }
 
 bool valid_stack(const lx_weight* w, int N, int K) {
-  if (!w || !w->data || w->type < LX_W_BF16 || w->type > LX_W_NVFP4) return false;
+  if (!w || !w->data || w->type < LX_W_BF16 || w->type > LX_W_BF16X) return false;
+  if (w->type == LX_W_BF16X) return N > 0 && K > 0 && K < (1 << 23) && (reinterpret_cast<uintptr_t>(w->data) & 7) == 0;
   if (w->type != LX_W_BF16 && !w->scale) return false;
   if (w->type == LX_W_NVFP4 && K % 16 != 0) return false;
   return N > 0 && K > 0;
@@ -52,7 +57,7 @@ bool valid_stack(const lx_weight* w, int N, int K) {
 WeightRef stack_ref(void* stream, const lx_weight* w) {
   return WeightRef{addr(stream, w->data, kUnknownExtent), addr(stream, w->scale, w->scale ? kUnknownExtent : 0),
                    addr(stream, w->expert_global, w->expert_global ? kUnknownExtent : 0),
-                   w->type == LX_W_NVFP4 ? w->global : 1.0f, w->type};
+                   w->type == LX_W_NVFP4 ? w->global : 1.0f, w->type == LX_W_BF16X ? kWeightBF16X : int(w->type)};
 }
 
 int decode_experts(const void* latent, const int32_t* ids, const float* weights, const lx_weight* gate_up,
@@ -190,7 +195,8 @@ int lx_moe_experts_decode(const void* latent, const int32_t* ids, const float* w
                           void* stream) {
   if (T <= 0) return kOk;
   if (T > kDecodeTokens || top_k < 1 || !workspace) return kInvalidValue;
-  if ((gate_up && gate_up->type == LX_W_BF16X) || (down && down->type == LX_W_BF16X)) return kNotSupported;
+  // Lossless stacks run the same kernels reading the encoding; both stacks must be encoded.
+  if (gate_up && down && (gate_up->type == LX_W_BF16X) != (down->type == LX_W_BF16X)) return kNotSupported;
   if (!valid_stack(gate_up, 2 * I, L) || !valid_stack(down, L, I)) return kInvalidValue;
   return decode_experts(latent, ids, weights, gate_up, down, out, workspace, T, L, I, top_k, stream);
 }
@@ -312,5 +318,31 @@ int lx_moe_experts_grouped(const void* latent, const int32_t* ids, const float* 
   CombineArgs c{addr(stream, ws + g.rows, size_t(P) * L * 4), addr_w(stream, out, size_t(T) * L * 4), T, L, top_k};
   return combine_k.launch(stream, c, size2(ceil_div(L, 64), NSUInteger(T)), size2(64, 1));
 }
+
+// Routed experts on lossless bf16 stacks: the few-token kernels reading the encoding, so out is
+// lx_moe_experts' on the bf16 stacks to the bit. Any T; the workspace is lx_moe_bf16x_workspace_bytes.
+int lx_moe_experts_bf16x(const void* latent, const int32_t* ids, const float* weights, const void* gate_up,
+                         const void* down, float* out, void* workspace, int T, int L, int I, int top_k, void* stream) {
+  if (T <= 0) return kOk;
+  if (L <= 0 || I <= 0 || top_k < 1 || top_k > 8 || !latent || !ids || !weights || !out || !workspace) return kInvalidValue;
+  const lx_weight gu{LX_W_BF16X, gate_up, nullptr, 1.0f, nullptr};
+  const lx_weight dn{LX_W_BF16X, down, nullptr, 1.0f, nullptr};
+  if (!valid_stack(&gu, 2 * I, L) || !valid_stack(&dn, L, I)) return kInvalidValue;
+  return decode_experts(latent, ids, weights, &gu, &dn, out, workspace, T, L, I, top_k, stream);
+}
+
+// The same kernels on plain bf16 stacks: on Metal, lx_moe_experts' own.
+int lx_moe_experts_decode_bf16(const void* latent, const int32_t* ids, const float* weights, const void* gate_up,
+                               const void* down, float* out, void* workspace, int T, int L, int I, int top_k,
+                               void* stream) {
+  if (T <= 0) return kOk;
+  if (L <= 0 || I <= 0 || top_k < 1 || top_k > 8 || !latent || !ids || !weights || !out || !workspace) return kInvalidValue;
+  const lx_weight gu{LX_W_BF16, gate_up, nullptr, 1.0f, nullptr};
+  const lx_weight dn{LX_W_BF16, down, nullptr, 1.0f, nullptr};
+  if (!valid_stack(&gu, 2 * I, L) || !valid_stack(&dn, L, I)) return kInvalidValue;
+  return decode_experts(latent, ids, weights, &gu, &dn, out, workspace, T, L, I, top_k, stream);
+}
+
+int64_t lx_moe_bf16x_workspace_bytes(int T, int I, int top_k) { return lx_moe_decode_workspace_bytes(T, I, top_k); }
 
 }  // extern "C"

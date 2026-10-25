@@ -141,12 +141,105 @@ kernel void fill_bytes(constant FillArgs& a [[buffer(0)]], uint i [[thread_posit
 // or e4m3, or 32 e2m1 (two NVFP4 scale blocks). decode_chunk writes its values as f32 with the NVFP4
 // block scales applied; the per-row factor (the INT8 / FP8 row scale, the NVFP4 global) is left out,
 // so a dot product applies it once per row: sum_k x * (v * s) = s * sum_k x * v. Format 4 is f32
-// (16 bytes, 4 values), used by the f32 GEMM.
-constant constexpr int W_BF16 = 0, W_INT8 = 1, W_FP8 = 2, W_NVFP4 = 3, W_F32 = 4;
+// (16 bytes, 4 values), used by the f32 GEMM. Format 5 is lossless bf16 (LX_W_BF16X, below), which a
+// reader expands to the very bf16 chunk the plain matrix holds and then treats as bf16.
+constant constexpr int W_BF16 = 0, W_INT8 = 1, W_FP8 = 2, W_NVFP4 = 3, W_F32 = 4, W_BF16X = 5;
 
-template <int F> constexpr int chunk_values() { return F == W_BF16 ? 8 : F == W_NVFP4 ? 32 : F == W_F32 ? 4 : 16; }
+// ---- lossless bf16 (LX_W_BF16X) ---------------------------------------------------------------
+// The layout of kernels.h and cuda/bf16x.cuh. A row of K values is a header (u32 patch slots, one base
+// exponent byte per block of 128, padding to 8 bytes), then per block 128 bytes of sign << 7 | mantissa
+// and 64 bytes of 4-bit codes (exponent = base - code; u32 word g holds values 8g + b in the low nibble
+// of byte b and 8g + 4 + b in the high one). Values more than 15 binades below their base are patches:
+// (k << 8 | exponent) in the slots, ascending, or in an overflow record when slot 0 has bit 31 set.
+constant constexpr uint kBf16xNoPatch = 0xffffffffu;
+inline int bf16x_blocks(int K) { return (K + 127) / 128; }
+inline int bf16x_header(int K) { return (4 * (2 + K / 2048) + bf16x_blocks(K) + 7) / 8 * 8; }
+inline int bf16x_slots(int K) { return (bf16x_header(K) - bf16x_blocks(K)) / 4; }
+inline int bf16x_base_offset(int K) { return 4 * bf16x_slots(K); }
+inline long bf16x_row_bytes(int K) { return bf16x_header(K) + 192l * bf16x_blocks(K); }
+
+// A row's patches in k order: `next` is the first one a reader moving up through k has not passed
+// (kBf16xNoPatch, at position 0xffffff, once none are left).
+struct Bf16xPatches {
+  const device uint* p;  // the slot after `next`
+  int left;              // slots readable after `next`
+  uint next;
+  void start(const device uchar* row, int K) {
+    p = (const device uint*)row;
+    next = p[0];
+    int slots = bf16x_slots(K);
+    if (next != kBf16xNoPatch && (next & 0x80000000u)) {  // the patches are in the row's overflow record
+      p = (const device uint*)(row + long(next & 0x7fffffffu) * 8);
+      slots = int(p[0]) + 1;  // the patches and their terminator
+      ++p;
+      next = p[0];
+    }
+    ++p;
+    left = slots - 1;
+  }
+  uint pos() const { return next >> 8; }
+  void advance() {
+    next = left > 0 ? *p : kBf16xNoPatch;
+    ++p;
+    --left;
+  }
+};
+
+// The bf16 bits of four values from their sign|mantissa bytes and exponents (one per byte): values 0 and
+// 1 in .x, 2 and 3 in .y, low half first, as the plain matrix holds them.
+inline uint2 bf16x_assemble(uint sm, uint e) {
+  const uchar4 hi = as_type<uchar4>((sm & 0x80808080u) | ((e >> 1) & 0x7f7f7f7fu));
+  const uchar4 lo = as_type<uchar4>((sm & 0x7f7f7f7fu) | ((e << 7) & 0x80808080u));
+  return uint2(as_type<uint>(uchar4(lo.x, hi.x, lo.y, hi.y)), as_type<uint>(uchar4(lo.z, hi.z, lo.w, hi.w)));
+}
+
+// Applies one patch to the exponents of values k0 .. k0 + 3, if it falls among them.
+inline uint bf16x_patch(uint e, uint slot, uint k0) {
+  const uint d = (slot >> 8) - k0;
+  if (d < 4u) {
+    const uint sh = 8u * d;
+    e = (e & ~(0xffu << sh)) | ((slot & 0xffu) << sh);
+  }
+  return e;
+}
+
+// Values k0 .. k0 + 7 of a row (k0 a multiple of 8) as the 16-byte chunk of the plain bf16 matrix.
+// `pc` must not have passed k0; it ends past k0 + 7.
+inline uint4 bf16x_chunk(const device uchar* row, int K, int k0, thread Bf16xPatches& pc) {
+  const int o = k0 & 127;
+  const device uchar* blk = row + bf16x_header(K) + long(k0 >> 7) * 192;
+  const uint2 sm = *(const device uint2*)(blk + o);
+  const uint codes = *(const device uint*)(blk + 128 + (o >> 1));
+  const uint base = uint(row[bf16x_base_offset(K) + (k0 >> 7)]) * 0x01010101u;
+  uint e0 = base - (codes & 0x0f0f0f0fu), e1 = base - ((codes >> 4) & 0x0f0f0f0fu);
+  while (pc.pos() < uint(k0 + 8)) {
+    e0 = bf16x_patch(e0, pc.next, uint(k0));
+    e1 = bf16x_patch(e1, pc.next, uint(k0 + 4));
+    pc.advance();
+  }
+  const uint2 a = bf16x_assemble(sm.x, e0), b = bf16x_assemble(sm.y, e1);
+  return uint4(a.x, a.y, b.x, b.y);
+}
+
+// The bf16 bits of value k of a row, one value at a time; `pc` must not have passed k.
+inline ushort bf16x_value(const device uchar* row, int K, int k, thread Bf16xPatches& pc) {
+  const device uchar* blk = row + bf16x_header(K) + long(k >> 7) * 192;
+  const int off = k & 127;
+  const uint sm = blk[off];
+  const uint cb = blk[128 + 4 * (off >> 3) + (off & 3)];
+  const uint code = (off & 4) ? cb >> 4 : cb & 15u;
+  uint e = (uint(row[bf16x_base_offset(K) + (k >> 7)]) - code) & 0xffu;
+  while (pc.pos() < uint(k)) pc.advance();
+  if (pc.pos() == uint(k)) e = pc.next & 0xffu;
+  return ushort(((sm & 0x80u) << 8) | (e << 7) | (sm & 0x7fu));
+}
+
+template <int F> constexpr int chunk_values() {
+  return F == W_BF16 || F == W_BF16X ? 8 : F == W_NVFP4 ? 32 : F == W_F32 ? 4 : 16;
+}
 // Bytes of row n's start, for a row of K values.
 template <int F> inline long row_offset(long n, long K) {
+  if (F == W_BF16X) return n * bf16x_row_bytes(int(K));
   return F == W_BF16 ? n * K * 2 : F == W_NVFP4 ? n * (K / 2) : F == W_F32 ? n * K * 4 : n * K;
 }
 
@@ -197,6 +290,12 @@ inline void load_chunk(const device uchar* row, const device uchar* scales, int 
 // One element (n, k) of a weight of format F (rows of K values), without the row factor.
 template <int F>
 inline float element(const device uchar* data, const device uchar* scale, long n, long k, long K) {
+  if (F == W_BF16X) {  // a random access walks the row's patches from the start
+    const device uchar* row = data + row_offset<W_BF16X>(n, K);
+    Bf16xPatches pc;
+    pc.start(row, int(K));
+    return bf(bf16x_value(row, int(K), int(k), pc));
+  }
   if (F == W_BF16) return bf(((const device ushort*)data)[n * K + k]);
   if (F == W_INT8) return float(((const device char*)data)[n * K + k]);
   if (F == W_FP8) return e4m3(data[n * K + k]);

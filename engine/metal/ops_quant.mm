@@ -29,8 +29,14 @@ int lx_quantize_weight(const void* w, lx_weight* out, int64_t rows, int cols, vo
   static Kernel int8_k("quantize_rows_int8"), fp8_k("quantize_rows_fp8"), amax_k("nvfp4_amax"),
       nvfp4_k("nvfp4_quant");
   if (!out) return kInvalidValue;
-  if (out->type == LX_W_BF16X) return kNotSupported;
   if (rows <= 0 || cols <= 0) return kOk;
+  if (out->type == LX_W_BF16X) {
+    // Lossless: the encoding of the bf16 matrix, sized by lx_bf16x_bytes (which synchronizes the stream).
+    if (!w || !out->data) return kInvalidValue;
+    const int64_t bytes = lx_bf16x_bytes(w, rows, cols, stream);
+    if (bytes < 0) return int(-bytes);
+    return lx_bf16x_encode(w, rows, cols, const_cast<void*>(out->data), bytes, stream);
+  }
   if (!w || !out->data || (out->type != LX_W_BF16 && !out->scale)) return kInvalidValue;
   QuantArgs a{};
   a.w = addr(stream, w, size_t(rows) * cols * 2);
@@ -47,7 +53,7 @@ int lx_quantize_weight(const void* w, lx_weight* out, int64_t rows, int cols, vo
     case LX_W_FP8:
       out->global = 1.0f;
       return fp8_k.launch(stream, a, size1(NSUInteger(rows)), size1(row_threads(cols)));
-    case LX_W_BF16X: return kNotSupported;
+    case LX_W_BF16X: break;  // encoded above
     case LX_W_NVFP4: {
       if (cols % 16 != 0) return kInvalidValue;
       uint32_t* word = amax_word(stream);
@@ -83,7 +89,7 @@ int lx_dequantize_weight(const lx_weight* w, void* out, int64_t rows, int cols, 
   static Kernel k0("dequantize_0"), k1("dequantize_1"), k2("dequantize_2"), k3("dequantize_3");
   if (!w || !out) return kInvalidValue;
   if (rows <= 0 || cols <= 0) return kOk;
-  if (w->type == LX_W_BF16X) return kNotSupported;
+  if (w->type == LX_W_BF16X) return w->data ? lx_bf16x_decode(w->data, rows, cols, out, stream) : kInvalidValue;
   if (w->type < LX_W_BF16 || w->type > LX_W_NVFP4 || !w->data) return kInvalidValue;
   if (w->type != LX_W_BF16 && !w->scale) return kInvalidValue;
   if (w->type == LX_W_NVFP4 && cols % 16 != 0) return kInvalidValue;

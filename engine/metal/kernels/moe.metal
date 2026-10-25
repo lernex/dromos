@@ -221,6 +221,7 @@ LX_EXPERT_F(0)
 LX_EXPERT_F(1)
 LX_EXPERT_F(2)
 LX_EXPERT_F(3)
+LX_EXPERT_F(5)  // lossless bf16
 
 // ---- grouped experts ----------------------------------------------------------------------------
 // Pairs are bucketed by expert (moe_group), each expert's run is cut into tiles of up to 64 pairs, and

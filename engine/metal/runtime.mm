@@ -413,7 +413,7 @@ size_t weight_data_bytes(lx_wtype type, int64_t N, int64_t K) {
     case LX_W_INT8:
     case LX_W_FP8: return static_cast<size_t>(N * K);
     case LX_W_NVFP4: return static_cast<size_t>(N * (K / 2));
-    case LX_W_BF16X: break;  // not run on Metal
+    case LX_W_BF16X: return kUnknownExtent;  // overflow records may follow the rows
   }
   return 0;
 }

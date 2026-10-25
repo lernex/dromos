@@ -18,6 +18,7 @@ constexpr NSUInteger kGemmSmemNax = kTileM * kTileN * 4;
 // Activation formats (A_* in the kernel) and the f32 weight of lx_gemm_f32.
 constexpr int kActBf16 = 0, kActF32 = 1, kActInt8 = 2, kActE4m3 = 3, kActFp4 = 4, kActF32Exact = 5;
 constexpr int kWeightF32 = 4;
+constexpr int kWeightBF16X = 5;  // the kernels' number for LX_W_BF16X (common.metal W_BF16X)
 
 // gemm_<AF><WF>_<MODE>: MODE 0 plain, 1 grouped gate_up, 2 grouped down.
 inline int gemm_variant(int af, int wf, int mode) { return (af * 5 + wf) * 3 + mode; }
