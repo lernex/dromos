@@ -207,20 +207,20 @@ TEST_CASE("state: Mamba conv and SSM per slot, KV per position, both over every 
   CHECK(kv_bytes_per_position(c) == 2ull * 2 * (2 * 8 * 64 * 2));
 }
 
-TEST_CASE("the math table: the device decides, not only the format") {
+TEST_CASE("the default math is BF16 for every format on every device") {
   const DeviceInfo a100 = simulated("A100 80GB", 80, 80, 2039, 108), ada = simulated("RTX 4090 24GB", 89, 24, 1008, 128);
   const DeviceInfo b200 = simulated("B200", 100, 180, 8000, 148), rtx50 = simulated("RTX 5070 Ti 16GB", 120, 16, 896, 70);
-  CHECK(native_math(LX_W_BF16, rtx50) == LX_MATH_BF16);
-  CHECK(native_math(LX_W_INT8, a100) == LX_MATH_INT8);
-  CHECK(native_math(LX_W_FP8, a100) == LX_MATH_BF16);  // no FP8 tensor cores before sm_89
-  CHECK(native_math(LX_W_FP8, ada) == LX_MATH_FP8);
-  // NVFP4 weights need the sm_120 kernels for FP4 (and for FP8 math on them): sm_89 and sm_100 expand to BF16
-  CHECK(native_math(LX_W_NVFP4, ada) == LX_MATH_BF16);
-  CHECK(native_math(LX_W_NVFP4, b200) == LX_MATH_BF16);
-  CHECK(native_math(LX_W_NVFP4, rtx50) == LX_MATH_FP4);
-  const lx::ModelFormats f = model_formats(LX_W_NVFP4, ada, true);
+  // Chosen by KL on Praxis (plan.cpp); the quantized maths are LX_PREFILL's to select
+  for (const DeviceInfo* d : {&a100, &ada, &b200, &rtx50}) {
+    CHECK(native_math(LX_W_BF16, *d) == LX_MATH_BF16);
+    CHECK(native_math(LX_W_INT8, *d) == LX_MATH_BF16);
+    CHECK(native_math(LX_W_FP8, *d) == LX_MATH_BF16);
+    CHECK(native_math(LX_W_NVFP4, *d) == LX_MATH_BF16);
+  }
+  const lx::ModelFormats f = model_formats(LX_W_NVFP4, rtx50, true);
   CHECK(f.dense == LX_W_FP8);
-  CHECK(f.prefill_math == LX_MATH_FP8);
+  CHECK(f.experts == LX_W_NVFP4);
+  CHECK(f.prefill_math == LX_MATH_BF16);
   CHECK(f.expert_math == LX_MATH_BF16);
   CHECK_FALSE(f.bf16x_decode);  // decode copies are for BF16 models
 }
@@ -377,38 +377,38 @@ TEST_CASE("the default is the file's format: offloaded before anything narrower,
   CHECK(fp8.weights == LX_W_FP8);
   CHECK_FALSE(fp8.convert_at_load);
   CHECK_FALSE(fp8.offload.enabled);
-  CHECK(fp8.prefill_math == LX_MATH_FP8);
-  CHECK(fp8.expert_math == LX_MATH_FP8);
+  CHECK(fp8.prefill_math == LX_MATH_BF16);  // the default maths are BF16 (plan.cpp)
+  CHECK(fp8.expert_math == LX_MATH_BF16);
   const Plan fp4 = make_plan(simulated("RTX 5070 Ti 16GB", 120, 16, 896, 70), praxis(), nvfp4_checkpoint(), PlanRequest{});
   CHECK(fp4.weights == LX_W_NVFP4);
-  CHECK(fp4.expert_math == LX_MATH_FP4);
-  CHECK(fp4.prefill_math == LX_MATH_FP8);
+  CHECK(fp4.expert_math == LX_MATH_BF16);
+  CHECK(fp4.prefill_math == LX_MATH_BF16);
   // an explicit narrower format is planned as asked, converted at load
   const Plan asked = make_plan(simulated("RTX 4050 6GB", 89, 6, 272, 24), praxis(), bf16_checkpoint(), weights(LX_W_FP8));
   CHECK(asked.weights == LX_W_FP8);
   CHECK(asked.convert_at_load);
   CHECK_FALSE(asked.offload.enabled);
-  CHECK(asked.prefill_math == LX_MATH_FP8);
+  CHECK(asked.prefill_math == LX_MATH_BF16);
   const Plan int8 = make_plan(simulated("RTX 3060 6GB", 86, 6, 360, 28), praxis(), bf16_checkpoint(), weights(LX_W_INT8));
-  CHECK(int8.prefill_math == LX_MATH_INT8);
+  CHECK(int8.prefill_math == LX_MATH_BF16);
   const Plan fp8_on_86 = make_plan(simulated("RTX 3060 6GB", 86, 6, 360, 28), praxis(), bf16_checkpoint(), weights(LX_W_FP8));
   CHECK(fp8_on_86.prefill_math == LX_MATH_BF16);  // no FP8 tensor cores: weight-only, BF16 math
   CHECK(has_note(fp8_on_86, "no tensor-core instruction for FP8"));
 }
 
-TEST_CASE("the 4-bit format from the GPTQ folder: FP4 experts on sm_120, BF16 math elsewhere") {
+TEST_CASE("the 4-bit format from the GPTQ folder runs BF16 maths by default on every card") {
   const Plan twelve = make_plan(simulated("RTX 3060 12GB", 86, 12, 360, 28), logos(), nvfp4_checkpoint(), PlanRequest{});
   CHECK(twelve.weights == LX_W_NVFP4);
   CHECK(twelve.recipe.dense == LX_W_FP8);
   CHECK(twelve.recipe.latent_up == LX_W_BF16);
-  CHECK(twelve.prefill_math == LX_MATH_BF16);  // sm_86 has no FP8 tensor cores for the dense FP8 products
+  CHECK(twelve.prefill_math == LX_MATH_BF16);
   CHECK(twelve.expert_math == LX_MATH_BF16);
   const Plan blackwell = make_plan(simulated("RTX 5070 Ti 16GB", 120, 12, 896, 70), logos(), nvfp4_checkpoint(), PlanRequest{});
-  CHECK(blackwell.expert_math == LX_MATH_FP4);
-  CHECK(blackwell.prefill_math == LX_MATH_FP8);
+  CHECK(blackwell.expert_math == LX_MATH_BF16);
+  CHECK(blackwell.prefill_math == LX_MATH_BF16);
   const Plan b200 = make_plan(simulated("B200", 100, 180, 8000, 148), logos(), nvfp4_checkpoint(), PlanRequest{});
-  CHECK(b200.expert_math == LX_MATH_BF16);  // the FP4 kernels are sm_120's
-  CHECK(b200.prefill_math == LX_MATH_FP8);
+  CHECK(b200.expert_math == LX_MATH_BF16);
+  CHECK(b200.prefill_math == LX_MATH_BF16);
   // NVFP4 experts are not offloaded, so a card too small for four sequences runs fewer, and says the card is small
   for (double gib = 8.5; gib <= 10.0; gib += 0.25) {
     const Plan p = make_plan(simulated("Sized card", 89, gib, 272, 24), logos(), nvfp4_checkpoint(), PlanRequest{});

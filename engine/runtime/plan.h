@@ -85,12 +85,9 @@ struct WeightRecipe {
 };
 WeightRecipe recipe_for(lx_wtype target);
 
-// The math a product on weights held in `format` multiplies in on this device: the fastest tensor-core math that
-// reads the stored weights as they are. INT8 weights take INT8 math (IMMA, sm_80 and up); FP8 weights FP8 math on
-// sm_89 and up; NVFP4 weights FP4 math on the sm_120 family, the one target with the block-scaled FP4 and mixed
-// e2m1 x e4m3 instructions these kernels use (FP8 math on NVFP4 weights needs it too); everything else, and every
-// format on a device without its instruction, BF16 math with the weights expanded in registers. Which of FP4 and
-// FP8 math NVFP4 experts default to on sm_120 is the measurement stage's call (by KL); this table takes FP4.
+// The math a product on weights held in `format` multiplies in by default: BF16 for every format, with the weights
+// expanded in registers. The quantized tensor-core maths (INT8 IMMA, FP8 on sm_89 and up, FP4 on the sm_120 family)
+// are faster but measured less accurate on Praxis, so LX_PREFILL selects them; the device is not consulted.
 lx_math native_math(lx_wtype format, const DeviceInfo& device);
 // The model's formats for a target on a device: the recipe's kinds, native_math for the dense kind (prefill) and
 // the experts, and the BF16X decode copies when asked for (BF16 targets only).

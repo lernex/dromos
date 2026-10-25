@@ -79,10 +79,6 @@ int width_of(lx_wtype w) {
   }
 }
 
-// The sm_120 family: the block-scaled FP4 and mixed e2m1 x e4m3 instructions the GEMM kernels use (gemm_w.cuh,
-// kind_for) exist there and nowhere else in this build.
-bool sm120_family(const DeviceInfo& d) { return d.cc() >= 120 && d.cc() < 130; }
-
 // A convenience for the accounting: one bf16 or f32 tensor, aligned as the upload aligns it.
 size_t bf16_bytes(int64_t n) { return aligned(static_cast<size_t>(n) * 2); }
 size_t f32_bytes(int64_t n) { return aligned(static_cast<size_t>(n) * 4); }
@@ -261,14 +257,13 @@ WeightRecipe recipe_for(lx_wtype target) {
   return r;
 }
 
-lx_math native_math(lx_wtype format, const DeviceInfo& d) {
-  switch (format) {
-    case LX_W_INT8: return d.int8_mma ? LX_MATH_INT8 : LX_MATH_BF16;
-    case LX_W_FP8: return d.fp8_mma ? LX_MATH_FP8 : LX_MATH_BF16;
-    case LX_W_NVFP4: return sm120_family(d) ? LX_MATH_FP4 : LX_MATH_BF16;
-    default: return LX_MATH_BF16;
-  }
-}
+// The default maths are BF16 for every format, on every device. KL against the FP32 reference on Praxis (tools/compare.py,
+// top-20, full prefill, chat_think / chat_direct_tools / prose): INT8 maths 0.0116 / 0.0308 / 0.0072 against 0.0034 /
+// 0.0156 / 0.0031 in BF16; FP8 maths 0.0075 / 0.0385 / 0.0080 against 0.0047 / 0.0319 / 0.0048; NVFP4 with FP8 dense
+// and FP4 experts 0.0441 / 0.1367 / 0.0199 against 0.0245 / 0.0874 / 0.0107. BF16 maths give up 1 to 7 percent of
+// decode at 32 streams and 10 to 19 percent of prefill, and every format still beats BF16 on both. The quantized maths
+// stay one LX_PREFILL away, for measuring them.
+lx_math native_math(lx_wtype, const DeviceInfo&) { return LX_MATH_BF16; }
 
 lx::ModelFormats model_formats(lx_wtype target, const DeviceInfo& d, bool bf16x_decode) {
   const WeightRecipe r = recipe_for(target);
