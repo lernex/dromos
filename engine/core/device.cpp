@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <span>
 #include <stdexcept>
 #include <utility>
@@ -148,10 +149,20 @@ DeviceInfo query_device(int ordinal) {
 
   d.sms = props.sms;
   d.l2_bytes = static_cast<size_t>(props.l2_bytes);
-  // Peak bandwidth: the memory clock (kHz) with two transfers per clock, times the bus width in bytes.
+  d.l1_bytes = static_cast<size_t>(props.l1_bytes);
+  d.l3_bytes = static_cast<size_t>(props.l3_bytes);
+  d.cpu = lx_rt_backend() == LX_BACKEND_CPU;
+  d.isa.assign(props.isa, strnlen(props.isa, sizeof props.isa));
+  d.native_math = props.native_math;
+  // Peak bandwidth: the memory clock (kHz) with two transfers per clock, times the bus width in bytes. A
+  // backend that measured what its kernels read at (the CPU) reports that instead.
   const double clock_khz = static_cast<double>(props.mem_clock_khz);
   const double bus_bits = props.bus_bits;
   d.bandwidth_gbs = clock_khz * 1e3 * 2.0 * (bus_bits / 8.0) / 1e9;
+  if (props.read_bandwidth > 0) {
+    d.bandwidth_gbs = static_cast<double>(props.read_bandwidth) / 1e9;
+    d.bandwidth_measured = true;
+  }
 
   int64_t free_bytes = 0, total_bytes = 0;
   if (lx_rt_mem_info(&free_bytes, &total_bytes) != 0) throw std::runtime_error("reading device memory info");

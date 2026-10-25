@@ -1,6 +1,6 @@
 // lernex doctor [MODEL_DIR] [--weights bf16|int8|fp8|nvfp4] [--context N] [--sequences N]
 //
-// Prints what this GPU can do, which kernels this build has, which tuning table is in use, and, with a
+// Prints what this GPU or CPU can do, which kernels this build has, which tuning table is in use, and, with a
 // model folder, the plan the engine would run it under, in plain language.
 #include <cstdio>
 #include <cstdlib>
@@ -36,8 +36,53 @@ std::string names_text(const std::vector<std::string>& names) {
   return out.empty() ? "none" : out;
 }
 
-void print_device(const lx::runtime::DeviceInfo& d) {
-  using lx::runtime::DeviceInfo;
+// "A", "A and B", "A, B and C".
+std::string and_list(const std::vector<std::string>& items) {
+  std::string out;
+  for (std::size_t i = 0; i < items.size(); ++i)
+    out += (i == 0 ? "" : i + 1 == items.size() ? " and " : ", ") + items[i];
+  return out;
+}
+
+std::string bytes_text(std::size_t bytes) {
+  char buf[32];
+  if (bytes >= (std::size_t{1} << 20))
+    std::snprintf(buf, sizeof buf, "%.4g MB", static_cast<double>(bytes) / (1 << 20));
+  else
+    std::snprintf(buf, sizeof buf, "%zu KB", bytes >> 10);
+  return buf;
+}
+
+// A processor: what the kernels run on it, how wide its memory is, and which maths it multiplies itself.
+void print_cpu(const lx::runtime::DeviceInfo& d) {
+  std::printf("CPU        %s (device %d)\n", d.name.c_str(), d.ordinal);
+  if (d.cc() != d.real_cc())
+    std::printf("ISA        level %d: %s (LX_ARCH_OVERRIDE lowers it from %d)\n", d.cc(), d.isa.c_str(), d.real_cc());
+  else
+    std::printf("ISA        level %d: %s\n", d.cc(), d.isa.c_str());
+  std::printf("threads    %d%s\n", d.sms,
+              std::getenv("LX_THREADS") ? " (LX_THREADS)" : ", one per physical core (LX_THREADS sets them)");
+  std::printf("memory     %.2f GB total, %.2f GB free now\n", static_cast<double>(d.total_bytes) / 1e9,
+              static_cast<double>(d.free_bytes) / 1e9);
+  if (d.bandwidth_gbs > 0)
+    std::printf("bandwidth  %.0f GB/s, measured reading memory on %d threads\n", d.bandwidth_gbs, d.sms);
+  std::vector<std::string> caches;
+  if (d.l1_bytes) caches.push_back("L1d " + bytes_text(d.l1_bytes));
+  if (d.l2_bytes) caches.push_back("L2 " + bytes_text(d.l2_bytes) + (d.l3_bytes ? " per core" : ""));
+  if (d.l3_bytes) caches.push_back("L3 " + bytes_text(d.l3_bytes) + " shared");
+  if (!caches.empty()) std::printf("caches     %s\n", and_list(caches).c_str());
+  // The maths the kernels multiply in: a format's dot instruction where the processor has one, else the format
+  // widened (BF16 to f32, INT8 to 16-bit products). FP8 and FP4 products are exact on every processor.
+  const bool bf16_native = d.native_math & (1 << LX_MATH_BF16), int8_native = d.native_math & (1 << LX_MATH_INT8);
+  std::printf("math       %s\n", bf16_native ? "BF16 in the processor's bf16 dot instruction (batches of more than 8 rows)"
+                                             : "BF16 widened to f32 and multiplied with FMA (no bf16 dot instruction here)");
+  std::printf("           %s\n", int8_native ? "INT8 in the processor's int8 dot instructions (VNNI or SDOT)"
+                                               : "INT8 with 16-bit multiplies (no int8 dot instruction here)");
+  std::printf("           FP8 and FP4 products are exact, summed in double\n");
+}
+
+void print_gpu(const lx::runtime::DeviceInfo& d) {
+  const lx::dispatch::Info& backend = lx::dispatch::info();
   std::printf("GPU        %s (device %d)\n", d.name.c_str(), d.ordinal);
   if (d.cc() != d.real_cc())
     std::printf("arch       sm_%d as the kernels see it (the card is sm_%d; LX_ARCH_OVERRIDE lowers it)\n", d.cc(),
@@ -55,9 +100,14 @@ void print_device(const lx::runtime::DeviceInfo& d) {
   std::printf("math       tensor cores: %s\n", math.c_str());
   std::printf("clusters   %s\n", d.clusters ? "yes (sm_90 and up: the cluster paths run)"
                                             : "no (the one-block paths run)");
-  const lx::dispatch::Info& backend = lx::dispatch::info();
   std::printf("%-10s driver %s, runtime %s\n", backend.backend.empty() ? "backend" : backend.backend.c_str(),
               d.driver_text.c_str(), d.runtime_text.c_str());
+}
+
+void print_device(const lx::runtime::DeviceInfo& d) {
+  if (d.cpu) print_cpu(d);
+  else print_gpu(d);
+  const lx::dispatch::Info& backend = lx::dispatch::info();
   if (lx_rt_backend() == LX_BACKEND_CUDA)
     std::printf("build      kernels for %s\n", archs_text(lx::runtime::built_archs()).c_str());
   if (!d.built)
@@ -100,9 +150,12 @@ int cmd_doctor(int argc, char** argv) {
     const DeviceInfo device = query_device(0);
     print_device(device);
     const std::string table = load_tuning(device);
-    std::printf("tuning     %s\n", table.empty() ? "none for this GPU; the kernels use their own heuristics "
-                                                    "(lernex tune MODEL_DIR makes one)"
-                                              : table.c_str());
+    if (device.cpu && table.empty())
+      std::printf("tuning     none needed: each CPU product has one order, so there is nothing to choose\n");
+    else
+      std::printf("tuning     %s\n", table.empty() ? "none for this GPU; the kernels use their own heuristics "
+                                                      "(lernex tune MODEL_DIR makes one)"
+                                                : table.c_str());
 
     if (!dir.empty()) {
       const lx::MetisConfig config = lx::load_config(dir);

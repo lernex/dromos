@@ -62,7 +62,17 @@ std::string format_name(lx_wtype w) {
   }
   return "?";
 }
-std::string math_name(lx_math m) {
+std::string math_name(lx_math m, const DeviceInfo& d) {
+  if (d.cpu) {
+    const bool native = d.native_math & (1 << m);
+    switch (m) {
+      case LX_MATH_BF16: return native ? "BF16 dot products" : "f32 (BF16 widened)";
+      case LX_MATH_INT8: return native ? "INT8 dot products" : "INT8 (16-bit multiplies)";
+      case LX_MATH_FP8: return "FP8 (exact products, summed in double)";
+      case LX_MATH_FP4: return "FP4 (exact products, summed in double)";
+    }
+    return "?";
+  }
   switch (m) {
     case LX_MATH_BF16: return "BF16 tensor cores";
     case LX_MATH_INT8: return "INT8 tensor cores";
@@ -71,6 +81,8 @@ std::string math_name(lx_math m) {
   }
   return "?";
 }
+// The device as the notes name it.
+const char* this_device(const DeviceInfo& d) { return d.cpu ? "this machine" : "this GPU"; }
 
 // The math a product runs in, from the format it reads and the GPU. Quantized files run weight-only
 // (expanded in registers, bf16 or f32 math) where the GPU has no instruction for their format.
@@ -364,7 +376,7 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
     for (const Fit& f : tried)
       why += "\n  " + format_name(f.format) + " needs " + gb(f.need) + " for one sequence of " +
              std::to_string(kLimitedContext) + " tokens; " + gb(budget) + " is free for the model";
-    throw std::runtime_error("no weight format fits this GPU for this model:" + why);
+    throw std::runtime_error(std::string("no weight format fits ") + this_device(d) + " for this model:" + why);
   }
 
   Plan p;
@@ -420,12 +432,13 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
   } else {
     n.push_back("Holding the weights as " + format_name(p.weights) + ": the widest format that leaves room for " +
                 std::to_string(std::min(useful_slots, p.max_slots)) + "+ sequences at " +
-                std::to_string(std::min(kUsefulContext, p.kv_capacity)) + "+ tokens of context on this GPU.");
+                std::to_string(std::min(kUsefulContext, p.kv_capacity)) + "+ tokens of context on " + this_device(d) +
+                ".");
   }
   if (limited)
-    n.push_back("This GPU is small for the model: it runs " + std::to_string(p.max_slots) + " sequence" +
-                (p.max_slots == 1 ? "" : "s") + " of up to " + std::to_string(p.kv_capacity) +
-                " tokens, and the other formats do not leave room for more.");
+    n.push_back(std::string(d.cpu ? "This machine's memory" : "This GPU") + " is small for the model: it runs " +
+                std::to_string(p.max_slots) + " sequence" + (p.max_slots == 1 ? "" : "s") + " of up to " +
+                std::to_string(p.kv_capacity) + " tokens, and the other formats do not leave room for more.");
   for (const Fit& f : tried) {
     if (f.ok) break;
     n.push_back("  " + format_name(f.format) + " does not fit " + (limited ? "even that" : "usefully") + ": it needs " +
@@ -439,11 +452,12 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
   if (p.convert_at_load)
     n.push_back("The file is " + format_name(ck.stored) + "; it is converted to " + format_name(p.weights) +
                 " when it loads.");
-  n.push_back("Dense products multiply in " + math_name(p.prefill_math) + "; routed experts in " +
-              math_name(p.expert_math) + ".");
+  n.push_back("Dense products multiply in " + math_name(p.prefill_math, d) + "; routed experts in " +
+              math_name(p.expert_math, d) + ".");
   if (p.prefill_math == LX_MATH_BF16 && p.recipe.dense != LX_W_BF16)
-    n.push_back("This GPU has no tensor-core instruction for " + format_name(p.recipe.dense) +
-                " math, so the weights are expanded in registers and multiplied in BF16.");
+    n.push_back((d.cpu ? "This CPU has no instruction for " : "This GPU has no tensor-core instruction for ") +
+                format_name(p.recipe.dense) + " math, so the weights are expanded in registers and multiplied in " +
+                (d.cpu ? "f32." : "BF16."));
   n.push_back("Up to " + std::to_string(p.max_slots) + " sequences, " + std::to_string(p.kv_capacity) +
               " tokens each (" + gb(p.state_bytes + p.kv_bytes) + " of state and cache).");
   n.push_back("A step takes up to " + std::to_string(p.max_step_tokens) + " tokens; prompts are prefilled " +
