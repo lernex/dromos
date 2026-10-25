@@ -203,6 +203,8 @@ def test_gemm_w_split_k(lx, name, wtype, math, oldest, split):
     # The split-K variants (clusters along K, sm_90+) at a size where some CTAs of a cluster get no K tile
     # at all, with partial tiles, bias, beta and padded strides; the sum over the cluster runs in rank
     # order, so two calls give the same bits.
+    if BACKEND != "cuda":
+        pytest.skip("thread block clusters are CUDA's")
     have = native_arch(lx)
     if have < max(oldest, 90):
         pytest.skip("not on this GPU")
