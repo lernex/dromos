@@ -605,7 +605,8 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
   m.c_out_b = static_cast<const float*>(need(lw, "continuation.output.bias", LX_F32, {1}));
   // The decode program (LX_PROGRAM): not for what it does not cover yet (decode_program_covers), and
   // only on a backend that has it.
-  m.use_program = std::getenv("LX_PROGRAM") && !speculative && !experts && !m.bf16x && !m.keep_bf16x;
+  const char* program = std::getenv("LX_PROGRAM");  // opt-in: any value but 0
+  m.use_program = program && std::strcmp(program, "0") != 0 && !speculative && !experts && !m.bf16x && !m.keep_bf16x;
   if (m.use_program) {
     lx_program* probe = lx_program_create(1, nullptr, nullptr, nullptr, nullptr);
     m.use_program = probe != nullptr;
