@@ -117,6 +117,79 @@ inline hipError_t lx_launch_kernel_ex(const lx_launch_config* cfg, void (*k)(KAr
 }
 #endif
 
+// ---- Clock and system-scope loads --------------------------------------------------------------------
+
+// A nanosecond clock across the block: the SM globaltimer on NVIDIA, the 100 MHz real-time counter
+// (10 ns ticks) on AMD.
+__device__ __forceinline__ uint64_t lx_global_ns() {
+#if defined(LX_NVIDIA_SHIM)
+  uint64_t t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  return t;
+#else
+  return static_cast<uint64_t>(__builtin_amdgcn_s_memrealtime()) * 10u;
+#endif
+}
+
+// A load that orders the reads after it: the poll loops that wait on another device's write.
+__device__ __forceinline__ uint32_t lx_load_acquire_sys(const volatile uint32_t* p) {
+  const uint32_t v = *p;
+  __threadfence_system();
+  return v;
+}
+
+// ---- Shuffles over a 32-lane warp -------------------------------------------------------------------
+// The port keeps CUDA's warp: 32 lanes, addressed as threadIdx.x & 31 and threadIdx.x >> 5. A wave64
+// holds two such warps, so every shuffle is taken within its own 32-lane group (width 32). The mask
+// is passed through: the NVIDIA shim checks it, and ROCm ignores it.
+
+template <typename T, typename M>
+__device__ __forceinline__ T lx_shfl_sync(M mask, T v, int src, int width = 32) {
+  return __shfl_sync(mask, v, src, width);
+}
+template <typename T, typename M>
+__device__ __forceinline__ T lx_shfl_xor_sync(M mask, T v, int lane_mask, int width = 32) {
+  return __shfl_xor_sync(mask, v, lane_mask, width);
+}
+template <typename T, typename M>
+__device__ __forceinline__ T lx_shfl_down_sync(M mask, T v, unsigned delta, int width = 32) {
+  return __shfl_down_sync(mask, v, delta, width);
+}
+template <typename T, typename M>
+__device__ __forceinline__ T lx_shfl_up_sync(M mask, T v, unsigned delta, int width = 32) {
+  return __shfl_up_sync(mask, v, delta, width);
+}
+
+// ---- Warp functions over a 32-lane group -----------------------------------------------------------
+// The CUDA intrinsics with a 32-bit full mask, as the port runs them. Each reduces or matches within
+// its own 32 lanes (a wave64 holds two such groups), which is the group every caller addresses with
+// the 0xffffffff mask.
+
+template <typename T>
+__device__ __forceinline__ T lx_reduce_max_sync(unsigned, T v) {
+  for (int o = 16; o > 0; o >>= 1) {
+    const T w = static_cast<T>(__shfl_xor_sync(LX_FULL_MASK, v, o, 32));
+    v = v > w ? v : w;
+  }
+  return v;
+}
+
+template <typename T>
+__device__ __forceinline__ T lx_reduce_add_sync(unsigned, T v) {
+  for (int o = 16; o > 0; o >>= 1) v += static_cast<T>(__shfl_xor_sync(LX_FULL_MASK, v, o, 32));
+  return v;
+}
+
+// The lanes of the group whose value equals this lane's, as a bitmask over group lanes 0..31.
+__device__ __forceinline__ unsigned lx_match_any_sync(unsigned, int v) {
+  unsigned m = 0;
+  for (int i = 0; i < 32; ++i) {
+    const int w = __shfl_sync(LX_FULL_MASK, v, i, 32);
+    if (w == v) m |= 1u << i;
+  }
+  return m;
+}
+
 // ---- Host ------------------------------------------------------------------------------------------
 
 // Lanes per wavefront on the current device. Host code sizes blocks and grids with this; the device

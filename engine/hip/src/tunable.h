@@ -29,16 +29,71 @@ LX_API int lx_tune_kernels(const char** names, int capacity);  // returns the to
 LX_API int lx_tune_variants(const char* kernel);               // 0 when unknown
 LX_API const char* lx_tune_variant_name(const char* kernel, int variant);
 
+// The autotuner's entry points, so host code times and stores a kernel's variants through the ABI and
+// never sees the kernels' C++ types. A problem is one timed case: M rows against an N x K weight, or
+// against `experts` such weights, in the weight format `weight` and math `math` (0 for both when the
+// kernel has no such choice). M, N and K are as lx::TuneProblem has them.
+typedef struct {
+  int M, N, K;
+  int experts;
+  int weight;
+  int math;
+} lx_tune_problem;
+// Runs variant `variant` of a registered kernel on the problem and writes its result as f32 to `out`
+// (M * N elements). Returns LX_ERR_NOT_SUPPORTED when the variant or the problem cannot run here.
+LX_API int lx_tune_run(const char* kernel, int variant, const lx_tune_problem* problem, float* out, void* stream);
+// 1 when the kernel registered a runner, so lx_tune_run can time its variants; else 0.
+LX_API int lx_tune_runnable(const char* kernel);
+// The table key of a kernel's problem: the kernel name with the format, math and expert count appended
+// when they are not the defaults. Writes it NUL-terminated to `out` (at most `capacity` bytes) and
+// returns its length.
+LX_API int lx_tune_key(const char* kernel, const lx_tune_problem* problem, char* out, int capacity);
+
 #ifdef __cplusplus
 }
 
 #include <initializer_list>
+#include <string>
 
 namespace lx {
+
+// The first architecture with thread-block clusters and programmatic dependent launch (sm_90).
+// Kernels take their one-block paths below it, and the host checks this before a cluster launch.
+constexpr int kClusterArch = 90;
+
+// One problem a tunable kernel is timed on: a product of M rows with an N x K weight, or with
+// `experts` such weights (an expert stack), in the weight format and math the plan runs it in.
+// `weight` is an lx_wtype and `math` an lx_math (0 for both when the kernel has no such choice).
+struct TuneProblem {
+  int M = 1, N = 1, K = 1;
+  int experts = 1;
+  int weight = 0;
+  int math = 0;
+};
+
+// Runs variant `variant` of a kernel on a problem. The kernel makes its own inputs (deterministic,
+// and cached per problem), launches that variant rather than the table's choice, and writes its
+// result as f32 to `out`, M * N elements, so the tuner can check every variant against variant 0.
+// Returns a cudaError_t. cudaErrorNotSupported marks a variant or a problem this device or build
+// cannot run; the tuner skips it.
+using TuneRunner = int (*)(int variant, const TuneProblem& problem, float* out, void* stream);
+
+// The key a kernel's table entries live under: the kernel's name, with its format, math and expert
+// count appended when they are not the defaults, so one kernel keeps a winner per format it runs.
+// Kernels call lx_tune_get with the same string.
+std::string tune_key(const char* kernel, const TuneProblem& problem);
+
+// The runner registered for a kernel, or null.
+TuneRunner tunable_runner(const char* kernel);
+
 // Registers a kernel's variants at load time:
 //   static const lx::TunableRegistration reg("gemv_w", {"rg2_s1", "rg4_s1", "rg4_s2"});
+// and, for the autotuner, its runner too:
+//   static const lx::TunableRegistration reg("mhc_read", {"block", "cluster8"}, &run_mhc_read);
 struct TunableRegistration {
   TunableRegistration(const char* kernel, std::initializer_list<const char*> variants);
+  TunableRegistration(const char* kernel, std::initializer_list<const char*> variants, TuneRunner runner);
 };
+
 }  // namespace lx
 #endif

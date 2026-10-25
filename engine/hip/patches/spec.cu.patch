@@ -1,0 +1,20 @@
+--- a/spec.cu
++++ b/spec.cu
+@@ -138,12 +138,11 @@
+ // (slot, head).
+ __host__ __device__ constexpr int hist_row_floats(int P, int N) { return round4(P) + round4(N) + 4; }
+ 
+-__device__ __forceinline__ void cp_async_f32(float* smem, const float* gmem) {
+-  const uint32_t dst = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
+-  asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(dst), "l"(gmem) : "memory");
+-}
+-__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
+-__device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wait_group 0;\n" ::: "memory"); }
++// cp.async as a synchronous copy in the HIP port (lx_hip.h): the copy is complete when it returns, so the
++// commit and the wait have nothing to do. Every reader of the staged value is behind a barrier.
++__device__ __forceinline__ void cp_async_f32(float* smem, const float* gmem) { *smem = *gmem; }
++__device__ __forceinline__ void cp_async_commit() {}
++__device__ __forceinline__ void cp_async_wait_all() {}
+ 
+ struct SpecScanArgs {
+   const float* x;

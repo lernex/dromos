@@ -5,33 +5,44 @@
 // write_kv_kernel rounds this step's k and v to bf16 into the cache before attention_kernel runs,
 // so prefill and decode read the same values. attention_kernel takes one (token, kv head) at a
 // time and serves all G = H / KVH query heads of that kv head from one pass over the cache, so
-// each cache row is read once per group. Cache tiles are staged through shared memory. Inside a
-// tile, each group of 8 lanes owns one key and each lane 8 of its dims (one 16-byte load), so a dot
-// product is a 3-step shuffle. Every group keeps its own online-softmax state, merged in registers
-// within a wavefront and through shared memory across wavefronts.
+// each cache row is read once per group. Cache tiles are staged through shared memory by a
+// cp.async pipeline. Inside a tile, each group of 8 lanes owns one key and each lane 8 of its
+// dims (one 16-byte load), so a dot product is a 3-step shuffle. Every group keeps its own
+// online-softmax state, merged in registers within a warp and through shared memory across warps.
 //
-// HIP port: the CUDA build also splits a decode item over a thread-block cluster (distributed shared
-// memory). HIP has no clusters, so every block here takes whole (token, kv head) items. Tiles are
-// staged synchronously (lx_pipeline_* in lx_hip.h), and the tile is 32 keys so three stages of K and V
-// fit the 64 KB of LDS a workgroup gets at Dh = 128. The wavefront is LX_WARP lanes: 32 on RDNA,
-// 64 on CDNA, and the key groups per wavefront follow from it.
+// Few (token, kv head) items, as in decode: the 8 blocks of a cluster share each item. Block r
+// takes cache tiles r, r + 8, ... and the 8 partial softmax states are merged through distributed
+// shared memory, so a single decode token runs on 8 SMs per kv head instead of one. Many items, as
+// in prefill: each block takes whole items and the cluster never synchronizes. The choice depends
+// on T, which is device data, so every block of a cluster makes the same one. Below sm_90 there are
+// no clusters: the host passes clusters = 0 and every block takes whole items, which is the same
+// result (the split only changes which SM does which tile).
 //
-// The C ABI has no token count, so the kernel reads T = cu_seqlens[n_seq] on the device and
-// grid-stride over the work. Launch sizes are constants.
+// The C ABI has no token count, so both kernels read T = cu_seqlens[n_seq] on the device and
+// grid-stride over the work. Launch sizes are constants; the grid is a multiple of the cluster size.
+//
+// Sequences with many new tokens (a prefill) go to the tensor-core kernel in attention_tc.cu instead,
+// which runs beside this one; this kernel skips their tokens.
+
+#include "attention_tc.h"
 #include "common.cuh"
 
 namespace {
 
-constexpr int kThreads = 256;                              // 8 wavefronts of 32, 4 of 64
+constexpr int kThreads = 256;                              // 8 warps
+constexpr int kWarps = kThreads / 32;
 constexpr int kLanesPerKey = 8;                            // lanes sharing one key, 8 dims each
 constexpr int kKeysPerTileStep = kThreads / kLanesPerKey;  // keys handled per step of a tile
+constexpr int kSplit = 8;                                  // blocks per item in split mode; the cluster size
+constexpr int kSplitBelow = 64;                            // fewer items than this: split each item
 constexpr int kTile = 4;                                   // query heads per pass over the cache
-constexpr int kBlockN = 32;                                // cache positions per shared-memory tile
-constexpr int kStages = 3;                                 // staged tiles in flight
+constexpr int kBlockN = 32;  // HIP: 3 stages of K and V in 48 KB of LDS (AMD's workgroup limit)                                // cache positions per shared-memory tile
+constexpr int kStages = 3;                                 // cp.async pipeline depth
 constexpr int kWriteBlocks = 256;
-constexpr int kAttnBlocks = 1024;
+constexpr int kAttnBlocks = 1024;                          // multiple of kSplit
 
 static_assert(kBlockN % kKeysPerTileStep == 0, "every group takes the same number of keys per tile");
+static_assert(kAttnBlocks % kSplit == 0, "clusters must tile the grid");
 
 // Sequence of token t: the last one whose first token is <= t. Empty sequences share their start
 // with the next sequence, so the search lands on the one that actually holds t.
@@ -81,39 +92,52 @@ __global__ void write_kv_kernel(const float* __restrict__ qkv, int ld_qkv,
   }
 }
 
-// NPL is the number of 8-dim chunks each lane owns: ceil(Dh / 64).
+// NPL is the number of 8-dim chunks each lane owns: ceil(Dh / 64). The cluster size in the
+// attribute below is kSplit; split mode shares each item across the cluster (see the file comment).
 template <int NPL>
-__global__ void __launch_bounds__(kThreads) attention_kernel(
+__global__ void LX_CLUSTER_DIMS(kSplit) __launch_bounds__(kThreads) attention_kernel(
     const float* __restrict__ qkv, int ld_qkv, const __hip_bfloat16* __restrict__ k_cache,
     const __hip_bfloat16* __restrict__ v_cache, const int32_t* __restrict__ slot_ids,
     const int32_t* __restrict__ start_pos, const int32_t* __restrict__ cu_seqlens, int n_seq, int capacity,
-    __hip_bfloat16* __restrict__ out, int H, int KVH, int Dh, float scale) {
-  constexpr int kWarps = kThreads / LX_WARP;      // wavefronts per block
-
+    __hip_bfloat16* __restrict__ out, int H, int KVH, int Dh, float scale, int clusters, int tc_min) {
   extern __shared__ __align__(16) unsigned char smem_raw[];
   __hip_bfloat16* sK = reinterpret_cast<__hip_bfloat16*>(smem_raw);  // [stage][kBlockN][Dh]
-  __hip_bfloat16* sV = sK + kStages * kBlockN * Dh;                   // [stage][kBlockN][Dh]
-  // After the tile loop, the same bytes hold each wavefront's state for the merge within the block.
+  __hip_bfloat16* sV = sK + kStages * kBlockN * Dh;                 // [stage][kBlockN][Dh]
+  // After the tile loop, the same bytes hold each warp's state for the merge within the block...
   float* sAcc = reinterpret_cast<float*>(smem_raw);  // [kWarps][kTile][Dh]
   float* sM = sAcc + kWarps * kTile * Dh;            // [kWarps][kTile]
-  float* sL = sM + kWarps * kTile;                   // [kWarps][kTile]
+  float* sL = sM + kWarps * kTile;
+  // ...and the block's merged state, which the other blocks of the cluster read in split mode.
+  float* sBlk = sL + kWarps * kTile;  // [kTile][Dh]
+  float* sBlkM = sBlk + kTile * Dh;   // [kTile]
+  float* sBlkL = sBlkM + kTile;       // [kTile]
 
+  const int rank = static_cast<int>(lx::cluster_block_rank());
   const int tid = threadIdx.x;
-  const int lane = tid & (LX_WARP - 1);
-  const int warp = tid / LX_WARP;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
   const int chunk = tid & (kLanesPerKey - 1);  // this lane's 8-dim chunk within a key
   const int key = tid / kLanesPerKey;          // this lane's key group within the block
   const int G = H / KVH;
   const int NCH = Dh / 8;                      // 8-dim chunks per row
   const int T = cu_seqlens[n_seq];
 
-  // Whole items per block, tiles 0, 1, ... in order.
-  for (int item = blockIdx.x; item < T * KVH; item += gridDim.x) {
+  // Split mode: the cluster's blocks share each item; block `rank` takes tiles rank, rank + S, ...
+  // Otherwise each block takes whole items and tiles 0, 1, ... Uniform across the cluster.
+  const bool split = clusters && T * KVH < kSplitBelow;
+  const int S = split ? kSplit : 1;
+  const int r0 = split ? rank : 0;
+  const int first = split ? blockIdx.x / kSplit : blockIdx.x;
+  const int stride = split ? gridDim.x / kSplit : gridDim.x;
+
+  for (int item = first; item < T * KVH; item += stride) {
     const int t = item / KVH, kvh = item % KVH;
     const int s = seq_of_token(cu_seqlens, n_seq, t);
+    if (cu_seqlens[s + 1] - cu_seqlens[s] >= tc_min) continue;  // the tensor-core kernel's (uniform per item)
     const int64_t slot = slot_ids[s];
     const int L = start_pos[s] + (t - cu_seqlens[s]) + 1;  // visible cache positions: 0 .. L - 1
     const int n_tiles = (L + kBlockN - 1) / kBlockN;
+    const int n_local = n_tiles > r0 ? (n_tiles - r0 + S - 1) / S : 0;
     const float* q_row = qkv + static_cast<int64_t>(t) * ld_qkv;
 
     for (int ht = 0; ht < G; ht += kTile) {
@@ -139,11 +163,11 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(
         }
       }
 
-      // Copies tile kk of K and V into its stage, 16 bytes at a time. Rows past L are skipped: they
-      // are never read.
+      // Copies this block's local tile kk (global tile r0 + kk * S) of K and V into its stage,
+      // 16 bytes at a time. Rows past L are skipped: they are never read.
       auto stage = [&](int kk) {
         const int buf = kk % kStages;
-        const int tile = kk;
+        const int tile = r0 + kk * S;
         for (int c = tid; c < kBlockN * NCH; c += kThreads) {
           const int r = c / NCH, ch = c % NCH;
           const int p = tile * kBlockN + r;
@@ -155,20 +179,22 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(
         }
       };
 
-      // Stage kStages - 1 tiles, then each step stages the next tile before reading the current one.
-      // A stage is only written after the barrier that ends the step which read it.
+      // Prefetch kStages - 1 tiles, then each step issues the next tile before waiting on the
+      // current one, so the cache loads overlap the math. Every commit is issued, even empty, so
+      // wait_prior counts the same groups on every step.
 #pragma unroll
       for (int i = 0; i < kStages - 1; ++i) {
-        if (i < n_tiles) stage(i);
+        if (i < n_local) stage(i);
         lx_pipeline_commit();
       }
-      for (int kk = 0; kk < n_tiles; ++kk) {
-        if (kk + kStages - 1 < n_tiles) stage(kk + kStages - 1);
+      for (int kk = 0; kk < n_local; ++kk) {
+        // The stage this writes was read by the previous step, which ended with a barrier.
+        if (kk + kStages - 1 < n_local) stage(kk + kStages - 1);
         lx_pipeline_commit();
         lx_pipeline_wait_prior(kStages - 1);
         __syncthreads();
 
-        const int tile = kk;
+        const int tile = r0 + kk * S;
         const __hip_bfloat16* kb = sK + (kk % kStages) * kBlockN * Dh;
         const __hip_bfloat16* vb = sV + (kk % kStages) * kBlockN * Dh;
 #pragma unroll
@@ -184,7 +210,7 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(
           }
 
           // Partial dot products for each head, then the key's full dot over its 8 lanes. Every
-          // lane of the wavefront takes part, so the shuffles never diverge.
+          // lane of the warp takes part, so the shuffles never diverge.
           float dot[kTile];
 #pragma unroll
           for (int g = 0; g < kTile; ++g) {
@@ -199,7 +225,7 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(
           for (int g = 0; g < kTile; ++g)
 #pragma unroll
             for (int off = kLanesPerKey / 2; off > 0; off >>= 1)
-              dot[g] += __shfl_xor_sync(LX_FULL_MASK, dot[g], off);
+              dot[g] += lx_shfl_xor_sync(0xffffffffu, dot[g], off);
 
           if (valid) {
 #pragma unroll
@@ -223,21 +249,21 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(
       }
       lx_pipeline_wait_prior(0);
 
-      // Merge the key groups of each wavefront. Lanes that differ only in bits 3 and up hold the same
-      // chunk, so the butterfly is a plain xor exchange across the wavefront's key groups. A group with
-      // no keys has m = -inf and weight 0, which is why the weights are guarded.
+      // Merge the four key groups of each warp. Lanes that differ only in bits 3 and 4 hold the
+      // same chunk, so the butterfly is a plain xor exchange. A group with no keys has m = -inf
+      // and weight 0, which is why the weights are guarded.
 #pragma unroll
       for (int g = 0; g < kTile; ++g) {
         if (g < nh) {
 #pragma unroll
-          for (int off = kLanesPerKey; off < LX_WARP; off <<= 1) {
-            const float m2 = __shfl_xor_sync(LX_FULL_MASK, m[g], off);
-            const float l2 = __shfl_xor_sync(LX_FULL_MASK, l[g], off);
+          for (int off = kLanesPerKey; off < 32; off <<= 1) {
+            const float m2 = lx_shfl_xor_sync(0xffffffffu, m[g], off);
+            const float l2 = lx_shfl_xor_sync(0xffffffffu, l[g], off);
             float a2[NPL][8];
 #pragma unroll
             for (int k = 0; k < NPL; ++k)
 #pragma unroll
-              for (int e = 0; e < 8; ++e) a2[k][e] = __shfl_xor_sync(LX_FULL_MASK, acc[g][k][e], off);
+              for (int e = 0; e < 8; ++e) a2[k][e] = lx_shfl_xor_sync(0xffffffffu, acc[g][k][e], off);
             const float mn = fmaxf(m[g], m2);
             const float w1 = m[g] == -INFINITY ? 0.f : __expf(m[g] - mn);
             const float w2 = m2 == -INFINITY ? 0.f : __expf(m2 - mn);
@@ -250,7 +276,7 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(
           }
         }
       }
-      if (lane < kLanesPerKey) {  // lanes 0..7 of each wavefront hold its merged state
+      if (lane < kLanesPerKey) {  // lanes 0..7 of each warp hold its merged state
 #pragma unroll
         for (int g = 0; g < kTile; ++g) {
           if (g < nh) {
@@ -270,7 +296,9 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(
       }
       __syncthreads();
 
-      // Merge the wavefronts. The output is final here: the block took the whole item.
+      // Merge the warps. In split mode the block's state goes to shared memory for the cluster;
+      // otherwise the output is final. M is -inf for a block that had no tiles in split mode, and
+      // then every weight is 0.
       for (int idx = tid; idx < nh * Dh; idx += kThreads) {
         const int g = idx / Dh, d = idx % Dh;
         float M = -INFINITY;
@@ -284,9 +312,39 @@ __global__ void __launch_bounds__(kThreads) attention_kernel(
             A += sAcc[(w * kTile + g) * Dh + d] * wt;
           }
         }
-        out[static_cast<int64_t>(t) * H * Dh + (hq0 + g) * Dh + d] = lx::from_f32<__hip_bfloat16>(A / Z);
+        if (split) {
+          sBlk[g * Dh + d] = A;
+          if (d == 0) {
+            sBlkM[g] = M;
+            sBlkL[g] = Z;
+          }
+        } else {
+          out[static_cast<int64_t>(t) * H * Dh + (hq0 + g) * Dh + d] = lx::from_f32<__hip_bfloat16>(A / Z);
+        }
       }
-      __syncthreads();  // the next pass stages into the same shared memory
+
+      if (split) {
+        lx::cluster_sync();  // every block's state is in its shared memory
+        // Cluster merge: block `rank` writes a strided share of the (head, dim) outputs, reading
+        // every block's state across the cluster.
+        for (int idx = rank * kThreads + tid; idx < nh * Dh; idx += kSplit * kThreads) {
+          const int g = idx / Dh, d = idx % Dh;
+          float M = -INFINITY;
+          for (int r2 = 0; r2 < kSplit; ++r2) M = fmaxf(M, lx::cluster_peer(sBlkM, r2)[g]);
+          float Z = 0.f, A = 0.f;
+          for (int r2 = 0; r2 < kSplit; ++r2) {
+            const float mr = lx::cluster_peer(sBlkM, r2)[g];
+            if (mr == -INFINITY) continue;  // this block had no tiles of the item
+            const float wt = __expf(mr - M);
+            Z += lx::cluster_peer(sBlkL, r2)[g] * wt;
+            A += lx::cluster_peer(sBlk, r2)[g * Dh + d] * wt;
+          }
+          out[static_cast<int64_t>(t) * H * Dh + (hq0 + g) * Dh + d] = lx::from_f32<__hip_bfloat16>(A / Z);
+        }
+        lx::cluster_sync();  // nobody leaves, or restages its stages, while another block still reads them
+      } else {
+        __syncthreads();  // the next pass stages into the same shared memory
+      }
     }
   }
 }
@@ -297,6 +355,7 @@ extern "C" int lx_attention_varlen(const float* qkv, int ld_qkv, void* k_cache, 
                                    const int32_t* slot_ids, const int32_t* start_pos, const int32_t* cu_seqlens,
                                    int n_seq, int capacity, void* out, int H, int KVH, int Dh, float scale,
                                    void* stream) {
+  const int clusters = lx_arch() >= lx::kNoClusterArch ? 1 : 0;
   // Rows of the cache are read as 16-byte chunks, and a row fits the 8-lane key layout at up to
   // 128 dims. Anything else is a bad call, not a case to round around.
   if (n_seq <= 0 || capacity <= 0 || KVH <= 0 || H <= 0 || H % KVH != 0 || Dh <= 0 || Dh % 8 != 0 ||
@@ -308,20 +367,22 @@ extern "C" int lx_attention_varlen(const float* qkv, int ld_qkv, void* k_cache, 
   auto o = static_cast<__hip_bfloat16*>(out);
   write_kv_kernel<<<kWriteBlocks, kThreads, 0, s>>>(qkv, ld_qkv, kc, vc, slot_ids, start_pos, cu_seqlens,
                                                     n_seq, capacity, H, KVH, Dh);
-  // kStages of K and V tiles: kStages * 2 * kBlockN * Dh bf16 (48 KB at Dh = 128).
+  const int tc_min = lx::attention_tc_min_tokens(H, KVH, Dh);
+  if (int e = lx::attention_tc(qkv, ld_qkv, kc, vc, slot_ids, start_pos, cu_seqlens, n_seq, capacity, o, H, KVH, Dh,
+                               scale, s))
+    return e;
+  // Three stages of K and V tiles: kStages * 2 * kBlockN * Dh bf16. Above 48 KB needs the opt-in.
   const int smem = kStages * 2 * kBlockN * Dh * static_cast<int>(sizeof(__hip_bfloat16));
   if (Dh <= 64) {
-    if (hipError_t err = hipFuncSetAttribute(reinterpret_cast<const void*>(&attention_kernel<1>),
-                        hipFuncAttributeMaxDynamicSharedMemorySize, smem); err != hipSuccess)
-      return static_cast<int>(err);
+    hipFuncSetAttribute(attention_kernel<1>, hipFuncAttributeMaxDynamicSharedMemorySize, smem);
     attention_kernel<1><<<kAttnBlocks, kThreads, smem, s>>>(qkv, ld_qkv, kc, vc, slot_ids, start_pos,
-                                                            cu_seqlens, n_seq, capacity, o, H, KVH, Dh, scale);
+                                                            cu_seqlens, n_seq, capacity, o, H, KVH, Dh, scale,
+                                                            clusters, tc_min);
   } else {
-    if (hipError_t err = hipFuncSetAttribute(reinterpret_cast<const void*>(&attention_kernel<2>),
-                        hipFuncAttributeMaxDynamicSharedMemorySize, smem); err != hipSuccess)
-      return static_cast<int>(err);
+    hipFuncSetAttribute(attention_kernel<2>, hipFuncAttributeMaxDynamicSharedMemorySize, smem);
     attention_kernel<2><<<kAttnBlocks, kThreads, smem, s>>>(qkv, ld_qkv, kc, vc, slot_ids, start_pos,
-                                                            cu_seqlens, n_seq, capacity, o, H, KVH, Dh, scale);
+                                                            cu_seqlens, n_seq, capacity, o, H, KVH, Dh, scale,
+                                                            clusters, tc_min);
   }
   return lx::launch_status();
 }

@@ -5,16 +5,22 @@
     translate.py save FILE...    write engine/hip/patches/FILE.patch from the hand-edited src/FILE
     translate.py check           fail if src/ is not what generate would produce
 
-Two layers. The rules are mechanical: CUDA names become their HIP names (cudaMalloc -> hipMalloc,
-cublasLt -> hipblasLt, __nv_bfloat16 -> __hip_bfloat16), and the NVIDIA-only constructs the port
-does not use (thread-block clusters, cp.async, programmatic dependent launch) become the portable
-no-op or synchronous forms in include/lx_hip.h. The patches are the structural changes a rename
-cannot make: warp size taken from the target instead of the constant 32, and the decode paths that
-used clusters or asynchronous copies, which the HIP port replaces with one-block-per-row forms.
+Three layers. The rules are mechanical: CUDA names become their HIP names (cudaMalloc -> hipMalloc,
+cublasLt -> hipblasLt, __nv_bfloat16 -> __hip_bfloat16), the warp shuffles take the 32-lane width
+(lx_shfl_*), and the NVIDIA-only constructs the port does not use (thread-block clusters, cp.async,
+programmatic dependent launch, the inline PTX of the FP8 and FP4 conversions) become the portable forms
+in include/. The handwritten files are copied from include/ in place of their CUDA source: mma.cuh (the
+tensor-core helpers, lx_mma.cuh) and the FP8/FP4, block-scan and runtime headers they include. The
+patches are the structural changes a rename cannot make: the attention tile size on the workgroup's LDS
+and the split-K launch that HIP does not offer.
 
-A patch applies to the output of the rules for its file. When the CUDA source changes and a patch
-no longer applies, `generate` stops and names the file: re-port that file's change by hand in src/,
-then `save` it again. kernels.h and tunable.h are the ABI and are copied verbatim.
+Warp model: a warp is 32 lanes (threadIdx.x & 31, threadIdx.x >> 5), as in the CUDA sources. A wave64
+holds two such warps, and every shuffle is width 32, so each warp reduces within its own lanes. Nothing
+here depends on the wavefront size.
+
+A patch applies to the output of the rules for its file. When the CUDA source changes and a patch no
+longer applies, `generate` stops and names the file: re-port that file's change by hand in src/, then
+`save` it again. kernels.h and tunable.h are the ABI and are copied verbatim.
 """
 
 import difflib
@@ -37,6 +43,10 @@ BANNER = (
 
 # Files copied verbatim: the ABI and the tuning interface.
 VERBATIM = {"kernels.h", "tunable.h"}
+
+# Files whose HIP form is written by hand under include/: the CUDA file's place in src/ is taken by the
+# include/ file, unchanged. mma.cuh is the PTX tensor-core header; lx_mma.cuh has the same interface.
+HANDWRITTEN = {"mma.cuh": "lx_mma.cuh"}
 
 # Identifier renames, applied in order. The generic cuda -> hip and cublas -> hipblas rules come last,
 # so the specific ones above them win.
@@ -64,6 +74,21 @@ RENAMES = [
     (r"\bcublas", "hipblas"),
     (r"\bCUDA_R_", "HIP_R_"),
     (r"\bcudaDataType\b", "hipDataType"),
+    # HIP has no thread-block clusters: no architecture takes the cluster path (common.cuh).
+    (r"\blx::kClusterArch\b", "lx::kNoClusterArch"),
+    (r"\b__shfl_sync\(", "lx_shfl_sync("),
+    (r"\b__shfl_xor_sync\(", "lx_shfl_xor_sync("),
+    (r"\b__shfl_down_sync\(", "lx_shfl_down_sync("),
+    (r"\b__shfl_up_sync\(", "lx_shfl_up_sync("),
+    (r"\b__match_any_sync\(", "lx_match_any_sync("),
+    (r"\b__reduce_max_sync\(", "lx_reduce_max_sync("),
+    (r"\b__reduce_add_sync\(", "lx_reduce_add_sync("),
+    (r"\bcudaDevAttrMultiProcessorCount\b", "hipDeviceAttributeMultiprocessorCount"),
+    (r"\bcudaDeviceProp\b", "hipDeviceProp_t"),
+    (r"\bcudaPointerAttributes\b", "hipPointerAttribute_t"),
+    (r"\bcudaDeviceAttr\b", "hipDeviceAttribute_t"),
+    (r"\bcudaDevAttrGlobalMemoryBusWidth\b", "hipDeviceAttributeMemoryBusWidth"),
+    (r"\bcudaDevAttr([A-Z])", r"hipDeviceAttribute\1"),
     (r"\bcuda([A-Z_])", r"hip\1"),
 ]
 
@@ -74,13 +99,18 @@ INCLUDES = [
     (r"#include <cooperative_groups\.h>\n", ""),
     (r"namespace cg = cooperative_groups;\n", ""),
     (r"#include <cublasLt\.h>", "#include <hipblaslt/hipblaslt.h>"),
+    (r"#include <cuda_fp16\.h>", "#include <hip/hip_fp16.h>"),
+    (r"#include <cuda_fp8\.h>", '#include "lx_fp8.h"'),
+    (r"#include <cuda_fp4\.h>", '#include "lx_fp8.h"'),
+    (r"#include <cub/block/block_scan\.cuh>", '#include "lx_cub.h"'),
+    (r"#include <cub/cub\.cuh>", '#include "lx_cub.h"'),
     (r'#include "cuda/', '#include "'),
 ]
 
 # Cluster attributes have no HIP form; kernels that used them are removed by the patches, and any
 # left over are dropped here so the rules output still compiles on its own.
 DROPS = [
-    (r"__cluster_dims__\([^)]*\)\s*", ""),
+    (r"__cluster_dims__\([^)]*\)[ \t]*", ""),
 ]
 
 
@@ -96,6 +126,9 @@ def rules(text):
 
 def base_text(name):
     """The rules output for one CUDA file, with the banner."""
+    if name in HANDWRITTEN:
+        with open(os.path.join(HERE, "include", HANDWRITTEN[name]), encoding="utf-8") as f:
+            return f.read()
     with open(os.path.join(CUDA, name), encoding="utf-8") as f:
         text = f.read()
     if name in VERBATIM:
