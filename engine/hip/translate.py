@@ -60,6 +60,7 @@ RENAMES = [
     (r"\bcudaLaunchKernelEx\b", "lx_launch_kernel_ex"),
     (r"\bcudaLaunchConfig_t\b", "lx_launch_config"),
     (r"\bcudaLaunchAttributeProgrammaticStreamSerialization\b", "LX_LAUNCH_ATTR_PDL"),
+    (r"\bcudaLaunchAttributeCooperative\b", "LX_LAUNCH_ATTR_COOPERATIVE"),
     (r"\bcudaLaunchAttribute\b", "lx_launch_attr"),
     (r"\b__ldg\(", "lx_ldg("),
     (r"\b__ldcs\(", "lx_ldcs("),

@@ -20,6 +20,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <tuple>
 #include <utility>
 
 #include <hip/hip_runtime.h>  // the ROCm headers, or nvidia/hip (LX_NVIDIA_SHIM) in the test build
@@ -38,6 +39,12 @@
 
 // HIP takes a 64-bit warp mask on every AMD target, wave32 included (it truncates to the wave), so the
 // AMD mask is 64 bits. The NVIDIA shim keeps CUDA's 32-bit mask.
+// The opt-in shared-memory limit is an NVIDIA attribute (above the default 48 KB per block). AMD's per-block limit is
+// the one a kernel can size its LDS to, so the attribute name means that limit there.
+#if !defined(LX_NVIDIA_SHIM)
+#define hipDeviceAttributeMaxSharedMemoryPerBlockOptin hipDeviceAttributeMaxSharedMemoryPerBlock
+#endif
+
 #if defined(LX_NVIDIA_SHIM)
 #define LX_FULL_MASK 0xffffffffu
 using lx_mask_t = unsigned int;
@@ -92,11 +99,12 @@ __device__ __forceinline__ void lx_pipeline_wait_prior(int) {}
 __device__ __forceinline__ void lx_pdl_trigger() {}
 __device__ __forceinline__ void lx_pdl_wait() {}
 
-enum { LX_LAUNCH_ATTR_PDL = 1 };
+enum { LX_LAUNCH_ATTR_PDL = 1, LX_LAUNCH_ATTR_COOPERATIVE = 2 };
 struct lx_launch_attr {
   int id;
   union {
     int programmaticStreamSerializationAllowed;
+    int cooperative;
   } val;
 };
 struct lx_launch_config {
@@ -108,9 +116,29 @@ struct lx_launch_config {
   unsigned numAttrs;
 };
 
+// The cooperative attribute: every block resident at once, which the decode program needs, since its tasks wait on
+// other blocks' tasks. Both platforms launch it through hipLaunchCooperativeKernel, with the arguments packed.
+inline bool lx_wants_cooperative(const lx_launch_config* cfg) {
+  for (unsigned i = 0; i < cfg->numAttrs; ++i)
+    if (cfg->attrs[i].id == LX_LAUNCH_ATTR_COOPERATIVE && cfg->attrs[i].val.cooperative) return true;
+  return false;
+}
+
+template <typename... KArgs, std::size_t... I>
+inline hipError_t lx_launch_cooperative(const lx_launch_config* cfg, void (*k)(KArgs...),
+                                        std::tuple<KArgs...>& packed, std::index_sequence<I...>) {
+  void* args[] = {const_cast<void*>(static_cast<const volatile void*>(&std::get<I>(packed)))...};
+  return hipLaunchCooperativeKernel(reinterpret_cast<const void*>(k), cfg->gridDim, cfg->blockDim, args,
+                                    cfg->dynamicSmemBytes, cfg->stream);
+}
+
 #if defined(LX_NVIDIA_SHIM)
 template <typename... KArgs, typename... Args>
 inline hipError_t lx_launch_kernel_ex(const lx_launch_config* cfg, void (*k)(KArgs...), Args&&... args) {
+  if (lx_wants_cooperative(cfg)) {
+    std::tuple<KArgs...> packed(std::forward<Args>(args)...);
+    return lx_launch_cooperative(cfg, k, packed, std::index_sequence_for<KArgs...>{});
+  }
   cudaLaunchConfig_t c{};
   c.gridDim = cfg->gridDim;
   c.blockDim = cfg->blockDim;
@@ -121,6 +149,10 @@ inline hipError_t lx_launch_kernel_ex(const lx_launch_config* cfg, void (*k)(KAr
 #else
 template <typename... KArgs, typename... Args>
 inline hipError_t lx_launch_kernel_ex(const lx_launch_config* cfg, void (*k)(KArgs...), Args&&... args) {
+  if (lx_wants_cooperative(cfg)) {
+    std::tuple<KArgs...> packed(std::forward<Args>(args)...);
+    return lx_launch_cooperative(cfg, k, packed, std::index_sequence_for<KArgs...>{});
+  }
   hipLaunchKernelGGL(k, cfg->gridDim, cfg->blockDim, cfg->dynamicSmemBytes, cfg->stream,
                      std::forward<Args>(args)...);
   return hipGetLastError();

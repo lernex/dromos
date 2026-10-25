@@ -349,6 +349,7 @@ void set_weight(GroupedParams& pp, const lx_weight& w, int rows, int K) {
   pp.ldb = ldb;
   pp.b_stride = ldb * rows;
   pp.b_global = w.type == LX_W_NVFP4 ? w.global : 1.0f;
+  pp.b_expert_global = w.type == LX_W_NVFP4 ? w.expert_global : nullptr;
   pp.b_scale = nullptr;
   pp.b_sf = nullptr;
   if (w.type == LX_W_INT8 || w.type == LX_W_FP8) {

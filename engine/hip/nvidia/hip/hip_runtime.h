@@ -26,6 +26,9 @@ typedef cudaDataType hipDataType;
 #define hipErrorInvalidDevice cudaErrorInvalidDevice
 #define hipErrorUnknown cudaErrorUnknown
 #define hipErrorOutOfMemory cudaErrorMemoryAllocation
+#define hipErrorInvalidConfiguration cudaErrorInvalidConfiguration
+#define hipLaunchCooperativeKernel cudaLaunchCooperativeKernel
+#define hipDeviceAttributeMaxSharedMemoryPerBlockOptin cudaDevAttrMaxSharedMemoryPerBlockOptin
 
 #define hipMemcpyHostToDevice cudaMemcpyHostToDevice
 #define hipMemcpyDeviceToHost cudaMemcpyDeviceToHost

@@ -9,7 +9,8 @@ stays the source of truth. Nothing under `engine/cuda` or `engine/model` is chan
 | Check | Result |
 | --- | --- |
 | AMD compile, ROCm SDK 7.9rc `amdclang++`, `--offload-arch` per target | gfx942, gfx1100, gfx1201: 0 errors, 0 warnings each |
-| NVIDIA test shim (RTX 5070 Ti, sm_120a), `tests/kernels` | 1013 passed |
+| NVIDIA test shim (RTX 5070 Ti, sm_120a), `tests/kernels` | 3743 passed, 42 skipped (the CUDA library: 3784 passed, 1 skipped) |
+| `lernex doctor` with `LX_BACKEND=hip` on the shim | missing none |
 | End to end, Praxis BF16, HIP library on the NVIDIA shim | prefill bitwise equal to the CUDA library; decode within bf16 noise (below) |
 | Run on AMD hardware | not done: no AMD GPU was available to this port |
 
@@ -55,6 +56,12 @@ becomes `__hip_bfloat16`, and the NVIDIA-only constructs map to the portable for
 - **`cp.async` is a synchronous copy** (`lx_pipeline_memcpy_async`). Correctness rests on the
   existing `__syncthreads` ordering. The copy no longer overlaps the math.
 - **Programmatic dependent launch** is a no-op. The stream orders the kernels.
+- **Cooperative launch** (the decode program's persistent kernel, whose tasks wait on other blocks' tasks, so every
+  block must be resident) goes through `hipLaunchCooperativeKernel` with the arguments packed, on both platforms
+  (`lx_launch_kernel_ex` in `include/lx_hip.h`). The NVIDIA shim takes the same path.
+- **The opt-in shared-memory limit** (`cudaDevAttrMaxSharedMemoryPerBlockOptin`) is AMD's per-block LDS limit.
+- **No K split.** The quantised GEMM's K split runs on thread-block clusters, which HIP does not have, so `split_for`
+  (`patches/gemm_w.cu.patch`) never splits on HIP. The split variants would answer `hipErrorNotSupported`.
 - **hipBLASLt alignment.** hipBLASLt 7.2.4 has no minimum-alignment preference (the CUDA source sets
   four). The NVIDIA shim maps the names, so CUDA keeps them. On AMD the heuristic is not told the
   operands' alignment, so `gemm.cu` refuses an operand narrower than 16 bytes with

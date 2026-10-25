@@ -142,7 +142,8 @@ const char* default_tile(int kind, int M, int N) {
 // the RTX 5070 Ti, int8, fp8 and fp4, M 16 to 96, N 1024 to 4096, K 1024 to 8192). A split also makes a
 // row's bits depend on M (kernels.h), so it is used only where it pays.
 int split_for(int kind, int tiles, int k_tiles, int arch) {
-  if (arch < 90) return 1;
+  // The K split runs on thread-block clusters. HIP has none (common.cuh: kNoClusterArch), so no device here splits.
+  if (arch < 90 || arch < lx::kNoClusterArch) return 1;
   const bool mixed = kind == kW8I8 || kind == kW8F8 || kind == kW4A16 || kind == kW4A8;
   if (mixed) {
     if (tiles <= 17 && k_tiles >= 8) return 4;

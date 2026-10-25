@@ -59,6 +59,7 @@ struct DenseProb {
   }
   static __device__ __forceinline__ float a_scale(const Params& p, const Tile& t, int r) { return p.a_scale[t.m0 + r]; }
   static __device__ __forceinline__ int64_t b_row(const Params&, const Tile& t, int r) { return t.n0 + r; }
+  static __device__ __forceinline__ float b_global(const Params& p, const Tile&) { return p.b_global; }
 };
 
 // y = alpha * (v + bias) + beta * y, v already scaled. Pairs of columns, stored together when aligned.
