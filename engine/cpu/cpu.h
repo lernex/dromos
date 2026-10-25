@@ -22,6 +22,7 @@ constexpr int kOk = 0;
 constexpr int kInvalid = 1;        // cudaErrorInvalidValue
 constexpr int kNoMemory = 2;       // cudaErrorMemoryAllocation
 constexpr int kBadDevice = 101;    // cudaErrorInvalidDevice
+constexpr int kBadHandle = 400;    // cudaErrorInvalidResourceHandle
 constexpr int kNotSupported = LX_ERR_NOT_SUPPORTED;
 
 // Records the status of the last failing call for lx_rt_last_error, and returns it.
@@ -82,6 +83,9 @@ inline bool valid_dtype(int d) { return d == LX_F32 || d == LX_BF16; }
 
 // The kernel table of the level in effect (lx_arch, after any override).
 const Kern& kern();
+
+// The highest level this CPU supports and the library was built with: lx_arch before any override.
+int real_level();
 
 // ---- Threads ------------------------------------------------------------------------------------
 

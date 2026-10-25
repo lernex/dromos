@@ -58,7 +58,8 @@ void print_device(const lx::runtime::DeviceInfo& d) {
   const lx::dispatch::Info& backend = lx::dispatch::info();
   std::printf("%-10s driver %s, runtime %s\n", backend.backend.empty() ? "backend" : backend.backend.c_str(),
               d.driver_text.c_str(), d.runtime_text.c_str());
-  std::printf("build      kernels for %s\n", archs_text(lx::runtime::built_archs()).c_str());
+  if (lx_rt_backend() == LX_BACKEND_CUDA)
+    std::printf("build      kernels for %s\n", archs_text(lx::runtime::built_archs()).c_str());
   if (!d.built)
     std::printf("           this card (sm_%d) has no kernels in this build: rebuild with -DLX_ARCHS=all\n", d.real_cc());
   if (backend.backend.empty()) {

@@ -20,6 +20,8 @@ struct Epilogue {
   int64_t ld_y = 0;
   float alpha = 1.0f, beta = 0.0f;
   void apply(const float* sums, int64_t ld_s, int64_t m0, int64_t m1, int64_t n0, int64_t n1) const;
+  // The same from exact sums: row_factor * x_scale * sum in double, rounded once to f32, then as above.
+  void apply_d(const double* sums, int64_t ld_s, int64_t m0, int64_t m1, int64_t n0, int64_t n1) const;
 };
 
 struct Product {
@@ -31,6 +33,7 @@ struct Product {
   int64_t M = 0, N = 0, K = 0;
   WeightRef w{};
   Epilogue ep;
+  bool exact = false;  // kPathF32 with quantized operands (FP8 / FP4 maths): exact sums (DotF32::out_d)
 };
 
 int product(const Product& p);

@@ -5,7 +5,8 @@
 // bandwidth  a multithreaded read of a large buffer (the ceiling for decode, which reads every weight
 //            once per token), at 1 thread, at the pool's size, and at each count in between that is a
 //            power of two
-// gemv       the decode GEMV at Praxis' shapes in every format: time, and the weight bytes it read per
+// gemv       the decode GEMV at Praxis' shapes in every format (and lossless BF16X, with Gaussian bf16
+//            weights so its patches come at a checkpoint's rate): time, and the weight bytes it read per
 //            second as a fraction of the measured read bandwidth
 // experts    Praxis' routed experts for one decode token (4 of 128) in every format, the same way
 // gemm       a prefill-sized product (512 tokens) in every math, in GFLOP/s
@@ -193,6 +194,33 @@ const char* fmt_name(int t) {
   return n[t];
 }
 
+// Gaussian bf16 rows (a checkpoint's spread of exponents) encoded as LX_W_BF16X: its bytes, the encoding.
+struct Encoded {
+  void* data = nullptr;
+  int64_t bytes = 0;
+};
+Encoded make_bf16x(int64_t rows, int64_t K, float std) {
+  std::vector<uint16_t> w(static_cast<size_t>(rows * K));
+  uint64_t s = 0x2545F4914F6CDD1Dull;
+  auto uniform = [&] {
+    s ^= s << 13;
+    s ^= s >> 7;
+    s ^= s << 17;
+    return static_cast<float>((s >> 40) * (1.0 / 16777216.0));
+  };
+  for (auto& v : w) {
+    const float g = sqrtf(-2.0f * logf(uniform() + 1e-7f)) * cosf(6.2831853f * uniform()) * std;
+    uint32_t u;
+    memcpy(&u, &g, 4);
+    v = static_cast<uint16_t>((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+  }
+  Encoded e;
+  e.bytes = lx_bf16x_bytes(w.data(), rows, static_cast<int>(K), nullptr);
+  lx_rt_alloc(&e.data, e.bytes);
+  lx_bf16x_encode(w.data(), rows, static_cast<int>(K), e.data, e.bytes, nullptr);
+  return e;
+}
+
 // ---- GEMV ---------------------------------------------------------------------------------------------------
 
 void gemv() {
@@ -229,6 +257,26 @@ void gemv() {
       printf("\n");
       release(w);
     }
+    // The same product on the lossless encoding of bf16 weights.
+    const int64_t rb = lx_bf16x_row_bytes(s.K);
+    const int copies = static_cast<int>(std::max<int64_t>(1, (256ll << 20) / (rb * s.N) + 1));
+    Encoded e = make_bf16x(int64_t{s.N} * copies, s.K, 0.02f);
+    std::vector<uint16_t> x(s.K, 0x3f80);
+    std::vector<float> y(s.N);
+    int c = 0;
+    const double t = median_time(
+        [&] {
+          const char* w = static_cast<const char*>(e.data) + int64_t{c} * s.N * rb;
+          c = (c + 1) % copies;
+          lx_gemv_bf16x(x.data(), LX_BF16, s.K, w, nullptr, LX_F32, y.data(), LX_F32, s.N, 1, s.N, s.K, 1.0f, 0.0f,
+                        nullptr);
+        },
+        std::max(g_reps * 5, copies * 3));
+    const double gbs = static_cast<double>(e.bytes) / copies / t / 1e9;
+    printf("  %-14s %5d x %4d  %-5s  %8.1f us  %6.1f GB/s", s.what, s.N, s.K, "BF16X", t * 1e6, gbs);
+    if (g_bandwidth > 0) printf("  %3.0f%% of read bandwidth", 100 * gbs / g_bandwidth);
+    printf("  (%.2f bits per value)\n", 8.0 * e.bytes / (static_cast<double>(s.N) * copies * s.K));
+    lx_rt_free(e.data);
   }
 }
 
@@ -269,6 +317,38 @@ void experts() {
     printf("\n");
     for (auto& w : gu) release(w);
     for (auto& w : dn) release(w);
+  }
+  // The lossless encoding of bf16 stacks.
+  {
+    const int64_t gu_rb = lx_bf16x_row_bytes(L), dn_rb = lx_bf16x_row_bytes(I);
+    const int layers = static_cast<int>(std::max<int64_t>(2, (512ll << 20) / (E * (2 * I * gu_rb + L * dn_rb)) + 1));
+    std::vector<Encoded> gu, dn;
+    for (int l = 0; l < layers; ++l) {
+      gu.push_back(make_bf16x(int64_t{E} * 2 * I, L, 0.03f));
+      dn.push_back(make_bf16x(int64_t{E} * L, I, 0.04f));
+    }
+    std::vector<uint16_t> latent(L, 0x3f80);
+    std::vector<float> out(L);
+    std::vector<uint8_t> ws(lx_moe_bf16x_workspace_bytes(1, I, top_k) + 64);
+    int32_t ids[top_k];
+    float weights[top_k] = {0.4f, 0.3f, 0.2f, 0.1f};
+    int layer = 0, step = 0;
+    const double t = median_time(
+        [&] {
+          for (int k = 0; k < top_k; ++k) ids[k] = (step * 37 + k * 29) % E;
+          ++step;
+          lx_moe_experts_bf16x(latent.data(), ids, weights, gu[layer].data, dn[layer].data, out.data(), ws.data(), 1, L,
+                               I, top_k, nullptr);
+          layer = (layer + 1) % layers;
+        },
+        std::max(g_reps * 5, layers * 3));
+    const int64_t bytes = top_k * (2 * I * gu_rb + L * dn_rb);
+    const double gbs = bytes / t / 1e9;
+    printf("  %-5s  %8.1f us  %6.1f GB/s", "BF16X", t * 1e6, gbs);
+    if (g_bandwidth > 0) printf("  %3.0f%% of read bandwidth", 100 * gbs / g_bandwidth);
+    printf("\n");
+    for (auto& e : gu) lx_rt_free(e.data);
+    for (auto& e : dn) lx_rt_free(e.data);
   }
 }
 

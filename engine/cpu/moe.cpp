@@ -41,6 +41,9 @@ Slice slice(const lx_weight& s, int64_t e, int64_t N, int64_t K) {
     case LX_W_BF16:
       out.w.data = static_cast<const uint16_t*>(s.data) + rows * K;
       break;
+    case LX_W_BF16X:  // a stack is E * N encoded rows
+      out.w.data = static_cast<const uint8_t*>(s.data) + rows * bf16x::row_bytes(K);
+      break;
     case LX_W_INT8:
     case LX_W_FP8:
       out.w.data = static_cast<const uint8_t*>(s.data) + rows * K;
@@ -85,6 +88,7 @@ struct Acts {
   uint16_t* b = nullptr;
   float* scale = nullptr;  // per row (INT8 / FP8 / FP4 maths), or null
   int64_t K = 0;
+  bool exact = false;  // FP8 / FP4 maths: quantized operands, so the dots are summed exactly (double sums)
 };
 
 // Fills row r of acts from a bf16 source row, for the math.
@@ -115,13 +119,15 @@ void fill_row(Acts& a, int64_t r, const uint16_t* src, int math, uint8_t* tmp) {
   }
 }
 
-// sums[j, n - n0] for rows [n0, n1) of `w` against acts rows [r0, r0 + count).
+// sums[j, n - n0] for rows [n0, n1) of `w` against acts rows [r0, r0 + count): f32, or double when the
+// acts are exact (then `sums` points at doubles).
 void dot_rows(const Kern& k, const Acts& a, int64_t r0, int64_t count, const WeightRef& w, int64_t n0, int64_t n1,
-              float* sums, int64_t ld_s) {
+              void* sums, int64_t ld_s) {
   const int64_t K = a.K;
   switch (a.path) {
     case kPathF32: {
-      DotF32 d{a.f + r0 * K, K, w, K, sums, ld_s, nullptr, 0};
+      DotF32 d{a.f + r0 * K, K, w, K, static_cast<float*>(sums), ld_s, nullptr, 0};
+      if (a.exact) d.out_d = static_cast<double*>(sums);
       if (count > 8) {
         const int64_t floats = std::min<int64_t>((n1 - n0) * K, std::max<int64_t>(128 * 1024, 4 * K));
         d.panel = static_cast<float*>(scratch(sizeof(float) * floats, 3));
@@ -131,12 +137,12 @@ void dot_rows(const Kern& k, const Acts& a, int64_t r0, int64_t count, const Wei
       break;
     }
     case kPathI8: {
-      DotI8 d{a.i + r0 * K, K, static_cast<const int8_t*>(w.data), K, sums, ld_s, nullptr, 0};
+      DotI8 d{a.i + r0 * K, K, static_cast<const int8_t*>(w.data), K, static_cast<float*>(sums), ld_s, nullptr, 0};
       k.dot_i8(d, 0, count, n0, n1);
       break;
     }
     default: {
-      DotBF16 d{a.b + r0 * K, K, w, K, sums, ld_s, nullptr, 0};
+      DotBF16 d{a.b + r0 * K, K, w, K, static_cast<float*>(sums), ld_s, nullptr, 0};
       if (w.type != kW_BF16) {
         const int64_t bytes = 2 * std::min<int64_t>((n1 - n0) * K, std::max<int64_t>(128 * 1024, 4 * K));
         d.panel = scratch(bytes, 3);
@@ -150,8 +156,8 @@ void dot_rows(const Kern& k, const Acts& a, int64_t r0, int64_t count, const Wei
 
 int path_for(const Kern& k, int math, int max_group) {
   if (math == LX_MATH_INT8) return kPathI8;
-  if (math != kMathWeightOnly && k.dot_bf16 && max_group > 8) return kPathBF16;
-  return kPathF32;
+  if (math == LX_MATH_BF16 && k.dot_bf16 && max_group > 8) return kPathBF16;
+  return kPathF32;  // weight-only, and the exact dots of FP8 / FP4
 }
 
 int run(const Job& j) {
@@ -192,6 +198,8 @@ int run(const Job& j) {
   // activations for the down pass), and every pair's down contribution.
   Acts x1, x2;
   x1.path = x2.path = path;
+  const bool exact = j.math == LX_MATH_FP8 || j.math == LX_MATH_FP4;
+  x1.exact = x2.exact = exact;
   x1.K = L;
   x2.K = I;
   char* b1 = static_cast<char*>(scratch(static_cast<size_t>(P * L * elem + P * 4 + 64), 4));
@@ -236,15 +244,26 @@ int run(const Job& j) {
       const int64_t i0 = (it % blocks1) * rb, i1 = std::min(I, i0 + rb);
       const int64_t g0 = start[e], cnt = start[e + 1] - g0, ni = i1 - i0;
       const Slice s = slice(j.gu, e, 2 * I, L);
-      float* sums = static_cast<float*>(scratch(sizeof(float) * 2 * cnt * ni, 2));
-      dot_rows(k, x1, g0, cnt, s.w, i0, i1, sums, ni);
-      dot_rows(k, x1, g0, cnt, s.w, I + i0, I + i1, sums + cnt * ni, ni);
+      void* buf = scratch(sizeof(double) * 2 * cnt * ni, 2);
+      float* sums = static_cast<float*>(buf);
+      double* sums_d = static_cast<double*>(buf);
+      const int64_t esz = exact ? 2 : 1;  // the up sums follow the gate sums, in floats
+      dot_rows(k, x1, g0, cnt, s.w, i0, i1, buf, ni);
+      dot_rows(k, x1, g0, cnt, s.w, I + i0, I + i1, sums + esz * cnt * ni, ni);
       uint16_t* row = static_cast<uint16_t*>(scratch(2 * ni, 0));
       for (int64_t r = 0; r < cnt; ++r) {
         const float xs = x1.scale ? x1.scale[g0 + r] : 1.0f;
         for (int64_t i = 0; i < ni; ++i) {
           const float sg = s.rf ? s.rf[i0 + i] : s.rf_scalar;
           const float su = s.rf ? s.rf[I + i0 + i] : s.rf_scalar;
+          if (exact) {
+            // From the exact dots, the whole SwiGLU in double: the intermediate is quantized again, and in a
+            // format this coarse a last-bit difference here can move a value by a whole code.
+            const double g = sg * (static_cast<double>(xs) * sums_d[r * ni + i]);
+            const double u = su * (static_cast<double>(xs) * sums_d[(cnt + r) * ni + i]);
+            row[i] = f32_to_bf16(static_cast<float>(g / (1.0 + std::exp(-g)) * u));
+            continue;
+          }
           const float g = sg * (xs * sums[r * ni + i]);
           const float u = su * (xs * sums[(cnt + r) * ni + i]);
           // The intermediate is rounded to bf16 before the down projection, as the reference does.
@@ -276,12 +295,18 @@ int run(const Job& j) {
       const int64_t l0 = (it % blocks2) * lb, l1 = std::min(L, l0 + lb);
       const int64_t g0 = start[e], cnt = start[e + 1] - g0, nl = l1 - l0;
       const Slice s = slice(j.dn, e, L, I);
-      float* sums = static_cast<float*>(scratch(sizeof(float) * cnt * nl, 2));
-      dot_rows(k, x2, g0, cnt, s.w, l0, l1, sums, nl);
+      void* buf = scratch(sizeof(double) * cnt * nl, 2);
+      dot_rows(k, x2, g0, cnt, s.w, l0, l1, buf, nl);
+      const float* sums = static_cast<const float*>(buf);
+      const double* sums_d = static_cast<const double*>(buf);
       for (int64_t r = 0; r < cnt; ++r) {
         const float xs = x2.scale ? x2.scale[g0 + r] : 1.0f;
         float* c = contrib + (g0 + r) * L;
-        for (int64_t l = 0; l < nl; ++l) c[l0 + l] = (s.rf ? s.rf[l0 + l] : s.rf_scalar) * (xs * sums[r * nl + l]);
+        for (int64_t l = 0; l < nl; ++l) {
+          const float rf = s.rf ? s.rf[l0 + l] : s.rf_scalar;
+          c[l0 + l] = exact ? static_cast<float>(rf * (static_cast<double>(xs) * sums_d[r * nl + l]))
+                            : rf * (xs * sums[r * nl + l]);
+        }
       }
     }
   });
@@ -426,6 +451,39 @@ int lx_moe_experts_w8(const void* latent, const int32_t* ids, const float* weigh
   return run(j);
 }
 
+// Routed experts on BF16X stacks, and the plain-bf16 baseline of the same contract. Both are lx_moe_experts
+// (bf16 math, the same grouping and order) on another weight row reader, so out equals it bit for bit.
+int lx_moe_experts_bf16x(const void* latent, const int32_t* ids, const float* weights, const void* gate_up,
+                         const void* down, float* out, void* workspace, int T, int L, int I, int top_k, void* stream) {
+  LX_PROFILE("moe_experts_bf16x");
+  (void)stream;
+  if (T <= 0) return kOk;
+  if (int e = check_common(latent, ids, weights, out, L, I, top_k)) return e;
+  if (top_k > 8 || !gate_up || !down || !workspace || L >= bf16x::kMaxK || I >= bf16x::kMaxK) return fail(kInvalid);
+  const Job j{static_cast<const uint16_t*>(latent),
+              ids,
+              weights,
+              lx_weight{LX_W_BF16X, gate_up, nullptr, 1.0f, nullptr},
+              lx_weight{LX_W_BF16X, down, nullptr, 1.0f, nullptr},
+              T, L, I, top_k, 0, LX_MATH_BF16, out};
+  return run(j);
+}
+
+int lx_moe_experts_decode_bf16(const void* latent, const int32_t* ids, const float* weights, const void* gate_up,
+                               const void* down, float* out, void* workspace, int T, int L, int I, int top_k,
+                               void* stream) {
+  // Profiled as moe_experts, which it is.
+  if (T <= 0) return kOk;
+  if (top_k > 8 || !workspace) return fail(kInvalid);
+  return lx_moe_experts(latent, ids, weights, gate_up, down, out, T, L, I, top_k, stream);
+}
+
+// The CUDA size (the intermediates), so a caller that allocates by it works on every backend.
+int64_t lx_moe_bf16x_workspace_bytes(int T, int I, int top_k) {
+  if (T <= 0 || I <= 0 || top_k <= 0) return 0;
+  return (2 * static_cast<int64_t>(T) * top_k * I + 255) / 256 * 256;
+}
+
 // The CUDA sizes, so callers that size buffers from them work on every backend.
 int64_t lx_moe_workspace_bytes(int T, int I, int top_k) {
   if (T <= 0 || I <= 0 || top_k <= 0) return 0;
@@ -439,11 +497,17 @@ int lx_moe_experts_decode(const void* latent, const int32_t* ids, const float* w
                           void* stream) {
   LX_PROFILE("moe_experts_decode");
   (void)stream;
-  (void)workspace;
   if (T <= 0) return kOk;
   if (T > 8 || top_k > 8) return fail(kInvalid);
   if (int e = check_common(latent, ids, weights, out, L, I, top_k)) return e;
-  if (!gate_up || !down || !valid_stack(*gate_up, L) || !valid_stack(*down, I)) return fail(kInvalid);
+  if (!gate_up || !down) return fail(kInvalid);
+  if (gate_up->type == LX_W_BF16X || down->type == LX_W_BF16X) {
+    // Lossless stacks have their own entry point; both must be encoded, a mixed pair has no kernel.
+    if (gate_up->type != LX_W_BF16X || down->type != LX_W_BF16X) return fail(kNotSupported);
+    return lx_moe_experts_bf16x(latent, ids, weights, gate_up->data, down->data, out, workspace, T, L, I, top_k,
+                                stream);
+  }
+  if (!valid_stack(*gate_up, L) || !valid_stack(*down, I)) return fail(kInvalid);
   const Job j{static_cast<const uint16_t*>(latent), ids, weights, *gate_up, *down, T, L, I, top_k, 0, kMathWeightOnly,
               out};
   return run(j);
