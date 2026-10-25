@@ -79,16 +79,22 @@ __device__ __forceinline__ uint8_t f32_to_e4m3(float v, bool saturate) {
   return static_cast<uint8_t>(sign | (static_cast<uint32_t>(exp) << 3) | m3);
 }
 
-// f32 to e5m2 (bias 15, max 57344), through the half encoding it shares its top byte with.
+// f32 to e5m2 (bias 15, max 57344), rounded once from the f32 bits (a half intermediate would round twice).
 __device__ __forceinline__ uint8_t f32_to_e5m2(float v, bool saturate) {
-  const uint32_t h = f32_to_f16_bits(v);
-  const uint32_t sign = (h >> 8) & 0x80u;
-  const uint32_t mag = h & 0x7fffu;
-  if (mag > 0x7c00u) return static_cast<uint8_t>(sign | 0x7fu);                    // NaN
-  if (mag == 0x7c00u) return static_cast<uint8_t>(sign | (saturate ? 0x7bu : 0x7cu));  // infinity
-  const uint32_t r = (mag + 0x7fu + ((mag >> 8) & 1u)) >> 8;                       // nearest, ties to even
-  if (r >= 0x7cu) return static_cast<uint8_t>(sign | (saturate ? 0x7bu : 0x7cu));  // overflow
-  return static_cast<uint8_t>(sign | r);
+  const uint32_t u = __float_as_uint(v);
+  const uint32_t sign = (u >> 24) & 0x80u;
+  const uint32_t a = u & 0x7fffffffu;
+  if (a > 0x7f800000u) return static_cast<uint8_t>(sign | 0x7fu);                     // NaN
+  if (a == 0x7f800000u) return static_cast<uint8_t>(sign | (saturate ? 0x7bu : 0x7cu));  // infinity
+  if (a < 0x38800000u) {  // below 2^-14: subnormal, units of 2^-16, nearest even (4 units is the first normal)
+    return static_cast<uint8_t>(sign | __float2uint_rn(__uint_as_float(a) * 65536.0f));
+  }
+  // Normal: the exponent rebiased to 15 sits above the 23 mantissa bits; keep 2 of them, round at bit 21.
+  uint32_t m = a - (112u << 23);
+  m += (1u << 20) - 1u + ((m >> 21) & 1u);  // nearest, ties to even
+  m >>= 21;
+  if (m >= 0x7cu) return static_cast<uint8_t>(sign | (saturate ? 0x7bu : 0x7cu));  // overflow
+  return static_cast<uint8_t>(sign | m);
 }
 
 }  // namespace lx::fp8
