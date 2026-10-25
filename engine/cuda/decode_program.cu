@@ -777,6 +777,12 @@ int lx_program_build(lx_program* p) {
     }
     if (r) turn = (order[r - 1] + 1) % B;
   }
+  // Each dependency carries its op's block count, so a block waits for it from its descriptor alone.
+  for (OpDesc& d : p->ops)
+    for (int k = 0; k < d.ndeps; ++k) {
+      const int dep = d.deps[k];
+      d.deps[k] = dep | p->ops[dep].nblocks << 16;
+    }
   // The flattened lists; per block its prefetch spans (adjacent ones merged up to 32 KB) and per
   // entry the block's prefetch bytes before it.
   std::vector<uint32_t> flat, ahead;

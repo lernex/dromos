@@ -211,7 +211,7 @@ struct Continuation {
 // memory 16 bytes at a time, so its size is a multiple of 16.
 struct alignas(16) OpDesc {
   int32_t kind, ntasks, nblocks, ndeps, pool, dyn_dep;
-  int32_t deps[kMaxDeps];
+  int32_t deps[kMaxDeps];  // op | (that op's nblocks << 16): the counters a task waits for
   union {
     Gemv gemv;
     Embed embed;

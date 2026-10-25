@@ -1975,13 +1975,14 @@ __device__ __forceinline__ void work(const Program& P, int block) {
       const int4* src = reinterpret_cast<const int4*>(P.ops + op);
       int4* dst = reinterpret_cast<int4*>(dsm + kDescOff);
       for (int k = tid; k < static_cast<int>(sizeof(OpDesc) / 16); k += kCT) dst[k] = __ldg(src + k);
+      csync();  // the descriptor, its dependencies with their block counts included, is in shared memory
       if (tid < 32) {
         // a lane per dependency, so they are waited for together; the barrier after it hands what
         // each lane acquired to the whole block
-        const OpDesc& od = P.ops[op];
+        const OpDesc& od = desc();
         for (int k = tid; k < od.ndeps; k += 32) {
-          const int dep = __ldg(&od.deps[k]);
-          const uint32_t need = static_cast<uint32_t>(__ldg(&P.ops[dep].nblocks));
+          const int dep = od.deps[k] & 0xffff;
+          const uint32_t need = static_cast<uint32_t>(od.deps[k]) >> 16;
           while (ld_acquire(&P.done[dep]) < need) {
           }
         }
