@@ -152,11 +152,19 @@ int run_family(const DenseProb::Params& pp, const DenseEpi::Params& ep, hipStrea
   const Variant* v = Family<kKind, kArch>::variants(n);
   const int arch = lx_arch();
   int pick = lx_tune_get(Family<kKind, kArch>::name(), pp.M, pp.N, pp.K);
-  if (pick < 0 || pick >= n || v[pick].min_arch > arch) {
+  const int lds = lx_lds_limit();
+  if (pick < 0 || pick >= n || v[pick].min_arch > arch || v[pick].smem > lds) {
     const char* want = default_tile(kKind, pp.M, pp.N);
     pick = 0;
     for (int i = 0; i < n; ++i)
       if (!std::strcmp(v[i].name, want)) pick = i;
+    // A tile whose LDS does not fit this device cannot launch: take the first one that does.
+    if (v[pick].smem > lds)
+      for (int i = 0; i < n; ++i)
+        if (v[i].smem <= lds && v[i].split == 1) {
+          pick = i;
+          break;
+        }
     const int k_tile = lx::tc::Config<kKind, kArch, 32, 128, 1, 4, 4, (kKind == kF4 ? 64 : 128)>::kKTile;
     const int tiles = ((pp.M + 31) / 32) * ((pp.N + 127) / 128);
     const int split = v[pick].bm == 32 ? split_for(kKind, tiles, (pp.K + k_tile - 1) / k_tile, arch) : 1;

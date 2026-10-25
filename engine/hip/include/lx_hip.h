@@ -36,10 +36,20 @@
 #define LX_WARP 32
 #endif
 
-#if LX_WARP == 64
-#define LX_FULL_MASK 0xffffffffffffffffull
+// HIP takes a 64-bit warp mask on every AMD target, wave32 included (it truncates to the wave), so the
+// AMD mask is 64 bits. The NVIDIA shim keeps CUDA's 32-bit mask.
+#if defined(LX_NVIDIA_SHIM)
+#define LX_FULL_MASK 0xffffffffu
+using lx_mask_t = unsigned int;
 #else
-#define LX_FULL_MASK 0xffffffffull
+#define LX_FULL_MASK 0xffffffffffffffffull
+using lx_mask_t = unsigned long long;
+#endif
+
+// __grid_constant__ marks a kernel parameter read-only in CUDA's parameter space. ROCm keeps kernel
+// arguments in the kernarg segment already, so the qualifier has no meaning there.
+#ifndef __grid_constant__
+#define __grid_constant__
 #endif
 
 // ---- bf16 pairs -------------------------------------------------------------------------------------
@@ -127,7 +137,10 @@ __device__ __forceinline__ uint64_t lx_global_ns() {
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
   return t;
 #else
-  return static_cast<uint64_t>(__builtin_amdgcn_s_memrealtime()) * 10u;
+  // The constant-rate wall clock (HIP's wall_clock64): s_memrealtime on gfx9, the realtime message on RDNA.
+  // The device reports its rate as hipDeviceAttributeWallClockRate, 100 MHz on the targets this port
+  // builds, so each tick is 10 ns.
+  return static_cast<uint64_t>(__builtin_readsteadycounter()) * 10u;
 #endif
 }
 
@@ -145,20 +158,65 @@ __device__ __forceinline__ uint32_t lx_load_acquire_sys(const volatile uint32_t*
 
 template <typename T, typename M>
 __device__ __forceinline__ T lx_shfl_sync(M mask, T v, int src, int width = 32) {
-  return __shfl_sync(mask, v, src, width);
+  return __shfl_sync(static_cast<lx_mask_t>(mask), v, src, width);
 }
 template <typename T, typename M>
 __device__ __forceinline__ T lx_shfl_xor_sync(M mask, T v, int lane_mask, int width = 32) {
-  return __shfl_xor_sync(mask, v, lane_mask, width);
+  return __shfl_xor_sync(static_cast<lx_mask_t>(mask), v, lane_mask, width);
 }
 template <typename T, typename M>
 __device__ __forceinline__ T lx_shfl_down_sync(M mask, T v, unsigned delta, int width = 32) {
-  return __shfl_down_sync(mask, v, delta, width);
+  return __shfl_down_sync(static_cast<lx_mask_t>(mask), v, delta, width);
 }
 template <typename T, typename M>
 __device__ __forceinline__ T lx_shfl_up_sync(M mask, T v, unsigned delta, int width = 32) {
-  return __shfl_up_sync(mask, v, delta, width);
+  return __shfl_up_sync(static_cast<lx_mask_t>(mask), v, delta, width);
 }
+
+// The most LDS one workgroup may use on the current device. On AMD that is the hardware limit (the
+// SDK compiler reports 65536 bytes on gfx942, gfx1100 and gfx1201). The NVIDIA shim keeps its opt-in
+// sizes, so it has no cap here.
+#if defined(LX_NVIDIA_SHIM)
+inline int lx_lds_limit() { return 0x7fffffff; }
+#else
+inline int lx_lds_limit() {
+  int dev = 0, v = 0;
+  hipGetDevice(&dev);
+  if (hipDeviceGetAttribute(&v, hipDeviceAttributeMaxSharedMemoryPerBlock, dev) != hipSuccess || v <= 0)
+    return 65536;
+  return v;
+}
+#endif
+
+// cudaFuncSetAttribute takes the kernel itself, a template instance; hipFuncSetAttribute takes a
+// const void*. The carveout preference splits L1 against shared memory on NVIDIA. An AMD part has a fixed
+// LDS, so there the preference is accepted and changes nothing.
+#if !defined(LX_NVIDIA_SHIM)
+#ifndef hipSharedmemCarveoutMaxShared
+#define hipSharedmemCarveoutMaxShared 100
+#endif
+#endif
+
+template <typename F>
+inline hipError_t lx_func_set_attribute(F func, hipFuncAttribute attr, int value) {
+#if !defined(LX_NVIDIA_SHIM)
+  if (attr == hipFuncAttributePreferredSharedMemoryCarveout) return hipSuccess;
+#endif
+  return hipFuncSetAttribute(reinterpret_cast<const void*>(func), attr, value);
+}
+
+#if !defined(LX_NVIDIA_SHIM)
+// CUDA's cache-volatile load (ld.global.cv): a volatile load reads memory, not a cached copy.
+template <typename T>
+__device__ __forceinline__ T __ldcv(const T* p) {
+  return *static_cast<const volatile T*>(p);
+}
+// The 32-bit shared-window address of an LDS pointer is the low 32 bits of the flat pointer, the same
+// convention the port's smem_addr uses.
+__device__ __forceinline__ uint32_t __cvta_generic_to_shared(const void* p) {
+  return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(p));
+}
+#endif
 
 // ---- Warp functions over a 32-lane group -----------------------------------------------------------
 // The CUDA intrinsics with a 32-bit full mask, as the port runs them. Each reduces or matches within
