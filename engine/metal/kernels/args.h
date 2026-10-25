@@ -466,3 +466,73 @@ struct Bf16xArgs {
   lx_i64 rows;
   int K;
 };
+
+// ---- offload ------------------------------------------------------------------------------------
+// The offload structs (lx_expert_ref, lx_offload_state, the mailbox) hold the ABI's pointers, which on
+// Metal are CPU addresses. A kernel translates each one before it dereferences it, through an OxMap:
+// the device registry's ranges (a sorted table in device memory), then a few ranges wrapped for this
+// dispatch alone (unregistered host memory, which only the kernel tests pass). Refs the kernels write
+// (a plan's src and fill) stay CPU addresses, as the ABI says.
+#define LX_OX_EXTRAS 48
+struct OxRange {
+  lx_u64 lo, hi;      // CPU addresses [lo, hi)
+  LX_PTR(uchar) gpu;  // the GPU address of lo
+};
+struct OxMap {
+  LX_CPTR(OxRange) table;  // sorted by lo; registrations may overlap
+  int table_n, extra_n;
+  OxRange extra[LX_OX_EXTRAS];
+};
+// lx_expert_ref and lx_offload_state with their pointers as CPU addresses (the host checks the layout).
+struct OxRef {
+  lx_u64 gate_up, gate_up_scale, down, down_scale;
+};
+struct OxState {
+  int n_layers, n_experts, top_k, L, I, type;
+  lx_u64 vram_slot, host_slot, cpu_first, layer_first, layer_pinned, slot_expert, slot_stamp, slot_prefetched, clock;
+  OxRef vram_pool, host_pool;
+  lx_i64 gate_up_stride, gate_up_scale_stride, down_stride, down_scale_stride;
+  int max_cpu_pairs;
+  float cpu_fraction;
+  int fill;
+  lx_u64 mailbox, cpu_latent, cpu_result, job_seq, job_pending, error, counters;
+};
+// Routed experts through per-pair refs: decode (src, fill [P]) or grouped (groups [G], offsets, pairs).
+struct OxExpertsArgs {
+  LX_CPTR(ushort) latent;  // bf16 [T, L]
+  LX_CPTR(float) weights;  // [T, top_k]
+  LX_CPTR(OxRef) refs;     // src [P], or groups [G]
+  LX_CPTR(OxRef) fill;     // [P] or 0
+  LX_CPTR(int) offsets;    // grouped: [G + 1]
+  LX_CPTR(int) pairs;
+  LX_PTR(ushort) inter;    // workspace: bf16 [P, I]
+  LX_PTR(float) partial;   // workspace: f32 [P, L] (grouped)
+  LX_PTR(float) out;       // [T, L]
+  int T, L, I, top_k, rows, n;
+  OxMap map;
+};
+struct OxCopyArgs {
+  LX_CPTR(OxRef) src;
+  LX_CPTR(OxRef) dst;
+  LX_CPTR(int) count;
+  lx_i64 gu_bytes, gus_bytes, dn_bytes, dns_bytes;
+  OxMap map;
+};
+// The cache kernels: plan (src, fill), join (out), prefetch (src, dst = fill, count).
+struct OxCacheArgs {
+  LX_CPTR(int) ids;  // plan: routing [T, top_k]; prefetch: predicted [n]
+  LX_CPTR(float) weights;
+  LX_CPTR(ushort) latent;
+  LX_CPTR(OxState) state;
+  LX_PTR(OxRef) src;
+  LX_PTR(OxRef) fill;
+  LX_PTR(int) count;
+  LX_PTR(float) out;
+  int layer, T, L, n;
+  OxMap map;
+};
+struct OxProbeArgs {
+  LX_CPTR(uint4) src;
+  LX_PTR(ulong) sink;
+  lx_i64 n;  // 16-byte loads
+};

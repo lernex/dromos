@@ -11,11 +11,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <thread>
 
 #include "metal/kernels/args.h"
 
@@ -52,7 +55,8 @@ size_t page_size() {
   return p;
 }
 
-// The end of the virtual memory region holding address a (0 if it is not mapped).
+}  // namespace
+
 uintptr_t region_end(uintptr_t a, size_t limit) {
   // The kernel keeps a large anonymous allocation as several map entries (of 128 MB on macOS), so the
   // entries that follow without a gap and stay readable belong to the same range.
@@ -73,6 +77,8 @@ uintptr_t region_end(uintptr_t a, size_t limit) {
   }
   return end;
 }
+
+namespace {
 
 // Errors from command buffers that failed on the GPU, reported by the next sync and lx_rt_last_error.
 std::atomic<int> g_async_error{0};
@@ -312,6 +318,7 @@ int Device::alloc(void** ptr, size_t bytes) {
     const auto at = std::lower_bound(entries_.begin(), entries_.end(), base,
                                      [](const auto& e, uintptr_t v) { return e.first < v; });
     entries_.insert(at, {base, Entry{b, rounded, true}});
+    ++generation_;
     [residency_ addAllocation:b];
     [residency_ commit];
   }
@@ -332,6 +339,7 @@ int Device::map_host(void* ptr, size_t bytes) {
   const auto at = std::lower_bound(entries_.begin(), entries_.end(), lo,
                                    [](const auto& e, uintptr_t v) { return e.first < v; });
   entries_.insert(at, {lo, Entry{b, hi - lo, false}});
+  ++generation_;
   [residency_ addAllocation:b];
   [residency_ commit];
   return kOk;
@@ -353,6 +361,7 @@ int Device::release(uintptr_t key, bool owned) {
       [residency_ removeAllocation:it->second.buffer];
       [residency_ commit];
       entries_.erase(it);
+      ++generation_;
       return kOk;
     }
   }
@@ -407,6 +416,29 @@ id<MTLBuffer> Device::lookup(const void* p, size_t bytes, uintptr_t* base) {
   return nil;
 }
 
+id<MTLBuffer> Device::table(int* n) {
+  std::lock_guard<std::mutex> g(mu_);
+  if (table_generation_ != generation_) {
+    // A new buffer each time: command buffers and graphs that hold the old one keep reading it.
+    const size_t count = entries_.size();
+    id<MTLBuffer> b = [device_ newBufferWithLength:std::max<size_t>(count, 1) * sizeof(OxRange) options:kShared];
+    if (!b) {
+      *n = 0;
+      return nil;
+    }
+    auto* rows = static_cast<OxRange*>(b.contents);
+    for (size_t i = 0; i < count; ++i) {
+      const auto& [base, e] = entries_[i];
+      rows[i] = OxRange{base, base + e.bytes, e.buffer.gpuAddress};
+    }
+    table_ = b;
+    table_n_ = static_cast<int>(count);
+    table_generation_ = generation_;
+  }
+  *n = table_n_;
+  return table_;
+}
+
 size_t weight_data_bytes(lx_wtype type, int64_t N, int64_t K) {
   switch (type) {
     case LX_W_BF16: return static_cast<size_t>(N * K * 2);
@@ -433,6 +465,7 @@ size_t weight_scale_bytes(lx_wtype type, int64_t N, int64_t K) {
 
 Stream::Stream(id<MTLCommandQueue> queue) : queue_(queue) {
   timeline_ = [Device::get().mtl() newSharedEvent];
+  chain_ = [Device::get().mtl() newEvent];
   Device::get().add_stream(this);
 }
 
@@ -445,8 +478,10 @@ Stream::~Stream() {
 void Stream::open() {
   if (cb_) return;
   cb_ = [queue_ commandBufferWithUnretainedReferences];
-  // Untracked buffers: nothing orders this command buffer after the previous one but this wait.
-  if (committed_ > 0) [cb_ encodeWaitForEvent:timeline_ value:committed_];
+  // Untracked buffers: nothing orders this command buffer after the previous one but this wait. It is
+  // on the GPU-only twin of the timeline: on the M5 a wait on a shared event costs 230-440 us per
+  // command buffer when the GPU is not busy (20-28 us on an MTLEvent), measured from cold.
+  if (committed_ > 0) [cb_ encodeWaitForEvent:chain_ value:committed_];
   for (const auto& [event, value] : waits_) [cb_ encodeWaitForEvent:event value:value];
   waits_.clear();
   enc_ = [cb_ computeCommandEncoderWithDispatchType:serial() ? MTLDispatchTypeSerial : MTLDispatchTypeConcurrent];
@@ -515,6 +550,126 @@ uint64_t Stream::address(const void* p, size_t bytes, bool write) {
   }
   wraps_.push_back(Wrap{lo, hi, b});
   return b.gpuAddress + (a - lo);
+}
+
+void Stream::touch_all() {
+  if (!serial()) taking_.push_back(Access{0, UINTPTR_MAX, true});
+}
+
+uint64_t Stream::retain(id<MTLBuffer> buffer) {
+  if (!buffer) return 0;
+  if (graph_) {
+    if (std::find(graph_->keep.begin(), graph_->keep.end(), buffer) == graph_->keep.end())
+      graph_->keep.push_back(buffer);
+    return buffer.gpuAddress;
+  }
+  open();
+  for (const Wrap& w : wraps_)
+    if (w.buffer == buffer) return buffer.gpuAddress;
+  [enc_ useResource:buffer usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+  wraps_.push_back(Wrap{0, 0, buffer});  // an empty range: kept until the command buffer finishes, never reused
+  return buffer.gpuAddress;
+}
+
+void Stream::cut() {
+  if (graph_) {
+    Command c;
+    c.kind = Command::kCut;
+    graph_->commands.push_back(std::move(c));
+    return;
+  }
+  cut_ = flush();
+}
+
+void Stream::mailbox_wait(const void* state) {
+  if (graph_) {
+    Command c;
+    c.kind = Command::kMailbox;
+    c.state = state;
+    graph_->commands.push_back(std::move(c));
+    return;
+  }
+  const uint64_t ticket = schedule_mailbox(cut_, state);
+  wait_here(mailbox_, ticket, nullptr);
+}
+
+void Stream::wait_here(id<MTLEvent> event, uint64_t value, const std::vector<id<MTLBuffer>>* keep) {
+  if (!cb_) {
+    waits_.emplace_back(event, value);
+    return;
+  }
+  // A new encoder after the wait; untracked buffers need the fence to order it after the one before.
+  if (!fence_) fence_ = [Device::get().mtl() newFence];
+  [enc_ updateFence:fence_];
+  [enc_ endEncoding];
+  [cb_ encodeWaitForEvent:event value:value];
+  enc_ = [cb_ computeCommandEncoderWithDispatchType:serial() ? MTLDispatchTypeSerial : MTLDispatchTypeConcurrent];
+  [enc_ waitForFence:fence_];
+  for (const Wrap& w : wraps_) [enc_ useResource:w.buffer usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+  if (keep)
+    for (id<MTLBuffer> b : *keep) [enc_ useResource:b usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+  bound_ = nil;
+  reads_.clear();
+  writes_.clear();
+}
+
+namespace {
+
+// Reads a 32-bit word the CPU worker or the GPU writes.
+uint32_t load_word(uint64_t address) {
+  return __atomic_load_n(reinterpret_cast<const uint32_t*>(address), __ATOMIC_ACQUIRE);
+}
+
+// Waits until `event` reaches `value`. The plan's command buffer is short, and a blocked wait wakes about
+// 100 us after the signal on the M5 (measured: a decode layer's join cost 185 us with it, 86 us spinning),
+// so this spins first and blocks only past half a millisecond.
+void await_value(id<MTLSharedEvent> event, uint64_t value) {
+  const auto start = std::chrono::steady_clock::now();
+  while (event.signaledValue < value) {
+    if (std::chrono::steady_clock::now() - start > std::chrono::microseconds(500)) {
+      [event waitUntilSignaledValue:value timeoutMS:600000];
+      return;
+    }
+  }
+}
+
+// Waits until the CPU lane answered the job the plan posted, if it posted one: done == job_seq, or ten
+// seconds (the worker is gone; ox_join then flags the error). The plan's command buffer has finished.
+void wait_for_cpu_lane(const void* state) {
+  const auto* st = static_cast<const lx_offload_state*>(state);
+  const auto pending = reinterpret_cast<uint64_t>(st->job_pending);
+  const auto seq = reinterpret_cast<uint64_t>(st->job_seq);
+  const auto mailbox = reinterpret_cast<uint64_t>(st->mailbox);
+  if (!pending || !seq || !mailbox || !load_word(pending)) return;
+  const uint32_t want = load_word(seq);
+  const uint64_t done = mailbox + offsetof(lx_offload_mailbox, done);
+  const auto start = std::chrono::steady_clock::now();
+  while (load_word(done) != want) {
+    const auto waited = std::chrono::steady_clock::now() - start;
+    if (waited > std::chrono::seconds(10)) return;
+    // A job takes the worker a fraction of a millisecond or more: spin through that, then nap.
+    if (waited > std::chrono::microseconds(300)) std::this_thread::sleep_for(std::chrono::microseconds(20));
+  }
+}
+
+}  // namespace
+
+uint64_t Stream::schedule_mailbox(uint64_t after, const void* state) {
+  if (!mailbox_) {
+    mailbox_ = [Device::get().mtl() newSharedEvent];
+    poller_ = dispatch_queue_create("net.lernex.metal.offload", DISPATCH_QUEUE_SERIAL);
+  }
+  const uint64_t ticket = ++mailbox_ticket_;
+  id<MTLSharedEvent> timeline = timeline_, mailbox = mailbox_;
+  // The block runs once the plan's command buffer finished (its writes are then visible here), watches
+  // the mailbox and lets the waiting work go, often before the GPU gets there: the experts run between.
+  // One queue per stream: tickets are signaled in order.
+  dispatch_async(poller_, ^{
+    await_value(timeline, after);
+    wait_for_cpu_lane(state);
+    mailbox.signaledValue = ticket;
+  });
+  return ticket;
 }
 
 static bool skipped(id<MTLComputePipelineState> pipeline) {
@@ -603,6 +758,7 @@ uint64_t Stream::flush() {
   if (!cb_) return committed_;
   [enc_ endEncoding];
   const uint64_t value = ++committed_;
+  [cb_ encodeSignalEvent:chain_ value:value];
   [cb_ encodeSignalEvent:timeline_ value:value];
   Profile* profile = Profile::get();
   const int dispatches = pending_;
@@ -649,12 +805,13 @@ uint64_t Stream::flush() {
 
 bool Stream::done(uint64_t value) const { return timeline_.signaledValue >= value; }
 
-int Stream::wait_for(id<MTLSharedEvent> event, uint64_t value) {
-  if (event == timeline_ || value == 0 || event.signaledValue >= value) return kOk;  // already ordered, or done
+int Stream::wait_for(Stream* other, uint64_t value) {
+  if (other == this || value == 0 || other->done(value)) return kOk;  // already ordered, or done
   if (graph_) return note(kNotSupported);  // a recording is one stream's work
-  // The work so far goes now; the next command buffer, which holds whatever comes after, waits.
+  // The work so far goes now; the next command buffer, which holds whatever comes after, waits on the
+  // other stream's GPU-only event (a shared event's wait is the slow kind, see open()).
   flush();
-  waits_.emplace_back(event, value);
+  waits_.emplace_back(other->chain_, value);
   return kOk;
 }
 
@@ -736,6 +893,18 @@ void Stream::replay(const Graph& graph) {
   // A step usually starts on an idle GPU: the first few commands go at once, the rest in the usual chunks.
   int limit = std::min(flush_interval(), 16);
   for (const Command& c : graph.commands) {
+    if (c.kind == Command::kCut) {
+      cut_ = flush();
+      open();
+      for (id<MTLBuffer> b : graph.keep) [enc_ useResource:b usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+      continue;
+    }
+    if (c.kind == Command::kMailbox) {
+      if (!cb_) open();  // nothing to wait in front of otherwise
+      const uint64_t ticket = schedule_mailbox(cut_, c.state);
+      wait_here(mailbox_, ticket, &graph.keep);
+      continue;
+    }
     if (profile_timed()) {
       timed_encoder(c.pipeline, &graph.keep);
     } else if (!serial() && (c.barrier || (first && after))) {
@@ -1065,7 +1234,7 @@ int lx_rt_stream_wait(void* stream, void* event) {
   auto* e = static_cast<Event*>(event);
   if (!e) return note(kInvalidValue);
   if (!e->stream) return kOk;  // never recorded: nothing to wait for
-  return stream_of(stream)->wait_for(e->stream->timeline(), e->value);
+  return stream_of(stream)->wait_for(e->stream, e->value);
 }
 
 }  // extern "C"

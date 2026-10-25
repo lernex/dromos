@@ -66,7 +66,9 @@ if DEVICE == "cpu":
     torch.Generator = _HostGenerator
     torch.cuda.current_stream = lambda *a, **k: _HostStream()
     torch.cuda.synchronize = _device_sync
-    torch.Tensor.cuda = lambda self, *a, **k: self
+    # On a GPU, .cuda() of a host tensor is a copy in device memory, and tests rely on it being separate
+    # from the original (they zero or overwrite the device copy). On the CPU it has to be a copy too.
+    torch.Tensor.cuda = lambda self, *a, **k: self.clone()
 
 F32, BF16 = 0, 1
 DTYPE = {torch.float32: F32, torch.bfloat16: BF16}
