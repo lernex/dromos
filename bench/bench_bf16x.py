@@ -142,6 +142,7 @@ SHAPES = [  # (N, K, what) of every Praxis decode GEMV
     (256, 2048, "memory state_write, query"),
     (2048, 256, "memory output"),
     (256, 6400, "memory route_projection"),
+    (8, 2048, "attention pass_lora_down"),
 ]
 
 

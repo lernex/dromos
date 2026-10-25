@@ -4,12 +4,12 @@ on PyTorch CUDA tensors, and compare against a PyTorch reference written beside 
 LX_KERNELS points at build/liblernex_kernels.so (scripts/remote.sh sets it).
 
 The same tests run against any backend library. LX_BACKEND=cpu (with LX_KERNELS pointing at
-liblernex_cpu.so) runs them on CPU tensors: every tensor the tests create on "cuda" is created on the
-CPU instead, torch.cuda's stream and synchronize calls become the backend's (the CPU's streams are
-synchronous), and the kernels get host pointers. The tests themselves are unchanged. LX_BACKEND=metal
-(liblernex_metal.dylib) runs the same way: Metal reads host memory in place (unified memory), and
-every call is followed by a stream sync (torch.cuda.synchronize waits for the device). Without LX_BACKEND,
-the library's name picks the backend.
+liblernex_cpu.so) runs them on CPU tensors: every tensor (and generator) the tests create on "cuda" is
+created on the CPU instead, .cuda() copies as it does on a GPU, torch.cuda's stream and synchronize calls
+become the backend's (the CPU's streams are synchronous), and the kernels get host pointers. The tests
+themselves are unchanged. LX_BACKEND=metal (liblernex_metal.dylib) runs the same way: Metal reads host
+memory in place (unified memory), and every call is followed by a stream sync (torch.cuda.synchronize
+waits for the device). Without LX_BACKEND, the library's name picks the backend.
 """
 
 import ctypes
@@ -56,16 +56,18 @@ if DEVICE == "cpu":
             _device_sync()
 
     class _HostGenerator(torch.Generator):
-        """torch.Generator(device="cuda") is a constructor, which the function mode does not see."""
+        """torch.Generator("cuda") as a CPU generator, for the CPU tensors it will draw into."""
 
-        def __new__(cls, device=None):
-            device = _host(device)
-            return super().__new__(cls) if device is None else super().__new__(cls, device)
+        def __new__(cls, device="cpu"):
+            return super().__new__(cls, _host(device))
+
+        def __init__(self, device="cpu"):
+            pass
 
     _CudaOnHost().__enter__()
-    torch.Generator = _HostGenerator
     torch.cuda.current_stream = lambda *a, **k: _HostStream()
     torch.cuda.synchronize = _device_sync
+    torch.Generator = _HostGenerator
     # On a GPU, .cuda() of a host tensor is a copy in device memory, and tests rely on it being separate
     # from the original (they zero or overwrite the device copy). On the CPU it has to be a copy too.
     torch.Tensor.cuda = lambda self, *a, **k: self.clone()

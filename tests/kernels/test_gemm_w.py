@@ -204,7 +204,7 @@ def test_gemm_w_split_k(lx, name, wtype, math, oldest, split):
     # at all, with partial tiles, bias, beta and padded strides; the sum over the cluster runs in rank
     # order, so two calls give the same bits.
     if BACKEND != "cuda":
-        pytest.skip("thread block clusters are CUDA's")
+        pytest.skip("the tile variants are the CUDA kernels'")
     have = native_arch(lx)
     if have < max(oldest, 90):
         pytest.skip("not on this GPU")

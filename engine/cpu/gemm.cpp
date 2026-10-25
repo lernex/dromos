@@ -33,6 +33,21 @@ void Epilogue::apply(const float* sums, int64_t ld_s, int64_t m0, int64_t m1, in
   }
 }
 
+void Epilogue::apply_d(const double* sums, int64_t ld_s, int64_t m0, int64_t m1, int64_t n0, int64_t n1) const {
+  for (int64_t m = m0; m < m1; ++m) {
+    const double* srow = sums + (m - m0) * ld_s;
+    const double xs = x_scale ? x_scale[m] : 1.0;
+    for (int64_t n = n0; n < n1; ++n) {
+      const double rf = row_factor ? row_factor[n] : row_factor_scalar;
+      float t = static_cast<float>(rf * xs * srow[n - n0]);
+      if (bias) t += load_as_f32(bias, bias_dtype, n);
+      float v = alpha * t;
+      if (beta != 0.0f) v = beta * load_as_f32(y, y_dtype, m * ld_y + n) + v;
+      store_from_f32(y, y_dtype, m * ld_y + n, v);
+    }
+  }
+}
+
 namespace {
 
 // Item shape: columns per item, and rows per item, so the pool has a few items per thread.
@@ -67,7 +82,7 @@ int product(const Product& p) {
   // Weight rows decoded per item: a few hundred KB, so the block stays in the core's L2.
   const int64_t panel_floats = std::min<int64_t>(nc * K, std::max<int64_t>(128 * 1024, 4 * K));
   parallel_for(items, 1, [&](int64_t i0, int64_t i1) {
-    float* sums = static_cast<float*>(scratch(sizeof(float) * mc * nc, 2));
+    float* sums = static_cast<float*>(scratch(sizeof(double) * mc * nc, 2));
     for (int64_t it = i0; it < i1; ++it) {
       const int64_t m0 = (it / n_items) * mc, n0 = (it % n_items) * nc;
       const int64_t m1 = std::min(p.M, m0 + mc), n1 = std::min(p.N, n0 + nc);
@@ -77,6 +92,12 @@ int product(const Product& p) {
           if (m1 - m0 > 8 && p.w.type != kW_F32) {
             a.panel = static_cast<float*>(scratch(sizeof(float) * panel_floats, 3));
             a.panel_floats = panel_floats;
+          }
+          if (p.exact) {
+            a.out_d = reinterpret_cast<double*>(sums);
+            k.dot_f32(a, m0, m1, n0, n1);
+            p.ep.apply_d(a.out_d, nc, m0, m1, n0, n1);
+            continue;
           }
           k.dot_f32(a, m0, m1, n0, n1);
           break;
@@ -134,13 +155,15 @@ void set_weight(Product& p, const lx_weight& w) {
   p.ep.row_factor_scalar = w.type == LX_W_NVFP4 ? w.global : 1.0f;
 }
 
-// The decode GEMV of every format: weight-only, f32 math, x read as it is.
+// The decode GEMV of every format: weight-only, f32 math, x read as it is. BF16X weights (lx_gemv_bf16x
+// only) run through the same product as BF16, so the two give the same bits.
 int gemv_any(const void* x, lx_dtype x_dtype, int ld_x, const lx_weight& w, const void* bias, lx_dtype bias_dtype, void* y,
              lx_dtype y_dtype, int ld_y, int M, int N, int K, float alpha, float beta) {
   if (M == 0 || N == 0) return kOk;
   if (M < 0 || M > 8 || K <= 0 || ld_x < K || ld_y < N) return fail(kInvalid);
   if (!valid_dtype(x_dtype) || !valid_dtype(y_dtype) || !valid_dtype(bias_dtype)) return fail(kInvalid);
-  if (!x || !y || !valid_weight(&w, K)) return fail(kInvalid);
+  const bool bf16x = w.type == LX_W_BF16X && w.data && K < bf16x::kMaxK;
+  if (!x || !y || !(bf16x || valid_weight(&w, K))) return fail(kInvalid);
   Product p;
   p.path = kPathF32;
   p.M = M;
@@ -199,7 +222,10 @@ int gemm_any(const void* x, int x_dtype, int64_t ld_x, const lx_weight& w, int m
   char* wsb = static_cast<char*>(ws);
   float* scales = reinterpret_cast<float*>(wsb);  // [M], first, so the rest stays 64-byte aligned
   char* rows = wsb + (M * 4 + 63) / 64 * 64;
-  const bool bf16_dot = k.dot_bf16 != nullptr && M > 8;
+  // The FP8 and FP4 maths multiply quantized values, so their dots are summed exactly (f32 rows, double
+  // sums); BF16 runs on the bf16 dot instructions where the level has them.
+  const bool quantized = math == LX_MATH_FP8 || math == LX_MATH_FP4;
+  const bool bf16_dot = k.dot_bf16 != nullptr && M > 8 && !quantized;
 
   if (math == LX_MATH_INT8) {
     int8_t* q = reinterpret_cast<int8_t*>(rows);
@@ -257,6 +283,7 @@ int gemm_any(const void* x, int x_dtype, int64_t ld_x, const lx_weight& w, int m
   } else {
     p.path = kPathF32;
     p.xf = xf;
+    p.exact = quantized;
   }
   return product(p);
 }
@@ -325,7 +352,32 @@ int lx_gemv_w(const void* x, lx_dtype x_dtype, int ld_x, const lx_weight* w, con
   LX_PROFILE("gemv_w");
   (void)stream;
   if (!w) return fail(kInvalid);
+  // Lossless bf16: the same contract, y equal bit for bit to the bf16 weights it encodes.
+  if (w->type == LX_W_BF16X)
+    return lx_gemv_bf16x(x, x_dtype, ld_x, w->data, bias, bias_dtype, y, y_dtype, ld_y, M, N, K, alpha, beta, stream);
   return gemv_any(x, x_dtype, ld_x, *w, bias, bias_dtype, y, y_dtype, ld_y, M, N, K, alpha, beta);
+}
+
+// Lossless BF16: the bf16 GEMV's product on the encoded rows (Row<kW_BF16X> in kern/isa.cpp hands the dot
+// the same bf16 values in the same lanes), so y is lx_gemv's to the bit while the weights stream at about
+// 12.2 bits a value instead of 16.
+int lx_gemv_bf16x(const void* x, lx_dtype x_dtype, int ld_x, const void* w, const void* bias, lx_dtype bias_dtype,
+                  void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K, float alpha, float beta, void* stream) {
+  LX_PROFILE("gemv_bf16x");
+  (void)stream;
+  if (M != 0 && N != 0 && (reinterpret_cast<uintptr_t>(w) & 7) != 0) return fail(kInvalid);
+  const lx_weight wt{LX_W_BF16X, w, nullptr, 1.0f, nullptr};
+  return gemv_any(x, x_dtype, ld_x, wt, bias, bias_dtype, y, y_dtype, ld_y, M, N, K, alpha, beta);
+}
+
+// The GPU's like-for-like baseline for BF16X; on the CPU it is lx_gemv itself.
+int lx_gemv_decode_bf16(const void* x, lx_dtype x_dtype, int ld_x, const void* w, const void* bias, lx_dtype bias_dtype,
+                        void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K, float alpha, float beta,
+                        void* stream) {
+  LX_PROFILE("gemv_decode_bf16");
+  (void)stream;
+  const lx_weight wt{LX_W_BF16, w, nullptr, 1.0f, nullptr};
+  return gemv_any(x, x_dtype, ld_x, wt, bias, bias_dtype, y, y_dtype, ld_y, M, N, K, alpha, beta);
 }
 
 int lx_gemm_w(const void* x, lx_dtype x_dtype, int ld_x, const lx_weight* w, lx_math math, const void* bias,
