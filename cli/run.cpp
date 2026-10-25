@@ -327,7 +327,8 @@ int cmd_run(int argc, char** argv) {
   runtime::EngineOptions engine_options;
   engine_options.prefix_cache = prefix_cache;
   cli::StartedEngine started =
-      cli::start_engine(model, 1, context, format.weights, engine_options, memory_fraction, format.bf16x);
+      cli::start_engine(model, 1, context, format.weights, engine_options, memory_fraction, format.bf16x,
+                        format.fast_math);
   const runtime::Plan& plan = started.plan;
   for (const std::string& note : plan.notes) std::fprintf(stderr, "%s\n", note.c_str());
   runtime::Engine& engine = *started.engine;

@@ -257,22 +257,33 @@ WeightRecipe recipe_for(lx_wtype target) {
   return r;
 }
 
+// The sm_120 family: the block-scaled FP4 and mixed e2m1 x e4m3 instructions the GEMM kernels use (gemm_w.cuh,
+// kind_for) exist there and nowhere else in this build.
+static bool sm120_family(const DeviceInfo& d) { return d.cc() >= 120 && d.cc() < 130; }
+
 // The default maths are BF16 for every format, on every device. KL against the FP32 reference on Praxis (tools/compare.py,
 // top-20, full prefill, chat_think / chat_direct_tools / prose): INT8 maths 0.0116 / 0.0308 / 0.0072 against 0.0034 /
 // 0.0156 / 0.0031 in BF16; FP8 maths 0.0075 / 0.0385 / 0.0080 against 0.0047 / 0.0319 / 0.0048; NVFP4 with FP8 dense
 // and FP4 experts 0.0441 / 0.1367 / 0.0199 against 0.0245 / 0.0874 / 0.0107. BF16 maths give up 1 to 7 percent of
-// decode at 32 streams and 10 to 19 percent of prefill, and every format still beats BF16 on both. The quantized maths
-// stay one LX_PREFILL away, for measuring them.
-lx_math native_math(lx_wtype, const DeviceInfo&) { return LX_MATH_BF16; }
+// decode at 32 streams and 10 to 19 percent of prefill, and every format still beats BF16 on both.
+lx_math native_math(lx_wtype format, const DeviceInfo& d, bool fast) {
+  if (!fast) return LX_MATH_BF16;
+  switch (format) {
+    case LX_W_INT8: return d.int8_mma ? LX_MATH_INT8 : LX_MATH_BF16;
+    case LX_W_FP8: return d.fp8_mma ? LX_MATH_FP8 : LX_MATH_BF16;
+    case LX_W_NVFP4: return sm120_family(d) ? LX_MATH_FP4 : LX_MATH_BF16;
+    default: return LX_MATH_BF16;
+  }
+}
 
-lx::ModelFormats model_formats(lx_wtype target, const DeviceInfo& d, bool bf16x_decode) {
+lx::ModelFormats model_formats(lx_wtype target, const DeviceInfo& d, bool bf16x_decode, bool fast) {
   const WeightRecipe r = recipe_for(target);
   lx::ModelFormats f;
   f.dense = r.dense;
   f.experts = r.experts;
   f.latent_up = r.latent_up;
-  f.prefill_math = native_math(r.dense, d);
-  f.expert_math = native_math(r.experts, d);
+  f.prefill_math = native_math(r.dense, d, fast);
+  f.expert_math = native_math(r.experts, d, fast);
   f.bf16x_decode = bf16x_decode && target == LX_W_BF16;
   return f;
 }
@@ -376,9 +387,24 @@ double decode_bytes_per_token(const MetisConfig& c, lx_wtype target, bool bf16x_
   return per_pass * c.num_passes + head_read + 2.0 * static_cast<double>(state_bytes_per_slot(c));
 }
 
+// The share of the card's bandwidth one stream's decode reaches on each path: the tokens per second the kernels measure
+// (Praxis on an RTX 5070 Ti, bench at one stream, 2026-10-24) times the bytes a token reads, over the card's bandwidth.
+// The decode estimates scale the card's bandwidth by these, so a note never promises more than the kernels deliver.
+double decode_efficiency(lx_wtype target, bool bf16x_decode) {
+  constexpr double kBF16 = 0.577, kBF16X = 0.512, kINT8 = 0.5, kFP8 = 0.5, kNVFP4 = 0.5;
+  switch (target) {
+    case LX_W_BF16: return bf16x_decode ? kBF16X : kBF16;
+    case LX_W_BF16X: return kBF16X;
+    case LX_W_INT8: return kINT8;
+    case LX_W_FP8: return kFP8;
+    case LX_W_NVFP4: return kNVFP4;
+    default: return kBF16;
+  }
+}
+
 double decode_ceiling_tps(const DeviceInfo& d, const MetisConfig& c, lx_wtype target, bool bf16x_decode) {
   const double bytes = decode_bytes_per_token(c, target, bf16x_decode);
-  return d.bandwidth_gbs > 0 && bytes > 0 ? d.bandwidth_gbs * 1e9 / bytes : 0.0;
+  return d.bandwidth_gbs > 0 && bytes > 0 ? d.bandwidth_gbs * 1e9 * decode_efficiency(target, bf16x_decode) / bytes : 0.0;
 }
 
 size_t state_bytes_per_slot(const MetisConfig& c) {
@@ -508,6 +534,15 @@ std::string recipe_text(lx_wtype target) {
 
 }  // namespace
 
+// The products' maths as lernex doctor names them: one name, or the dense and the expert ones.
+std::string maths_text(const lx::ModelFormats& f) {
+  auto name = [](lx_math m) {
+    return m == LX_MATH_INT8 ? "INT8" : m == LX_MATH_FP8 ? "FP8" : m == LX_MATH_FP4 ? "FP4" : "BF16";
+  };
+  if (f.prefill_math == f.expert_math) return name(f.prefill_math);
+  return std::string("dense ") + name(f.prefill_math) + ", experts " + name(f.expert_math);
+}
+
 Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& ck, const PlanRequest& req) {
   if (!d.built)
     throw std::runtime_error("this build has no kernels for sm_" + std::to_string(d.real_cc()) +
@@ -548,7 +583,7 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
     Fit f;
     f.format = format;
     f.bf16x = bf16x;
-    f.formats = model_formats(format, d, bf16x);
+    f.formats = model_formats(format, d, bf16x, req.fast_math);
     f.wb = weight_bytes(c, format, bf16x);
     f.need = f.wb.total() + scratch_bytes(c, kMinStepTokens, 0, f.formats) +
              static_cast<size_t>(want_slots) * (per_slot_state + per_position * static_cast<size_t>(floor_ctx));
@@ -587,6 +622,9 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
     if (f == LX_W_BF16 && bf16x_kernels) o.bf16x_bytes = weight_bytes(c, f, true).bf16x;
     o.fits = attempt(f, false, useful_slots, kUsefulContext).ok;
     o.decode_ceiling_tps = decode_ceiling_tps(d, c, f, f == LX_W_BF16 && bf16x_kernels);
+    o.maths = maths_text(model_formats(f, d, false));
+    const std::string fast = maths_text(model_formats(f, d, false, true));
+    o.fast_maths = fast == o.maths ? std::string("-") : fast;
     options.push_back(o);
   }
   // The narrower format to name when this plan is slower than it needs to be: of the ones this file loads into
@@ -725,7 +763,8 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
     p.prefix_host_bytes = kPrefixHostBytes;
   }
   const double active = decode_bytes_per_token(c, target, p.bf16x_decode);
-  if (d.bandwidth_gbs > 0 && active > 0) p.decode_ceiling_tps = d.bandwidth_gbs * 1e9 / active;
+  if (d.bandwidth_gbs > 0 && active > 0)
+    p.decode_ceiling_tps = d.bandwidth_gbs * 1e9 * decode_efficiency(target, p.bf16x_decode) / active;
 
   // Notes, in the order a person reads them.
   p.reason = describe_load();
@@ -744,7 +783,7 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
                 std::to_string(p.kv_capacity) + "; --no-bf16x keeps them.");
   n.push_back("Dense products multiply in " + math_name(p.prefill_math) + "; routed experts in " +
               math_name(p.expert_math) + ".");
-  if (p.prefill_math == LX_MATH_BF16 && p.recipe.dense != LX_W_BF16 && p.recipe.dense != LX_W_BF16X)
+  if (req.fast_math && p.prefill_math == LX_MATH_BF16 && p.recipe.dense != LX_W_BF16 && p.recipe.dense != LX_W_BF16X)
     n.push_back("This GPU has no tensor-core instruction for " + format_name(p.recipe.dense) +
                 " math, so the weights are expanded in registers and multiplied in BF16.");
   n.push_back("Up to " + std::to_string(p.max_slots) + " sequences, " + std::to_string(p.kv_capacity) +
@@ -755,9 +794,14 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
   if (p.decode_ceiling_tps > 0) {
     char buf[200];
     std::snprintf(buf, sizeof buf,
-                  "One stream reads about %s per token, so bandwidth caps it near %.0f tokens per second.",
+                  "One stream reads about %s per token, so it decodes at about %.0f tokens per second.",
                   mb(static_cast<size_t>(active)).c_str(), p.decode_ceiling_tps);
     n.push_back(buf);
+  }
+  if (!req.fast_math) {
+    const std::string fast = maths_text(model_formats(target, d, p.bf16x_decode, true));
+    if (fast != maths_text(p.formats()))
+      n.push_back("--fast-math multiplies in " + fast + " instead: faster prefill, less accurate than BF16.");
   }
   if (const FormatOption* o = faster(p.decode_ceiling_tps))
     n.push_back("--weights " + weights_flag(o->format) +

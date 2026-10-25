@@ -1,11 +1,22 @@
 cmake_minimum_required(VERSION 3.28)
+if(APPLE)
+  set(APPLE_DEFAULT ON)
+  set(NOT_APPLE_DEFAULT OFF)
+else()
+  set(APPLE_DEFAULT OFF)
+  set(NOT_APPLE_DEFAULT ON)
+endif()
 # Backends: each is one shared library exporting every lx_* function of engine/cuda/kernels.h.
-#   LX_BACKEND_CUDA  liblernex_kernels.so plus the CUDA runtime, model and CLI (the default)
-#   LX_BACKEND_CPU   liblernex_cpu.so, x86 (AVX2, AVX-VNNI, AVX-512) and ARM (NEON, dot product, I8MM,
-#                    BF16), no CUDA needed: cmake -DLX_BACKEND_CUDA=OFF -DLX_BACKEND_CPU=ON. Built by
-#                    default next to CUDA too: the offload runtime loads it for its CPU lane.
-option(LX_BACKEND_CUDA "Build the CUDA backend, model and CLI" ON)
-option(LX_BACKEND_CPU "Build the CPU backend (liblernex_cpu.so)" ON)
+#   LX_BACKEND_CUDA   liblernex_kernels.so (the default off macOS)
+#   LX_BACKEND_CPU    liblernex_cpu.so, x86 (AVX2, AVX-VNNI, AVX-512) and ARM (NEON, dot product, I8MM,
+#                     BF16), no CUDA needed: cmake -DLX_BACKEND_CUDA=OFF -DLX_BACKEND_CPU=ON. Built by
+#                     default next to CUDA too: the offload runtime loads it for its CPU lane.
+#   LX_BACKEND_METAL  liblernex_metal.dylib, Apple silicon GPUs (the default on macOS; engine/metal)
+# The model, runtime and CLI (lernex) link no backend and build with any of them: lernex opens one at run
+# time (engine/dispatch).
+option(LX_BACKEND_CUDA "Build the CUDA backend" ${NOT_APPLE_DEFAULT})
+option(LX_BACKEND_CPU "Build the CPU backend (liblernex_cpu.so)" ${NOT_APPLE_DEFAULT})
+option(LX_BACKEND_METAL "Build the Metal backend (liblernex_metal.dylib)" ${APPLE_DEFAULT})
 
 # The CUDA architectures this build compiles for, chosen with -DLX_ARCHS:
 #   120a-real  the development default (RTX 50), so an edit-compile loop stays fast
@@ -26,6 +37,10 @@ if(LX_BACKEND_CUDA)
   set(CMAKE_CUDA_ARCHITECTURES ${LX_ARCH_LIST})
 endif()
 project(lernex_engine LANGUAGES CXX)
+if(LX_BACKEND_METAL)
+  enable_language(OBJCXX)
+  set(CMAKE_OBJCXX_STANDARD 20)
+endif()
 
 # The compute capabilities this build has code for (80, 86, 89, 90, 100, 120), for the device report.
 set(LX_BUILT_ARCHS "")
@@ -44,6 +59,9 @@ endif()
 
 if(LX_BACKEND_CPU)
   add_subdirectory(engine/cpu)
+endif()
+if(LX_BACKEND_METAL)
+  include(engine/metal/metal.cmake)
 endif()
 
 # The dispatcher: the lx_* stubs the host calls, and the loader that opens one backend library at run time
@@ -73,22 +91,20 @@ target_include_directories(lernex_dispatch PUBLIC engine)
 target_compile_definitions(lernex_dispatch PRIVATE "LX_INSTALL_LIBDIR=\"${LX_INSTALL_LIBDIR}\"")
 target_link_libraries(lernex_dispatch PUBLIC ${CMAKE_DL_LIBS})
 
-if(NOT LX_BACKEND_CUDA)
-  return()
+if(LX_BACKEND_CUDA)
+  enable_language(CUDA)
+  set(CMAKE_CUDA_STANDARD 20)
+  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr -lineinfo")
+
+  find_package(CUDAToolkit REQUIRED)
+
+  # Every kernel, behind a C ABI (engine/cuda/kernels.h) so the tests can call them through ctypes.
+  file(GLOB LX_CUDA_SOURCES CONFIGURE_DEPENDS engine/cuda/*.cu)
+  add_library(lernex_kernels SHARED ${LX_CUDA_SOURCES})
+  target_include_directories(lernex_kernels PUBLIC engine)
+  target_link_libraries(lernex_kernels PUBLIC CUDA::cudart CUDA::cublasLt)
 endif()
-
-enable_language(CUDA)
-set(CMAKE_CUDA_STANDARD 20)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr -lineinfo")
-
-find_package(CUDAToolkit REQUIRED)
-
-# Every kernel, behind a C ABI (engine/cuda/kernels.h) so the tests can call them through ctypes.
-file(GLOB LX_CUDA_SOURCES CONFIGURE_DEPENDS engine/cuda/*.cu)
-add_library(lernex_kernels SHARED ${LX_CUDA_SOURCES})
-target_include_directories(lernex_kernels PUBLIC engine)
-target_link_libraries(lernex_kernels PUBLIC CUDA::cudart CUDA::cublasLt)
 
 # The prefix cache snapshots the model's slot state. That needs MetisModel::save_slot and restore_slot,
 # which live in docs/handoff/serving-metis.diff until the lead applies it to engine/model/metis.cpp.
@@ -119,7 +135,7 @@ if(LX_CLI_SOURCES AND TARGET lernex_core)
   target_include_directories(lernex PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(lernex PRIVATE lernex_core)
   # The backend libraries are opened at run time from next to the executable, so the CLI builds them too.
-  foreach(backend lernex_kernels lernex_cpu)
+  foreach(backend lernex_kernels lernex_cpu lernex_metal)
     if(TARGET ${backend})
       add_dependencies(lernex ${backend})
     endif()

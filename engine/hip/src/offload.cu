@@ -742,6 +742,7 @@ int launch_decode(const void* latent, const float* weights, const lx_expert_ref*
   ox_gate_up<F><<<P * rows1, kThreads, 0, s>>>(static_cast<const bf16*>(latent), src, fill, inter, L, I, top_k, rows1);
   const int rows2 = (L + kWarps - 1) / kWarps;
   const size_t smem = static_cast<size_t>(top_k) * I * sizeof(bf16);
+  if (smem > static_cast<size_t>(lx_lds_limit())) return static_cast<int>(hipErrorInvalidValue);
   ox_down<F><<<T * rows2, kThreads, smem, s>>>(inter, weights, src, fill, out, L, I, top_k, rows2);
   return lx::launch_status();
 }

@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from conftest import DTYPE, F32
+from conftest import BACKEND, DTYPE, F32
 
 W_BF16 = 0
 METIS_SHAPES = [  # (N, K) of every Praxis decode product
@@ -414,6 +414,8 @@ def use_table(lib, which):
     """Clears the tuner, then for "shipped" applies the 5070 Ti table's GEMV entries the way the engine does."""
     lib.lx_tune_clear()
     if which == "shipped":
+        if BACKEND != "cuda":
+            pytest.skip("the shipped table is the 5070 Ti's")
         for e in json.loads(TUNING.read_text())["entries"]:
             if e["key"].startswith("gemv_w_") or e["key"].startswith("gemv_bf16x"):
                 status = lib.lx_tune_set(e["key"].encode(), e["M"], e["N"], e["K"], e["variant"])

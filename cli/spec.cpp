@@ -78,7 +78,8 @@ Loaded load(const std::string& dir, int slots, int max_tokens, const lx::cli::Fo
   l.config = lx::load_config(dir);
   if (offload) {
     const lx::runtime::Plan plan =
-        lx::cli::plan_for(lx::cli::find_model(dir, false), slots, 8192, format.weights, 0.92, format.bf16x);
+        lx::cli::plan_for(lx::cli::find_model(dir, false), slots, 8192, format.weights, 0.92, format.bf16x,
+                                          format.fast_math);
     if (plan.offload.enabled) {
       l.offloaded = lx::offload::OffloadedModel::load(dir, l.config, lx::runtime::offload_options(plan));
       l.model = std::make_unique<lx::MetisModel>(l.config, l.offloaded->weights(), plan.formats(), slots, 8192,

@@ -6,9 +6,15 @@ The reference follows the kernel's arithmetic in float64: the latent as the math
 quantized per token with the reference quantizer that test_quant_act checks bit for bit), the experts'
 weights dequantized from their stored format, the SwiGLU intermediate rounded to bf16, then that
 intermediate as the math sees it (quantized per pair row) through the down projection, weighted and summed
-per token. What is left is float32 accumulation order, the kernel's fast exp in silu, and the bf16 and
-quantization roundings those can tip, so the bound is relative to the output's magnitude: 2e-3, and 6e-3
-under FP4 math (an e2m1 step is a quarter of its block's scale, so a tipped intermediate moves further)."""
+per token. What is left is float32 accumulation order, the kernel's exp in silu (CUDA's fast __expf, Metal's
+exp), and the bf16 and quantization roundings those can tip, so the bound is relative to the output's
+magnitude: 2e-3 under BF16 and INT8 math, 6e-3 under FP4 math (an e2m1 step is a quarter of its block's
+scale, so a tipped intermediate moves further), and 8e-3 under FP8 math. Under FP8 the intermediate is
+rounded to e4m3 per pair row: one rounding flip of one intermediate moves its token's output row by up to
+about half a percent of the output's largest magnitude, and it can happen at any sequence length, since
+the chance of a flip grows with the number of rows. Measured on the Metal backend over 16 random cases
+(T = 1024 and 4096, skewed routing), the worst case was 5.3e-3, and every case over 2e-3 had a single row
+over it. 8e-3 leaves margin over that while still catching a systematic error, which moves every row."""
 
 import ctypes
 
@@ -137,10 +143,14 @@ def run(lx, case, math, T, L, I, E, top_k):
     return call_grouped(lx, latent, ids, weights, gu, dn, math, out, ws, T, L, I, E, top_k), out
 
 
+# Relative to the output's largest magnitude; the reasons are in the module docstring.
+TOLERANCE = {MATH_BF16: 2e-3, MATH_INT8: 2e-3, MATH_FP8: 8e-3, MATH_FP4: 6e-3}
+
+
 def check(out, case, math):
     latent, ids, weights, gu, dn = case
     want = reference(latent, ids, weights, gu, dn, math)
-    tol = (6e-3 if math == MATH_FP4 else 2e-3) * want.abs().max().item()
+    tol = TOLERANCE[math] * want.abs().max().item()
     close(out, want.float(), atol=tol)
 
 
@@ -287,3 +297,76 @@ def test_moe_grouped_rows_do_not_depend_on_the_batch(lx, name, wtype, math, olde
         assert status == 0, f"lx_moe_experts_grouped returned CUDA error {status}"
         for t in range(T):
             assert torch.equal(out[t], alone[t]), f"{name}: token {t} of a T={T} batch differs from the token alone"
+
+
+def native_family(lx, name):
+    """The variant family that runs pair `name` on this card, as moe_grouped.cu dispatches it."""
+    kind = {"bf16": "bf16", "w8a16_int8": "w8i8", "w8a16_fp8": "w8f8", "w4a16": "w4a16", "int8": "i8", "fp8": "f8",
+            "w4a8": "w4a8", "fp4": "f4"}[name]
+    names = (ctypes.c_char_p * 256)()
+    lx.lib.lx_tune_kernels.restype = ctypes.c_int
+    count = lx.lib.lx_tune_kernels(names, 256)
+    fams = [names[i].decode() for i in range(min(count, 256)) if names[i].decode().startswith(f"moe_grouped.{kind}.sm")]
+    have = native_arch(lx)
+    return max((f for f in fams if int(f.split(".sm")[1]) <= have), key=lambda f: int(f.split(".sm")[1])).encode()
+
+
+@pytest.mark.parametrize("skew", [False, True])
+@pytest.mark.parametrize("name,wtype,math,oldest", PAIRS)
+def test_moe_grouped_repeats_bit_for_bit(lx, name, wtype, math, oldest, skew):
+    # The engine rule, run to run: five calls at a prefill size with Praxis's widest routing (top 8) give the
+    # same bits, each from a fresh workspace full of garbage. Thousands of tiles write a token's pair rows in
+    # whatever order the GPU runs them; the sum over them must not show it.
+    if native_arch(lx) < oldest:
+        pytest.skip("not on this GPU")
+    T, L, I, E, top_k = 1024, 1024, 512, 128, 8
+    case = make_case(T, L, I, E, top_k, wtype, seed=91 + math, skew=skew)
+    status, first = run(lx, case, math, T, L, I, E, top_k)
+    assert status == 0, f"lx_moe_experts_grouped returned CUDA error {status}"
+    for _ in range(4):
+        status, out = run(lx, case, math, T, L, I, E, top_k)
+        assert status == 0, f"lx_moe_experts_grouped returned CUDA error {status}"
+        assert torch.equal(out, first), f"{name}: a repeated call gave different bits"
+
+
+@pytest.mark.parametrize("name,wtype,math,oldest", PAIRS)
+def test_moe_grouped_rows_do_not_depend_on_a_prefill_batch(lx, name, wtype, math, oldest):
+    # The engine rule at prefill sizes: a token's row is the same bits whether it shares the launch with 63 or
+    # with 511 other tokens, and whichever tile variant of its family runs the 64 (another tile height and
+    # other tile tables; every tile adds the K steps in one order).
+    if native_arch(lx) < oldest:
+        pytest.skip("not on this GPU")
+    T, L, I, E, top_k = 512, 1024, 512, 128, 4
+    case = make_case(T, L, I, E, top_k, wtype, seed=123 + math)
+    status, big = run(lx, case, math, T, L, I, E, top_k)
+    assert status == 0, f"lx_moe_experts_grouped returned CUDA error {status}"
+    small = tuple(x[:64].contiguous() for x in case[:3]) + case[3:]
+    fam = native_family(lx, name)
+    lx.lib.lx_tune_variant_name.restype = ctypes.c_char_p
+    for v in range(lx.lib.lx_tune_variants(fam)):
+        lx.lib.lx_tune_force(fam, 64 * top_k, 2 * I, L, v)
+        lx.lib.lx_tune_force(fam, 64 * top_k, L, I, v)
+        try:
+            status, out = run(lx, small, math, 64, L, I, E, top_k)
+        finally:
+            lx.lib.lx_tune_clear()
+        label = f"{name}, variant {lx.lib.lx_tune_variant_name(fam, v).decode()}"
+        assert status == 0, f"{label} returned CUDA error {status}"
+        assert torch.equal(out, big[:64]), f"{label}: the first 64 tokens differ from their rows in a batch of 512"
+
+
+@pytest.mark.parametrize("name,wtype,math,oldest", [PAIRS[0], PAIRS[4], PAIRS[7]])
+def test_moe_grouped_expert_chosen_twice(lx, name, wtype, math, oldest):
+    # A token routed to the same expert in two slots: its two rows sit side by side in one expert's run, often
+    # in one tile, and both count towards the token's sum like any other pair.
+    if native_arch(lx) < oldest:
+        pytest.skip("not on this GPU")
+    T, L, I, E, top_k = 300, 512, 256, 16, 4
+    latent, ids, weights, gu, dn = make_case(T, L, I, E, top_k, wtype, seed=7)
+    ids[::3, 2] = ids[::3, 0]
+    case = (latent, ids.contiguous(), weights, gu, dn)
+    status, a = run(lx, case, math, T, L, I, E, top_k)
+    assert status == 0, f"lx_moe_experts_grouped returned CUDA error {status}"
+    status, b = run(lx, case, math, T, L, I, E, top_k)
+    assert torch.equal(a, b)
+    check(a, case, math)

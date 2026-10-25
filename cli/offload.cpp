@@ -88,7 +88,8 @@ Loaded load(const std::string& dir, int max_tokens) {
   Loaded l;
   l.weights = off::OffloadedModel::load(dir, config, options_from_env());
   // The plan's formats for the dense weights as they loaded; the offloaded experts multiply weight-only.
-  lx::ModelFormats formats = lx::runtime::model_formats(l.weights->weights().format(), lx::runtime::query_device(0), false);
+  lx::ModelFormats formats = lx::runtime::model_formats(l.weights->weights().format(), lx::runtime::query_device(0), false,
+                                                      g_format.fast_math);
   formats.expert_math = LX_MATH_BF16;
   l.model = std::make_unique<lx::MetisModel>(config, l.weights->weights(), formats, 1, 4096, max_tokens,
                                              &l.weights->experts());

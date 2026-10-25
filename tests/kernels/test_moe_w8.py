@@ -12,7 +12,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from conftest import close
+from conftest import DEVICE, close
 
 METIS_E = [128, 192]
 METIS_T = [1, 2, 4, 8, 64, 300]
@@ -35,15 +35,15 @@ def quantize_w8(w, chunk=16):
 
 def make_w8_experts(T, E, L, I, top_k, ids=None):
     """Random bf16 experts, quantized. Routing is distinct experts per token unless ids is given."""
-    latent = torch.randn(T, L, device="cuda").to(torch.bfloat16).contiguous()
-    gate_up = (torch.randn(E, 2 * I, L, device="cuda") / L**0.5).to(torch.bfloat16)
-    down = (torch.randn(E, L, I, device="cuda") / I**0.5).to(torch.bfloat16)
+    latent = torch.randn(T, L, device=DEVICE).to(torch.bfloat16).contiguous()
+    gate_up = (torch.randn(E, 2 * I, L, device=DEVICE) / L**0.5).to(torch.bfloat16)
+    down = (torch.randn(E, L, I, device=DEVICE) / I**0.5).to(torch.bfloat16)
     q_gu, s_gu = quantize_w8(gate_up)
     q_dn, s_dn = quantize_w8(down)
     if ids is None:
-        ids = torch.rand(T, E, device="cuda").argsort(-1)[:, :top_k]
+        ids = torch.rand(T, E, device=DEVICE).argsort(-1)[:, :top_k]
     ids = ids.to(torch.int32).contiguous()
-    weights = torch.softmax(torch.randn(T, top_k, device="cuda"), -1).contiguous()
+    weights = torch.softmax(torch.randn(T, top_k, device=DEVICE), -1).contiguous()
     return latent, ids, weights, q_gu, s_gu, q_dn, s_dn
 
 
@@ -80,9 +80,9 @@ def run_w8(lx, latent, ids, weights, q_gu, s_gu, q_dn, s_dn):
     top_k = ids.shape[1]
     nbytes = workspace_bytes(lx, T, I, top_k)
     assert nbytes >= 2 * T * top_k * I, "workspace smaller than the bf16 intermediates it holds"
-    ws = torch.full((nbytes,), 255, dtype=torch.uint8, device="cuda")
+    ws = torch.full((nbytes,), 255, dtype=torch.uint8, device=DEVICE)
     # Written, not accumulated: the output starts as NaN and must come out fully written.
-    out = torch.full((T, L), float("nan"), device="cuda")
+    out = torch.full((T, L), float("nan"), device=DEVICE)
     lx("moe_experts_w8", latent, ids, weights, q_gu, s_gu, q_dn, s_dn, out, ws, T, L, I, top_k)
     return out
 
@@ -130,8 +130,8 @@ def test_moe_w8_repeated_experts(lx):
     # Tokens share a small pool of experts, so most expert reads are shared across pairs.
     torch.manual_seed(21)
     T, E = 16, 128
-    pool = torch.randperm(E, device="cuda")[:6]
-    ids = pool[torch.rand(T, 6, device="cuda").argsort(-1)[:, :TOP_K]]
+    pool = torch.randperm(E, device=DEVICE)[:6]
+    ids = pool[torch.rand(T, 6, device=DEVICE).argsort(-1)[:, :TOP_K]]
     check_against_reference(lx, *make_w8_experts(T, E, METIS_L, METIS_I, TOP_K, ids=ids))
 
 
@@ -139,7 +139,7 @@ def test_moe_w8_identical_routing(lx):
     # Every token picks the same four experts: each expert's leader pair covers all T tokens.
     torch.manual_seed(22)
     T, E = 300, 128
-    ids = torch.tensor([[5, 17, 60, 99]], device="cuda").expand(T, TOP_K)
+    ids = torch.tensor([[5, 17, 60, 99]], device=DEVICE).expand(T, TOP_K)
     check_against_reference(lx, *make_w8_experts(T, E, METIS_L, METIS_I, TOP_K, ids=ids))
 
 

@@ -36,7 +36,7 @@ constexpr int kKeysPerTileStep = kThreads / kLanesPerKey;  // keys handled per s
 constexpr int kSplit = 8;                                  // blocks per item in split mode; the cluster size
 constexpr int kSplitBelow = 64;                            // fewer items than this: split each item
 constexpr int kTile = 4;                                   // query heads per pass over the cache
-constexpr int kBlockN = 32;  // HIP: 3 stages of K and V in 48 KB of LDS (AMD's workgroup limit)                                // cache positions per shared-memory tile
+constexpr int kBlockN = 32;  // HIP: 3 stages of K and V take 48 KB, inside the 64 KB a workgroup gets (lx_lds_limit)                                // cache positions per shared-memory tile
 constexpr int kStages = 3;                                 // cp.async pipeline depth
 constexpr int kWriteBlocks = 256;
 constexpr int kAttnBlocks = 1024;                          // multiple of kSplit
@@ -374,12 +374,12 @@ extern "C" int lx_attention_varlen(const float* qkv, int ld_qkv, void* k_cache, 
   // Three stages of K and V tiles: kStages * 2 * kBlockN * Dh bf16. Above 48 KB needs the opt-in.
   const int smem = kStages * 2 * kBlockN * Dh * static_cast<int>(sizeof(__hip_bfloat16));
   if (Dh <= 64) {
-    hipFuncSetAttribute(attention_kernel<1>, hipFuncAttributeMaxDynamicSharedMemorySize, smem);
+    lx_func_set_attribute(attention_kernel<1>, hipFuncAttributeMaxDynamicSharedMemorySize, smem);
     attention_kernel<1><<<kAttnBlocks, kThreads, smem, s>>>(qkv, ld_qkv, kc, vc, slot_ids, start_pos,
                                                             cu_seqlens, n_seq, capacity, o, H, KVH, Dh, scale,
                                                             clusters, tc_min);
   } else {
-    hipFuncSetAttribute(attention_kernel<2>, hipFuncAttributeMaxDynamicSharedMemorySize, smem);
+    lx_func_set_attribute(attention_kernel<2>, hipFuncAttributeMaxDynamicSharedMemorySize, smem);
     attention_kernel<2><<<kAttnBlocks, kThreads, smem, s>>>(qkv, ld_qkv, kc, vc, slot_ids, start_pos,
                                                             cu_seqlens, n_seq, capacity, o, H, KVH, Dh, scale,
                                                             clusters, tc_min);

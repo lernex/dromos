@@ -65,6 +65,8 @@ struct PlanRequest {
   // A BF16 model decodes from lossless BF16X copies of its weights when they fit (--no-bf16x turns them off,
   // for measuring plain BF16 decode).
   bool bf16x = true;
+  // --fast-math: the quantized tensor-core maths in place of BF16 (native_math): faster prefill, less accurate.
+  bool fast_math = false;
   int context = 0;    // context each sequence is sized for, 0 for automatic
   int sequences = 0;  // concurrent sequences wanted, 0 for automatic
   double memory_fraction = 0.92;  // of the free memory at startup; the rest is left for others
@@ -85,13 +87,13 @@ struct WeightRecipe {
 };
 WeightRecipe recipe_for(lx_wtype target);
 
-// The math a product on weights held in `format` multiplies in by default: BF16 for every format, with the weights
-// expanded in registers. The quantized tensor-core maths (INT8 IMMA, FP8 on sm_89 and up, FP4 on the sm_120 family)
-// are faster but measured less accurate on Praxis, so LX_PREFILL selects them; the device is not consulted.
-lx_math native_math(lx_wtype format, const DeviceInfo& device);
+// The math a product on weights held in `format` multiplies in: BF16 by default, for every format and device (the
+// KL in plan.cpp). With `fast` (--fast-math), the quantized tensor-core maths the weights can run: INT8 IMMA for INT8,
+// FP8 on sm_89 and up for FP8, FP4 for NVFP4 experts on the sm_120 family (FP8 for NVFP4's dense products).
+lx_math native_math(lx_wtype format, const DeviceInfo& device, bool fast = false);
 // The model's formats for a target on a device: the recipe's kinds, native_math for the dense kind (prefill) and
 // the experts, and the BF16X decode copies when asked for (BF16 targets only).
-lx::ModelFormats model_formats(lx_wtype target, const DeviceInfo& device, bool bf16x_decode);
+lx::ModelFormats model_formats(lx_wtype target, const DeviceInfo& device, bool bf16x_decode, bool fast = false);
 // Whether a target can be loaded from a folder stored as `stored`: the file's own format; INT8, FP8 or BF16X
 // narrower than or as wide as the file (round-to-nearest, or the lossless encoding); NVFP4 only from a stored
 // NVFP4 folder (the GPTQ checkpoint: round-to-nearest fails its KL). A format wider than the file holds the same
@@ -112,6 +114,8 @@ struct FormatOption {
   size_t weight_bytes = 0; // one copy of every weight, resident
   size_t bf16x_bytes = 0;  // the BF16X decode copies a BF16 model adds when it keeps them
   double decode_ceiling_tps = 0;  // resident, one stream; BF16 with its BF16X copies when this build has them
+  std::string maths;       // the maths the format's products multiply in by default
+  std::string fast_maths;  // with --fast-math, or "-" when that changes nothing
 };
 
 struct Plan {

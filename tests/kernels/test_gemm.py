@@ -8,7 +8,7 @@ untouched. pad 3 gives odd row strides, which the cuBLASLt alignment preference 
 import pytest
 import torch
 
-from conftest import DTYPE, close
+from conftest import DEVICE, DTYPE, close
 
 SHAPES = [
     (1, 10304, 2048),  # decode: the Mamba in_proj
@@ -16,6 +16,7 @@ SHAPES = [
     (300, 3072, 2048),  # prefill
     (5, 128, 1280),
     (1, 256, 6400),
+    (300, 256, 6400),  # prefill: the depth head, narrow with a long K
     (33, 24, 64),
 ]
 SCALARS = [(1.0, 0.0), (0.5, 0.0), (1.0, 1.0), (0.5, 1.0)]  # (alpha, beta)
@@ -40,10 +41,10 @@ def reference(x, w, bias, alpha, beta, y0):
 @pytest.mark.parametrize("M,N,K", SHAPES)
 def test_gemm_bf16(lx, M, N, K, y_dtype, alpha, beta, with_bias, pad):
     torch.manual_seed(M * 7919 + N * 31 + K)
-    x_buf = torch.randn(M, K + pad, device="cuda").to(torch.bfloat16)
-    w = torch.randn(N, K, device="cuda").to(torch.bfloat16)
-    bias = torch.randn(N, device="cuda").to(torch.bfloat16) if with_bias else None
-    y_prefill = torch.randn(M, N + pad, device="cuda").to(y_dtype)
+    x_buf = torch.randn(M, K + pad, device=DEVICE).to(torch.bfloat16)
+    w = torch.randn(N, K, device=DEVICE).to(torch.bfloat16)
+    bias = torch.randn(N, device=DEVICE).to(torch.bfloat16) if with_bias else None
+    y_prefill = torch.randn(M, N + pad, device=DEVICE).to(y_dtype)
     y_buf = y_prefill.clone()
 
     lx("gemm_bf16", x_buf, K + pad, w, bias, y_buf, DTYPE[y_dtype], N + pad, M, N, K, alpha, beta)
@@ -65,10 +66,10 @@ def test_gemm_bf16(lx, M, N, K, y_dtype, alpha, beta, with_bias, pad):
 @pytest.mark.parametrize("M,N,K", SHAPES)
 def test_gemm_f32(lx, M, N, K, with_bias, pad):
     torch.manual_seed(M * 7919 + N * 31 + K + 1)
-    x_buf = torch.randn(M, K + pad, device="cuda")
-    w = torch.randn(N, K, device="cuda")
-    bias = torch.randn(N, device="cuda") if with_bias else None
-    y_buf = torch.full((M, N + pad), float("nan"), device="cuda")
+    x_buf = torch.randn(M, K + pad, device=DEVICE)
+    w = torch.randn(N, K, device=DEVICE)
+    bias = torch.randn(N, device=DEVICE) if with_bias else None
+    y_buf = torch.full((M, N + pad), float("nan"), device=DEVICE)
 
     lx("gemm_f32", x_buf, K + pad, w, bias, y_buf, N + pad, M, N, K)
 

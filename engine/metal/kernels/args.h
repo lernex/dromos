@@ -1,0 +1,538 @@
+// Kernel argument structs, shared by the host (C++) and the kernels (Metal Shading Language). Each
+// kernel takes one of these in the constant address space at buffer(0). Device memory is passed as GPU
+// addresses: a 64-bit integer on the host, a typed device pointer in the kernel, so both sides lay the
+// struct out the same way (pointers first, 8-byte aligned, then 4-byte scalars).
+#ifndef __METAL_VERSION__
+#pragma once
+#endif
+
+#ifdef __METAL_VERSION__
+#define LX_PTR(T) device T*
+#define LX_CPTR(T) device const T*
+typedef long lx_i64;
+typedef ulong lx_u64;
+#else
+#include <stdint.h>
+#define LX_PTR(T) uint64_t
+#define LX_CPTR(T) uint64_t
+typedef int64_t lx_i64;
+typedef uint64_t lx_u64;
+typedef uint32_t uint;
+#endif
+
+// ---- runtime --------------------------------------------------------------------------------
+struct CopyArgs {
+  LX_CPTR(uchar) src;
+  LX_PTR(uchar) dst;
+  lx_i64 bytes;
+};
+struct FillArgs {
+  LX_PTR(uchar) dst;
+  lx_i64 bytes;
+  uint value;
+};
+
+// ---- elementwise, norms ---------------------------------------------------------------------
+struct RmsnormArgs {
+  LX_CPTR(void) x;
+  LX_CPTR(ushort) w;
+  LX_PTR(void) y;
+  int dim;
+  float eps;
+};
+struct Copy2dArgs {
+  LX_CPTR(void) src;
+  LX_PTR(void) dst;
+  int ld_src, ld_dst, rows, cols;
+};
+struct ActivateArgs {
+  LX_PTR(float) y;
+  lx_i64 n;
+};
+struct SiluMulArgs {
+  LX_CPTR(float) x;
+  LX_PTR(void) out;
+  int ld_x, rows, cols;
+};
+struct AddRowArgs {
+  LX_PTR(float) y;
+  LX_CPTR(ushort) row;
+  int rows, cols;
+};
+struct AxpbyArgs {
+  LX_PTR(float) y;
+  LX_CPTR(float) x;
+  lx_i64 n;
+  float a, b;
+};
+struct SubArgs {
+  LX_CPTR(float) a;
+  LX_CPTR(float) b;
+  LX_PTR(float) out;
+  lx_i64 n;
+};
+struct MetaScalarsArgs {
+  LX_CPTR(float) entropy;
+  LX_CPTR(float) confidence;
+  LX_CPTR(float) continuation;
+  LX_PTR(ushort) meta;
+  float mean_k, inv_log_experts;
+  int ld, col, T;
+};
+struct GatherLastArgs {
+  LX_CPTR(float) src;
+  LX_CPTR(int) cu;
+  LX_PTR(float) out;
+  int D;
+};
+
+// ---- streams --------------------------------------------------------------------------------
+struct EmbedArgs {
+  LX_CPTR(ushort) table;
+  LX_CPTR(int) ids;
+  LX_CPTR(ushort) stream_emb;
+  LX_PTR(float) streams;
+  int S, D;
+};
+struct StreamMeanArgs {
+  LX_CPTR(float) streams;
+  LX_PTR(float) mean;
+  int T, S, D;
+};
+struct MhcReadArgs {
+  LX_CPTR(float) streams;
+  LX_CPTR(float) matrix;
+  LX_CPTR(float) read;
+  LX_CPTR(ushort) norm_w;
+  LX_PTR(float) mixed;
+  LX_PTR(ushort) h;
+  float eps;
+  int S, D, split;  // split: threadgroups per token (the decode form), 1 for one per token
+};
+struct MhcWriteArgs {
+  LX_CPTR(float) mixed;
+  LX_CPTR(float) write;
+  LX_CPTR(float) update;
+  LX_PTR(float) streams;
+  int T, S, D;
+};
+
+// ---- depth memory ---------------------------------------------------------------------------
+struct MemoryAttendArgs {
+  LX_CPTR(float) q;
+  LX_CPTR(float) bank_k;
+  LX_CPTR(float) bank_v;
+  LX_PTR(ushort) out;
+  int n_entries, max_entries, rows, S, M;
+};
+struct MemoryFuseArgs {
+  LX_PTR(float) streams;
+  LX_CPTR(float) projected;
+  LX_CPTR(ushort) gate;
+  LX_CPTR(ushort) gate_bias;
+  LX_PTR(float) summary;
+  int S, D, split;
+};
+struct ContinuationArgs {
+  LX_CPTR(float) logit;
+  LX_CPTR(float) state;
+  LX_CPTR(float) difference;
+  LX_PTR(float) out;
+  float limit;
+  int D;
+};
+
+// ---- Mamba-2 --------------------------------------------------------------------------------
+struct ConvArgs {
+  LX_CPTR(float) x;
+  LX_CPTR(ushort) w;
+  LX_CPTR(ushort) bias;
+  LX_PTR(float) state;
+  LX_CPTR(int) slot_ids;
+  LX_CPTR(int) has_state;
+  LX_CPTR(int) cu;
+  LX_PTR(float) out;
+  int ld_x, C, W;
+};
+struct ScanArgs {
+  LX_CPTR(float) x;
+  LX_CPTR(float) dt_raw;
+  LX_CPTR(float) B;
+  LX_CPTR(float) C;
+  LX_CPTR(float) A_log;
+  LX_CPTR(float) D;
+  LX_CPTR(float) dt_bias;
+  LX_PTR(float) state;
+  LX_CPTR(int) slot_ids;
+  LX_CPTR(int) has_state;
+  LX_CPTR(int) cu;
+  LX_PTR(float) y;
+  int ld_x, ld_dt, ld_bc, H, P, G, N;
+};
+struct GatedNormArgs {
+  LX_CPTR(float) y;
+  LX_CPTR(float) z;
+  LX_CPTR(ushort) w;
+  LX_PTR(ushort) out;
+  int ld_z, I, groups;
+  float eps;
+};
+
+// ---- attention ------------------------------------------------------------------------------
+struct AttnArgs {
+  LX_CPTR(float) qkv;
+  LX_PTR(ushort) k_cache;
+  LX_PTR(ushort) v_cache;
+  LX_CPTR(int) slot_ids;
+  LX_CPTR(int) start_pos;
+  LX_CPTR(int) cu;
+  LX_PTR(ushort) out;
+  LX_PTR(float) partial;  // split decode: [items, splits, G, Dh + 2] partial softmax states
+  int ld_qkv, n_seq, capacity, H, KVH, Dh;
+  float scale;
+  int splits;  // threadgroups per (token, kv head); 1 for whole items
+  int tile;    // cache positions per split
+  int flash;   // nax/attention.metal takes the prefill items (see flash_takes)
+};
+
+// ---- experts and routing --------------------------------------------------------------------
+struct RouteArgs {
+  LX_CPTR(float) logits;
+  LX_CPTR(float) bias;
+  LX_PTR(int) ids;
+  LX_PTR(float) weights;
+  LX_PTR(float) entropy;
+  LX_PTR(float) confidence;
+  int T, E, top_k;
+};
+struct SummaryArgs {
+  LX_CPTR(int) ids;
+  LX_CPTR(float) weights;
+  LX_CPTR(ushort) emb;
+  LX_PTR(float) summary;
+  int T, R, top_k;
+};
+
+// A weight in one of the formats of kernels.h ("Weight formats"), as kernels see it.
+struct WeightRef {
+  LX_CPTR(uchar) data;
+  LX_CPTR(uchar) scale;          // f32 [N] (INT8, FP8), e4m3 [N, K / 16] (NVFP4), unused for BF16
+  LX_CPTR(float) expert_global;  // NVFP4 stacks: f32 [E], or 0 for `global`
+  float global;
+  int type;
+};
+
+// Few-token experts. links [2P]: per pair its rank among the pairs on the same expert, then the next
+// such pair (or -1). A pair whose rank is a multiple of 8 leads a batch of up to 8 pairs that share
+// every weight read.
+struct LinkArgs {
+  LX_CPTR(int) ids;
+  LX_PTR(int) links;
+  int P;
+};
+// Stage 1: inter[p, i] = bf16(silu(gate . x) * (up . x)) for pair p = t * top_k + k.
+struct ExpertUpArgs {
+  WeightRef w;  // gate_up stack [E, 2I, L]
+  LX_CPTR(ushort) latent;
+  LX_CPTR(int) ids;
+  LX_CPTR(int) links;
+  LX_PTR(ushort) inter;
+  int L, I, top_k, P;
+};
+// Stage 2: out[t, l] = sum_k weights[t, k] * (down[ids[t, k]][l] . inter[t * top_k + k]).
+struct ExpertDownArgs {
+  WeightRef w;  // down stack [E, L, I]
+  LX_CPTR(ushort) inter;
+  LX_CPTR(int) ids;
+  LX_CPTR(float) weights;
+  LX_PTR(float) out;
+  int T, L, I, top_k;
+};
+
+// Grouped experts (any T): pairs bucketed by expert in the workspace, then a GEMM per expert tile.
+struct GroupArgs {
+  LX_CPTR(int) ids;
+  LX_PTR(int) counts;  // [E + 1]: the start of each expert's pairs in `order`, then P
+  LX_PTR(int) order;   // [P]: pair indices, grouped by expert, in pair order within an expert
+  LX_PTR(int) tiles;   // [1 + max_tiles * 3]: the tile count, then (expert, first row in order, rows)
+  int P, E, tile_rows, max_tiles;
+};
+struct CombineArgs {
+  LX_CPTR(float) rows;  // [P, L] per-pair down outputs, already weighted
+  LX_PTR(float) out;    // [T, L]
+  int T, L, top_k;
+};
+
+// ---- products -------------------------------------------------------------------------------
+struct GemvArgs {
+  WeightRef w;
+  LX_CPTR(void) x;
+  LX_CPTR(void) bias;
+  LX_PTR(void) y;
+  int ld_x, ld_y, M, N, K;
+  float alpha, beta;
+  int x_bf16, bias_bf16, y_bf16, split;  // split: threadgroups sharing one row group's K range
+};
+// The tile GEMM (gemm.metal): y = alpha * (x @ W^T + bias) + beta * y, x in one of the activation
+// formats, W in one of the weight formats. In the grouped forms the rows of a tile are pairs, gathered
+// through `order`, and the weight is the tile's expert's.
+struct GemmArgs {
+  WeightRef w;
+  LX_CPTR(uchar) x;        // activations: bf16 / f32 rows of ld_x elements, or quantized rows of ld_x bytes
+  LX_CPTR(float) x_scale;  // quantized activations: the per-row scale (the global for FP4)
+  LX_CPTR(uchar) x_block;  // FP4 activations: e4m3 block scales, rows of ld_xb bytes
+  LX_CPTR(void) bias;
+  LX_PTR(void) y;
+  LX_CPTR(int) order;      // grouped: pairs by expert
+  LX_CPTR(int) tiles;      // grouped: tile list (GroupArgs)
+  LX_CPTR(float) pair_w;   // grouped down: the routing weight of each pair
+  int ld_x, ld_xb, ld_y, M, N, K;
+  float alpha, beta;
+  int bias_bf16, y_bf16, x_vec;  // x_vec: activation rows allow 16-byte loads
+  int top_k, stack_n;            // grouped: pairs per token, rows of one expert in the stack
+};
+
+// ---- quantization ---------------------------------------------------------------------------
+struct QuantArgs {
+  LX_CPTR(ushort) w;
+  LX_PTR(uchar) q;
+  LX_PTR(uchar) scale;
+  LX_PTR(uint) amax;  // NVFP4: the matrix absmax, as f32 bits (atomic max of non-negative floats)
+  lx_i64 rows;
+  int cols;
+  float global;
+};
+struct DequantArgs {
+  WeightRef w;
+  LX_PTR(ushort) out;
+  lx_i64 rows;
+  int cols;
+};
+// Per-token activation quantization (lx_quantize_act).
+struct QuantActArgs {
+  LX_CPTR(void) x;
+  LX_PTR(uchar) q;
+  LX_PTR(float) scale;
+  LX_PTR(uchar) block_scale;
+  int ld_x, ld_q, ld_bs, M, K, x_bf16;
+};
+
+// ---- speculative decoding -------------------------------------------------------------------
+struct SpecGemvArgs {
+  LX_CPTR(float) x;
+  LX_CPTR(float) w;
+  LX_CPTR(float) bias;  // 0 for none
+  LX_PTR(float) y;
+  int ld_x, ld_y, M, N, K;
+};
+
+// ---- sampling -------------------------------------------------------------------------------
+// One row's parameters: lx_sampling, field for field (56 bytes on both sides).
+struct SamplingRow {
+  lx_u64 seed;
+  lx_u64 position;
+  int slot, row;
+  float temperature, top_p;
+  int top_k;
+  float min_p, repetition_penalty, presence_penalty, frequency_penalty;
+};
+struct SampleArgs {
+  LX_CPTR(float) logits;
+  LX_CPTR(SamplingRow) params;
+  LX_PTR(int) seen;
+  LX_PTR(int) out_counts;
+  LX_PTR(float) work;
+  LX_PTR(int) tokens;
+  LX_PTR(float) token_logprob;  // 0 for none
+  LX_PTR(int) top_tokens;
+  LX_PTR(float) top_logprobs;
+  int V, top_n;
+};
+struct ObserveArgs {
+  LX_PTR(int) counts;
+  LX_CPTR(int) tokens;
+  int n;
+};
+struct MaskLogitsArgs {
+  LX_PTR(float) logits;
+  LX_CPTR(int) rows;
+  LX_CPTR(uint) bits;
+  int V, words;
+};
+struct SpecConvArgs {
+  LX_CPTR(float) x;
+  LX_CPTR(ushort) w;
+  LX_CPTR(ushort) bias;
+  LX_PTR(float) state;
+  LX_PTR(float) hist;
+  LX_CPTR(int) slot_ids;
+  LX_CPTR(int) has_state;
+  LX_CPTR(int) fold;
+  LX_CPTR(int) keep;
+  LX_CPTR(int) cu;
+  LX_PTR(float) out;
+  int ld_x, C, W;
+};
+struct SpecScanArgs {
+  LX_CPTR(float) x;
+  LX_CPTR(float) dt_raw;
+  LX_CPTR(float) B;
+  LX_CPTR(float) C;
+  LX_CPTR(float) A_log;
+  LX_CPTR(float) D;
+  LX_CPTR(float) dt_bias;
+  LX_PTR(float) state;
+  LX_PTR(float) hist;
+  LX_CPTR(int) slot_ids;
+  LX_CPTR(int) has_state;
+  LX_CPTR(int) fold;
+  LX_CPTR(int) keep;
+  LX_CPTR(int) cu;
+  LX_PTR(float) y;
+  int ld_x, ld_dt, ld_bc, H, P, G, N;
+};
+// lx_spec_filter and lx_spec_rng, field for field.
+struct SpecFilter {
+  float temperature, top_p;
+  int top_k;
+  float min_p;
+};
+struct SpecRng {
+  lx_u64 seed;
+  lx_u64 position;
+};
+struct SpecProbsArgs {
+  LX_CPTR(float) logits;
+  LX_CPTR(SpecFilter) filters;
+  LX_PTR(float) probs;
+  int V;
+};
+struct SpecVerifyArgs {
+  LX_CPTR(float) p;
+  LX_CPTR(float) q;  // 0: the drafter proposes tokens outright
+  LX_CPTR(int) tokens;
+  LX_CPTR(int) cu;
+  LX_CPTR(SpecRng) rng;
+  LX_PTR(int) accepted;
+  LX_PTR(int) next;
+  int V;
+};
+struct SpecGreedyArgs {
+  LX_CPTR(float) logits;
+  LX_CPTR(int) tokens;
+  LX_CPTR(int) cu;
+  LX_PTR(int) argmax;
+  LX_PTR(int) accepted;
+  LX_PTR(int) next;
+  int V, n_seq;
+};
+struct SpecSampleArgs {
+  LX_CPTR(float) probs;
+  LX_CPTR(int) rows;  // 0: row i
+  LX_CPTR(SpecRng) rng;
+  LX_PTR(int) tokens;
+  int V;
+  uint domain;
+};
+// The rotation frequencies theta^(-2i / Dh), i < Dh / 2, as float pairs (hi + lo) from the host's doubles.
+struct SpecRopeArgs {
+  LX_PTR(float) x;
+  LX_CPTR(ushort) w;  // 0: no norm
+  int ld_x, rows, heads, Dh;
+  float eps;
+  int pos0;
+  float inv_hi[128];
+  float inv_lo[128];
+};
+struct SpecBlockAttnArgs {
+  LX_CPTR(float) q;
+  LX_CPTR(float) k_ctx;
+  LX_CPTR(float) v_ctx;
+  LX_CPTR(float) k_blk;
+  LX_CPTR(float) v_blk;
+  LX_PTR(float) out;
+  int ld_q, n_ctx, ld_blk, ld_out, B, H, KVH, Dh;
+  int chunk;  // keys whose scores share threadgroup memory at once
+  float scale;
+};
+
+// ---- lossless bf16 ------------------------------------------------------------------------------
+struct Bf16xArgs {
+  LX_CPTR(ushort) w;        // bf16 [rows, K]
+  LX_PTR(uchar) data;       // the encoding (encode writes it, decode reads it)
+  LX_PTR(uint) counts;      // patches per row
+  LX_CPTR(lx_i64) offsets;  // each overflowing row's record, from the end of the rows
+  LX_PTR(ushort) out;       // decode: bf16 [rows, K]
+  lx_i64 rows;
+  int K;
+};
+
+// ---- offload ------------------------------------------------------------------------------------
+// The offload structs (lx_expert_ref, lx_offload_state, the mailbox) hold the ABI's pointers, which on
+// Metal are CPU addresses. A kernel translates each one before it dereferences it, through an OxMap:
+// the device registry's ranges (a sorted table in device memory), then a few ranges wrapped for this
+// dispatch alone (unregistered host memory, which only the kernel tests pass). Refs the kernels write
+// (a plan's src and fill) stay CPU addresses, as the ABI says.
+#define LX_OX_EXTRAS 48
+struct OxRange {
+  lx_u64 lo, hi;      // CPU addresses [lo, hi)
+  LX_PTR(uchar) gpu;  // the GPU address of lo
+};
+struct OxMap {
+  LX_CPTR(OxRange) table;  // sorted by lo; registrations may overlap
+  int table_n, extra_n;
+  OxRange extra[LX_OX_EXTRAS];
+};
+// lx_expert_ref and lx_offload_state with their pointers as CPU addresses (the host checks the layout).
+struct OxRef {
+  lx_u64 gate_up, gate_up_scale, down, down_scale;
+};
+struct OxState {
+  int n_layers, n_experts, top_k, L, I, type;
+  lx_u64 vram_slot, host_slot, cpu_first, layer_first, layer_pinned, slot_expert, slot_stamp, slot_prefetched, clock;
+  OxRef vram_pool, host_pool;
+  lx_i64 gate_up_stride, gate_up_scale_stride, down_stride, down_scale_stride;
+  int max_cpu_pairs;
+  float cpu_fraction;
+  int fill;
+  lx_u64 mailbox, cpu_latent, cpu_result, job_seq, job_pending, error, counters;
+};
+// Routed experts through per-pair refs: decode (src, fill [P]) or grouped (groups [G], offsets, pairs).
+struct OxExpertsArgs {
+  LX_CPTR(ushort) latent;  // bf16 [T, L]
+  LX_CPTR(float) weights;  // [T, top_k]
+  LX_CPTR(OxRef) refs;     // src [P], or groups [G]
+  LX_CPTR(OxRef) fill;     // [P] or 0
+  LX_CPTR(int) offsets;    // grouped: [G + 1]
+  LX_CPTR(int) pairs;
+  LX_PTR(ushort) inter;    // workspace: bf16 [P, I]
+  LX_PTR(float) partial;   // workspace: f32 [P, L] (grouped)
+  LX_PTR(float) out;       // [T, L]
+  int T, L, I, top_k, rows, n;
+  OxMap map;
+};
+struct OxCopyArgs {
+  LX_CPTR(OxRef) src;
+  LX_CPTR(OxRef) dst;
+  LX_CPTR(int) count;
+  lx_i64 gu_bytes, gus_bytes, dn_bytes, dns_bytes;
+  OxMap map;
+};
+// The cache kernels: plan (src, fill), join (out), prefetch (src, dst = fill, count).
+struct OxCacheArgs {
+  LX_CPTR(int) ids;  // plan: routing [T, top_k]; prefetch: predicted [n]
+  LX_CPTR(float) weights;
+  LX_CPTR(ushort) latent;
+  LX_CPTR(OxState) state;
+  LX_PTR(OxRef) src;
+  LX_PTR(OxRef) fill;
+  LX_PTR(int) count;
+  LX_PTR(float) out;
+  int layer, T, L, n;
+  OxMap map;
+};
+struct OxProbeArgs {
+  LX_CPTR(uint4) src;
+  LX_PTR(ulong) sink;
+  lx_i64 n;  // 16-byte loads
+};

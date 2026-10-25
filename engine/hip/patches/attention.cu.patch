@@ -5,7 +5,7 @@
  constexpr int kSplitBelow = 64;                            // fewer items than this: split each item
  constexpr int kTile = 4;                                   // query heads per pass over the cache
 -constexpr int kBlockN = 64;                                // cache positions per shared-memory tile
-+constexpr int kBlockN = 32;  // HIP: 3 stages of K and V in 48 KB of LDS (AMD's workgroup limit)                                // cache positions per shared-memory tile
++constexpr int kBlockN = 32;  // HIP: 3 stages of K and V take 48 KB, inside the 64 KB a workgroup gets (lx_lds_limit)                                // cache positions per shared-memory tile
  constexpr int kStages = 3;                                 // cp.async pipeline depth
  constexpr int kWriteBlocks = 256;
  constexpr int kAttnBlocks = 1024;                          // multiple of kSplit

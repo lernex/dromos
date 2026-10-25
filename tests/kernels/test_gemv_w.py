@@ -9,6 +9,7 @@ rounded once (2^-8 of its value), an f32 output differs only in summation order 
 
 import ctypes
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -248,6 +249,8 @@ def use_table(lib, which):
     """Clears the tuner, then for "shipped" applies the 5070 Ti table's GEMV entries the way the engine does."""
     lib.lx_tune_clear()
     if which == "shipped":
+        if BACKEND != "cuda":
+            pytest.skip("the shipped table is the 5070 Ti's")
         for e in json.loads(TUNING.read_text())["entries"]:
             if e["key"].startswith("gemv_w_"):
                 status = lib.lx_tune_set(e["key"].encode(), e["M"], e["N"], e["K"], e["variant"])
@@ -255,8 +258,8 @@ def use_table(lib, which):
 
 
 def variant_split(name):
-    """The split S a variant name carries: "s2r4d3g" has S = 2."""
-    return int(name[1 : name.index("r")])
+    """The split S a variant name carries: "s2r4d3g" (CUDA) and "s2" (Metal) have S = 2."""
+    return int(re.match(r"s(\d+)", name).group(1))
 
 
 @pytest.mark.parametrize("table", ["default", "shipped"])

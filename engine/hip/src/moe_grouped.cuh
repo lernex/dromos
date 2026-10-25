@@ -202,9 +202,9 @@ inline int launch_grouped(GroupedParams pp, const typename Epi::Params& ep, cons
   using C = lx::tc::Config<kKind, kArch, BM, BN, WM, WN, ST, RB>;
   auto kernel = grouped_kernel<kKind, kArch, BM, BN, WM, WN, ST, RB, Prob, Epi>;
   static const hipError_t attr = [&] {
-    hipError_t e = hipFuncSetAttribute(kernel, hipFuncAttributeMaxDynamicSharedMemorySize, C::kSmem);
+    hipError_t e = lx_func_set_attribute(kernel, hipFuncAttributeMaxDynamicSharedMemorySize, C::kSmem);
     if (e == hipSuccess)
-      e = hipFuncSetAttribute(kernel, hipFuncAttributePreferredSharedMemoryCarveout, hipSharedmemCarveoutMaxShared);
+      e = lx_func_set_attribute(kernel, hipFuncAttributePreferredSharedMemoryCarveout, hipSharedmemCarveoutMaxShared);
     return e;
   }();
   if (attr != hipSuccess) return static_cast<int>(attr);

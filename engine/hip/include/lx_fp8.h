@@ -107,23 +107,28 @@ __device__ __forceinline__ __nv_fp8_storage_t __nv_cvt_float_to_fp8(float v, __n
   return interp == __NV_E4M3 ? lx::fp8::f32_to_e4m3(v, saturate) : lx::fp8::f32_to_e5m2(v, saturate);
 }
 
+// A __half2_raw is one 32-bit word of two half bit patterns. Its members are unsigned shorts on NVIDIA and
+// half-precision unions on AMD, so the word is written whole.
+__device__ __forceinline__ __half2_raw lx_half2_raw(uint16_t lo, uint16_t hi) {
+  const uint32_t packed = static_cast<uint32_t>(lo) | (static_cast<uint32_t>(hi) << 16);
+  __half2_raw r;
+  static_assert(sizeof(r) == sizeof(packed), "__half2_raw is one 32-bit word");
+  __builtin_memcpy(&r, &packed, sizeof r);
+  return r;
+}
+
 __device__ __forceinline__ __half2_raw __nv_cvt_fp8x2_to_halfraw2(__nv_fp8x2_storage_t x,
                                                                   __nv_fp8_interpretation_t interp) {
-  __half2_raw r;
   if (interp == __NV_E4M3) {
-    r.x = lx::fp8::f32_to_f16_bits(lx::fp8::e4m3_to_f32(x & 0xffu));
-    r.y = lx::fp8::f32_to_f16_bits(lx::fp8::e4m3_to_f32((x >> 8) & 0xffu));
-  } else {  // e5m2 is the top byte of a half: the bits move up by 8 and are exact
-    r.x = static_cast<uint16_t>((x & 0xffu) << 8);
-    r.y = static_cast<uint16_t>((x >> 8) << 8);
+    return lx_half2_raw(lx::fp8::f32_to_f16_bits(lx::fp8::e4m3_to_f32(x & 0xffu)),
+                        lx::fp8::f32_to_f16_bits(lx::fp8::e4m3_to_f32((x >> 8) & 0xffu)));
   }
-  return r;
+  // e5m2 is the top byte of a half: the bits move up by 8 and are exact
+  return lx_half2_raw(static_cast<uint16_t>((x & 0xffu) << 8), static_cast<uint16_t>((x >> 8) << 8));
 }
 
 __device__ __forceinline__ __half2_raw __nv_cvt_fp4x2_to_halfraw2(__nv_fp4x2_storage_t x,
                                                                   __nv_fp4_interpretation_t) {
-  __half2_raw r;
-  r.x = lx::fp8::f32_to_f16_bits(lx::fp8::e2m1_to_f32(x & 0xfu));
-  r.y = lx::fp8::f32_to_f16_bits(lx::fp8::e2m1_to_f32((x >> 4) & 0xfu));
-  return r;
+  return lx_half2_raw(lx::fp8::f32_to_f16_bits(lx::fp8::e2m1_to_f32(x & 0xfu)),
+                      lx::fp8::f32_to_f16_bits(lx::fp8::e2m1_to_f32((x >> 4) & 0xfu)));
 }

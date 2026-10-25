@@ -2,8 +2,10 @@
 
 #include <dlfcn.h>
 #include <fcntl.h>
-#include <immintrin.h>
 #include <sys/mman.h>
+#if defined(__x86_64__)
+#include <immintrin.h>
+#endif
 #include <time.h>
 #include <unistd.h>
 
@@ -49,12 +51,26 @@ constexpr size_t kHuge = 2u << 20;
 
 size_t round_up(size_t n, size_t to) { return (n + to - 1) / to * to; }
 
+// A read-only descriptor that bypasses the page cache: O_DIRECT on Linux, F_NOCACHE where there is no
+// O_DIRECT (macOS).
+int open_direct(const char* path) {
+#if defined(O_DIRECT)
+  return open(path, O_RDONLY | O_DIRECT);
+#else
+  const int fd = open(path, O_RDONLY);
+  if (fd >= 0) fcntl(fd, F_NOCACHE, 1);
+  return fd;
+#endif
+}
+
 // Anonymous memory, backed by huge pages where the kernel allows (the CPU lane streams whole experts,
 // so fewer TLB misses matter), then pinned and mapped for the GPU.
 void* pin_region(size_t bytes, void** device) {
   void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (p == MAP_FAILED) throw std::runtime_error("mmap of " + std::to_string(bytes) + " bytes failed");
+#if defined(MADV_HUGEPAGE)
   madvise(p, bytes, MADV_HUGEPAGE);
+#endif
   if (const int e = lx_rt_host_register(p, static_cast<int64_t>(bytes), device); e != 0) {
     munmap(p, bytes);
     throw std::runtime_error("pinning " + std::to_string(bytes >> 20) + " MiB of host memory failed (error " +
@@ -386,7 +402,7 @@ void ExpertOffload::finalize(const RoutingStats& stats, int64_t vram_cache_bytes
         const DiskLocation& loc = disk_[id];
         if (fd < 0 || fd_path != loc.file.string()) {
           if (fd >= 0) close(fd);
-          fd = open(loc.file.c_str(), O_RDONLY | O_DIRECT);
+          fd = open_direct(loc.file.c_str());
           fd_path = loc.file.string();
           if (fd < 0) throw std::runtime_error("cannot open " + fd_path);
         }
@@ -751,7 +767,7 @@ void ExpertOffload::prefill(int layer, const int32_t* ids, const float* weights,
 void ExpertOffload::load_disk_expert(int layer, int expert, int cs) {
   const int id = layer * shape_.n_experts + expert;
   const DiskLocation& loc = disk_[id];
-  const int fd = open(loc.file.c_str(), O_RDONLY | O_DIRECT);
+  const int fd = open_direct(loc.file.c_str());
   if (fd < 0) throw std::runtime_error("cannot open " + loc.file.string());
   static thread_local std::vector<char> bounce;
   bounce.resize(static_cast<size_t>(shape_.gate_up_bytes()) + 3 * 8192);
@@ -851,7 +867,11 @@ void ExpertOffload::cpu_worker() {
     }
     // Spin while the model is generating (a job every ~100 us); after 50 ms idle, nap 20 us at a time.
     if (seconds_since(last) < 0.05) {
+#if defined(__x86_64__)
       _mm_pause();
+#elif defined(__aarch64__)
+      __asm__ __volatile__("yield");
+#endif
     } else {
       timespec ts{0, 20000};
       nanosleep(&ts, nullptr);

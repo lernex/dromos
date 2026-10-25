@@ -169,7 +169,8 @@ int cmd_bench(int argc, char** argv) {
   options.load_tokenizer = false;
   options.prefix_cache = args.prefix_cache;
   lx::cli::StartedEngine started = lx::cli::start_engine(model, max_streams, args.prompt_tokens + args.gen_tokens + 16,
-                                                         args.format.weights, options, 0.92, args.format.bf16x);
+                                                         args.format.weights, options, 0.92, args.format.bf16x,
+                                                         args.format.fast_math);
   const Plan& plan = started.plan;
   Engine& engine = *started.engine;
 

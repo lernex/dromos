@@ -7,7 +7,9 @@ The same tests run against any backend library. LX_BACKEND=cpu (with LX_KERNELS 
 liblernex_cpu.so) runs them on CPU tensors: every tensor (and generator) the tests create on "cuda" is
 created on the CPU instead, .cuda() copies as it does on a GPU, torch.cuda's stream and synchronize calls
 become the backend's (the CPU's streams are synchronous), and the kernels get host pointers. The tests
-themselves are unchanged.
+themselves are unchanged. LX_BACKEND=metal (liblernex_metal.dylib) runs the same way: Metal reads host
+memory in place (unified memory), and every call is followed by a stream sync (torch.cuda.synchronize
+waits for the device). Without LX_BACKEND, the library's name picks the backend.
 """
 
 import ctypes
@@ -16,8 +18,9 @@ import os
 import pytest
 import torch
 
-BACKEND = os.environ.get("LX_BACKEND", "cuda")
-DEVICE = "cpu" if BACKEND == "cpu" else "cuda"
+_LIB_NAME = os.path.basename(os.environ.get("LX_KERNELS", ""))
+BACKEND = os.environ.get("LX_BACKEND") or ("metal" if "metal" in _LIB_NAME else "cpu" if "cpu" in _LIB_NAME else "cuda")
+DEVICE = "cpu" if BACKEND in ("cpu", "metal") else "cuda"
 
 if DEVICE == "cpu":
     from torch.overrides import TorchFunctionMode
@@ -37,11 +40,20 @@ if DEVICE == "cpu":
                 args = tuple(_host(a) if isinstance(a, (str, torch.device)) else a for a in args)
             return func(*args, **kwargs)
 
+    _sync_lib = []
+
+    def _device_sync(*a, **k):
+        """The CPU's streams are synchronous; Metal's are not, so a sync there waits for the device."""
+        if BACKEND == "metal":
+            if not _sync_lib:
+                _sync_lib.append(ctypes.CDLL(os.environ["LX_KERNELS"]))
+            assert _sync_lib[0].lx_rt_device_sync() == 0
+
     class _HostStream:
         cuda_stream = 0
 
         def synchronize(self):
-            pass
+            _device_sync()
 
     class _HostGenerator(torch.Generator):
         """torch.Generator("cuda") as a CPU generator, for the CPU tensors it will draw into."""
@@ -54,7 +66,7 @@ if DEVICE == "cpu":
 
     _CudaOnHost().__enter__()
     torch.cuda.current_stream = lambda *a, **k: _HostStream()
-    torch.cuda.synchronize = lambda *a, **k: None
+    torch.cuda.synchronize = _device_sync
     torch.Generator = _HostGenerator
     # On a GPU, .cuda() of a host tensor is a copy in device memory, and tests rely on it being separate
     # from the original (they zero or overwrite the device copy). On the CPU it has to be a copy too.
@@ -67,6 +79,11 @@ DTYPE = {torch.float32: F32, torch.bfloat16: BF16}
 class Kernels:
     def __init__(self, path):
         self.lib = ctypes.CDLL(path)
+
+    @property
+    def stream(self):
+        """The stream the calls run on, for tests that call the library directly."""
+        return ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
 
     def __call__(self, name, *args):
         """Call lx_<name>(*args, stream=current); tensors pass as device pointers."""

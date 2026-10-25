@@ -63,7 +63,8 @@ int cmd_serve(int argc, char** argv) {
   runtime::EngineOptions engine_options;
   engine_options.prefix_cache = prefix_cache;
   cli::StartedEngine started =
-      cli::start_engine(model, sequences, context, format.weights, engine_options, memory_fraction, format.bf16x);
+      cli::start_engine(model, sequences, context, format.weights, engine_options, memory_fraction, format.bf16x,
+                        format.fast_math);
   const runtime::Plan& plan = started.plan;
   runtime::Engine& engine = *started.engine;
 

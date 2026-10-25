@@ -72,20 +72,22 @@ void print_device(const lx::runtime::DeviceInfo& d) {
 // The plan for a model folder, as lernex doctor prints it.
 void print_plan(const lx::runtime::Plan& plan) {
   using namespace lx::runtime;
-  std::printf("\nformats    %-6s %-4s %10s %15s   %s\n", "", "fits", "weights", "decode ceiling", "loads");
+  std::printf("\nformats    %-6s %-4s %10s %12s %-14s %-18s %s\n", "", "fits", "weights", "decode est.", "maths",
+              "with --fast-math", "loads");
   for (const FormatOption& o : plan.options) {
     char ceiling[48] = "-";
     if (o.decode_ceiling_tps > 0)
       std::snprintf(ceiling, sizeof ceiling, "%.0f tok/s%s", o.decode_ceiling_tps, o.bf16x_bytes ? "*" : "");
-    std::printf("           %-6s %-4s %7.2f GB %15s   %s%s\n", format_name(o.format).c_str(), o.fits ? "yes" : "no",
-                static_cast<double>(o.weight_bytes) / 1e9, ceiling, o.loadable ? "" : "no: ", o.load.c_str());
+    std::printf("           %-6s %-4s %7.2f GB %12s %-14s %-18s %s%s\n", format_name(o.format).c_str(),
+                o.fits ? "yes" : "no", static_cast<double>(o.weight_bytes) / 1e9, ceiling, o.maths.c_str(),
+                o.fast_maths.c_str(), o.loadable ? "" : "no: ", o.load.c_str());
   }
   for (const FormatOption& o : plan.options)
     if (o.bf16x_bytes)
       std::printf("           * decoding from the BF16X copies of the BF16 weights (%.2f GB more)\n",
                   static_cast<double>(o.bf16x_bytes) / 1e9);
-  std::printf("           fits: resident with room for %d sequences of %d tokens; decode ceiling: one stream, "
-              "bandwidth over the bytes it reads per token\n",
+  std::printf("           fits: resident with room for %d sequences of %d tokens; decode est.: one stream, the "
+              "measured share of the card's bandwidth over the bytes a token reads\n",
               kUsefulSlots, kUsefulContext);
 
   std::printf("\nstored     %s\n", format_name(plan.stored).c_str());
@@ -105,7 +107,8 @@ void print_plan(const lx::runtime::Plan& plan) {
     std::printf("BF16X      off: decode copies are for BF16 weights, and these are %s\n",
                 format_name(plan.weights).c_str());
   if (plan.decode_ceiling_tps > 0)
-    std::printf("decode     at most %.0f tokens per second for one stream (bandwidth over bytes read per token)\n",
+    std::printf("decode     about %.0f tokens per second for one stream (the measured share of the card's bandwidth "
+                "over the bytes a token reads)\n",
                 plan.decode_ceiling_tps);
   else
     std::printf("decode     set by the experts that miss the VRAM cache, which only a run measures\n");

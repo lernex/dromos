@@ -60,12 +60,16 @@ Model find_model(const std::string& name, bool download) {
   return Model{dir, name, ref.repo};
 }
 
-const char* const kFormatUsage = "[--weights bf16|int8|fp8|nvfp4|bf16x] [--no-bf16x]";
+const char* const kFormatUsage = "[--weights bf16|int8|fp8|nvfp4|bf16x] [--no-bf16x] [--fast-math]";
 
 bool parse_format_flag(int argc, char** argv, int& i, FormatFlags& flags) {
   const std::string a = argv[i];
   if (a == "--no-bf16x") {
     flags.bf16x = false;
+    return true;
+  }
+  if (a == "--fast-math") {
+    flags.fast_math = true;
     return true;
   }
   if (a != "--weights") return false;
@@ -86,13 +90,14 @@ size_t env_gib(const char* name) {
 }  // namespace
 
 runtime::Plan plan_for(const Model& model, int sequences, int context, int weights, double memory_fraction,
-                       bool bf16x) {
+                       bool bf16x, bool fast) {
   const MetisConfig config = load_config(model.dir.string());
   runtime::PlanRequest request;
   request.sequences = sequences;
   request.context = context;
   request.weights = weights;
   request.bf16x = bf16x;
+  request.fast_math = fast;
   request.memory_fraction = memory_fraction;
   request.vram_budget = env_gib("LX_VRAM_BUDGET_GB");
   request.ram_budget = env_gib("LX_RAM_BUDGET_GB");
@@ -109,7 +114,7 @@ LoadedWeights load_weights(const fs::path& dir, const MetisConfig& config, const
   const runtime::DeviceInfo device = runtime::query_device(0);
   LoadedWeights out;
   out.format = target;
-  out.formats = runtime::model_formats(target, device, flags.bf16x && runtime::bf16x_available());
+  out.formats = runtime::model_formats(target, device, flags.bf16x && runtime::bf16x_available(), flags.fast_math);
   LoadOptions options;
   options.target = target;
   out.weights = std::make_unique<ModelWeights>(ModelWeights::load(dir, config, options));
@@ -129,12 +134,12 @@ LoadedWeights load_weights(const fs::path& dir, const MetisConfig& config, const
 }
 
 StartedEngine start_engine(const Model& model, int sequences, int context, int weights,
-                           const runtime::EngineOptions& options, double memory_fraction, bool bf16x) {
+                           const runtime::EngineOptions& options, double memory_fraction, bool bf16x, bool fast) {
   double fraction = memory_fraction;
   int wanted = sequences;
   int format = weights;
   for (int attempt = 1;; ++attempt) {
-    runtime::Plan plan = plan_for(model, wanted, context, format, fraction, bf16x);
+    runtime::Plan plan = plan_for(model, wanted, context, format, fraction, bf16x, fast);
     try {
       auto engine = std::make_unique<runtime::Engine>(model.dir.string(), plan, options);
       return StartedEngine{std::move(plan), std::move(engine)};

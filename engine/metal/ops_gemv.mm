@@ -1,0 +1,163 @@
+// Decode GEMV on every weight format (kernels/gemv.metal), and lx_gemm_f32 on up to 8 rows.
+#include <algorithm>
+#include <cstdio>
+
+#include "cuda/tunable.h"
+#include "metal/backend.h"
+#include "metal/gemm.h"
+#include "metal/kernels/args.h"
+
+using namespace lx::metal;
+
+namespace {
+
+constexpr int kGroups = 4;  // simdgroups per threadgroup
+constexpr int kMaxM = 8;
+
+// Rows per simdgroup (R in the kernel): one for a single x row, which streams the weight fastest, two
+// when several x rows share each weight chunk (measured on the M5, Praxis decode shapes). R only changes
+// how the loads are issued, never a sum.
+int rows_for(int mm) { return mm == 1 ? 1 : 2; }
+// Variant index: format, x bf16, x vector loads, M bucket (1, 4, 8), scalar, rows per simdgroup (1, 2).
+int variant(int f, bool xb, bool xv, int mm, bool scalar, int R) {
+  const int mb = mm == 1 ? 0 : mm == 4 ? 1 : 2;
+  return (((((f * 2 + xb) * 2 + (scalar ? 0 : xv)) * 3 + mb) * 2) + scalar) * 2 + (R - 1);
+}
+std::string gemv_name(int i) {
+  const int R = i % 2 + 1, scalar = (i / 2) % 2, mb = (i / 4) % 3, xv = (i / 12) % 2, xb = (i / 24) % 2, f = i / 48;
+  const int mm = mb == 0 ? 1 : mb == 1 ? 4 : 8;
+  char name[64];
+  std::snprintf(name, sizeof(name), "gemv_%d_%d%d_%d_%d_%d", f, xb, xv, mm, R, scalar);
+  return name;
+}
+// The four formats, f32 weights (format 4), lossless bf16 (format 5, also with the other R).
+KernelSet<288> g_gemv(gemv_name);
+
+// The split S (simdgroups per row group) is a shape's order class: one while the row groups alone fill
+// the GPU, more for short outputs. It depends on N alone, so every batch size of a shape shares it.
+int order_class(int N) { return N >= 2048 ? 1 : N >= 768 ? 2 : 4; }
+
+// Variants by split, named s<S> as CUDA's are; the tuner may only choose a shape's class.
+constexpr int kSplits[] = {1, 2, 4};
+bool admits(int variant, int M, int N, int K) { return kSplits[variant] == order_class(N); }
+const char* tune_name(int f) {
+  switch (f) {
+    case LX_W_BF16: return "gemv_w_bf16";
+    case LX_W_INT8: return "gemv_w_int8";
+    case LX_W_FP8: return "gemv_w_fp8";
+    default: return "gemv_w_nvfp4";
+  }
+}
+const lx::TunableRegistration reg_bf16("gemv_w_bf16", {"s1", "s2", "s4"}, &admits);
+const lx::TunableRegistration reg_int8("gemv_w_int8", {"s1", "s2", "s4"}, &admits);
+const lx::TunableRegistration reg_fp8("gemv_w_fp8", {"s1", "s2", "s4"}, &admits);
+const lx::TunableRegistration reg_nvfp4("gemv_w_nvfp4", {"s1", "s2", "s4"}, &admits);
+// The lossless GEMV's own knob, rows per simdgroup: it changes no sum, so every variant is admitted
+// everywhere. Its split is bf16's (gemv_w_bf16), which keeps it equal to lx_gemv.
+bool admits_any(int, int, int, int) { return true; }
+const lx::TunableRegistration reg_bf16x("gemv_bf16x", {"r1", "r2"}, &admits_any);
+
+// One launch over format f (0 .. 3 the lx_wtype, 4 f32 weights, 5 lossless bf16) once the arguments are
+// checked. Lossless bf16 takes every choice the bf16 weights it encodes would (their rows are 16-byte
+// aligned whenever they are whole chunks), so its sums are lx_gemv's on them to the bit.
+int launch(int f, const void* data, const void* scale, float global, const void* x, lx_dtype x_dtype, int ld_x,
+           const void* bias, lx_dtype bias_dtype, void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K, float alpha,
+           float beta, void* stream) {
+  const bool xb = x_dtype == LX_BF16;
+  const size_t xs = dtype_size(x_dtype);
+  const bool lossless = f == kWeightBF16X;
+  const int values = f == LX_W_BF16 || lossless ? 8 : f == LX_W_NVFP4 ? 32 : f == kWeightF32 ? 4 : 16;
+  const bool scalar = K % values != 0 || (!lossless && (reinterpret_cast<uintptr_t>(data) & 15) != 0) ||
+                      (f == LX_W_NVFP4 && (reinterpret_cast<uintptr_t>(scale) & 1) != 0);
+  const bool xv = (reinterpret_cast<uintptr_t>(x) & 15) == 0 && (size_t(ld_x) * xs) % 16 == 0;
+  const int mm = M == 1 ? 1 : M <= 4 ? 4 : 8;
+
+  const int v = f == kWeightF32 ? -1 : lx_tune_get(tune_name(lossless ? LX_W_BF16 : f), M, N, K);
+  const int S = v >= 0 && v < 3 ? kSplits[v] : order_class(N);
+
+  const size_t data_bytes = f == kWeightF32 ? size_t(N) * K * 4
+                            : lossless      ? kUnknownExtent  // overflow records follow the rows
+                                            : weight_data_bytes(lx_wtype(f), N, K);
+  const size_t scale_bytes = f == kWeightF32 || lossless ? 0 : weight_scale_bytes(lx_wtype(f), N, K);
+  GemvArgs a{};
+  a.w = WeightRef{addr(stream, data, data_bytes), addr(stream, scale, scale_bytes), 0, global, f};
+  a.x = addr(stream, x, span(M, K, ld_x, xs));
+  a.bias = addr(stream, bias, bias ? size_t(N) * dtype_size(bias_dtype) : 0);
+  a.y = addr_w(stream, y, span(M, N, ld_y, dtype_size(y_dtype)));
+  a.ld_x = ld_x;
+  a.ld_y = ld_y;
+  a.M = M;
+  a.N = N;
+  a.K = K;
+  a.alpha = alpha;
+  a.beta = beta;
+  a.x_bf16 = xb;
+  a.bias_bf16 = bias_dtype == LX_BF16;
+  a.y_bf16 = y_dtype == LX_BF16;
+  a.split = S;
+  int R = rows_for(mm);
+  if (lossless) {  // one row: the expansion's integer work leaves no room for a second (measured on the M5)
+    const int r = lx_tune_get("gemv_bf16x", M, N, K);
+    R = r == 0 || r == 1 ? r + 1 : 1;
+  }
+  const int rows_per_group = R * kGroups / S;
+  const NSUInteger red = S > 1 ? NSUInteger(kGroups * R * mm * 4) : 0;
+  return g_gemv.launch(variant(f, xb, xv, mm, scalar, R), stream, a, size1(ceil_div(N, rows_per_group)),
+                       size1(32 * kGroups), red);
+}
+
+}  // namespace
+
+namespace lx::metal {
+
+int gemv_f32(const float* x, int ld_x, const float* w, const float* bias, float* y, int ld_y, int M, int N, int K,
+             void* stream) {
+  return launch(kWeightF32, w, nullptr, 1.0f, x, LX_F32, ld_x, bias, LX_F32, y, LX_F32, ld_y, M, N, K, 1.0f, 0.0f,
+                stream);
+}
+
+}  // namespace lx::metal
+
+extern "C" {
+
+int lx_gemv_w(const void* x, lx_dtype x_dtype, int ld_x, const lx_weight* w, const void* bias, lx_dtype bias_dtype,
+              void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K, float alpha, float beta, void* stream) {
+  if (!w || M < 1 || M > kMaxM || N <= 0 || K <= 0 || ld_x < K || ld_y < N) return kInvalidValue;
+  if (!valid_dtype(x_dtype) || !valid_dtype(y_dtype) || (bias && !valid_dtype(bias_dtype))) return kInvalidValue;
+  if (w->type == LX_W_BF16X)  // the lossless GEMV: the same contract, lx_gemv's bits on the weights it encodes
+    return lx_gemv_bf16x(x, x_dtype, ld_x, w->data, bias, bias_dtype, y, y_dtype, ld_y, M, N, K, alpha, beta, stream);
+  if (w->type < LX_W_BF16 || w->type > LX_W_NVFP4 || !w->data) return kInvalidValue;
+  if (w->type != LX_W_BF16 && !w->scale) return kInvalidValue;
+  if (w->type == LX_W_NVFP4 && K % 16 != 0) return kInvalidValue;
+  return launch(w->type, w->data, w->scale, w->type == LX_W_NVFP4 ? w->global : 1.0f, x, x_dtype, ld_x, bias,
+                bias_dtype, y, y_dtype, ld_y, M, N, K, alpha, beta, stream);
+}
+
+int lx_gemv(const void* x, lx_dtype x_dtype, int ld_x, const void* w, lx_wtype w_type, const float* w_scale,
+            const void* bias, lx_dtype bias_dtype, void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K,
+            float alpha, float beta, void* stream) {
+  if (w_type != LX_W_BF16 && w_type != LX_W_INT8) return kInvalidValue;
+  const lx_weight lw{w_type, w, w_scale, 1.0f, nullptr};
+  return lx_gemv_w(x, x_dtype, ld_x, &lw, bias, bias_dtype, y, y_dtype, ld_y, M, N, K, alpha, beta, stream);
+}
+
+int lx_gemv_bf16x(const void* x, lx_dtype x_dtype, int ld_x, const void* w, const void* bias, lx_dtype bias_dtype,
+                  void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K, float alpha, float beta, void* stream) {
+  if (M == 0 || N == 0) return kOk;
+  if (M < 0 || M > kMaxM || N < 0 || K <= 0 || K >= (1 << 23) || ld_x < K || ld_y < N) return kInvalidValue;
+  if (!valid_dtype(x_dtype) || !valid_dtype(y_dtype) || (bias && !valid_dtype(bias_dtype))) return kInvalidValue;
+  if (!x || !w || !y || (reinterpret_cast<uintptr_t>(w) & 7) != 0) return kInvalidValue;
+  return launch(kWeightBF16X, w, nullptr, 1.0f, x, x_dtype, ld_x, bias, bias_dtype, y, y_dtype, ld_y, M, N, K, alpha,
+                beta, stream);
+}
+
+// The like-for-like baseline of the lossless GEMV: on Metal the very kernel lx_gemv runs.
+int lx_gemv_decode_bf16(const void* x, lx_dtype x_dtype, int ld_x, const void* w, const void* bias,
+                        lx_dtype bias_dtype, void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K, float alpha,
+                        float beta, void* stream) {
+  if (M == 0 || N == 0) return kOk;
+  const lx_weight lw{LX_W_BF16, w, nullptr, 1.0f, nullptr};
+  return lx_gemv_w(x, x_dtype, ld_x, &lw, bias, bias_dtype, y, y_dtype, ld_y, M, N, K, alpha, beta, stream);
+}
+
+}  // extern "C"

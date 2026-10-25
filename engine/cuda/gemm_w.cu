@@ -134,14 +134,22 @@ const char* default_tile(int kind, int M, int N) {
 // Small problems on sm_90+: the 32x128 tile split along K over a cluster of 2 or 4 CTAs when its tiles
 // alone would leave SMs idle (measured, bench/tune_gemm_w.py: at most one CTA per SM after the split).
 // The kernels that expand weights in the mainloop (W8A16, W4A16, W4A8) are bound by that arithmetic and
-// gain from any more CTAs (up to 2.7x at M = 16), even with a couple of K tiles each; the homogeneous
-// kinds are reading weights at small M and gain up to ~20%, only while each CTA keeps 8 K tiles or more.
+// gain from any more CTAs (up to 2.7x at M = 16), even with a couple of K tiles each. The homogeneous
+// kinds are reading weights at small M and gain up to ~25%, but only while each CTA's K loop stays long
+// against the cluster's sum: 4-way from 8 K tiles each with a handful of tiles (16 each up to 17 tiles),
+// 2-way from 8 each up to 24 tiles and 16 each up to 35; past that a split costs up to 11% (measured on
+// the RTX 5070 Ti, int8, fp8 and fp4, M 16 to 96, N 1024 to 4096, K 1024 to 8192). A split also makes a
+// row's bits depend on M (kernels.h), so it is used only where it pays.
 int split_for(int kind, int tiles, int k_tiles, int arch) {
   if (arch < 90) return 1;
   const bool mixed = kind == kW8I8 || kind == kW8F8 || kind == kW4A16 || kind == kW4A8;
-  const int min_kt = mixed ? 2 : 8;  // K tiles each CTA keeps
-  if (tiles <= 17 && k_tiles >= 4 * min_kt) return 4;
-  if (tiles <= 35 && k_tiles >= 2 * min_kt) return 2;
+  if (mixed) {
+    if (tiles <= 17 && k_tiles >= 8) return 4;
+    if (tiles <= 35 && k_tiles >= 4) return 2;
+    return 1;
+  }
+  if (k_tiles >= 64 ? tiles <= 17 : (tiles <= 8 && k_tiles >= 32)) return 4;
+  if (k_tiles >= 32 ? tiles <= 35 : (tiles <= 24 && k_tiles >= 16)) return 2;
   return 1;
 }
 

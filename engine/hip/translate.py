@@ -76,6 +76,7 @@ RENAMES = [
     (r"\bcudaDataType\b", "hipDataType"),
     # HIP has no thread-block clusters: no architecture takes the cluster path (common.cuh).
     (r"\blx::kClusterArch\b", "lx::kNoClusterArch"),
+    (r"\bcudaFuncSetAttribute\(", "lx_func_set_attribute("),
     (r"\b__shfl_sync\(", "lx_shfl_sync("),
     (r"\b__shfl_xor_sync\(", "lx_shfl_xor_sync("),
     (r"\b__shfl_down_sync\(", "lx_shfl_down_sync("),
