@@ -158,7 +158,7 @@ struct MetisModel::Impl {
   FILE* route_trace = nullptr;                // LX_ROUTE_TRACE: every layer's routing, for the placement stats
   // With the trace: the next layer's routing predicted from the streams as they leave this layer
   // (the next layer's MoE read, latent_down and router applied early, with this layer's features).
-  float *pred_mixed = nullptr, *pred_latent = nullptr, *pred_router_in = nullptr, *pred_logits = nullptr,
+  float *pred_mixed = nullptr, *pred_router_in = nullptr, *pred_logits = nullptr,
         *pred_w = nullptr, *pred_entropy = nullptr, *pred_confidence = nullptr;
   void* pred_h = nullptr;
   int32_t* pred_ids = nullptr;
@@ -795,7 +795,6 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
   if (m.route_trace || m.prefetch > 0) {
     m.pred_mixed = m.alloc<float>(TS * D);
     m.pred_h = m.alloc<uint16_t>(T * D);
-    m.pred_latent = m.alloc<float>(T * Lat);
     m.pred_router_in = m.alloc<float>(T * (Lat + R));
     m.pred_logits = m.alloc<float>(T * E);
     m.pred_ids = m.alloc<int32_t>(T * Impl::kPredicted);
@@ -1704,9 +1703,9 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
       // latent mixture of experts
       const float* ec = layer.moe_conn.params + pass * params;
       LX_CHECK(lx_mhc_read(m.streams, ec, ec + S * S, layer.moe_conn.norm, c.rms_norm_eps, m.mixed, m.h_bf, T, S, D, s));
-      linear(m, layer.latent_down, m.h_bf, LX_BF16, D, m.latent, LX_F32, Lat, T, s);
-      to_bf16(m.latent, Lat, m.latent_bf, Lat, T, Lat, s);
-      copy_f32(m.latent, Lat, m.router_in, Lat + R, T, Lat, s);
+      // the latent lands in the router's input: [latent | features], one row of Lat + R per token
+      linear(m, layer.latent_down, m.h_bf, LX_BF16, D, m.router_in, LX_F32, Lat + R, T, s);
+      to_bf16(m.router_in, Lat + R, m.latent_bf, Lat, T, Lat, s);
       copy_f32(m.features, R, m.router_in + Lat, Lat + R, T, R, s);
       gemm_f32(m.router_in, Lat + R, layer.router_w, layer.router_b, m.router_logits, E, T, E, Lat + R, s);
       LX_CHECK(lx_moe_route(m.router_logits, layer.selection_bias, m.route_ids, m.route_w, m.entropy, m.confidence, T,
@@ -1763,8 +1762,7 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
         check(lx_rt_event_record(m.fork_events[slot_index], s), "event record");
         void* b = m.side;
         check(lx_rt_stream_wait(b, m.fork_events[slot_index]), "stream wait");
-        linear(m, nx.latent_down, m.pred_h, LX_BF16, D, m.pred_latent, LX_F32, Lat, T, b);
-        copy_f32(m.pred_latent, Lat, m.pred_router_in, Lat + R, T, Lat, b);
+        linear(m, nx.latent_down, m.pred_h, LX_BF16, D, m.pred_router_in, LX_F32, Lat + R, T, b);
         LX_CHECK(lx_gemm_f32(m.pred_router_in, Lat + R, nx.router_w, nx.router_b, m.pred_logits, E, T, E, Lat + R, b));
         LX_CHECK(lx_moe_route(m.pred_logits, nx.selection_bias, m.pred_ids, m.pred_w, m.pred_entropy, m.pred_confidence,
                               T, E, Impl::kPredicted, b));
@@ -1779,8 +1777,7 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
         const float* nc = nx.moe_conn.params + pass * params;
         LX_CHECK(lx_mhc_read(m.streams, nc, nc + S * S, nx.moe_conn.norm, c.rms_norm_eps, m.pred_mixed, m.pred_h, T, S,
                              D, s));
-        linear(m, nx.latent_down, m.pred_h, LX_BF16, D, m.pred_latent, LX_F32, Lat, T, s);
-        copy_f32(m.pred_latent, Lat, m.pred_router_in, Lat + R, T, Lat, s);
+        linear(m, nx.latent_down, m.pred_h, LX_BF16, D, m.pred_router_in, LX_F32, Lat + R, T, s);
         copy_f32(m.features, R, m.pred_router_in + Lat, Lat + R, T, R, s);
         LX_CHECK(lx_gemm_f32(m.pred_router_in, Lat + R, nx.router_w, nx.router_b, m.pred_logits, E, T, E, Lat + R, s));
         LX_CHECK(lx_moe_route(m.pred_logits, nx.selection_bias, m.pred_ids, m.pred_w, m.pred_entropy, m.pred_confidence,
