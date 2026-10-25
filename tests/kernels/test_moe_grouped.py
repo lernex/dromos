@@ -6,9 +6,15 @@ The reference follows the kernel's arithmetic in float64: the latent as the math
 quantized per token with the reference quantizer that test_quant_act checks bit for bit), the experts'
 weights dequantized from their stored format, the SwiGLU intermediate rounded to bf16, then that
 intermediate as the math sees it (quantized per pair row) through the down projection, weighted and summed
-per token. What is left is float32 accumulation order, the kernel's fast exp in silu, and the bf16 and
-quantization roundings those can tip, so the bound is relative to the output's magnitude: 2e-3, and 6e-3
-under FP4 math (an e2m1 step is a quarter of its block's scale, so a tipped intermediate moves further)."""
+per token. What is left is float32 accumulation order, the kernel's exp in silu (CUDA's fast __expf, Metal's
+exp), and the bf16 and quantization roundings those can tip, so the bound is relative to the output's
+magnitude: 2e-3 under BF16 and INT8 math, 6e-3 under FP4 math (an e2m1 step is a quarter of its block's
+scale, so a tipped intermediate moves further), and 8e-3 under FP8 math. Under FP8 the intermediate is
+rounded to e4m3 per pair row: one rounding flip of one intermediate moves its token's output row by up to
+about half a percent of the output's largest magnitude, and it can happen at any sequence length, since
+the chance of a flip grows with the number of rows. Measured on the Metal backend over 16 random cases
+(T = 1024 and 4096, skewed routing), the worst case was 5.3e-3, and every case over 2e-3 had a single row
+over it. 8e-3 leaves margin over that while still catching a systematic error, which moves every row."""
 
 import ctypes
 
@@ -135,10 +141,14 @@ def run(lx, case, math, T, L, I, E, top_k):
     return call_grouped(lx, latent, ids, weights, gu, dn, math, out, ws, T, L, I, E, top_k), out
 
 
+# Relative to the output's largest magnitude; the reasons are in the module docstring.
+TOLERANCE = {MATH_BF16: 2e-3, MATH_INT8: 2e-3, MATH_FP8: 8e-3, MATH_FP4: 6e-3}
+
+
 def check(out, case, math):
     latent, ids, weights, gu, dn = case
     want = reference(latent, ids, weights, gu, dn, math)
-    tol = (6e-3 if math == MATH_FP4 else 2e-3) * want.abs().max().item()
+    tol = TOLERANCE[math] * want.abs().max().item()
     close(out, want.float(), atol=tol)
 
 
