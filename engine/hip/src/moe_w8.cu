@@ -66,12 +66,12 @@ __host__ __device__ inline int64_t chain_offset(int P, int I) {
   return (2 * static_cast<int64_t>(P) * I + 15) / 16 * 16;
 }
 
-// Asynchronous 16-byte global to shared copy, used by stage 2 to stage weights before the wait.
+// 16-byte global to shared copy, used by stage 2 to stage weights before the wait. On HIP it is a plain
+// copy that lands before the call returns, so the wait has nothing left to do (the same as mamba.cu).
 __device__ __forceinline__ void cp_async16(void* smem, const void* gmem) {
-  const uint32_t dst = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
-  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(gmem) : "memory");
+  *static_cast<uint4*>(smem) = *static_cast<const uint4*>(gmem);
 }
-__device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wait_all;" ::: "memory"); }
+__device__ __forceinline__ void cp_async_wait_all() {}
 
 // Stage 1, decode form, vector path: one pair per block row, NC chunks of 512 bytes per row. Each lane
 // owns 16 bytes per chunk, so a warp reads 512 contiguous bytes per load. Requires L % 16 == 0.

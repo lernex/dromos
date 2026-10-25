@@ -253,7 +253,7 @@ int launch(const float* qkv, int ld_qkv, const bf16* k_cache, const bf16* v_cach
   constexpr int smem = Layout<Dh>::kSmem;
   if constexpr (smem > 48 * 1024) {
     static const hipError_t attr =
-        hipFuncSetAttribute(attention_tc_kernel<Dh>, hipFuncAttributeMaxDynamicSharedMemorySize, smem);
+        lx_func_set_attribute(attention_tc_kernel<Dh>, hipFuncAttributeMaxDynamicSharedMemorySize, smem);
     if (attr != hipSuccess) return static_cast<int>(attr);
   }
   attention_tc_kernel<Dh><<<grid, kThreads, smem, s>>>(qkv, ld_qkv, k_cache, v_cache, slot_ids, start_pos, cu, n_seq,

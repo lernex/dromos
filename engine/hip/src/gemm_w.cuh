@@ -130,9 +130,9 @@ inline int launch_dense(DenseProb::Params pp, const DenseEpi::Params& ep, hipStr
   using C = lx::tc::Config<kKind, kArch, BM, BN, WM, WN, ST, RB>;
   auto kernel = dense_kernel<kKind, kArch, BM, BN, WM, WN, ST, RB, kSplit>;
   static const hipError_t attr = [&] {
-    hipError_t e = hipFuncSetAttribute(kernel, hipFuncAttributeMaxDynamicSharedMemorySize, C::kSmem);
+    hipError_t e = lx_func_set_attribute(kernel, hipFuncAttributeMaxDynamicSharedMemorySize, C::kSmem);
     if (e == hipSuccess)
-      e = hipFuncSetAttribute(kernel, hipFuncAttributePreferredSharedMemoryCarveout, hipSharedmemCarveoutMaxShared);
+      e = lx_func_set_attribute(kernel, hipFuncAttributePreferredSharedMemoryCarveout, hipSharedmemCarveoutMaxShared);
     return e;
   }();
   if (attr != hipSuccess) return static_cast<int>(attr);
@@ -156,6 +156,7 @@ struct Variant {
   LaunchFn fn;
   int split;     // CTAs per tile along K (1: none)
   int min_arch;  // lx::kNoClusterArch for the split variants (thread block clusters)
+  int smem;      // LDS bytes one CTA of this tile needs (lx::tc::Config::kSmem)
 };
 
 template <int kKind, int kArch>
@@ -184,12 +185,12 @@ LX_GEMMW_FAMILY(kW4A8, 120)
 // A family's definition: its tuner name and its variants, BMxBN, warps along M x N, stages, A bytes per
 // row per k-tile.
 #define LX_V(K, A, BM, BN, WM, WN, ST, RB) \
-  Variant { #BM "x" #BN "_w" #WM "x" #WN "_s" #ST "_k" #RB, BM, launch_dense<lx::tc::K, A, BM, BN, WM, WN, ST, RB>, 1, 0 }
+  Variant { #BM "x" #BN "_w" #WM "x" #WN "_s" #ST "_k" #RB, BM, launch_dense<lx::tc::K, A, BM, BN, WM, WN, ST, RB>, 1, 0, lx::tc::Config<lx::tc::K, A, BM, BN, WM, WN, ST, RB>::kSmem }
 // A split-K variant: kSplit CTAs per tile along K (sm_90+).
 #define LX_VS(K, A, BM, BN, WM, WN, ST, RB, S)                                                          \
   Variant {                                                                                            \
     #BM "x" #BN "_w" #WM "x" #WN "_s" #ST "_k" #RB "_x" #S, BM, launch_dense<lx::tc::K, A, BM, BN, WM, WN, ST, RB, S>, \
-        S, lx::kNoClusterArch                                                                            \
+        S, lx::kNoClusterArch, lx::tc::Config<lx::tc::K, A, BM, BN, WM, WN, ST, RB>::kSmem                                                                            \
   }
 #define LX_FAMILY(K, A, NAME, ...)                                  \
   template <>                                                       \
