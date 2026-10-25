@@ -344,7 +344,9 @@ LX_API int lx_gemv_w(const void* x, lx_dtype x_dtype, int ld_x, const lx_weight*
 // x bf16 or f32 (quantized on the fly when math needs it, into `workspace`, at least
 // lx_gemm_workspace_bytes(M, K, math) bytes). Same dtype rules for bias and y as lx_gemm_bf16.
 // Deterministic: the same call gives the same bits (small products on sm_90+ may split K across a
-// thread block cluster; the partial sums are added in a fixed order).
+// thread block cluster; the partial sums are added in a fixed order). A row's bits do not depend on the
+// other rows of the call either (every tile adds the K steps in one order), with two exceptions that
+// change with M: that split-K, and BF16 x BF16, which runs on cuBLASLt and its per-shape algorithm.
 LX_API int lx_gemm_w(const void* x, lx_dtype x_dtype, int ld_x, const lx_weight* w, lx_math math, const void* bias,
                      lx_dtype bias_dtype, void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K, float alpha,
                      float beta, void* workspace, void* stream);
