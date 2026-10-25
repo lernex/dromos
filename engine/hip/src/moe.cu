@@ -20,13 +20,10 @@ namespace {
 using bf16 = __hip_bfloat16;
 
 constexpr int kThreads = 256;                   // expert kernels: 8 warps per block
-constexpr int kWarps = kThreads / LX_WARP;  // wavefronts per block (device code; host: warps_per_block())
+constexpr int kWarps = kThreads / 32;
 constexpr int kRouteWarps = 4;                  // route kernel: one token per warp, 4 per block
 constexpr int kMaxTopK = 32;                    // route keeps one pick per lane of its warp
 constexpr size_t kMaxSmem = 48 * 1024;          // default dynamic shared memory limit
-
-// Wavefronts per block on the current device, for the host's grid sizes.
-inline int warps_per_block() { return kThreads / lx_warp_size(); }
 
 // Eight bf16 values in one 16-byte load.
 struct alignas(16) Bf16x8 {
@@ -39,7 +36,7 @@ struct alignas(16) Bf16x8 {
 __device__ __forceinline__ float warp_dot(const bf16* row, const bf16* x, int n, int lane) {
   float acc = 0.0f;
   if (n % 8 == 0) {
-    for (int c = lane * 8; c < n; c += 8 * LX_WARP) {
+    for (int c = lane * 8; c < n; c += 256) {
       const Bf16x8 a = *reinterpret_cast<const Bf16x8*>(row + c);
       const Bf16x8 b = *reinterpret_cast<const Bf16x8*>(x + c);
 #pragma unroll
@@ -50,7 +47,7 @@ __device__ __forceinline__ float warp_dot(const bf16* row, const bf16* x, int n,
       }
     }
   } else {
-    for (int c = lane; c < n; c += LX_WARP) acc += lx::to_f32(row[c]) * lx::to_f32(x[c]);
+    for (int c = lane; c < n; c += 32) acc += lx::to_f32(row[c]) * lx::to_f32(x[c]);
   }
   return lx::warp_sum(acc);
 }
@@ -61,7 +58,7 @@ __global__ void moe_route_kernel(const float* __restrict__ logits, const float* 
                                  float* __restrict__ entropy, float* __restrict__ confidence, int T, int E,
                                  int top_k) {
   __shared__ int picked[kRouteWarps][kMaxTopK];
-  const int warp = threadIdx.x / LX_WARP, lane = threadIdx.x & (LX_WARP - 1);
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int t = blockIdx.x * kRouteWarps + warp;
   if (t >= T) return;  // whole warp returns together, so the shuffles below stay full-warp
   const float* row = logits + static_cast<int64_t>(t) * E;
@@ -69,13 +66,13 @@ __global__ void moe_route_kernel(const float* __restrict__ logits, const float* 
   // Three passes over the logits: max, normaliser z, entropy. The largest probability is
   // exp(0) / z, so confidence is 1 / z with no second pass.
   float m = -INFINITY;
-  for (int i = lane; i < E; i += LX_WARP) m = fmaxf(m, row[i]);
+  for (int i = lane; i < E; i += 32) m = fmaxf(m, row[i]);
   m = lx::warp_max(m);
   float z = 0.0f;
-  for (int i = lane; i < E; i += LX_WARP) z += expf(row[i] - m);
+  for (int i = lane; i < E; i += 32) z += expf(row[i] - m);
   z = lx::warp_sum(z);
   float h = 0.0f;
-  for (int i = lane; i < E; i += LX_WARP) {
+  for (int i = lane; i < E; i += 32) {
     const float p = expf(row[i] - m) / z;
     h -= p * logf(fmaxf(p, 1e-9f));
   }
@@ -91,7 +88,7 @@ __global__ void moe_route_kernel(const float* __restrict__ logits, const float* 
   for (int r = 0; r < top_k; ++r) {
     float best = -INFINITY;
     int best_i = E;
-    for (int i = lane; i < E; i += LX_WARP) {
+    for (int i = lane; i < E; i += 32) {
       bool taken = false;
       for (int j = 0; j < r; ++j) taken |= pick[j] == i;
       if (taken) continue;
@@ -101,9 +98,9 @@ __global__ void moe_route_kernel(const float* __restrict__ logits, const float* 
         best_i = i;
       }
     }
-    for (int o = LX_WARP / 2; o > 0; o >>= 1) {
-      const float ov = __shfl_xor_sync(LX_FULL_MASK, best, o);
-      const int oi = __shfl_xor_sync(LX_FULL_MASK, best_i, o);
+    for (int o = 16; o > 0; o >>= 1) {
+      const float ov = lx_shfl_xor_sync(0xffffffffu, best, o);
+      const int oi = lx_shfl_xor_sync(0xffffffffu, best_i, o);
       if (ov > best || (ov == best && oi < best_i)) {
         best = ov;
         best_i = oi;
@@ -134,12 +131,12 @@ __global__ void moe_intermediate_kernel(const bf16* __restrict__ latent, const i
                                         int I, int top_k, int row_blocks) {
   extern __shared__ __align__(16) bf16 x[];
   const int64_t p = static_cast<int64_t>(blockIdx.x) / row_blocks;
-  const int i = static_cast<int>(blockIdx.x % row_blocks) * kWarps + (threadIdx.x / LX_WARP);
+  const int i = static_cast<int>(blockIdx.x % row_blocks) * kWarps + (threadIdx.x >> 5);
   const int64_t t = p / top_k;
   for (int c = threadIdx.x; c < L; c += kThreads) x[c] = latent[t * L + c];
   __syncthreads();
   if (i >= I) return;
-  const int lane = threadIdx.x & (LX_WARP - 1);
+  const int lane = threadIdx.x & 31;
   // gate_up[e] is [2I, L]: rows 0..I-1 are the gate, rows I..2I-1 the up projection.
   const bf16* w = gate_up + static_cast<int64_t>(ids[p]) * 2 * I * L;
   const float gate = warp_dot(w + static_cast<int64_t>(i) * L, x, L, lane);
@@ -156,12 +153,12 @@ __global__ void moe_down_kernel(const bf16* __restrict__ inter, const int32_t* _
                                 float* __restrict__ out, int L, int I, int top_k, int row_blocks) {
   extern __shared__ __align__(16) bf16 h[];
   const int64_t t = static_cast<int64_t>(blockIdx.x) / row_blocks;
-  const int l = static_cast<int>(blockIdx.x % row_blocks) * kWarps + (threadIdx.x / LX_WARP);
+  const int l = static_cast<int>(blockIdx.x % row_blocks) * kWarps + (threadIdx.x >> 5);
   const bf16* src = inter + t * top_k * I;
   for (int c = threadIdx.x; c < top_k * I; c += kThreads) h[c] = src[c];
   __syncthreads();
   if (l >= L) return;
-  const int lane = threadIdx.x & (LX_WARP - 1);
+  const int lane = threadIdx.x & 31;
   float acc = 0.0f;
   for (int k = 0; k < top_k; ++k) {
     const int64_t p = t * top_k + k;
@@ -196,7 +193,7 @@ extern "C" int lx_moe_route(const float* logits, const float* selection_bias, in
   if (T <= 0) return 0;
   if (top_k < 1 || top_k > kMaxTopK || top_k > E) return static_cast<int>(hipErrorInvalidValue);
   auto s = static_cast<hipStream_t>(stream);
-  moe_route_kernel<<<(T + kRouteWarps - 1) / kRouteWarps, kRouteWarps * lx_warp_size(), 0, s>>>(
+  moe_route_kernel<<<(T + kRouteWarps - 1) / kRouteWarps, kRouteWarps * 32, 0, s>>>(
       logits, selection_bias, ids, weights, entropy, confidence, T, E, top_k);
   return lx::launch_status();
 }
@@ -215,16 +212,15 @@ extern "C" int lx_moe_experts(const void* latent, const int32_t* ids, const floa
   hipError_t err = hipMallocAsync(reinterpret_cast<void**>(&inter), pairs * I * sizeof(bf16), s);
   if (err != hipSuccess) return static_cast<int>(err);
 
-  const int wpb = warps_per_block();
-  const int row_blocks_a = (I + wpb - 1) / wpb;
+  const int row_blocks_a = (I + kWarps - 1) / kWarps;
   moe_intermediate_kernel<<<static_cast<unsigned int>(row_blocks_a * pairs), kThreads, smem_latent, s>>>(
       static_cast<const bf16*>(latent), ids, static_cast<const bf16*>(gate_up), inter, L, I, top_k, row_blocks_a);
 
-  const int row_blocks_b = (L + wpb - 1) / wpb;
+  const int row_blocks_b = (L + kWarps - 1) / kWarps;
   moe_down_kernel<<<static_cast<unsigned int>(T * row_blocks_b), kThreads, smem_inter, s>>>(
       inter, ids, weights, static_cast<const bf16*>(down), out, L, I, top_k, row_blocks_b);
 
-  if (hipError_t f = hipFreeAsync(inter, s); f != hipSuccess) return static_cast<int>(f);
+  hipFreeAsync(inter, s);
   return lx::launch_status();
 }
 

@@ -66,6 +66,8 @@ target_include_directories(lernex_hip PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/includ
 if(LX_HIP_PLATFORM STREQUAL "nvidia")
   # The shim's HIP names go first, so they win over anything else on the path.
   target_include_directories(lernex_hip BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/nvidia)
+# The same constexpr rule the CUDA build uses (the root CMakeLists): device lambdas call constexpr host functions.
+target_compile_options(lernex_hip PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
   target_link_libraries(lernex_hip PRIVATE CUDA::cudart CUDA::cublasLt)
 else()
   # hipBLASLt is the dense GEMM. Its headers come from the ROCm install (or LX_HIPBLASLT_INCLUDE).

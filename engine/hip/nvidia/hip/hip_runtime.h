@@ -77,3 +77,37 @@ static inline hipError_t hipGraphInstantiate(hipGraphExec_t* exec, hipGraph_t gr
 #define hipEventDestroy cudaEventDestroy
 #define hipEventRecord cudaEventRecord
 #define hipEventSynchronize cudaEventSynchronize
+
+// Names the translator renames onto HIP's own spellings (translate.py RENAMES).
+#define hipDeviceAttributeComputeCapabilityMajor cudaDevAttrComputeCapabilityMajor
+#define hipDeviceAttributeComputeCapabilityMinor cudaDevAttrComputeCapabilityMinor
+#define hipDeviceAttributeMultiprocessorCount cudaDevAttrMultiProcessorCount
+#define hipDeviceAttributeL2CacheSize cudaDevAttrL2CacheSize
+#define hipDeviceAttributeMemoryClockRate cudaDevAttrMemoryClockRate
+#define hipDeviceAttributeMemoryBusWidth cudaDevAttrGlobalMemoryBusWidth
+#define hipOccupancyMaxActiveBlocksPerMultiprocessor cudaOccupancyMaxActiveBlocksPerMultiprocessor
+#define hipMemcpyDefault cudaMemcpyDefault
+#define hipRuntimeGetVersion cudaRuntimeGetVersion
+#define hipDriverGetVersion cudaDriverGetVersion
+#define hipGetDeviceProperties cudaGetDeviceProperties
+#define hipPointerGetAttributes cudaPointerGetAttributes
+#define hipMemoryTypeHost cudaMemoryTypeHost
+#define hipGetErrorString cudaGetErrorString
+#define hipDeviceSynchronize cudaDeviceSynchronize
+#define hipEventElapsedTime cudaEventElapsedTime
+#define hipEventCreate cudaEventCreate
+typedef cudaDeviceProp hipDeviceProp_t;
+typedef cudaPointerAttributes hipPointerAttribute_t;
+typedef cudaDeviceAttr hipDeviceAttribute_t;
+#define hipHostAlloc cudaHostAlloc
+#define hipHostAllocPortable cudaHostAllocPortable
+#define hipHostAllocMapped cudaHostAllocMapped
+#define hipHostRegister cudaHostRegister
+#define hipHostRegisterPortable cudaHostRegisterPortable
+#define hipHostRegisterMapped cudaHostRegisterMapped
+#define hipHostUnregister cudaHostUnregister
+#define hipHostGetDevicePointer cudaHostGetDevicePointer
+#define hipStreamWaitEvent cudaStreamWaitEvent
+#define hipMemGetInfo cudaMemGetInfo
+#define hipSharedmemCarveoutMaxShared cudaSharedmemCarveoutMaxShared
+#define hipFuncAttributePreferredSharedMemoryCarveout cudaFuncAttributePreferredSharedMemoryCarveout

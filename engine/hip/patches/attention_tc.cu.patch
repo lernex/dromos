@@ -1,0 +1,15 @@
+--- a/attention_tc.cu
++++ b/attention_tc.cu
+@@ -46,11 +46,7 @@
+   return static_cast<uint32_t>(r * (Dh * 2) + ((c ^ (r & 7)) << 4));
+ }
+ 
+-__device__ __forceinline__ float ex2(float x) {
+-  float y;
+-  asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+-  return y;
+-}
++__device__ __forceinline__ float ex2(float x) { return exp2f(x); }
+ 
+ __device__ __forceinline__ float bf16_lo(uint32_t w) { return __uint_as_float(w << 16); }
+ __device__ __forceinline__ float bf16_hi(uint32_t w) { return __uint_as_float(w & 0xffff0000u); }
