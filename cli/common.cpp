@@ -60,24 +60,81 @@ Model find_model(const std::string& name, bool download) {
   return Model{dir, name, ref.repo};
 }
 
-runtime::Plan plan_for(const Model& model, int sequences, int context, int weights, double memory_fraction) {
+const char* const kFormatUsage = "[--weights bf16|int8|fp8|nvfp4|bf16x] [--no-bf16x]";
+
+bool parse_format_flag(int argc, char** argv, int& i, FormatFlags& flags) {
+  const std::string a = argv[i];
+  if (a == "--no-bf16x") {
+    flags.bf16x = false;
+    return true;
+  }
+  if (a != "--weights") return false;
+  if (i + 1 >= argc) throw std::runtime_error("--weights needs a value: bf16, int8, fp8, nvfp4 or bf16x");
+  flags.weights = runtime::weights_from_flag(argv[++i]);
+  return true;
+}
+
+namespace {
+
+// A budget in GiB from the environment, in bytes, or 0 when it is not set.
+size_t env_gib(const char* name) {
+  const char* v = std::getenv(name);
+  const double gib = v && *v ? std::atof(v) : 0.0;
+  return gib > 0 ? static_cast<size_t>(gib * 1073741824.0) : 0;
+}
+
+}  // namespace
+
+runtime::Plan plan_for(const Model& model, int sequences, int context, int weights, double memory_fraction,
+                       bool bf16x) {
   const MetisConfig config = load_config(model.dir.string());
   runtime::PlanRequest request;
   request.sequences = sequences;
   request.context = context;
   request.weights = weights;
+  request.bf16x = bf16x;
   request.memory_fraction = memory_fraction;
+  request.vram_budget = env_gib("LX_VRAM_BUDGET_GB");
+  request.ram_budget = env_gib("LX_RAM_BUDGET_GB");
   const runtime::CheckpointInfo checkpoint = runtime::inspect_checkpoint(model.dir.string());
   return runtime::make_plan(runtime::query_device(0), config, checkpoint, request);
 }
 
+LoadedWeights load_weights(const fs::path& dir, const MetisConfig& config, const FormatFlags& flags) {
+  const lx_wtype stored = ModelWeights::stored_format(dir);
+  const lx_wtype target = flags.weights >= 0 ? static_cast<lx_wtype>(flags.weights) : stored;
+  std::string how;
+  if (!runtime::can_load(target, stored, config, &how))
+    throw std::runtime_error(runtime::format_name(target) + " cannot be loaded: " + how);
+  const runtime::DeviceInfo device = runtime::query_device(0);
+  LoadedWeights out;
+  out.format = target;
+  out.formats = runtime::model_formats(target, device, flags.bf16x && runtime::bf16x_available());
+  LoadOptions options;
+  options.target = target;
+  out.weights = std::make_unique<ModelWeights>(ModelWeights::load(dir, config, options));
+  auto math = [](lx_math m) {
+    switch (m) {
+      case LX_MATH_INT8: return "INT8";
+      case LX_MATH_FP8: return "FP8";
+      case LX_MATH_FP4: return "FP4";
+      default: return "BF16";
+    }
+  };
+  out.description = "weights " + runtime::format_name(target) + " (" + how + "), " +
+                    human_bytes(out.weights->device_bytes()) + "; prefill math " + math(out.formats.prefill_math) +
+                    ", experts " + math(out.formats.expert_math) +
+                    (out.formats.bf16x_decode ? "; decode reads BF16X copies" : "");
+  return out;
+}
+
 StartedEngine start_engine(const Model& model, int sequences, int context, int weights,
-                           const runtime::EngineOptions& options, double memory_fraction) {
+                           const runtime::EngineOptions& options, double memory_fraction, bool bf16x) {
   double fraction = memory_fraction;
   int wanted = sequences;
   int format = weights;
   for (int attempt = 1;; ++attempt) {
-    runtime::Plan plan = plan_for(model, wanted, context, format, fraction);
+    runtime::Plan plan = plan_for(model, wanted, context, format, fraction, bf16x);
     try {
       auto engine = std::make_unique<runtime::Engine>(model.dir.string(), plan, options);
       return StartedEngine{std::move(plan), std::move(engine)};

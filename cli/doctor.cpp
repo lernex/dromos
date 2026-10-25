@@ -1,7 +1,10 @@
-// lernex doctor [MODEL_DIR] [--weights bf16|int8|fp8|nvfp4] [--context N] [--sequences N]
+// lernex doctor [MODEL_DIR] [--weights bf16|int8|fp8|nvfp4|bf16x] [--no-bf16x] [--context N] [--sequences N]
 //
 // Prints what this GPU can do, which kernels this build has, which tuning table is in use, and, with a
-// model folder, the plan the engine would run it under, in plain language.
+// model folder, the plan the engine would run it under, in plain language: the format the file stores,
+// every format with whether it loads from this file, fits this GPU, and how fast one stream could decode
+// in it, the one chosen and why, whether the experts are offloaded, whether decode reads BF16X copies,
+// and the plan's notes.
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -9,20 +12,13 @@
 #include <stdexcept>
 #include <string>
 
+#include "cli/common.h"
 #include "core/config.h"
 #include "dispatch/dispatch.h"
 #include "runtime/plan.h"
 #include "runtime/tuner.h"
 
 namespace {
-
-const char* weight_flag(const std::string& name) {
-  if (name == "bf16") return "0";
-  if (name == "int8") return "1";
-  if (name == "fp8") return "2";
-  if (name == "nvfp4") return "3";
-  return nullptr;
-}
 
 std::string archs_text(const std::vector<int>& archs) {
   std::string out;
@@ -73,6 +69,50 @@ void print_device(const lx::runtime::DeviceInfo& d) {
   }
 }
 
+// The plan for a model folder, as lernex doctor prints it.
+void print_plan(const lx::runtime::Plan& plan) {
+  using namespace lx::runtime;
+  std::printf("\nformats    %-6s %-4s %10s %15s   %s\n", "", "fits", "weights", "decode ceiling", "loads");
+  for (const FormatOption& o : plan.options) {
+    char ceiling[48] = "-";
+    if (o.decode_ceiling_tps > 0)
+      std::snprintf(ceiling, sizeof ceiling, "%.0f tok/s%s", o.decode_ceiling_tps, o.bf16x_bytes ? "*" : "");
+    std::printf("           %-6s %-4s %7.2f GB %15s   %s%s\n", format_name(o.format).c_str(), o.fits ? "yes" : "no",
+                static_cast<double>(o.weight_bytes) / 1e9, ceiling, o.loadable ? "" : "no: ", o.load.c_str());
+  }
+  for (const FormatOption& o : plan.options)
+    if (o.bf16x_bytes)
+      std::printf("           * decoding from the BF16X copies of the BF16 weights (%.2f GB more)\n",
+                  static_cast<double>(o.bf16x_bytes) / 1e9);
+  std::printf("           fits: resident with room for %d sequences of %d tokens; decode ceiling: one stream, "
+              "bandwidth over the bytes it reads per token\n",
+              kUsefulSlots, kUsefulContext);
+
+  std::printf("\nstored     %s\n", format_name(plan.stored).c_str());
+  std::printf("chosen     %s, %s\n", format_name(plan.weights).c_str(), plan.reason.c_str());
+  if (plan.offload.enabled) {
+    std::printf("offload    yes: %.0f%% of the %s experts cached in %.2f GB of VRAM, all of them in %s\n",
+                100.0 * plan.offload.resident_fraction, format_name(plan.recipe.experts).c_str(),
+                static_cast<double>(plan.offload.expert_cache_bytes) / 1e9,
+                plan.offload.disk_expert_bytes ? "pinned RAM and on NVMe" : "pinned RAM");
+  } else {
+    std::printf("offload    no: the model is resident (%d sequence%s of %d tokens)\n", plan.max_slots,
+                plan.max_slots == 1 ? "" : "s", plan.kv_capacity);
+  }
+  if (!plan.bf16x_reason.empty())
+    std::printf("BF16X      %s %s\n", plan.bf16x_decode ? "on:" : "off:", plan.bf16x_reason.c_str());
+  else
+    std::printf("BF16X      off: decode copies are for BF16 weights, and these are %s\n",
+                format_name(plan.weights).c_str());
+  if (plan.decode_ceiling_tps > 0)
+    std::printf("decode     at most %.0f tokens per second for one stream (bandwidth over bytes read per token)\n",
+                plan.decode_ceiling_tps);
+  else
+    std::printf("decode     set by the experts that miss the VRAM cache, which only a run measures\n");
+  std::printf("\nplan\n");
+  for (const std::string& note : plan.notes) std::printf("  %s\n", note.c_str());
+}
+
 }  // namespace
 
 int cmd_doctor(int argc, char** argv) {
@@ -82,10 +122,12 @@ int cmd_doctor(int argc, char** argv) {
   try {
     for (int i = 1; i < argc; ++i) {
       const std::string arg = argv[i];
-      if (arg == "--weights" && i + 1 < argc) {
-        const char* code = weight_flag(argv[++i]);
-        if (!code) throw std::runtime_error("--weights takes bf16, int8, fp8 or nvfp4");
-        req.weights = std::atoi(code);
+      lx::cli::FormatFlags format;
+      format.weights = req.weights;
+      format.bf16x = req.bf16x;
+      if (lx::cli::parse_format_flag(argc, argv, i, format)) {
+        req.weights = format.weights;
+        req.bf16x = format.bf16x;
       } else if (arg == "--context" && i + 1 < argc) {
         req.context = std::stoi(argv[++i]);
       } else if (arg == "--sequences" && i + 1 < argc) {
@@ -111,9 +153,9 @@ int cmd_doctor(int argc, char** argv) {
                   config.family.c_str(), config.num_hidden_layers, config.attention_layer_indices.size(),
                   config.hidden_size, config.n_routed_experts, config.num_passes);
       std::printf("checkpoint %s\n", checkpoint.description.c_str());
-      const Plan plan = make_plan(device, config, checkpoint, req);
-      std::printf("\nplan\n");
-      for (const std::string& note : plan.notes) std::printf("  %s\n", note.c_str());
+      if (const char* v = std::getenv("LX_VRAM_BUDGET_GB")) req.vram_budget = static_cast<size_t>(std::atof(v) * 1073741824.0);
+      if (const char* v = std::getenv("LX_RAM_BUDGET_GB")) req.ram_budget = static_cast<size_t>(std::atof(v) * 1073741824.0);
+      print_plan(make_plan(device, config, checkpoint, req));
     }
   } catch (const std::exception& e) {
     std::fprintf(stderr, "error: %s\n", e.what());

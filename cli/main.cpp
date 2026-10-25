@@ -27,13 +27,13 @@ void usage() {
   std::fprintf(stderr,
                "usage: lernex <command>\n"
                "  run MODEL [--think on|off] [--context N]  chat in the terminal\n"
-               "  serve MODEL [--host H] [--port P] [--weights bf16|fp8|nvfp4] [--context N] [--sequences N]\n"
+               "  serve MODEL [--host H] [--port P] [--context N] [--sequences N]\n"
                "                                            the OpenAI API on this machine\n"
                "  pull MODEL                                download a model into the cache\n"
                "  list                                      the models and which are installed\n"
                "  bench MODEL [--streams 1,8,32,64] [--prompt-tokens N] [--gen-tokens N]\n"
                "                                            throughput of the engine on this GPU\n"
-               "  doctor [MODEL_DIR] [--weights F] [--context N] [--sequences N]\n"
+               "  doctor [MODEL_DIR] [--context N] [--sequences N]\n"
                "                                            the GPU, what it can run, and the plan for a model\n"
                "  tune MODEL_DIR [--out PATH] [--log]       time the kernel variants on this GPU, keep the winners\n"
                "  inspect MODEL_DIR                         load a model and describe it\n"
@@ -47,7 +47,9 @@ void usage() {
                "  block-check MODEL_DIR HEAD PROMPTS OUT    a block drafter's proposal, for check_block.py\n"
                "  weights MODEL_DIR bf16|int8|fp8|nvfp4|bf16x [--reference DIR] [--bytes-against DIR]\n"
                "                                            load a folder in a weight format and check it\n"
-               "  prefill MODEL_DIR PROMPTS_JSON T [RUNS]   time one T-token prefill\n");
+               "  prefill MODEL_DIR PROMPTS_JSON T [RUNS]   time one T-token prefill\n"
+               "run, serve, bench, doctor, eval, prefill and the spec commands take --weights bf16|int8|fp8|nvfp4|bf16x\n"
+               "(default: the format the file stores) and --no-bf16x (decode from plain BF16 weights).\n");
 }
 
 }  // namespace

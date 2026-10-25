@@ -7,7 +7,9 @@
 //   lernex offload bench MODEL PROMPTS [N] [REPEAT]   single-stream decode speed: prefill N tokens of each
 //                                                     prompt, then decode the rest one token at a time
 //
-// The weights load as BF16, the dense ones and the experts (OffloadLoadOptions carries the plan's formats).
+// The weights load in the format the folder stores, the dense ones and the experts, unless --weights names another
+// (bf16, int8 or fp8: the formats the offload kernels read); the dense products take the plan's math for it. The
+// serving commands plan this themselves (runtime/plan.h): a model larger than the GPU runs offloaded there too.
 // The rest of the plan comes from the environment:
 //   LX_VRAM_BUDGET_GB   everything this process may hold on the GPU, its context included (default:
 //                       the card); other processes only limit it through the memory they leave free
@@ -28,11 +30,13 @@
 #include <string>
 #include <vector>
 
+#include "cli/common.h"
 #include "core/config.h"
 #include "cuda/kernels.h"
 #include "model/metis.h"
 #include "runtime/offload.h"
 #include "runtime/offload_model.h"
+#include "runtime/plan.h"
 
 namespace {
 
@@ -57,10 +61,12 @@ double env_double(const char* name, double fallback) {
   return v && *v ? std::atof(v) : fallback;
 }
 
+lx::cli::FormatFlags g_format;  // --weights, read by cmd_offload
+
 off::OffloadLoadOptions options_from_env() {
   off::OffloadLoadOptions o;
-  o.weights = LX_W_BF16;
-  o.experts = LX_W_BF16;
+  o.weights = g_format.weights;  // -1: the folder's own format
+  o.experts = g_format.weights;
   o.vram_budget = off::vram_budget_bytes();
   o.ram_budget = off::ram_budget_bytes();
   if (const char* p = std::getenv("LX_ROUTING_STATS")) o.routing_stats = p;
@@ -81,7 +87,10 @@ Loaded load(const std::string& dir, int max_tokens) {
   const lx::MetisConfig config = lx::load_config(dir);
   Loaded l;
   l.weights = off::OffloadedModel::load(dir, config, options_from_env());
-  l.model = std::make_unique<lx::MetisModel>(config, l.weights->weights(), lx::ModelFormats{}, 1, 4096, max_tokens,
+  // The plan's formats for the dense weights as they loaded; the offloaded experts multiply weight-only.
+  lx::ModelFormats formats = lx::runtime::model_formats(l.weights->weights().format(), lx::runtime::query_device(0), false);
+  formats.expert_math = LX_MATH_BF16;
+  l.model = std::make_unique<lx::MetisModel>(config, l.weights->weights(), formats, 1, 4096, max_tokens,
                                              &l.weights->experts());
   l.weights->finalize();
   std::printf("loaded in %.1f s\n%s", seconds_since(t0), l.weights->describe().c_str());
@@ -241,8 +250,13 @@ int cmd_bench(int argc, char** argv) {
 
 }  // namespace
 
-int cmd_offload(int argc, char** argv) {
+int cmd_offload(int argc_in, char** argv_in) {
   try {
+    std::vector<char*> args;
+    for (int i = 0; i < argc_in; ++i)
+      if (i == 0 || !lx::cli::parse_format_flag(argc_in, argv_in, i, g_format)) args.push_back(argv_in[i]);
+    const int argc = static_cast<int>(args.size());
+    char** argv = args.data();
     if (argc >= 2 && !std::strcmp(argv[1], "probe")) return cmd_probe(argc - 1, argv + 1);
     if (argc >= 2 && !std::strcmp(argv[1], "eval")) return cmd_eval(argc - 1, argv + 1);
     if (argc >= 2 && !std::strcmp(argv[1], "bench")) return cmd_bench(argc - 1, argv + 1);
@@ -252,7 +266,7 @@ int cmd_offload(int argc, char** argv) {
   }
   std::fprintf(stderr,
                "usage: lernex offload probe [FILE]\n"
-               "       lernex offload eval MODEL_DIR PROMPTS_JSON OUT_DIR [N]\n"
-               "       lernex offload bench MODEL_DIR PROMPTS_JSON [N] [REPEAT]\n");
+               "       lernex offload eval MODEL_DIR PROMPTS_JSON OUT_DIR [N] [--weights bf16|int8|fp8]\n"
+               "       lernex offload bench MODEL_DIR PROMPTS_JSON [N] [REPEAT] [--weights bf16|int8|fp8]\n");
   return 2;
 }

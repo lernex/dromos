@@ -112,7 +112,9 @@ struct EngineStats {
 
 class Engine {
  public:
-  // Loads the checkpoint in model_dir (BF16 safetensors) and the tokenizer, and starts the scheduler.
+  // Loads the checkpoint in model_dir in the plan's format (plan.weights: the file's own, or a conversion the
+  // plan allowed), builds the model in the plan's formats and maths, and starts the scheduler. An offloaded plan
+  // (plan.offload.enabled) runs the routed experts from the offload runtime: RAM, NVMe and a VRAM cache.
   Engine(const std::string& model_dir, const Plan& plan, const EngineOptions& options = {});
   ~Engine();
   Engine(const Engine&) = delete;
@@ -121,6 +123,8 @@ class Engine {
   const lx::MetisConfig& config() const;
   const lx::text::Tokenizer* tokenizer() const;  // null when not loaded
   const Plan& plan() const { return plan_; }
+  // Where an offloaded plan's experts live, in lines (empty for a resident plan).
+  const std::string& placement() const;
 
   // Queues a request. Throws std::invalid_argument for a request the engine cannot run (empty
   // prompt, a prompt longer than the context, out-of-range sampling values) and std::runtime_error

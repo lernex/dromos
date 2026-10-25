@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <map>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -27,6 +28,14 @@ struct LoadOptions {
   // globals) off the device. The offload runtime holds them: their shapes and byte sizes stay readable.
   bool skip_experts = false;
 };
+
+// The loader's recipe, for the plan's accounting: the format a projection is held in for `target`, by its name
+// without ".weight" ("layers.4.mixer.qkv"; "embedding" for the tied head). A folder loaded in its own format
+// keeps each projection as the file stores it, which for the published folders is this same rule.
+lx_wtype projection_format(lx_wtype target, std::string_view projection);
+// Why NVFP4 cannot load from a folder stored as `stored`: the text ModelWeights::load throws, naming the
+// model's GPTQ NVFP4 checkpoint when there is one.
+std::string nvfp4_unavailable(lx_wtype stored, const MetisConfig& config);
 
 class ModelWeights {
  public:

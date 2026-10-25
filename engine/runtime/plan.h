@@ -11,6 +11,7 @@
 
 #include "core/config.h"
 #include "cuda/kernels.h"
+#include "model/metis.h"
 
 namespace lx::runtime {
 
@@ -45,39 +46,83 @@ std::vector<int> built_archs();
 
 // The formats a checkpoint folder holds, read from its safetensors headers without loading it.
 struct CheckpointInfo {
-  lx_wtype stored = LX_W_BF16;  // the format of the large projections in the file
+  lx_wtype stored = LX_W_BF16;  // the format of the large projections in the file (ModelWeights::stored_format)
   size_t bytes = 0;             // the file's tensor bytes
-  std::string description;      // plain language: "BF16 safetensors, 6.2 GB"
+  std::string description;      // plain language: "BF16 checkpoint, 6.2 GB on disk"
 };
 CheckpointInfo inspect_checkpoint(const std::string& model_dir);
 
-// The user's wishes; anything left unset is decided from the hardware.
+// A format fits a GPU usefully when it leaves room for kUsefulSlots sequences (or as many as were asked for, when
+// fewer) of kUsefulContext tokens.
+constexpr int kUsefulSlots = 4;
+constexpr int kUsefulContext = 4096;
+
+// The user's wishes; anything left unset is decided from the checkpoint and the hardware.
 struct PlanRequest {
-  int weights = -1;   // an lx_wtype, or -1 for automatic (the widest format that fits usefully)
+  // An lx_wtype the user named (--weights), or -1 for the format the file stores. Nothing narrower than the
+  // file is ever chosen for the user, and nothing wider is planned at all.
+  int weights = -1;
+  // A BF16 model decodes from lossless BF16X copies of its weights when they fit (--no-bf16x turns them off,
+  // for measuring plain BF16 decode).
+  bool bf16x = true;
   int context = 0;    // context each sequence is sized for, 0 for automatic
   int sequences = 0;  // concurrent sequences wanted, 0 for automatic
   double memory_fraction = 0.92;  // of the free memory at startup; the rest is left for others
-  // Offload (runtime/offload_plan.h): the GPU memory this process may use, 0 for the card
-  // (LX_VRAM_BUDGET_GB), and the pinned RAM the offloaded experts may take, 0 for all of them
-  // (LX_RAM_BUDGET_GB; the rest are read from the checkpoint on NVMe).
+  // The GPU memory this process may use, 0 for the card (LX_VRAM_BUDGET_GB), and the pinned RAM offloaded
+  // experts may take, 0 for all of them (LX_RAM_BUDGET_GB; the rest are read from the checkpoint on NVMe).
+  // A model that does not fit the GPU, or the budget, runs with its experts offloaded (runtime/offload_plan.h).
   size_t vram_budget = 0;
   size_t ram_budget = 0;
 };
 
-// The format of each kind of tensor in a target format (the Formats recipe): dense projections, routed
-// experts, and the two projections that stay wider by design.
+// The format of each kind of tensor in a target format: dense projections, routed experts, and latent_up. The
+// loader's recipe (core/checkpoint.h, projection_format) keeps some projections of each kind wider (BF16);
+// ModelFormats takes these three as the formats the model accepts besides BF16.
 struct WeightRecipe {
-  lx_wtype dense = LX_W_BF16;   // attention, Mamba in_proj, depth memory, shared expert, latent_down, the head
-  lx_wtype experts = LX_W_BF16; // routed expert stacks
+  lx_wtype dense = LX_W_BF16;    // attention, Mamba in_proj, latent_down, shared expert, depth memory, the head
+  lx_wtype experts = LX_W_BF16;  // routed expert stacks
   lx_wtype latent_up = LX_W_BF16;
-  // Mamba-2's out_proj is BF16 in every format: it is the one projection int8 visibly hurts.
 };
 WeightRecipe recipe_for(lx_wtype target);
 
+// The math a product on weights held in `format` multiplies in on this device: the fastest tensor-core math that
+// reads the stored weights as they are. INT8 weights take INT8 math (IMMA, sm_80 and up); FP8 weights FP8 math on
+// sm_89 and up; NVFP4 weights FP4 math on the sm_120 family, the one target with the block-scaled FP4 and mixed
+// e2m1 x e4m3 instructions these kernels use (FP8 math on NVFP4 weights needs it too); everything else, and every
+// format on a device without its instruction, BF16 math with the weights expanded in registers. Which of FP4 and
+// FP8 math NVFP4 experts default to on sm_120 is the measurement stage's call (by KL); this table takes FP4.
+lx_math native_math(lx_wtype format, const DeviceInfo& device);
+// The model's formats for a target on a device: the recipe's kinds, native_math for the dense kind (prefill) and
+// the experts, and the BF16X decode copies when asked for (BF16 targets only).
+lx::ModelFormats model_formats(lx_wtype target, const DeviceInfo& device, bool bf16x_decode);
+// Whether a target can be loaded from a folder stored as `stored`: the file's own format; INT8, FP8 or BF16X
+// narrower than or as wide as the file (round-to-nearest, or the lossless encoding); NVFP4 only from a stored
+// NVFP4 folder (the GPTQ checkpoint: round-to-nearest fails its KL). A format wider than the file holds the same
+// values in more bytes and is refused. `how` gets a plain description of the load, or why it is refused.
+bool can_load(lx_wtype target, lx_wtype stored, const MetisConfig& config, std::string* how = nullptr);
+// "BF16", "INT8", "FP8", "NVFP4", "BF16X"; and the --weights value for each ("bf16", ... "bf16x").
+std::string format_name(lx_wtype format);
+std::string weights_flag(lx_wtype format);
+// The lx_wtype a --weights value names. Throws std::runtime_error, listing the values, for anything else.
+int weights_from_flag(const std::string& name);
+
+// One weight format for this model on this device, as lernex doctor lists them.
+struct FormatOption {
+  lx_wtype format = LX_W_BF16;
+  bool loadable = false;
+  std::string load;        // "as stored", "round-to-nearest from BF16", or why it cannot load
+  bool fits = false;       // resident, with room for the useful sequences and context
+  size_t weight_bytes = 0; // one copy of every weight, resident
+  size_t bf16x_bytes = 0;  // the BF16X decode copies a BF16 model adds when it keeps them
+  double decode_ceiling_tps = 0;  // resident, one stream; BF16 with its BF16X copies when this build has them
+};
+
 struct Plan {
+  lx_wtype stored = LX_W_BF16;    // the file's format
   lx_wtype weights = LX_W_BF16;   // the target format (the headline: "BF16", "FP8", ...)
   WeightRecipe recipe;            // what each kind of tensor is held in
-  bool convert_at_load = false;   // the file is in another format (round-to-nearest or exact dequant at load)
+  bool convert_at_load = false;   // the file is in another format (round-to-nearest or the lossless encoding at load)
+  bool bf16x_decode = false;      // decode reads lossless BF16X copies of the BF16 weights (budgeted in weight_bytes)
   lx_math prefill_math = LX_MATH_BF16;  // dense products, prefill and batched steps
   lx_math batch_math = LX_MATH_BF16;    // the same, for the rows of a batched decode step
   lx_math expert_math = LX_MATH_BF16;   // routed experts
@@ -86,9 +131,13 @@ struct Plan {
   int max_step_tokens = 0;    // tokens in one step (decode rows and prefill rows together)
   int prefill_chunk = 0;      // prompt tokens a sequence takes per step while it is being prefilled
   size_t weight_bytes = 0, state_bytes = 0, kv_bytes = 0, scratch_bytes = 0, budget_bytes = 0;
+  size_t bf16x_bytes = 0;          // of weight_bytes, the BF16X decode copies
   size_t prefix_device_bytes = 0;  // prefix snapshots kept in device memory (what the model leaves over)
   size_t prefix_host_bytes = 0;    // and in pinned host memory, when the device share is full
-  double decode_ceiling_tps = 0;  // bandwidth / weight bytes: the most tokens per second one stream can make
+  double decode_ceiling_tps = 0;   // bandwidth / bytes read per token: the most tokens per second one stream can make
+  std::string reason;              // why this format: "the format the file stores", "as asked: ..."
+  std::string bf16x_reason;        // why the BF16X decode copies are on or off, in one line
+  std::vector<FormatOption> options;  // every format, for lernex doctor
   std::vector<std::string> notes;  // plain-language lines `lernex` prints (why this format, etc.)
 
   // Running larger than the GPU (make_offload_plan in runtime/offload_plan.h): every routed expert is
@@ -103,31 +152,53 @@ struct Plan {
     double cpu_fraction = 0;        // share of a step's misses the CPU computes from RAM
     int max_cpu_pairs = 0;          // at most this many pairs per step on the CPU
     int prefetch = 0;               // next-layer experts copied ahead per token, 0 for none
+    size_t vram_budget = 0, ram_budget = 0;  // the request's budgets, which the runtime holds itself to
   } offload;
+
+  // The formats MetisModel runs in under this plan.
+  lx::ModelFormats formats() const;
 };
 
-// Throws std::runtime_error, saying what is missing, when no format fits the device for the model.
+// The plan. The format is the file's (or the one --weights names); a model that does not fit the GPU usefully
+// in it runs with its routed experts offloaded before anything smaller is considered, and never in a narrower
+// format than asked for. Throws std::runtime_error, saying what is missing and which narrower format would fit,
+// when the model does not run on this device in that format at all.
 Plan make_plan(const DeviceInfo& device, const MetisConfig& config, const CheckpointInfo& checkpoint,
                const PlanRequest& request);
 
-// Exact byte accounting, shared by the plan and its tests. Each weight is counted once, in the format
-// the engine holds it, with the 256-byte alignment the upload uses.
+// Exact byte accounting, shared by the plan and its tests. Each weight is counted once, in the format the loader
+// holds it in (core/checkpoint.h, projection_format), with the 256-byte alignment of a device allocation.
 struct WeightBytes {
-  size_t plain = 0;     // bf16 and f32 tensors kept as they are (norms, biases, depth memory, routers)
-  size_t dense = 0;     // dense projections, and the head's copy of the embedding table
-  size_t latent_up = 0;
-  size_t out_proj = 0;  // Mamba-2 out_proj, BF16 in every format
-  size_t experts = 0;
-  size_t total() const noexcept { return plain + dense + latent_up + out_proj + experts; }
+  size_t plain = 0;        // bf16 and f32 tensors kept as they are (norms, biases, embeddings, routers), the
+                           // bf16 gather table included
+  size_t projections = 0;  // every projection but the head and the routed experts
+  size_t head = 0;         // the tied head's own copy: 0 when it reads the bf16 gather table
+  size_t experts = 0;      // the routed expert stacks: data, scales, NVFP4 per-expert globals
+  size_t derived = 0;      // what the model computes at load: the hyper-connections' per-pass f32 parameters
+  size_t bf16x = 0;        // the lossless BF16X decode copies, when the plan keeps them
+  // What ModelWeights::device_bytes reports for the folder (the plain tensors the engine never reads aside).
+  size_t loaded() const noexcept { return plain + projections + head + experts; }
+  size_t total() const noexcept { return loaded() + derived + bf16x; }
 };
-WeightBytes weight_bytes(const MetisConfig& config, const WeightRecipe& recipe);
-// Bytes of one R x K projection (or an expert stack of R = E * N rows) held in `format`.
-size_t projection_bytes(lx_wtype format, int64_t rows, int64_t cols);
+WeightBytes weight_bytes(const MetisConfig& config, lx_wtype target, bool bf16x_decode = false);
+// Bytes of one projection of `rows` x `cols` held in `format` (an expert stack is rows = E * N): its data and
+// scales, and for an NVFP4 stack of `stack_experts` experts their per-expert globals. BF16X is the encoding's
+// fixed rows (lx_bf16x_row_bytes; the rare overflow records are not counted), 0 without a backend that has it.
+size_t projection_bytes(lx_wtype format, int64_t rows, int64_t cols, int64_t stack_experts = 0);
+// What one stream reads per decoded token in a target format, and the most tokens per second bandwidth allows:
+// every layer's dense weights and its routed experts' share once per pass, the head once, and the Mamba state.
+double decode_bytes_per_token(const MetisConfig& config, lx_wtype target, bool bf16x_decode);
+double decode_ceiling_tps(const DeviceInfo& device, const MetisConfig& config, lx_wtype target, bool bf16x_decode);
+// Whether the loaded backend has the BF16X kernels (the CUDA one does).
+bool bf16x_available();
 // Persistent state: the Mamba-2 conv and SSM state of one slot, and the attention KV cache of one slot
 // at `capacity` positions. Both count every pass.
 size_t state_bytes_per_slot(const MetisConfig& config);
 size_t kv_bytes_per_position(const MetisConfig& config);
-// The per-step scratch the model allocates for `tokens` tokens and `slots` slots (metis.cpp).
-size_t scratch_bytes(const MetisConfig& config, int tokens, int slots);
+// The per-step scratch the model allocates for `tokens` tokens and `slots` slots (metis.cpp's constructor):
+// the step's activations, the GEMM workspace for every dense math the step can use, the grouped expert
+// workspace (laid out for the ordered sum), the decode experts' workspace, and the bf16 scratch BF16X-held
+// weights expand into for prefill.
+size_t scratch_bytes(const MetisConfig& config, int tokens, int slots, const lx::ModelFormats& formats = {});
 
 }  // namespace lx::runtime

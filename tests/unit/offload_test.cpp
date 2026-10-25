@@ -86,7 +86,7 @@ TEST_CASE("Logos BF16 on a 16 GB card: the dense model resident, most of the exp
   // 18.1 GB of experts beside 2.4 GB of dense weights: the run on this card cached 72.7% of them
   CHECK(p.offload.resident_fraction > 0.6);
   CHECK(p.offload.resident_fraction < 0.8);
-  CHECK(p.offload.ram_expert_bytes == weight_bytes(logos(), recipe_for(LX_W_BF16)).experts);
+  CHECK(p.offload.ram_expert_bytes == weight_bytes(logos(), LX_W_BF16).experts);
   CHECK(p.offload.disk_expert_bytes == 0);
   CHECK_FALSE(p.convert_at_load);
 }
@@ -116,18 +116,27 @@ TEST_CASE("the VRAM budget bounds this process; other processes only through the
   CHECK(p14.offload.resident_fraction == doctest::Approx(1.0));
 }
 
-TEST_CASE("without a format the widest one that caches half the experts is taken") {
+TEST_CASE("without a format the file's own is taken, however few experts it caches") {
   PlanRequest req;
   req.vram_budget = 16 * kGiB;
   CHECK(make_offload_plan(card_16gb(), logos(), bf16_checkpoint(), req).weights == LX_W_BF16);
-  req.vram_budget = 8 * kGiB;  // BF16 would cache about a quarter of its experts
+  req.vram_budget = 8 * kGiB;  // BF16 caches about a quarter of its experts: it stays BF16, and says so
   const Plan p = make_offload_plan(card_16gb(), logos(), bf16_checkpoint(), req);
-  CHECK(p.weights == LX_W_FP8);
-  CHECK(p.offload.resident_fraction >= kMinResident);
-  req.vram_budget = 5 * kGiB;  // nothing reaches half: the format that caches the most, FP8 before INT8
-  const Plan q = make_offload_plan(card_16gb(), logos(), bf16_checkpoint(), req);
-  CHECK(q.offload.resident_fraction < kMinResident);
+  CHECK(p.weights == LX_W_BF16);
+  CHECK_FALSE(p.convert_at_load);
+  CHECK(p.offload.resident_fraction < kMinResident);
+  bool said = false;
+  for (const std::string& n : p.notes) said |= n.find("less than half of the experts") != std::string::npos;
+  CHECK(said);
+  // an FP8 file offloads as FP8; NVFP4 does not offload, and a format wider than the file is refused
+  CheckpointInfo fp8;
+  fp8.stored = LX_W_FP8;
+  const Plan q = make_offload_plan(card_16gb(), logos(), fp8, req);
   CHECK(q.weights == LX_W_FP8);
+  CHECK_FALSE(q.convert_at_load);
+  CHECK(q.offload.resident_fraction > p.offload.resident_fraction);
+  req.weights = LX_W_BF16;
+  CHECK_THROWS_AS(make_offload_plan(card_16gb(), logos(), fp8, req), std::runtime_error);
 }
 
 TEST_CASE("experts beyond the RAM budget are read from NVMe") {
@@ -136,7 +145,7 @@ TEST_CASE("experts beyond the RAM budget are read from NVMe") {
   req.ram_budget = 10 * kGiB;
   const Plan p = make_offload_plan(card_16gb(), logos(), bf16_checkpoint(), req);
   CHECK(p.offload.ram_expert_bytes == 10 * kGiB);
-  CHECK(p.offload.disk_expert_bytes == weight_bytes(logos(), recipe_for(LX_W_BF16)).experts - 10 * kGiB);
+  CHECK(p.offload.disk_expert_bytes == weight_bytes(logos(), LX_W_BF16).experts - 10 * kGiB);
 }
 
 TEST_CASE("a budget below one step of experts says what is missing") {

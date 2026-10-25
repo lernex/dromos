@@ -1,6 +1,11 @@
 // lernex eval: run reference prompts through the model and write every position's logits, for
 // tools/compare.py. With a split point N the first N tokens go in as one prefill and the rest as
 // single-token decode steps, which checks that the caches carry a sequence exactly.
+//
+//   lernex eval MODEL_DIR PROMPTS_JSON OUT_DIR [N] [--weights bf16|int8|fp8|nvfp4|bf16x] [--no-bf16x]
+//
+// The weights load in the format the folder stores (the published FP8 and GPTQ NVFP4 folders as they are), or
+// the one --weights names, with the maths the plan gives that format on this GPU; stderr says which.
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
@@ -10,6 +15,7 @@
 #include <string>
 #include <vector>
 
+#include "cli/common.h"
 #include "core/checkpoint.h"
 #include "core/config.h"
 #include "cuda/kernels.h"
@@ -22,23 +28,28 @@ using Clock = std::chrono::steady_clock;
 }  // namespace
 
 int cmd_eval(int argc, char** argv) {
-  if (argc != 4 && argc != 5) {
-    std::fprintf(stderr, "usage: lernex eval MODEL_DIR PROMPTS_JSON OUT_DIR [N]\n");
-    return 2;
-  }
   try {
-    const std::string dir = argv[1];
-    const int split = argc == 5 ? std::stoi(argv[4]) : 0;
-    const std::filesystem::path out_dir = argv[3];
+    lx::cli::FormatFlags format;
+    std::vector<std::string> args;
+    for (int i = 1; i < argc; ++i)
+      if (!lx::cli::parse_format_flag(argc, argv, i, format)) args.push_back(argv[i]);
+    if (args.size() != 3 && args.size() != 4) {
+      std::fprintf(stderr, "usage: lernex eval MODEL_DIR PROMPTS_JSON OUT_DIR [N] %s\n", lx::cli::kFormatUsage);
+      return 2;
+    }
+    const std::string dir = args[0];
+    const int split = args.size() == 4 ? std::stoi(args[3]) : 0;
+    const std::filesystem::path out_dir = args[2];
     std::filesystem::create_directories(out_dir);
     nlohmann::json prompts;
-    std::ifstream(argv[2]) >> prompts;
+    std::ifstream(args[1]) >> prompts;
 
     const lx::MetisConfig config = lx::load_config(dir);
-    const lx::ModelWeights weights = lx::ModelWeights::load(dir, config, lx::LoadOptions{LX_W_BF16});
+    const lx::cli::LoadedWeights loaded = lx::cli::load_weights(dir, config, format);
+    std::fprintf(stderr, "%s\n", loaded.description.c_str());
     size_t longest = 1;
     for (auto& [name, ids] : prompts.items()) longest = std::max(longest, ids.size());
-    lx::MetisModel model(config, weights, lx::ModelFormats{}, 1, 4096, static_cast<int>(longest));
+    lx::MetisModel model(config, *loaded.weights, loaded.formats, 1, 4096, static_cast<int>(longest));
 
     const int V = config.vocab_size;
     float* d_logits = nullptr;

@@ -1,12 +1,18 @@
-// The plan on simulated devices, and the exact byte accounting against the checkpoint on disk.
-// No GPU is needed: make_plan is a pure function of the device description, the config and the
-// checkpoint. The BF16 check reads LX_MODEL_DIR (a Praxis or Logos folder) and is skipped without it.
+// The plan on simulated devices, and the exact byte accounting against the checkpoints on disk and the loader.
+// make_plan is a pure function of the device description, the config and the checkpoint (the backend's
+// workspace and BF16X row sizes aside, read through the dispatcher). The accounting checks read the folders:
+//   LX_MODEL_DIR        a BF16 folder (Praxis or Logos): the BF16 total against the file
+//   LX_CKPT_BF16_DIR    the Praxis BF16 folder   } the plan's bytes against the files' tensors, and (with a GPU)
+//   LX_CKPT_FP8_DIR     the published FP8 folder } against what ModelWeights::load holds on the device, each
+//   LX_CKPT_NVFP4_DIR   the GPTQ NVFP4 folder    } within 1%
+// and each is skipped without its folder.
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
 
+#include "core/checkpoint.h"
 #include "core/config.h"
 #include "core/safetensors.h"
 #include "doctest.h"
@@ -87,10 +93,52 @@ MetisConfig logos() {
   return c;
 }
 
-CheckpointInfo bf16_checkpoint() {
+CheckpointInfo checkpoint(lx_wtype stored) {
   CheckpointInfo ck;
-  ck.stored = LX_W_BF16;
+  ck.stored = stored;
   return ck;
+}
+CheckpointInfo bf16_checkpoint() { return checkpoint(LX_W_BF16); }
+CheckpointInfo fp8_checkpoint() { return checkpoint(LX_W_FP8); }
+CheckpointInfo nvfp4_checkpoint() { return checkpoint(LX_W_NVFP4); }
+
+PlanRequest weights(lx_wtype w) {
+  PlanRequest r;
+  r.weights = w;
+  return r;
+}
+
+bool has_note(const Plan& p, const std::string& text) {
+  for (const std::string& line : p.notes)
+    if (line.find(text) != std::string::npos) return true;
+  return false;
+}
+
+const char* folder(const char* variable) {
+  const char* dir = std::getenv(variable);
+  return dir && *dir ? dir : nullptr;
+}
+
+// What the loader holds for a folder, from its tensors alone: every tensor but the scales a projection does not
+// keep (input_scale), the tied lm_head and n-gram tables the engine skips, and the plain tensors it never reads;
+// plus the bf16 gather table a quantized embedding is dequantized into.
+size_t folder_device_bytes(const std::string& dir) {
+  const SafetensorsSet set = SafetensorsSet::open(dir);
+  size_t bytes = 0;
+  for (const auto& [name, t] : set.tensors()) {
+    if (name.find("lm_head") != std::string::npos || name.find("ngram") != std::string::npos ||
+        name.find("input_scale") != std::string::npos || name.find("k_router") != std::string::npos ||
+        name.find("k_budget") != std::string::npos || name.find("depth_budget") != std::string::npos)
+      continue;
+    bytes += t.bytes;
+    if (name == "embedding.weight" && t.dtype != DType::BF16)
+      bytes += static_cast<size_t>(t.shape[0]) * static_cast<size_t>(t.shape[1]) * 2;
+  }
+  return bytes;
+}
+
+double relative(size_t a, size_t b) {
+  return std::fabs(static_cast<double>(a) - static_cast<double>(b)) / static_cast<double>(b);
 }
 
 // The GPUs the plan is judged on: the brief's list, with the numbers the vendors publish.
@@ -115,27 +163,39 @@ const Gpu& gpu(const char* name) {
 
 }  // namespace
 
-TEST_CASE("the recipe keeps Mamba out_proj wide, and NVFP4 keeps latent_up and dense FP8") {
+TEST_CASE("the recipe: kinds per format, the published FP8 and GPTQ NVFP4 choices") {
   const WeightRecipe bf = recipe_for(LX_W_BF16);
   CHECK(bf.dense == LX_W_BF16);
   CHECK(bf.experts == LX_W_BF16);
   const WeightRecipe fp8 = recipe_for(LX_W_FP8);
   CHECK(fp8.dense == LX_W_FP8);
   CHECK(fp8.experts == LX_W_FP8);
-  CHECK(fp8.latent_up == LX_W_FP8);
+  CHECK(fp8.latent_up == LX_W_BF16);
   const WeightRecipe fp4 = recipe_for(LX_W_NVFP4);
   CHECK(fp4.dense == LX_W_FP8);
   CHECK(fp4.experts == LX_W_NVFP4);
   CHECK(fp4.latent_up == LX_W_BF16);
+  // the loader's rule, which the accounting follows projection by projection
+  CHECK(projection_format(LX_W_FP8, "layers.0.moe.latent_down") == LX_W_BF16);
+  CHECK(projection_format(LX_W_FP8, "layers.0.moe.shared_expert.gate_up") == LX_W_BF16);
+  CHECK(projection_format(LX_W_FP8, "depth_memory.query") == LX_W_BF16);
+  CHECK(projection_format(LX_W_FP8, "embedding") == LX_W_BF16);
+  CHECK(projection_format(LX_W_FP8, "layers.4.mixer.qkv") == LX_W_FP8);
+  CHECK(projection_format(LX_W_FP8, "layers.0.mixer.impl.mixer.in_proj") == LX_W_FP8);
+  CHECK(projection_format(LX_W_FP8, "layers.0.moe.local_experts.down") == LX_W_FP8);
+  CHECK(projection_format(LX_W_NVFP4, "embedding") == LX_W_FP8);
+  CHECK(projection_format(LX_W_NVFP4, "layers.0.moe.latent_up") == LX_W_BF16);
 }
 
-TEST_CASE("projection bytes: data, scales and alignment") {
+TEST_CASE("projection bytes: data, scales, an NVFP4 stack's globals, alignment") {
   CHECK(projection_bytes(LX_W_BF16, 2048, 2048) == 2048ull * 2048 * 2);
   // 8-bit: one byte per weight and one f32 scale per row
   CHECK(projection_bytes(LX_W_INT8, 2048, 2048) == 2048ull * 2048 + 2048ull * 4);
   CHECK(projection_bytes(LX_W_FP8, 2048, 2048) == projection_bytes(LX_W_INT8, 2048, 2048));
-  // 4-bit: half a byte per weight, one e4m3 scale per 16, a global
-  CHECK(projection_bytes(LX_W_NVFP4, 2048, 2048) == 2048ull * 2048 / 2 + 2048ull * 2048 / 16 + 256);
+  // 4-bit: half a byte per weight, one e4m3 scale per 16; a stack of 128 experts adds their f32 globals
+  CHECK(projection_bytes(LX_W_NVFP4, 2048, 2048) == 2048ull * 2048 / 2 + 2048ull * 2048 / 16);
+  CHECK(projection_bytes(LX_W_NVFP4, 128 * 1024, 1024, 128) ==
+        128ull * 1024 * 1024 / 2 + 128ull * 1024 * 1024 / 16 + 512);
 }
 
 TEST_CASE("state: Mamba conv and SSM per slot, KV per position, both over every pass") {
@@ -147,32 +207,104 @@ TEST_CASE("state: Mamba conv and SSM per slot, KV per position, both over every 
   CHECK(kv_bytes_per_position(c) == 2ull * 2 * (2 * 8 * 64 * 2));
 }
 
-TEST_CASE("the BF16 accounting matches the Praxis checkpoint on disk") {
-  const char* dir = std::getenv("LX_MODEL_DIR");
+TEST_CASE("the math table: the device decides, not only the format") {
+  const DeviceInfo a100 = simulated("A100 80GB", 80, 80, 2039, 108), ada = simulated("RTX 4090 24GB", 89, 24, 1008, 128);
+  const DeviceInfo b200 = simulated("B200", 100, 180, 8000, 148), rtx50 = simulated("RTX 5070 Ti 16GB", 120, 16, 896, 70);
+  CHECK(native_math(LX_W_BF16, rtx50) == LX_MATH_BF16);
+  CHECK(native_math(LX_W_INT8, a100) == LX_MATH_INT8);
+  CHECK(native_math(LX_W_FP8, a100) == LX_MATH_BF16);  // no FP8 tensor cores before sm_89
+  CHECK(native_math(LX_W_FP8, ada) == LX_MATH_FP8);
+  // NVFP4 weights need the sm_120 kernels for FP4 (and for FP8 math on them): sm_89 and sm_100 expand to BF16
+  CHECK(native_math(LX_W_NVFP4, ada) == LX_MATH_BF16);
+  CHECK(native_math(LX_W_NVFP4, b200) == LX_MATH_BF16);
+  CHECK(native_math(LX_W_NVFP4, rtx50) == LX_MATH_FP4);
+  const lx::ModelFormats f = model_formats(LX_W_NVFP4, ada, true);
+  CHECK(f.dense == LX_W_FP8);
+  CHECK(f.prefill_math == LX_MATH_FP8);
+  CHECK(f.expert_math == LX_MATH_BF16);
+  CHECK_FALSE(f.bf16x_decode);  // decode copies are for BF16 models
+}
+
+TEST_CASE("what each file loads into: never wider, NVFP4 only from the GPTQ folder") {
+  const MetisConfig c = praxis();
+  std::string how;
+  CHECK(can_load(LX_W_BF16, LX_W_BF16, c, &how));
+  CHECK(how == "as stored");
+  CHECK(can_load(LX_W_FP8, LX_W_BF16, c));
+  CHECK(can_load(LX_W_INT8, LX_W_BF16, c));
+  CHECK(can_load(LX_W_INT8, LX_W_FP8, c));
+  CHECK_FALSE(can_load(LX_W_BF16, LX_W_FP8, c, &how));
+  CHECK(how.find("wider") != std::string::npos);
+  CHECK_FALSE(can_load(LX_W_FP8, LX_W_NVFP4, c));
+  CHECK_FALSE(can_load(LX_W_NVFP4, LX_W_BF16, c, &how));
+  CHECK(how.find("GPTQ NVFP4 checkpoint") != std::string::npos);
+  CHECK(can_load(LX_W_NVFP4, LX_W_NVFP4, c));
+  CHECK_FALSE(can_load(LX_W_BF16X, LX_W_FP8, c));
+  // the plan refuses the same
+  const DeviceInfo d = simulated("RTX 5070 Ti 16GB", 120, 16, 896, 70);
+  CHECK_THROWS_AS(make_plan(d, c, fp8_checkpoint(), weights(LX_W_BF16)), std::runtime_error);
+  CHECK_THROWS_AS(make_plan(d, c, bf16_checkpoint(), weights(LX_W_NVFP4)), std::runtime_error);
+  CHECK(make_plan(d, c, fp8_checkpoint(), weights(LX_W_INT8)).weights == LX_W_INT8);
+}
+
+TEST_CASE("the BF16 accounting matches the checkpoint on disk") {
+  const char* dir = folder("LX_MODEL_DIR");
   if (!dir) return;  // the server has the checkpoints; a laptop does not
   const MetisConfig c = load_config(dir);
-  const SafetensorsSet set = SafetensorsSet::open(dir);
   // The engine reads every tensor the model uses, each once, in BF16. The file also holds what the
   // engine does not read: lm_head (the config ties it to the embedding), the k_router and k_budget
   // tensors, and depth_budget. Those are left out, and what is left must match the file within the
   // 256-byte alignment of each tensor.
-  size_t used = 0;
-  for (const auto& [name, t] : set.tensors()) {
-    const bool unused = name.find("lm_head") != std::string::npos || name.find("k_router") != std::string::npos ||
-                        name.find("k_budget") != std::string::npos || name.find("depth_budget") != std::string::npos;
-    if (!unused) used += t.bytes;
-  }
-  const size_t accounted = weight_bytes(c, recipe_for(LX_W_BF16)).total();
+  const size_t used = folder_device_bytes(dir);
+  const size_t accounted = weight_bytes(c, LX_W_BF16).loaded();
   INFO("used " << used << " accounted " << accounted);
   CHECK(accounted >= used);
   CHECK(static_cast<double>(accounted - used) / static_cast<double>(used) < 0.002);
 }
 
-TEST_CASE("the Praxis plan on the development card runs BF16 with room to spare") {
+TEST_CASE("the plan's bytes match each published folder, and what the loader holds, within 1%") {
+  struct Case {
+    const char* variable;
+    lx_wtype format;
+  };
+  for (const Case& k : {Case{"LX_CKPT_BF16_DIR", LX_W_BF16}, Case{"LX_CKPT_FP8_DIR", LX_W_FP8},
+                        Case{"LX_CKPT_NVFP4_DIR", LX_W_NVFP4}}) {
+    const char* dir = folder(k.variable);
+    if (!dir) continue;
+    const MetisConfig c = load_config(dir);
+    REQUIRE(ModelWeights::stored_format(dir) == k.format);
+    const WeightBytes wb = weight_bytes(c, k.format);
+    const size_t file = folder_device_bytes(dir);
+    INFO(format_name(k.format) << ": the plan " << wb.loaded() << " bytes, the folder " << file);
+    CHECK(relative(wb.loaded(), file) < 0.01);
+    // On the device: the folder loaded in its own format, and without its experts.
+    LoadOptions options;
+    options.target = k.format;
+    const ModelWeights m = ModelWeights::load(dir, c, options);
+    std::printf("  %-6s plan %.4f GiB, loader %.4f GiB on the device (%.3f%%)\n", format_name(k.format).c_str(),
+                static_cast<double>(wb.loaded()) / (1ull << 30), static_cast<double>(m.device_bytes()) / (1ull << 30),
+                100.0 * relative(wb.loaded(), m.device_bytes()));
+    CHECK(relative(wb.loaded(), m.device_bytes()) < 0.01);
+    options.skip_experts = true;
+    const ModelWeights dense = ModelWeights::load(dir, c, options);
+    const size_t planned_dense = wb.loaded() - wb.experts;
+    std::printf("  %-6s without experts: plan %.4f GiB, loader %.4f GiB (%.3f%%)\n", format_name(k.format).c_str(),
+                static_cast<double>(planned_dense) / (1ull << 30), static_cast<double>(dense.device_bytes()) / (1ull << 30),
+                100.0 * relative(planned_dense, dense.device_bytes()));
+    CHECK(relative(planned_dense, dense.device_bytes()) < 0.01);
+  }
+}
+
+TEST_CASE("the Praxis plan on the development card: BF16, the file's format, with room to spare") {
   const DeviceInfo d = simulated("RTX 5070 Ti 16GB", 120, 16, 896, 70);
-  const Plan p = make_plan(d, praxis(), bf16_checkpoint(), PlanRequest{});
+  PlanRequest plain;
+  plain.bf16x = false;
+  const Plan p = make_plan(d, praxis(), bf16_checkpoint(), plain);
   CHECK(p.weights == LX_W_BF16);
+  CHECK(p.stored == LX_W_BF16);
   CHECK_FALSE(p.convert_at_load);
+  CHECK_FALSE(p.bf16x_decode);
+  CHECK_FALSE(p.offload.enabled);
   CHECK(p.prefill_math == LX_MATH_BF16);
   CHECK(p.expert_math == LX_MATH_BF16);
   CHECK(p.max_slots == 64);
@@ -181,86 +313,149 @@ TEST_CASE("the Praxis plan on the development card runs BF16 with room to spare"
   CHECK(p.prefill_chunk == 2048 - 64);
   CHECK(p.decode_ceiling_tps > 100);
   CHECK(p.notes.size() >= 5);
+  // the faster format is named, not taken
+  CHECK(has_note(p, "--weights fp8 would decode at about"));
+  // with the BF16X decode copies (when this build's backend has them): budgeted, and faster
+  if (!bf16x_available()) return;
+  const Plan x = make_plan(d, praxis(), bf16_checkpoint(), PlanRequest{});
+  CHECK(x.weights == LX_W_BF16);
+  CHECK(x.bf16x_decode);
+  CHECK(x.bf16x_bytes > 0);
+  CHECK(x.weight_bytes == p.weight_bytes + x.bf16x_bytes);
+  CHECK(x.decode_ceiling_tps > p.decode_ceiling_tps * 1.2);
+  CHECK(x.max_slots >= kUsefulSlots);
+  CHECK(x.formats().bf16x_decode);
 }
 
-TEST_CASE("the 8-bit format is FP8 on sm_89 and up, INT8 below, and quantized files compute with the math the GPU has") {
-  // Praxis on a 6 GB card does not fit in BF16 (6.2 GB of weights), but the 8-bit formats do
+TEST_CASE("--weights bf16x: the lossless encoding as the one copy, from a BF16 file only") {
+  CHECK(weights_from_flag("bf16x") == LX_W_BF16X);
+  CHECK(weights_from_flag("nvfp4") == LX_W_NVFP4);
+  CHECK_THROWS_AS(weights_from_flag("fp16"), std::runtime_error);
+  if (!bf16x_available()) return;
+  const DeviceInfo d = simulated("RTX 5070 Ti 16GB", 120, 16, 896, 70);
+  const Plan x = make_plan(d, praxis(), bf16_checkpoint(), weights(LX_W_BF16X));
+  CHECK(x.weights == LX_W_BF16X);
+  CHECK(x.convert_at_load);
+  CHECK_FALSE(x.bf16x_decode);  // the weights are the encoding: no second copy
+  CHECK(x.weight_bytes < weight_bytes(praxis(), LX_W_BF16).total());
+  CHECK(x.formats().dense == LX_W_BF16X);
+  CHECK(x.prefill_math == LX_MATH_BF16);
+  // prefill expands each weight into a bf16 scratch, which the plan counts
+  CHECK(scratch_bytes(praxis(), 512, 4, x.formats()) > scratch_bytes(praxis(), 512, 4, model_formats(LX_W_BF16, d, false)));
+  CHECK_THROWS_AS(make_plan(d, praxis(), fp8_checkpoint(), weights(LX_W_BF16X)), std::runtime_error);
+}
+
+TEST_CASE("BF16X decode copies are dropped, and said so, when they do not fit beside the useful sequences") {
+  if (!bf16x_available()) return;
+  // Praxis BF16 on 8 GB: the weights fit with four sequences, the copies beside them do not
+  const Plan p = make_plan(simulated("RTX 4060 8GB", 89, 8, 272, 24), praxis(), bf16_checkpoint(), PlanRequest{});
+  CHECK(p.weights == LX_W_BF16);
+  CHECK_FALSE(p.offload.enabled);
+  CHECK_FALSE(p.bf16x_decode);
+  CHECK(p.bf16x_bytes == 0);
+  CHECK(has_note(p, "BF16X decode copies dropped"));
+}
+
+TEST_CASE("the default is the file's format: offloaded before anything narrower, never narrowed") {
+  // Praxis BF16 on a 6 GB card does not fit usefully: its experts are offloaded, still BF16, and the notes name
+  // the 8-bit format the GPU multiplies natively (IMMA on sm_86, FP8 on sm_89)
   const Plan sm86 = make_plan(simulated("RTX 3060 6GB", 86, 6, 360, 28), praxis(), bf16_checkpoint(), PlanRequest{});
-  CHECK(sm86.weights == LX_W_INT8);  // no FP8 tensor cores on sm_86: the IMMA format comes first
-  CHECK(sm86.prefill_math == LX_MATH_INT8);
-  CHECK(sm86.convert_at_load);
+  CHECK(sm86.weights == LX_W_BF16);
+  CHECK(sm86.offload.enabled);
+  CHECK_FALSE(sm86.bf16x_decode);
+  CHECK(has_note(sm86, "--weights int8 would fit on the GPU"));
   const Plan sm89 = make_plan(simulated("RTX 4050 6GB", 89, 6, 272, 24), praxis(), bf16_checkpoint(), PlanRequest{});
-  CHECK(sm89.weights == LX_W_FP8);
-  CHECK(sm89.prefill_math == LX_MATH_FP8);
-  CHECK(sm89.expert_math == LX_MATH_FP8);
-  // Logos on a 16 GB card does not fit in BF16 (about 21 GB); its FP8 format does, with room
+  CHECK(sm89.weights == LX_W_BF16);
+  CHECK(has_note(sm89, "--weights fp8 would fit on the GPU"));
+  // Logos BF16 (about 21 GB) on a 16 GB card: offloaded BF16
   const Plan logos16 = make_plan(simulated("RTX 5070 Ti 16GB", 120, 16, 896, 70), logos(), bf16_checkpoint(), PlanRequest{});
-  CHECK(logos16.weights == LX_W_FP8);
-  CHECK(logos16.expert_math == LX_MATH_FP8);
+  CHECK(logos16.weights == LX_W_BF16);
+  CHECK(logos16.offload.enabled);
+  CHECK(logos16.offload.resident_fraction > 0.5);
+  // the published FP8 file runs as FP8, resident; the GPTQ file as NVFP4
+  const Plan fp8 = make_plan(simulated("RTX 5070 Ti 16GB", 120, 16, 896, 70), logos(), fp8_checkpoint(), PlanRequest{});
+  CHECK(fp8.weights == LX_W_FP8);
+  CHECK_FALSE(fp8.convert_at_load);
+  CHECK_FALSE(fp8.offload.enabled);
+  CHECK(fp8.prefill_math == LX_MATH_FP8);
+  CHECK(fp8.expert_math == LX_MATH_FP8);
+  const Plan fp4 = make_plan(simulated("RTX 5070 Ti 16GB", 120, 16, 896, 70), praxis(), nvfp4_checkpoint(), PlanRequest{});
+  CHECK(fp4.weights == LX_W_NVFP4);
+  CHECK(fp4.expert_math == LX_MATH_FP4);
+  CHECK(fp4.prefill_math == LX_MATH_FP8);
+  // an explicit narrower format is planned as asked, converted at load
+  const Plan asked = make_plan(simulated("RTX 4050 6GB", 89, 6, 272, 24), praxis(), bf16_checkpoint(), weights(LX_W_FP8));
+  CHECK(asked.weights == LX_W_FP8);
+  CHECK(asked.convert_at_load);
+  CHECK_FALSE(asked.offload.enabled);
+  CHECK(asked.prefill_math == LX_MATH_FP8);
+  const Plan int8 = make_plan(simulated("RTX 3060 6GB", 86, 6, 360, 28), praxis(), bf16_checkpoint(), weights(LX_W_INT8));
+  CHECK(int8.prefill_math == LX_MATH_INT8);
+  const Plan fp8_on_86 = make_plan(simulated("RTX 3060 6GB", 86, 6, 360, 28), praxis(), bf16_checkpoint(), weights(LX_W_FP8));
+  CHECK(fp8_on_86.prefill_math == LX_MATH_BF16);  // no FP8 tensor cores: weight-only, BF16 math
+  CHECK(has_note(fp8_on_86, "no tensor-core instruction for FP8"));
 }
 
-TEST_CASE("the 4-bit format: NVFP4 experts on sm_120 take FP4 math; below that they expand to BF16") {
-  // Logos on 12 GB: BF16 and the 8-bit formats are too big for four sequences, NVFP4 is not
-  const Plan twelve = make_plan(simulated("RTX 3060 12GB", 86, 12, 360, 28), logos(), bf16_checkpoint(), PlanRequest{});
+TEST_CASE("the 4-bit format from the GPTQ folder: FP4 experts on sm_120, BF16 math elsewhere") {
+  const Plan twelve = make_plan(simulated("RTX 3060 12GB", 86, 12, 360, 28), logos(), nvfp4_checkpoint(), PlanRequest{});
   CHECK(twelve.weights == LX_W_NVFP4);
   CHECK(twelve.recipe.dense == LX_W_FP8);
   CHECK(twelve.recipe.latent_up == LX_W_BF16);
   CHECK(twelve.prefill_math == LX_MATH_BF16);  // sm_86 has no FP8 tensor cores for the dense FP8 products
   CHECK(twelve.expert_math == LX_MATH_BF16);
-  // on sm_120 the same format's experts multiply in FP4, the dense FP8 products in FP8
-  const Plan blackwell = make_plan(simulated("RTX 5070 Ti 16GB", 120, 12, 896, 70), logos(), bf16_checkpoint(), PlanRequest{});
-  CHECK(blackwell.weights == LX_W_NVFP4);
+  const Plan blackwell = make_plan(simulated("RTX 5070 Ti 16GB", 120, 12, 896, 70), logos(), nvfp4_checkpoint(), PlanRequest{});
   CHECK(blackwell.expert_math == LX_MATH_FP4);
   CHECK(blackwell.prefill_math == LX_MATH_FP8);
-  // a card too small for four sequences of Logos runs fewer, and the notes say the card is small
+  const Plan b200 = make_plan(simulated("B200", 100, 180, 8000, 148), logos(), nvfp4_checkpoint(), PlanRequest{});
+  CHECK(b200.expert_math == LX_MATH_BF16);  // the FP4 kernels are sm_120's
+  CHECK(b200.prefill_math == LX_MATH_FP8);
+  // NVFP4 experts are not offloaded, so a card too small for four sequences runs fewer, and says the card is small
   for (double gib = 8.5; gib <= 10.0; gib += 0.25) {
-    const Plan p = make_plan(simulated("Sized card", 89, gib, 272, 24), logos(), bf16_checkpoint(), PlanRequest{});
-    bool said = false;
-    for (const std::string& line : p.notes)
-      if (line.find("small for the model") != std::string::npos) said = true;
+    const Plan p = make_plan(simulated("Sized card", 89, gib, 272, 24), logos(), nvfp4_checkpoint(), PlanRequest{});
     CHECK(p.max_slots >= 1);
-    CHECK(said == (p.max_slots < 4));
-    INFO("card " << gib << " GB: " << p.weights << " with " << p.max_slots << " sequences");
+    CHECK(has_note(p, "small for the model") == (p.max_slots < 4));
+    INFO("card " << gib << " GB: " << p.max_slots << " sequences");
   }
-  // 8 GB holds no Logos at all: the plan says what each format needs
-  CHECK_THROWS_AS(make_plan(simulated("RTX 4060 8GB", 89, 8, 272, 24), logos(), bf16_checkpoint(), PlanRequest{}),
-                  std::runtime_error);
 }
 
 TEST_CASE("the plan's choices across the brief's GPUs") {
-  // Praxis: BF16 wherever it fits usefully (6.2 GB of weights), from 12 GB up
   const PlanRequest none{};
-  CHECK(make_plan(simulated("RTX 3060 12GB", 86, 12, 360, 28), praxis(), bf16_checkpoint(), none).weights == LX_W_BF16);
-  CHECK(make_plan(simulated("RTX 4090 24GB", 89, 24, 1008, 128), praxis(), bf16_checkpoint(), none).weights == LX_W_BF16);
-  CHECK(make_plan(simulated("H100 80GB", 90, 80, 3350, 132), praxis(), bf16_checkpoint(), none).weights == LX_W_BF16);
-  CHECK(make_plan(simulated("B200", 100, 180, 8000, 148), praxis(), bf16_checkpoint(), none).weights == LX_W_BF16);
+  // Praxis: BF16 wherever it fits usefully (6.2 GB of weights), from 12 GB up
+  for (const char* name : {"RTX 3060 12GB", "RTX 4090 24GB", "H100 80GB", "B200"}) {
+    const Gpu& g = gpu(name);
+    const Plan p = make_plan(simulated(g.name, g.cc, g.gib, g.bandwidth, g.sms), praxis(), bf16_checkpoint(), none);
+    CHECK(p.weights == LX_W_BF16);
+    CHECK_FALSE(p.offload.enabled);
+  }
   CHECK(make_plan(simulated("RTX 5090 32GB", 120, 32, 1792, 170), praxis(), bf16_checkpoint(), none).max_slots == 64);
   CHECK(make_plan(simulated("A100 80GB", 80, 80, 2039, 108), praxis(), bf16_checkpoint(), none).expert_math == LX_MATH_BF16);
-  // Logos: BF16 on the 24 GB and bigger cards, 4-bit on 12 GB
-  CHECK(make_plan(simulated("RTX 4090 24GB", 89, 24, 1008, 128), logos(), bf16_checkpoint(), none).weights == LX_W_BF16);
-  CHECK(make_plan(simulated("A100 80GB", 80, 80, 2039, 108), logos(), bf16_checkpoint(), none).weights == LX_W_BF16);
-  CHECK(make_plan(simulated("RTX 3060 12GB", 86, 12, 360, 28), logos(), bf16_checkpoint(), none).weights == LX_W_NVFP4);
-  CHECK(make_plan(simulated("RTX 3060 12GB", 86, 12, 360, 28), praxis(), bf16_checkpoint(), none).weights == LX_W_BF16);
+  // Logos: BF16 resident on the 24 GB and bigger cards, offloaded BF16 on 12 GB
+  CHECK_FALSE(make_plan(simulated("RTX 4090 24GB", 89, 24, 1008, 128), logos(), bf16_checkpoint(), none).offload.enabled);
+  CHECK_FALSE(make_plan(simulated("A100 80GB", 80, 80, 2039, 108), logos(), bf16_checkpoint(), none).offload.enabled);
+  const Plan twelve = make_plan(simulated("RTX 3060 12GB", 86, 12, 360, 28), logos(), bf16_checkpoint(), none);
+  CHECK(twelve.weights == LX_W_BF16);
+  CHECK(twelve.offload.enabled);
 }
 
-TEST_CASE("a request for a format that cannot fit says why, and a plan never overflows the budget") {
-  const DeviceInfo small = simulated("RTX 4060 8GB", 89, 8, 272, 24);
-  CHECK_THROWS_AS(make_plan(small, logos(), bf16_checkpoint(), [] {
-                    PlanRequest r;
-                    r.weights = LX_W_BF16;
-                    return r;
-                  }()),
+TEST_CASE("a request that cannot fit says why, and a plan never overflows the budget") {
+  // BF16 Logos does not run on 2 GB even offloaded; NVFP4 Logos holds nothing on 8 GB (no offload for NVFP4)
+  CHECK_THROWS_AS(make_plan(simulated("Tiny 2GB", 89, 2, 272, 24), logos(), bf16_checkpoint(), weights(LX_W_BF16)),
+                  std::runtime_error);
+  CHECK_THROWS_AS(make_plan(simulated("RTX 4060 8GB", 89, 8, 272, 24), logos(), nvfp4_checkpoint(), PlanRequest{}),
                   std::runtime_error);
   for (const Gpu& g : kGpus) {
     for (const MetisConfig& c : {praxis(), logos()}) {
-      try {
-        const Plan p = make_plan(simulated(g.name, g.cc, g.gib, g.bandwidth, g.sms), c, bf16_checkpoint(), PlanRequest{});
-        const size_t used = p.weight_bytes + p.state_bytes + p.kv_bytes + p.scratch_bytes;
-        INFO(g.name << " " << c.family);
-        CHECK(used <= p.budget_bytes);
-        CHECK(p.max_slots >= 1);
-      } catch (const std::runtime_error&) {
-        // a card that cannot hold the model at all: the message is the test
+      for (const CheckpointInfo& ck : {bf16_checkpoint(), fp8_checkpoint(), nvfp4_checkpoint()}) {
+        try {
+          const Plan p = make_plan(simulated(g.name, g.cc, g.gib, g.bandwidth, g.sms), c, ck, PlanRequest{});
+          const size_t used = p.weight_bytes + p.state_bytes + p.kv_bytes + p.scratch_bytes;
+          INFO(g.name << " " << c.family << " " << format_name(ck.stored));
+          CHECK(used <= p.budget_bytes);
+          CHECK(p.max_slots >= 1);
+          CHECK(p.weights == ck.stored);
+        } catch (const std::runtime_error&) {
+          // a card that cannot hold the model at all: the message is the test
+        }
       }
     }
   }

@@ -6,6 +6,7 @@
 #include <memory>
 #include <string>
 
+#include "core/checkpoint.h"
 #include "runtime/engine.h"
 #include "runtime/plan.h"
 
@@ -23,9 +24,33 @@ struct Model {
 // Throws std::runtime_error with a plain message.
 Model find_model(const std::string& name, bool download);
 
+// The weight format a command was asked for: --weights bf16|int8|fp8|nvfp4|bf16x (-1, the default, is the format
+// the file stores) and --no-bf16x (a BF16 model decodes from its plain BF16 weights, for measuring).
+struct FormatFlags {
+  int weights = -1;
+  bool bf16x = true;
+};
+// When argv[i] is --weights (with its value, which it consumes) or --no-bf16x, records it and returns true.
+bool parse_format_flag(int argc, char** argv, int& i, FormatFlags& flags);
+// "[--weights bf16|int8|fp8|nvfp4|bf16x] [--no-bf16x]", for usage lines.
+extern const char* const kFormatUsage;
+
 // The plan for this GPU, the model, and the user's wishes (0 and -1 for automatic). memory_fraction is
-// the share of the free memory the plan may use.
-runtime::Plan plan_for(const Model& model, int sequences, int context, int weights = -1, double memory_fraction = 0.92);
+// the share of the free memory the plan may use. LX_VRAM_BUDGET_GB and LX_RAM_BUDGET_GB, when set, bound the
+// GPU memory this process takes and the pinned RAM offloaded experts may take.
+runtime::Plan plan_for(const Model& model, int sequences, int context, int weights = -1, double memory_fraction = 0.92,
+                       bool bf16x = true);
+
+// A model folder loaded for a command that runs MetisModel itself (eval, prefill, spec, features): in the file's
+// format or the one the flags name, under the plan's rules (runtime::can_load), with the formats and maths the plan
+// gives that format on this GPU (runtime::model_formats). `description` is one line saying which.
+struct LoadedWeights {
+  lx_wtype format = LX_W_BF16;
+  lx::ModelFormats formats;
+  std::unique_ptr<lx::ModelWeights> weights;
+  std::string description;
+};
+LoadedWeights load_weights(const std::filesystem::path& dir, const lx::MetisConfig& config, const FormatFlags& flags);
 
 // The engine for a plan. When the memory the plan asked for is not there (another process took it
 // after the plan was made), it plans again with fewer sequences and a smaller share of the free
@@ -38,7 +63,7 @@ struct StartedEngine {
 // `memory_fraction` of the memory free now; if the engine's allocations still fail, it retries with fewer
 // sequences and a smaller fraction, and says so on stderr.
 StartedEngine start_engine(const Model& model, int sequences, int context, int weights,
-                           const runtime::EngineOptions& options, double memory_fraction = 0.92);
+                           const runtime::EngineOptions& options, double memory_fraction = 0.92, bool bf16x = true);
 
 // The sampling a model recommends (generation_config.json), for a chat that asks for nothing else.
 runtime::SamplingParams recommended_sampling(const Model& model);

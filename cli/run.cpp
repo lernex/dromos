@@ -1,4 +1,7 @@
-// lernex run MODEL [--think on|off] [--context N]
+// lernex run MODEL [--think on|off] [--context N] [--weights bf16|int8|fp8|nvfp4|bf16x] [--no-bf16x]
+//
+// The weights run in the format the file stores unless --weights names another (runtime/plan.h); a model larger
+// than the GPU runs with its routed experts offloaded.
 //
 // An interactive chat in the terminal. Replies stream as they are sampled. The model's reasoning
 // shows dimmed while it thinks, then folds into one line when the answer starts (/expand reads it
@@ -297,12 +300,14 @@ int cmd_run(int argc, char** argv) {
   bool thinking = true;
   bool prefix_cache = true;
   double memory_fraction = 0.92;
+  cli::FormatFlags format;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto value = [&]() -> std::string {
       if (i + 1 >= argc) throw std::runtime_error(a + " needs a value");
       return argv[++i];
     };
+    if (cli::parse_format_flag(argc, argv, i, format)) continue;
     if (a == "--think") {
       const std::string v = value();
       if (v != "on" && v != "off") throw std::runtime_error("--think takes on or off");
@@ -314,17 +319,19 @@ int cmd_run(int argc, char** argv) {
     else throw std::runtime_error("unknown option " + a);
   }
   if (name.empty()) {
-    std::fprintf(stderr, "usage: lernex run MODEL [--think on|off] [--context N]\n");
+    std::fprintf(stderr, "usage: lernex run MODEL [--think on|off] [--context N] %s\n", cli::kFormatUsage);
     return 2;
   }
 
   const cli::Model model = cli::find_model(name, true);
   runtime::EngineOptions engine_options;
   engine_options.prefix_cache = prefix_cache;
-  cli::StartedEngine started = cli::start_engine(model, 1, context, -1, engine_options, memory_fraction);
+  cli::StartedEngine started =
+      cli::start_engine(model, 1, context, format.weights, engine_options, memory_fraction, format.bf16x);
   const runtime::Plan& plan = started.plan;
   for (const std::string& note : plan.notes) std::fprintf(stderr, "%s\n", note.c_str());
   runtime::Engine& engine = *started.engine;
+  if (!engine.placement().empty()) std::fprintf(stderr, "%s", engine.placement().c_str());
   if (!engine.tokenizer()) throw std::runtime_error("the model folder has no tokenizer");
 
   std::signal(SIGINT, on_interrupt);

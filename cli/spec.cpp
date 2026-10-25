@@ -32,6 +32,9 @@
 //     Feeds each prompt's second half one token at a time, then again as verify steps of random
 //     sizes with random rollbacks (and an occasional normal step, which folds), and requires every
 //     verify row's logits to be bit-identical to the one-token step at the same position.
+//
+//   spec, spec-cost and spec-check take --weights bf16|int8|fp8|nvfp4|bf16x and --no-bf16x: the target model loads
+//   in the folder's format unless --weights names another (cli/common.h, load_weights).
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -47,6 +50,7 @@
 #include <string>
 #include <vector>
 
+#include "cli/common.h"
 #include "core/checkpoint.h"
 #include "core/config.h"
 #include "cuda/kernels.h"
@@ -62,13 +66,23 @@ struct Loaded {
   std::unique_ptr<lx::MetisModel> model;
 };
 
-Loaded load(const std::string& dir, int slots, int max_tokens) {
+// The model in the folder's format, or the one the flags name, with the plan's maths for it on this GPU.
+Loaded load(const std::string& dir, int slots, int max_tokens, const lx::cli::FormatFlags& format = {}) {
   Loaded l;
   l.config = lx::load_config(dir);
-  l.weights = std::make_unique<lx::ModelWeights>(lx::ModelWeights::load(dir, l.config, lx::LoadOptions{LX_W_BF16}));
-  l.model = std::make_unique<lx::MetisModel>(l.config, *l.weights, lx::ModelFormats{}, slots, 8192, max_tokens,
-                                             nullptr, true);
+  lx::cli::LoadedWeights w = lx::cli::load_weights(dir, l.config, format);
+  std::fprintf(stderr, "%s\n", w.description.c_str());
+  l.weights = std::move(w.weights);
+  l.model = std::make_unique<lx::MetisModel>(l.config, *l.weights, w.formats, slots, 8192, max_tokens, nullptr, true);
   return l;
+}
+
+// argv without the format flags (which go to `format`), for the commands that read their arguments by position.
+std::vector<char*> without_format_flags(int argc, char** argv, lx::cli::FormatFlags& format) {
+  std::vector<char*> out;
+  for (int i = 0; i < argc; ++i)
+    if (i == 0 || !lx::cli::parse_format_flag(argc, argv, i, format)) out.push_back(argv[i]);
+  return out;
 }
 
 std::vector<std::string> split(const std::string& s, char sep) {
@@ -79,12 +93,12 @@ std::vector<std::string> split(const std::string& s, char sep) {
   return out;
 }
 
-int run_check(int argc, char** argv) {
+int run_check(int argc, char** argv, const lx::cli::FormatFlags& format) {
   const std::string dir = argv[1];
   nlohmann::json prompts;
   std::ifstream(argv[2]) >> prompts;
   const int K = argc >= 4 ? std::stoi(argv[3]) : 96;
-  Loaded l = load(dir, 1, 512);
+  Loaded l = load(dir, 1, 512, format);
   lx::MetisModel& model = *l.model;
   const int V = model.vocab_size(), maxv = model.max_verify_tokens();
   float* d_logits = nullptr;
@@ -164,10 +178,10 @@ int run_check(int argc, char** argv) {
 // Milliseconds per step: plain one-token steps, and verify steps of T = 1 .. max tokens, each
 // followed by the host sync and the rollback a real step does (one token kept, so folds happen at
 // their real rate).
-int run_cost(int argc, char** argv) {
+int run_cost(int argc, char** argv, const lx::cli::FormatFlags& format) {
   const std::string dir = argv[1];
   const int context = argc >= 3 ? std::stoi(argv[2]) : 1024;
-  Loaded l = load(dir, 1, 512);
+  Loaded l = load(dir, 1, 512, format);
   lx::MetisModel& model = *l.model;
   const int V = model.vocab_size(), maxv = model.max_verify_tokens();
   float* d_logits = nullptr;
@@ -241,12 +255,15 @@ struct Run {
 }  // namespace
 
 int cmd_spec_cost(int argc, char** argv) {
-  if (argc < 2 || argc > 4) {
-    std::fprintf(stderr, "usage: lernex spec-cost MODEL_DIR [CONTEXT [ROUNDS]]\n");
-    return 2;
-  }
   try {
-    return run_cost(argc, argv);
+    lx::cli::FormatFlags format;
+    std::vector<char*> args = without_format_flags(argc, argv, format);
+    const int n = static_cast<int>(args.size());
+    if (n < 2 || n > 4) {
+      std::fprintf(stderr, "usage: lernex spec-cost MODEL_DIR [CONTEXT [ROUNDS]] %s\n", lx::cli::kFormatUsage);
+      return 2;
+    }
+    return run_cost(n, args.data(), format);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "error: %s\n", e.what());
     return 1;
@@ -254,12 +271,15 @@ int cmd_spec_cost(int argc, char** argv) {
 }
 
 int cmd_spec_check(int argc, char** argv) {
-  if (argc != 3 && argc != 4) {
-    std::fprintf(stderr, "usage: lernex spec-check MODEL_DIR PROMPTS_JSON [N]\n");
-    return 2;
-  }
   try {
-    return run_check(argc, argv);
+    lx::cli::FormatFlags format;
+    std::vector<char*> args = without_format_flags(argc, argv, format);
+    const int n = static_cast<int>(args.size());
+    if (n != 3 && n != 4) {
+      std::fprintf(stderr, "usage: lernex spec-check MODEL_DIR PROMPTS_JSON [N] %s\n", lx::cli::kFormatUsage);
+      return 2;
+    }
+    return run_check(n, args.data(), format);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "error: %s\n", e.what());
     return 1;
@@ -364,12 +384,14 @@ int cmd_spec(int argc, char** argv) {
     float min_conf = 0.0f;
     int repeat = 1;
     std::string cost_list;
+    lx::cli::FormatFlags format;
     for (int i = 3; i < argc; ++i) {
       const std::string a = argv[i];
       auto val = [&]() -> std::string {
         if (i + 1 >= argc) throw std::runtime_error("missing value for " + a);
         return argv[++i];
       };
+      if (lx::cli::parse_format_flag(argc, argv, i, format)) continue;
       if (a == "--tokens") cfg.max_new_tokens = std::stoi(val());
       else if (a == "--k") cfg.max_drafts = std::stoi(val());
       else if (a == "--drafters") drafters = split(val(), ',');
@@ -393,7 +415,7 @@ int cmd_spec(int argc, char** argv) {
     }
     const bool greedy = !(cfg.filter.temperature > 0.0f);
     const bool self = std::find(drafters.begin(), drafters.end(), "self") != drafters.end();
-    Loaded target = load(dir, self ? 2 : 1, cfg.prefill_chunk);
+    Loaded target = load(dir, self ? 2 : 1, cfg.prefill_chunk, format);
     cfg.stop_ids = std::vector<int32_t>(target.config.eos_token_ids.begin(), target.config.eos_token_ids.end());
     Loaded draft;
     if (std::find(drafters.begin(), drafters.end(), "model") != drafters.end()) {

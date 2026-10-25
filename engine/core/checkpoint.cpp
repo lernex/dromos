@@ -198,6 +198,10 @@ lx_wtype stored_format_of(const SafetensorsSet& set) {
 
 }  // namespace
 
+lx_wtype projection_format(lx_wtype target, std::string_view projection) { return recipe(target, projection); }
+
+std::string nvfp4_unavailable(lx_wtype stored, const MetisConfig& config) { return nvfp4_refusal(stored, config); }
+
 // One projection of the folder: its tensors, the format the file holds it in, and the format it loads in.
 struct Projection {
   std::string key;                     // "layers.4.mixer.qkv", "moe" stacks included; "embedding" for the head

@@ -5,6 +5,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -17,6 +18,7 @@
 #include "core/safetensors.h"
 #include "cuda/kernels.h"
 #include "model/metis.h"
+#include "runtime/offload_model.h"
 #include "runtime/prefix_cache.h"
 #include "runtime/scheduler.h"
 #include "runtime/tool_grammar.h"
@@ -68,6 +70,27 @@ size_t held_suffix(const std::string& text, const std::vector<std::string>& stri
   return hold;
 }
 
+// The offload runtime's options for a plan: its formats and budgets, the CPU lane's share as the plan placed it,
+// and the measurement knobs `lernex offload` reads (LX_ROUTING_STATS, LX_OFFLOAD_DYNAMIC, LX_OFFLOAD_CPU_FRACTION,
+// LX_OFFLOAD_CPU_PAIRS, LX_OFFLOAD_FILL), which win when set.
+lx::offload::OffloadLoadOptions offload_options(const Plan& plan) {
+  auto env = [](const char* name, double fallback) {
+    const char* v = std::getenv(name);
+    return v && *v ? std::atof(v) : fallback;
+  };
+  lx::offload::OffloadLoadOptions o;
+  o.weights = plan.weights;
+  o.experts = plan.recipe.experts;
+  o.vram_budget = static_cast<int64_t>(plan.offload.vram_budget);
+  o.ram_budget = plan.offload.ram_budget > 0 ? static_cast<int64_t>(plan.offload.ram_budget) : -1;
+  if (const char* stats = std::getenv("LX_ROUTING_STATS")) o.routing_stats = stats;
+  o.policy.dynamic_fraction = env("LX_OFFLOAD_DYNAMIC", 1.0);
+  o.policy.cpu_fraction = env("LX_OFFLOAD_CPU_FRACTION", plan.offload.cpu_fraction);
+  o.policy.max_cpu_pairs = static_cast<int>(env("LX_OFFLOAD_CPU_PAIRS", plan.offload.max_cpu_pairs));
+  o.policy.fill = env("LX_OFFLOAD_FILL", 1) != 0;
+  return o;
+}
+
 }  // namespace
 
 struct Sequence {
@@ -102,14 +125,23 @@ struct Engine::Impl {
         max_queue(options.max_queue) {
     if (max_slots < 1 || kv_capacity < 2 || max_step_tokens < 1)
       throw std::invalid_argument("the plan leaves no room for a sequence");
-    if (plan.weights != LX_W_BF16)
-      throw std::invalid_argument("this build loads BF16 weights only; the other formats are not wired into the engine yet");
     if (options.load_tokenizer) tokenizer = lx::text::Tokenizer::load(dir);
 
     check(lx_rt_stream_create(&stream), "stream creation");
-    weights = std::make_unique<lx::ModelWeights>(lx::ModelWeights::load(dir, config, lx::LoadOptions{LX_W_BF16}));
-    model = std::make_unique<lx::MetisModel>(config, *weights, lx::ModelFormats{}, max_slots, kv_capacity,
-                                             max_step_tokens);
+    // The weights in the plan's format, and the model in the plan's formats and maths. An offloaded plan loads
+    // the dense weights alone (ModelWeights with skip_experts, inside OffloadedModel) and holds the routed
+    // experts in the offload runtime, in the plan's expert format.
+    const lx::ModelFormats formats = plan.formats();
+    if (plan.offload.enabled) {
+      offloaded = lx::offload::OffloadedModel::load(dir, config, offload_options(plan));
+      model = std::make_unique<lx::MetisModel>(config, offloaded->weights(), formats, max_slots, kv_capacity,
+                                               max_step_tokens, &offloaded->experts());
+    } else {
+      lx::LoadOptions load;
+      load.target = plan.weights;
+      weights = std::make_unique<lx::ModelWeights>(lx::ModelWeights::load(dir, config, load));
+      model = std::make_unique<lx::MetisModel>(config, *weights, formats, max_slots, kv_capacity, max_step_tokens);
+    }
 #ifdef LX_SLOT_STATE
     if (options.prefix_cache && plan.prefix_device_bytes + plan.prefix_host_bytes > 0)
       cache = std::make_unique<PrefixCache>(plan.prefix_device_bytes, plan.prefix_host_bytes, stream);
@@ -152,6 +184,11 @@ struct Engine::Impl {
 
     for (int s = max_slots - 1; s >= 0; --s) free_slots.push_back(s);
     stats.slots = max_slots;
+    // Last, with everything else allocated: the expert cache takes the VRAM the budget leaves.
+    if (offloaded) {
+      offloaded->finalize();
+      placement = offloaded->describe();
+    }
     epoch = Clock::now();
   }
 
@@ -177,8 +214,10 @@ struct Engine::Impl {
   void snapshot(const std::shared_ptr<Sequence>& s, int length, const std::vector<int32_t>& tokens);
 
   lx::MetisConfig config;
-  std::unique_ptr<lx::ModelWeights> weights;
-  std::unique_ptr<lx::MetisModel> model;
+  std::unique_ptr<lx::ModelWeights> weights;               // resident plans
+  std::unique_ptr<lx::offload::OffloadedModel> offloaded;  // offloaded plans: the dense weights and the experts
+  std::unique_ptr<lx::MetisModel> model;                   // declared after both, so it is destroyed first
+  std::string placement;                                   // where the offloaded experts live, or ""
   std::unique_ptr<PrefixCache> cache;  // null when prefix reuse is off or the model lacks slot state
   std::vector<std::string> token_texts;  // every token's text, for the tool grammar's masks
   size_t mask_words = 0;                 // 32-bit words per token mask
@@ -237,6 +276,8 @@ const lx::MetisConfig& Engine::config() const { return impl_->config; }
 const lx::text::Tokenizer* Engine::tokenizer() const { return impl_->tokenizer.get(); }
 
 double Engine::now() const { return impl_->now(); }
+
+const std::string& Engine::placement() const { return impl_->placement; }
 
 uint64_t Engine::submit(GenerateRequest request, RequestCallbacks callbacks) {
   Impl& m = *impl_;

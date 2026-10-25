@@ -1,4 +1,8 @@
 // lernex bench MODEL [--streams 1,8,32,64] [--prompt-tokens N] [--gen-tokens N]
+//                    [--weights bf16|int8|fp8|nvfp4|bf16x] [--no-bf16x]
+//
+// The weights run in the format the file stores unless --weights names another, so a speed is always the speed
+// of a named format (the first line of the plan says which).
 //
 // Runs the engine itself (its scheduler, batching and sampler) on synthetic prompts: every stream
 // gets the same number of random prompt tokens and generates the same number of tokens, greedy,
@@ -30,6 +34,7 @@ struct BenchArgs {
   int gen_tokens = 256;
   bool sample = false;
   bool prefix_cache = true;  // --no-prefix-cache measures the cold path
+  FormatFlags format;
 };
 
 std::vector<int> parse_list(const std::string& text) {
@@ -141,6 +146,7 @@ int cmd_bench(int argc, char** argv) {
       if (i + 1 >= argc) throw std::runtime_error(a + " needs a value");
       return argv[++i];
     };
+    if (parse_format_flag(argc, argv, i, args.format)) continue;
     if (a == "--streams") args.streams = parse_list(value());
     else if (a == "--prompt-tokens") args.prompt_tokens = std::stoi(value());
     else if (a == "--gen-tokens") args.gen_tokens = std::stoi(value());
@@ -150,7 +156,8 @@ int cmd_bench(int argc, char** argv) {
     else throw std::runtime_error("unknown option " + a);
   }
   if (args.model.empty()) {
-    std::fprintf(stderr, "usage: lernex bench MODEL [--streams 1,8,32,64] [--prompt-tokens N] [--gen-tokens N]\n");
+    std::fprintf(stderr, "usage: lernex bench MODEL [--streams 1,8,32,64] [--prompt-tokens N] [--gen-tokens N] %s\n",
+                 kFormatUsage);
     return 2;
   }
   if (args.streams.empty() || args.prompt_tokens < 1 || args.gen_tokens < 2)
@@ -161,13 +168,14 @@ int cmd_bench(int argc, char** argv) {
   EngineOptions options;
   options.load_tokenizer = false;
   options.prefix_cache = args.prefix_cache;
-  lx::cli::StartedEngine started =
-      lx::cli::start_engine(model, max_streams, args.prompt_tokens + args.gen_tokens + 16, -1, options);
+  lx::cli::StartedEngine started = lx::cli::start_engine(model, max_streams, args.prompt_tokens + args.gen_tokens + 16,
+                                                         args.format.weights, options, 0.92, args.format.bf16x);
   const Plan& plan = started.plan;
   Engine& engine = *started.engine;
 
   std::printf("%s  (%s)\n", args.model.c_str(), model.dir.c_str());
   for (const std::string& note : plan.notes) std::printf("  %s\n", note.c_str());
+  if (!engine.placement().empty()) std::printf("%s", engine.placement().c_str());
   std::printf("  %d slots, %d-token context, %d tokens per step\n", plan.max_slots, plan.kv_capacity,
               plan.max_step_tokens);
   std::printf("  %d prompt tokens, %d generated tokens per stream, %s\n\n", args.prompt_tokens, args.gen_tokens,

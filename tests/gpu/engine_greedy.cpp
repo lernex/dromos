@@ -27,7 +27,8 @@ int main(int argc, char** argv) {
     request.sequences = 1;
     request.context = static_cast<int>(prompt.size()) + n + 8;
     lx::MetisConfig config = lx::load_config(argv[1]);
-    lx::runtime::Plan plan = lx::runtime::make_plan(lx::runtime::query_device(0), config, lx::runtime::CheckpointInfo{}, request);
+    lx::runtime::Plan plan =
+        lx::runtime::make_plan(lx::runtime::query_device(0), config, lx::runtime::inspect_checkpoint(argv[1]), request);
     lx::runtime::EngineOptions options;
     options.load_tokenizer = false;
     lx::runtime::Engine engine(argv[1], plan, options);

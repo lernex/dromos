@@ -1,6 +1,9 @@
-// lernex serve MODEL [--host H] [--port P] [--weights bf16|fp8|nvfp4] [--context N] [--sequences N]
+// lernex serve MODEL [--host H] [--port P] [--weights bf16|int8|fp8|nvfp4|bf16x] [--no-bf16x] [--context N]
+//                    [--sequences N]
 //
-// Serves MODEL over the OpenAI API on this machine until Ctrl-C.
+// Serves MODEL over the OpenAI API on this machine until Ctrl-C. The weights run in the format the file stores
+// unless --weights names another (runtime/plan.h); a model larger than the GPU runs with its routed experts
+// offloaded.
 #include <algorithm>
 #include <csignal>
 #include <cstdio>
@@ -25,7 +28,8 @@ void on_interrupt(int) {
 
 int cmd_serve(int argc, char** argv) {
   using namespace lx;
-  std::string name, served, host = "127.0.0.1", weights;
+  std::string name, served, host = "127.0.0.1";
+  cli::FormatFlags format;
   int port = 8080, context = 0, sequences = 0;
   bool prefix_cache = true;
   double memory_fraction = 0.92;
@@ -35,9 +39,9 @@ int cmd_serve(int argc, char** argv) {
       if (i + 1 >= argc) throw std::runtime_error(a + " needs a value");
       return argv[++i];
     };
+    if (cli::parse_format_flag(argc, argv, i, format)) continue;
     if (a == "--host") host = value();
     else if (a == "--port") port = std::stoi(value());
-    else if (a == "--weights") weights = value();
     else if (a == "--name") served = value();
     else if (a == "--context") context = std::stoi(value());
     else if (a == "--sequences") sequences = std::stoi(value());
@@ -49,21 +53,17 @@ int cmd_serve(int argc, char** argv) {
   if (name.empty()) {
     std::fprintf(stderr,
                  "usage: lernex serve MODEL [--host 127.0.0.1] [--port 8080] [--name NAME]\n"
-                 "                     [--weights bf16|fp8|nvfp4] [--context N] [--sequences N] [--no-prefix-cache]\n");
+                 "                     %s\n"
+                 "                     [--context N] [--sequences N] [--no-prefix-cache]\n",
+                 cli::kFormatUsage);
     return 2;
-  }
-  int format = -1;
-  if (!weights.empty()) {
-    if (weights == "bf16") format = LX_W_BF16;
-    else if (weights == "fp8") format = LX_W_FP8;
-    else if (weights == "nvfp4") format = LX_W_NVFP4;
-    else throw std::runtime_error("--weights takes bf16, fp8 or nvfp4");
   }
 
   const cli::Model model = cli::find_model(name, true);
   runtime::EngineOptions engine_options;
   engine_options.prefix_cache = prefix_cache;
-  cli::StartedEngine started = cli::start_engine(model, sequences, context, format, engine_options, memory_fraction);
+  cli::StartedEngine started =
+      cli::start_engine(model, sequences, context, format.weights, engine_options, memory_fraction, format.bf16x);
   const runtime::Plan& plan = started.plan;
   runtime::Engine& engine = *started.engine;
 
@@ -79,6 +79,7 @@ int cmd_serve(int argc, char** argv) {
   std::signal(SIGTERM, on_interrupt);
 
   for (const std::string& note : plan.notes) std::fprintf(stderr, "%s\n", note.c_str());
+  if (!engine.placement().empty()) std::fprintf(stderr, "%s", engine.placement().c_str());
   std::fprintf(stderr, "Serving %s on http://%s:%d/v1  (Ctrl-C to stop)\n", name.c_str(), host.c_str(), port);
   const bool ok = server.run();
   g_server = nullptr;
