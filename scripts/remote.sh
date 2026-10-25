@@ -2,7 +2,7 @@
 # Build and test on the GPU server from this checkout.
 #
 #   scripts/remote.sh SLOT build              configure + build in the slot (Release, sm_120)
-#   scripts/remote.sh SLOT test [PYTEST ARGS] build, then the kernel tests and the C++ unit tests
+#   scripts/remote.sh SLOT test [PYTEST ARGS] build, then the kernel tests (under the GPU lock) and the C++ unit tests
 #   scripts/remote.sh SLOT run 'CMD'          run a shell command in the slot after syncing ($PY is the venv python)
 #   scripts/remote.sh SLOT x 'CMD'            the same, holding the GPU lock: use it for anything that loads a
 #                                             whole model or measures speed, so runs never share the card
@@ -32,7 +32,8 @@ build="cmake -S . -B $bdir -G Ninja -DCMAKE_BUILD_TYPE=Release $cfg >/dev/null &
 q() { printf '%q ' "$@"; }
 case "$verb" in
   build) ssh "$host" "cd $remote && $env && $build" ;;
-  test) ssh "$host" "cd $remote && $env && $build && \$PY -m pytest -q tests/kernels $(q "$@") && { [ ! -x $bdir/lernex_unit ] || $bdir/lernex_unit; }" ;;
+  # The kernel tests allocate gigabytes on the card, so they hold the GPU lock as model runs do.
+  test) ssh "$host" "cd $remote && $env && $build && flock \$HOME/lernex-engine-dev/.gpu.lock \$PY -m pytest -q tests/kernels $(q "$@") && { [ ! -x $bdir/lernex_unit ] || $bdir/lernex_unit; }" ;;
   run) ssh "$host" "cd $remote && $env && $*" ;;
   x) ssh "$host" "cd $remote && $env && flock \$HOME/lernex-engine-dev/.gpu.lock bash -c $(q "$*")" ;;
   *) echo "unknown verb $verb" >&2; exit 2 ;;
