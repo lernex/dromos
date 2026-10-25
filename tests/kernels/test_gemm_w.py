@@ -232,3 +232,68 @@ def test_gemm_w_split_k(lx, name, wtype, math, oldest, split):
     close(outs[0][:, :N], want.float(), atol=2e-4 * want.abs().max().item())
     assert torch.equal(outs[0], outs[1]), "split-K sum is not deterministic"
     assert torch.equal(outs[0][:, N:], y0[:, N:]), "wrote past the N columns of y"
+
+
+def plain_gemm(lx, x, w, math, bias, N):
+    """y = x @ W^T + bias as f32, from a garbage-filled workspace."""
+    M, K = x.shape
+    y = torch.full((M, N), float("nan"), device="cuda")
+    ws = torch.full((max(workspace_bytes(lx, M, K, math), 1),), 0xFF, dtype=torch.uint8, device="cuda")
+    status = call_gemm_w(lx, x, K, w, math, bias, y, N, M, N, K, 1.0, 0.0, ws)
+    assert status == 0, f"lx_gemm_w returned CUDA error {status}"
+    return y
+
+
+@pytest.mark.parametrize("name,wtype,math,oldest", PAIRS)
+def test_gemm_w_repeats_bit_for_bit(lx, name, wtype, math, oldest):
+    # The engine rule, run to run: five calls give the same bits, at a small M where the default pick splits K
+    # over a cluster (sm_90+), and at a prefill size. bf16 x bf16 without a bias runs on cuBLASLt.
+    if native_arch(lx) < oldest:
+        pytest.skip("not on this GPU")
+    for M, N, K in [(16, 2048, 4096), (2048, 2048, 1024)]:
+        torch.manual_seed(M + N + K + math)
+        x = torch.randn(M, K, device="cuda").to(torch.bfloat16)
+        w = quantize_weight(torch.randn(N, K, device="cuda") / K**0.5, wtype)
+        first = plain_gemm(lx, x, w, math, None, N)
+        for _ in range(4):
+            assert torch.equal(plain_gemm(lx, x, w, math, None, N), first), f"{name} at M = {M}: a repeat differs"
+
+
+@pytest.mark.parametrize("name,wtype,math,oldest", PAIRS)
+def test_gemm_w_rows_do_not_depend_on_the_batch(lx, name, wtype, math, oldest):
+    # The engine rule across batches: rows 0..63 have the same bits in a call of 64 rows as in a call of 512,
+    # whichever tile variant runs the 64 (every K step is added in the same order on every tile), and rows of
+    # 1 to 256 through the default picks. N = 5120 has more than 35 tiles even at M = 1, so no size splits K:
+    # split-K (small M on sm_90+) is the one pick that changes a row's bits, see kernels.h. The bf16 kernel
+    # runs here with an f32 bias; with a bf16 one (or none) bf16 x bf16 goes to cuBLASLt, which picks its
+    # algorithm per M.
+    have = native_arch(lx)
+    if have < oldest:
+        pytest.skip("not on this GPU")
+    N, K = 5120, 1024
+    torch.manual_seed(5 + math)
+    x = torch.randn(512, K, device="cuda").to(torch.bfloat16)
+    w = quantize_weight(torch.randn(N, K, device="cuda") / K**0.5, wtype)
+    bias = torch.randn(N, device="cuda") * 0.1
+    big = plain_gemm(lx, x, w, math, bias, N)
+    for M in (1, 16, 64, 256):
+        small = plain_gemm(lx, x[:M].contiguous(), w, math, bias, N)
+        assert torch.equal(small, big[:M]), f"{name}: rows of an M = {M} call differ from the same rows at M = 512"
+    kind = {"bf16": "bf16", "w8a16_int8": "w8i8", "w8a16_fp8": "w8f8", "w4a16": "w4a16", "int8": "i8", "fp8": "f8",
+            "w4a8": "w4a8", "fp4": "f4"}[name]
+    names = (ctypes.c_char_p * 256)()
+    count = lx.lib.lx_tune_kernels(names, 256)
+    fams = [names[i].decode() for i in range(min(count, 256)) if names[i].decode().startswith(f"gemm_w.{kind}.sm")]
+    fam = max((f for f in fams if int(f.split(".sm")[1]) <= have), key=lambda f: int(f.split(".sm")[1])).encode()
+    lx.lib.lx_tune_variant_name.restype = ctypes.c_char_p
+    head = x[:64].contiguous()
+    for v in range(lx.lib.lx_tune_variants(fam)):
+        vname = lx.lib.lx_tune_variant_name(fam, v).decode()
+        if "_x" in vname:
+            continue  # split-K
+        lx.lib.lx_tune_force(fam, 64, N, K, v)
+        try:
+            small = plain_gemm(lx, head, w, math, bias, N)
+        finally:
+            lx.lib.lx_tune_clear()
+        assert torch.equal(small, big[:64]), f"{name}, variant {vname}: rows differ from the same rows at M = 512"
