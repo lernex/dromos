@@ -167,6 +167,8 @@ struct MetisModel::Impl {
   // the same way and copies the top n predicted experts that are not in VRAM ahead of the layer.
   int prefetch = 0;
   void* side = nullptr;
+  // Decode steps: the routing features run on route_side, beside the mixer (see run)
+  void *route_side = nullptr, *route_fork = nullptr, *route_join = nullptr;
   std::vector<void*> fork_events, join_events;  // per (pass, layer)
   // Projections kept in host memory (offload, LX_OFFLOAD_DENSE_HOST): a prefill product copies its
   // weight into one of two VRAM buffers on a copy stream, so the next weight crosses PCIe while this
@@ -229,6 +231,9 @@ struct MetisModel::Impl {
     for (void* e : fork_events) lx_rt_event_destroy(e);
     for (void* e : join_events) lx_rt_event_destroy(e);
     if (side) lx_rt_stream_destroy(side);
+    if (route_side) lx_rt_stream_destroy(route_side);
+    if (route_fork) lx_rt_event_destroy(route_fork);
+    if (route_join) lx_rt_event_destroy(route_join);
     for (int b = 0; b < 2; ++b) {
       if (stage_copied[b]) lx_rt_event_destroy(stage_copied[b]);
       if (stage_free[b]) lx_rt_event_destroy(stage_free[b]);
@@ -791,6 +796,9 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
   check(lx_rt_host_alloc(&pinned, static_cast<int64_t>(m.meta_count * 4)), "pinned host allocation");
   m.h_meta = static_cast<int32_t*>(pinned);
   check(lx_rt_event_create(&m.meta_copied), "event create");
+  check(lx_rt_stream_create(&m.route_side), "stream create");
+  check(lx_rt_event_create(&m.route_fork), "event create");
+  check(lx_rt_event_create(&m.route_join), "event create");
   if (m.offload && std::getenv("LX_OFFLOAD_PREFETCH")) m.prefetch = std::atoi(std::getenv("LX_OFFLOAD_PREFETCH"));
   if (m.route_trace || m.prefetch > 0) {
     m.pred_mixed = m.alloc<float>(TS * D);
@@ -1657,10 +1665,19 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
       const int slot_index = pass * m.L_layers + i;
       const int params = S * S + 2 * S;
 
-      // depth-memory read and routing features
+      // depth-memory read, then the routing features beside the mixer. They read the streams as the read
+      // left them and write nothing the mixer touches, so on a decode-sized step they run on route_side and
+      // join before the MoE reads them. A larger step keeps its order: its GEMMs share one workspace.
       memory_retrieve(m, T, n_entries, s);
-      LX_CHECK(lx_stream_mean(m.streams, m.state, T, S, D, s));
-      routing_features(m, T, s);
+      const bool beside = T <= Impl::kGemvRows;
+      void* rs = beside ? m.route_side : s;
+      if (beside) {
+        check(lx_rt_event_record(m.route_fork, s), "event record");
+        check(lx_rt_stream_wait(rs, m.route_fork), "stream wait");
+      }
+      LX_CHECK(lx_stream_mean(m.streams, m.state, T, S, D, rs));
+      routing_features(m, T, rs);
+      if (beside) check(lx_rt_event_record(m.route_join, rs), "event record");
 
       // mixer
       const float* mc = layer.mixer_conn.params + pass * params;
@@ -1706,6 +1723,7 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
       // the latent lands in the router's input: [latent | features], one row of Lat + R per token
       linear(m, layer.latent_down, m.h_bf, LX_BF16, D, m.router_in, LX_F32, Lat + R, T, s);
       to_bf16(m.router_in, Lat + R, m.latent_bf, Lat, T, Lat, s);
+      if (beside) check(lx_rt_stream_wait(s, m.route_join), "stream wait");
       copy_f32(m.features, R, m.router_in + Lat, Lat + R, T, R, s);
       gemm_f32(m.router_in, Lat + R, layer.router_w, layer.router_b, m.router_logits, E, T, E, Lat + R, s);
       LX_CHECK(lx_moe_route(m.router_logits, layer.selection_bias, m.route_ids, m.route_w, m.entropy, m.confidence, T,
