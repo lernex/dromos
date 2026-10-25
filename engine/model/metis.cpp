@@ -170,6 +170,9 @@ struct MetisModel::Impl {
   void *route_side = nullptr, *route_fork = nullptr, *route_join = nullptr;
   // Decode steps: the shared expert's gate-up and activation run on shared_side, beside the routed experts
   void *shared_side = nullptr, *shared_fork = nullptr, *shared_join = nullptr;
+  // Decode steps: moe_summary runs beside latent_up, and the memory's value projection beside its key (see run)
+  void *moe_side = nullptr, *moe_fork = nullptr, *moe_join = nullptr;
+  void *value_side = nullptr, *value_fork = nullptr, *value_join = nullptr;
   std::vector<void*> fork_events, join_events;  // per (pass, layer)
   // The formats the model runs in (metis.h), and the prefill maths in force: the plan's prefill_math and
   // expert_math, or what LX_PREFILL names. Each product multiplies in its math when its weight's format can,
@@ -230,6 +233,12 @@ struct MetisModel::Impl {
     if (shared_side) lx_rt_stream_destroy(shared_side);
     if (shared_fork) lx_rt_event_destroy(shared_fork);
     if (shared_join) lx_rt_event_destroy(shared_join);
+    if (moe_side) lx_rt_stream_destroy(moe_side);
+    if (moe_fork) lx_rt_event_destroy(moe_fork);
+    if (moe_join) lx_rt_event_destroy(moe_join);
+    if (value_side) lx_rt_stream_destroy(value_side);
+    if (value_fork) lx_rt_event_destroy(value_fork);
+    if (value_join) lx_rt_event_destroy(value_join);
     for (auto& [key, exec] : graphs) lx_rt_graph_destroy(exec);
     if (meta_copied) lx_rt_event_destroy(meta_copied);
     if (h_meta) lx_rt_host_free(h_meta);
@@ -813,6 +822,12 @@ MetisModel::MetisModel(const MetisConfig& c, const ModelWeights& weights, const 
   check(lx_rt_stream_create(&m.shared_side), "stream create");
   check(lx_rt_event_create(&m.shared_fork), "event create");
   check(lx_rt_event_create(&m.shared_join), "event create");
+  check(lx_rt_stream_create(&m.moe_side), "stream create");
+  check(lx_rt_event_create(&m.moe_fork), "event create");
+  check(lx_rt_event_create(&m.moe_join), "event create");
+  check(lx_rt_stream_create(&m.value_side), "stream create");
+  check(lx_rt_event_create(&m.value_fork), "event create");
+  check(lx_rt_event_create(&m.value_join), "event create");
   if (m.offload && std::getenv("LX_OFFLOAD_PREFETCH")) m.prefetch = std::atoi(std::getenv("LX_OFFLOAD_PREFETCH"));
   if (m.route_trace || m.prefetch > 0) {
     m.pred_mixed = m.alloc<float>(TS * D);
@@ -1112,8 +1127,19 @@ void memory_write(Impl& m, const MetisConfig& c, int T, int pass, int anchor, in
   LX_CHECK(lx_add_row_bf16(m.entry, static_cast<const uint16_t*>(m.m_pass_emb) + pass * Mm, T, Mm, s));
   LX_CHECK(lx_add_row_bf16(m.entry, static_cast<const uint16_t*>(m.m_anchor_emb) + anchor * Mm, T, Mm, s));
   const int ld_bank = m.Emax * Mm;
-  linear(m, m.m_key, m.entry, LX_F32, Mm, m.bank_k + n_entries * Mm, LX_F32, ld_bank, T, s);
-  linear(m, m.m_value, m.entry, LX_F32, Mm, m.bank_v + n_entries * Mm, LX_F32, ld_bank, T, s);
+  // The key and the value read the same entry and write their own banks. On a decode-sized step the value runs
+  // on value_side beside the key, and the key joins it before the function returns.
+  if (T <= Impl::kGemvRows) {
+    check(lx_rt_event_record(m.value_fork, s), "event record");
+    check(lx_rt_stream_wait(m.value_side, m.value_fork), "stream wait");
+    linear(m, m.m_value, m.entry, LX_F32, Mm, m.bank_v + n_entries * Mm, LX_F32, ld_bank, T, m.value_side);
+    check(lx_rt_event_record(m.value_join, m.value_side), "event record");
+    linear(m, m.m_key, m.entry, LX_F32, Mm, m.bank_k + n_entries * Mm, LX_F32, ld_bank, T, s);
+    check(lx_rt_stream_wait(s, m.value_join), "stream wait");
+  } else {
+    linear(m, m.m_key, m.entry, LX_F32, Mm, m.bank_k + n_entries * Mm, LX_F32, ld_bank, T, s);
+    linear(m, m.m_value, m.entry, LX_F32, Mm, m.bank_v + n_entries * Mm, LX_F32, ld_bank, T, s);
+  }
   ++n_entries;
 }
 
@@ -1803,8 +1829,17 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
         LX_CHECK(lx_silu_mul(m.shared_gu, 2 * m.Ishared, m.shared_bf, LX_BF16, T, m.Ishared, s));
       }
       linear(m, layer.shared_down, m.shared_bf, LX_BF16, m.Ishared, m.routed, LX_F32, Lat, T, s, 1.0f, 1.0f);
+      // moe_summary reads the routing and the expert embeddings, not routed, so on a decode-sized step it runs
+      // on moe_side beside latent_up, and joins before the history update reads summary
+      const bool moe_beside = T <= Impl::kGemvRows;
+      if (moe_beside) {
+        check(lx_rt_event_record(m.moe_fork, s), "event record");
+        check(lx_rt_stream_wait(m.moe_side, m.moe_fork), "stream wait");
+        LX_CHECK(lx_moe_summary(m.route_ids, m.route_w, layer.expert_emb, m.summary, T, R, m.K, m.moe_side));
+        check(lx_rt_event_record(m.moe_join, m.moe_side), "event record");
+      }
       linear(m, layer.latent_up, m.routed, LX_F32, Lat, m.update, LX_F32, D, T, s);
-      LX_CHECK(lx_moe_summary(m.route_ids, m.route_w, layer.expert_emb, m.summary, T, R, m.K, s));
+      if (!moe_beside) LX_CHECK(lx_moe_summary(m.route_ids, m.route_w, layer.expert_emb, m.summary, T, R, m.K, s));
       LX_CHECK(lx_mhc_write(m.mixed, ec + S * S + S, m.update, m.streams, T, S, D, s));
 
       if (prefetching && i + 1 < m.L_layers) {
@@ -1848,6 +1883,7 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
         std::fwrite(ids.data(), 4, ids.size(), m.route_trace);
       }
 
+      if (moe_beside) check(lx_rt_stream_wait(s, m.moe_join), "stream wait");
       LX_CHECK(glue::axpby(m.history, m.summary, 0.5f, 0.5f, static_cast<int64_t>(T) * R, s));
       if (layer.attention) memory_write(m, c, T, pass, anchor++, n_entries, s);
       write_tap(m, pass, i, T, s);
