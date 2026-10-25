@@ -14,14 +14,14 @@ namespace lx {
 namespace offload {
 class ExpertOffload;
 }
+class ModelWeights;  // core/checkpoint.h
 
-// A weight as the model needs it: a device pointer, its dtype and shape. The model checks both.
+// A plain tensor as the model needs it: a device pointer, its dtype and shape. The model checks both.
 struct WeightView {
   const void* data = nullptr;
   int dtype = 0;  // lx_dtype: LX_F32 or LX_BF16
   std::vector<int64_t> shape;
 };
-using WeightLookup = std::function<WeightView(const std::string& name)>;
 
 // One step: the new tokens of n_seq sequences, concatenated. Each sequence lives in a state
 // slot; a slot's first step starts it from empty state, later steps continue it.
@@ -40,6 +40,20 @@ struct FeatureTap {
 
 // The formats a model runs in, as the plan decides them: the format of each kind of tensor (WeightRecipe), the
 // math each product multiplies in, and whether decode reads the lossless BF16X copy of the bf16 projections.
+//
+// Every projection and expert stack is one lx_weight, held in the format ModelWeights loaded it in, and decode
+// and prefill read that one copy: decode-sized products (at most 8 rows) through the GEMV and expert decode
+// kernels, weight-only; larger ones through the tensor-core GEMM and the grouped expert kernel, in
+// prefill_math (dense) and expert_math (experts). A weight whose format the math cannot read (a BF16
+// projection the recipe keeps wide, under INT8 or FP8 math) multiplies under BF16 math. dense, experts and
+// latent_up are the formats the plan chose: a weight must be held in its kind's format or in BF16 (wider by the
+// recipe), and the model refuses weights loaded in anything else.
+//
+// bf16x_decode: for each kind whose format is BF16, the model encodes a lossless BF16X copy (bf16x.cu) of every
+// BF16 projection and stack of that kind at construction, and decode reads it (the same logits to the bit at
+// ~1.3x fewer bytes) while prefill keeps reading the BF16 copy. The plan budgets the second copy. Weights held
+// as BF16X (loaded with that target) need no flag: decode reads them as they are, and prefill expands each one
+// to a bf16 scratch first.
 struct ModelFormats {
   lx_wtype dense = LX_W_BF16, experts = LX_W_BF16, latent_up = LX_W_BF16;
   lx_math prefill_math = LX_MATH_BF16, expert_math = LX_MATH_BF16;
@@ -48,12 +62,15 @@ struct ModelFormats {
 
 class MetisModel {
  public:
-  // With `experts`, the routed experts are not looked up: every MoE layer runs them through the
-  // offload runtime (engine/runtime/offload.h), wherever they live. `speculative` allocates the
-  // pending-position history of every Mamba layer (kernels.h, "Speculative decoding"), which
-  // forward_spec and truncate need.
-  MetisModel(const MetisConfig& config, const WeightLookup& weights, int max_slots, int kv_capacity,
-             int max_tokens, offload::ExpertOffload* experts = nullptr, bool speculative = false);
+  // The model reads `weights` (which must outlive it) in the formats `formats` names. With `experts`, the
+  // routed experts are not read from `weights`: every MoE layer runs them through the offload runtime
+  // (engine/runtime/offload.h), wherever they live. `speculative` allocates the pending-position history of
+  // every Mamba layer (kernels.h, "Speculative decoding"), which forward_spec and truncate need.
+  //
+  // LX_PREFILL=bf16|int8|fp8|fp4 overrides the prefill math of the dense products and the experts, for
+  // measurement; it never changes a stored weight (a weight the math cannot read stays at BF16 math).
+  MetisModel(const MetisConfig& config, const ModelWeights& weights, const ModelFormats& formats, int max_slots,
+             int kv_capacity, int max_tokens, offload::ExpertOffload* experts = nullptr, bool speculative = false);
   ~MetisModel();
   MetisModel(const MetisModel&) = delete;
   MetisModel& operator=(const MetisModel&) = delete;
@@ -100,12 +117,13 @@ class MetisModel {
   const float* features() const;
 
   // The tied embedding / LM head, for drafters that share it (a block drafter embeds its anchor
-  // with it and reads its logits through it): bf16 [V, D], and the int8 decode copy with per-row
-  // scales when the model made one (else null).
+  // with it and reads its logits through it): the bf16 gather table [V, D] (bf16 in every format),
+  // the head [V, D] as the model holds it (any format lx_gemv_w reads), and the BF16X copy decode
+  // reads instead when the model made one (ModelFormats::bf16x_decode; else null).
   struct HeadWeights {
-    const void* bf16 = nullptr;
-    const int8_t* int8 = nullptr;
-    const float* scale = nullptr;
+    const void* embedding = nullptr;
+    lx_weight head{LX_W_BF16, nullptr, nullptr, 1.0f, nullptr};
+    const void* head_bf16x = nullptr;
   };
   HeadWeights head_weights() const;
 

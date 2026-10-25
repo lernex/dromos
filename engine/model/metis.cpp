@@ -11,6 +11,7 @@
 #include <cstring>
 #include <stdexcept>
 
+#include "core/checkpoint.h"
 #include "cuda/kernels.h"
 #include "model/glue.h"
 #include "runtime/offload.h"
@@ -42,8 +43,10 @@ float round_bf16(float f) {
   return f;
 }
 
-// A weight's values on the host as float (for the per-pass constants computed at load).
-std::vector<float> host_values(const WeightView& w) {
+// A plain tensor's values on the host as float (for the per-pass constants computed at load).
+std::vector<float> host_values(const ModelWeights& weights, const std::string& name) {
+  const WeightView w = weights.find(name);
+  if (!w.data) throw std::runtime_error("missing weight " + name);
   int64_t n = 1;
   for (auto d : w.shape) n *= d;
   std::vector<float> out(n);
@@ -61,19 +64,15 @@ std::vector<float> host_values(const WeightView& w) {
 
 }  // namespace
 
-// A projection: its bf16 weight (prefill, through the dense GEMM) and, when quantized, an int8 copy with
-// per-row scales that decode steps read instead, at half the bytes. With LX_BF16X, decode reads a
-// lossless compressed copy instead (LX_W_BF16X: the same bf16 values in ~12.2 bits, so the same
+// A projection: one weight [N, K], in the format ModelWeights holds it (BF16, INT8, FP8, NVFP4 or the
+// lossless BF16X), which decode and prefill both read. A BF16 weight may also have a lossless BF16X copy
+// that decode reads instead (ModelFormats::bf16x_decode: the same bf16 values in ~12.2 bits, so the same
 // logits to the bit at ~1.3x fewer bytes).
 struct Linear {
-  const void* w = nullptr;     // bf16 [N, K]
+  lx_weight w{LX_W_BF16, nullptr, nullptr, 1.0f, nullptr};
   const void* bias = nullptr;  // bf16 [N] or null
-  int8_t* q = nullptr;         // int8 [N, K], or null to decode from w
-  float* scale = nullptr;      // f32 [N]
-  void* x16 = nullptr;         // LX_W_BF16X encoding of w, or null
+  const void* x16 = nullptr;   // LX_W_BF16X encoding of a bf16 w, read by decode, or null
   int N = 0, K = 0;
-  bool host = false;           // w is in pinned host memory (offload): prefill stages it into VRAM
-  lx_weight pw{LX_W_BF16, nullptr, nullptr, 1.0f};  // what prefill multiplies by (LX_PREFILL): w, or a copy
 };
 
 struct MetisModel::Impl {
@@ -93,11 +92,11 @@ struct MetisModel::Impl {
     std::vector<float> pass_gate;  // tanh(pass_gates[p]) rounded to bf16, per pass
     // MoE
     Linear latent_down, latent_up, shared_gate_up, shared_down;
-    const void *expert_emb, *gate_up, *down;      // bf16 experts, for prefill
-    int8_t *gate_up_q = nullptr, *down_q = nullptr;  // int8 experts, for decode
-    float *gate_up_scale = nullptr, *down_scale = nullptr;
-    lx_weight gate_up_pw{}, down_pw{};  // the experts as prefill multiplies them (LX_PREFILL)
-    void *gate_up_x16 = nullptr, *down_x16 = nullptr;  // LX_W_BF16X experts, for decode (LX_BF16X)
+    const void* expert_emb;
+    // The routed experts, gate_up [E, 2I, L] and down [E, L, I], in their stored format (not with offload),
+    // and the BF16X copies decode reads instead of bf16 stacks (ModelFormats::bf16x_decode), or null.
+    lx_weight gate_up{}, down{};
+    const void *gate_up_x16 = nullptr, *down_x16 = nullptr;
     const float *router_w, *router_b, *selection_bias;
     Connection mixer_conn, moe_conn;
   };
@@ -166,30 +165,22 @@ struct MetisModel::Impl {
   int prefetch = 0;
   void* side = nullptr;
   std::vector<void*> fork_events, join_events;  // per (pass, layer)
-  // Projections kept in host memory (offload, LX_OFFLOAD_DENSE_HOST): a prefill product copies its
-  // weight into one of two VRAM buffers on a copy stream, so the next weight crosses PCIe while this
-  // product runs, instead of the product reading host memory tile by tile.
-  size_t stage_bytes = 0;
-  void* stage[2] = {nullptr, nullptr};
-  int stage_next = 0;
-  void* stage_stream = nullptr;
-  void *stage_copied[2] = {nullptr, nullptr}, *stage_free[2] = {nullptr, nullptr};
-  // Prefill products (more than kGemvRows rows): lx_gemm_w and lx_moe_experts_grouped on the weight
-  // format and math LX_PREFILL names (bf16, w8a16, w4a16, int8, fp8, w4a8, fp4); LX_PREFILL_KEEP lists
-  // name fragments that stay bf16. The default keeps what the FP8 release keeps (the Mamba-2 output
-  // projection, the tied LM head, the depth memory, the latent projections and the shared expert), so
-  // only the experts, the Mamba-2 input projections and the attention projections are quantized: the
-  // measured best trade (W8A16 then sits at the BF16 noise floor; INT8 at 0.010 / 0.024 / 0.0058).
-  lx_wtype prefill_w = LX_W_BF16;
-  lx_math prefill_math = LX_MATH_BF16;
-  std::string prefill_keep;
-  bool grouped_experts = true;  // LX_OLD_EXPERTS=1: lx_moe_experts for prefill, as before
+  // The formats the model runs in (metis.h), and the prefill maths in force: the plan's prefill_math and
+  // expert_math, or what LX_PREFILL names. Each product multiplies in its math when its weight's format can,
+  // and in BF16 math otherwise (math_for).
+  ModelFormats formats;
+  lx_math dense_math = LX_MATH_BF16, expert_math = LX_MATH_BF16;
   void* gemm_ws = nullptr;
   void* moe_grouped_ws = nullptr;
-  std::string w8_keep;  // LX_W8_KEEP: comma-separated name fragments that stay bf16 for decode
-  bool bf16x = false;        // LX_BF16X: decode reads lossless compressed bf16 copies (no int8)
-  bool keep_bf16x = false;   // LX_KEEP_BF16X: what decode would read as plain bf16 it reads as LX_W_BF16X
-  bool decode_bf16 = false;  // LX_DECODE_BF16: plain bf16 decode experts run on bf16x.cu's expert kernels
+  // Weights held as BF16X (loaded with that target) have no GEMM: a prefill product expands its weight
+  // into this bf16 scratch first (lx_bf16x_decode), sized for the largest such weight (an expert layer's
+  // two stacks together).
+  void* unpack = nullptr;
+  size_t unpack_bytes = 0;
+  // Whether the backend has bf16x.cu's kernels (CUDA does; the others report no BF16X row size). Where it
+  // does, plain bf16 decode products run on them too: the BF16X kernels give the bits of the same kernels on
+  // plain bf16, so a model with BF16X decode copies and one without produce the same logits to the bit.
+  bool bf16x_kernels = false;
   void *streams_bf, *retrieved_bf, *feat_in_bf, *h_bf, *normed_bf, *lora_bf, *att_bf, *latent_bf, *shared_bf,
       *routed_bf, *entry_bf, *meta_bf, *out_bf;
 
@@ -207,11 +198,6 @@ struct MetisModel::Impl {
     for (void* e : fork_events) lx_rt_event_destroy(e);
     for (void* e : join_events) lx_rt_event_destroy(e);
     if (side) lx_rt_stream_destroy(side);
-    for (int b = 0; b < 2; ++b) {
-      if (stage_copied[b]) lx_rt_event_destroy(stage_copied[b]);
-      if (stage_free[b]) lx_rt_event_destroy(stage_free[b]);
-    }
-    if (stage_stream) lx_rt_stream_destroy(stage_stream);
     for (auto& [key, exec] : graphs) lx_rt_graph_destroy(exec);
     if (meta_copied) lx_rt_event_destroy(meta_copied);
     if (h_meta) lx_rt_host_free(h_meta);
@@ -223,8 +209,8 @@ namespace {
 
 using Impl = MetisModel::Impl;
 
-const void* need(const WeightLookup& lookup, const std::string& name, int dtype, std::vector<int64_t> shape) {
-  WeightView w = lookup(name);
+const void* need(const ModelWeights& weights, const std::string& name, int dtype, std::vector<int64_t> shape) {
+  WeightView w = weights.find(name);
   if (!w.data) throw std::runtime_error("missing weight " + name);
   if (w.dtype != dtype) throw std::runtime_error("weight " + name + " has the wrong dtype");
   if (w.shape != shape) {
@@ -236,35 +222,27 @@ const void* need(const WeightLookup& lookup, const std::string& name, int dtype,
   return w.data;
 }
 
-// Whether a weight stays bf16 for decode: LX_W8_KEEP lists name fragments to keep, for measuring
-// what quantizing each part of the model costs.
-bool listed(const std::string& list, const std::string& name) {
-  for (size_t pos = 0; pos < list.size();) {
-    const size_t end = list.find(',', pos);
-    const std::string frag = list.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
-    if (!frag.empty() && name.find(frag) != std::string::npos) return true;
-    pos = end == std::string::npos ? list.size() : end + 1;
+const char* format_name(lx_wtype t) {
+  switch (t) {
+    case LX_W_BF16: return "BF16";
+    case LX_W_INT8: return "INT8";
+    case LX_W_FP8: return "FP8";
+    case LX_W_NVFP4: return "NVFP4";
+    case LX_W_BF16X: return "BF16X";
   }
-  return false;
+  return "?";
 }
-bool kept_bf16(const Impl& m, const std::string& name) { return listed(m.w8_keep, name); }
 
-// The prefill copy of a bf16 [rows, cols] weight (rows may be a whole expert stack) in m.prefill_w;
-// an int8 decode copy is shared when the formats agree.
-lx_weight prefill_weight(Impl& m, const void* w, int8_t* q, float* scale, int64_t rows, int64_t cols) {
-  lx_weight out{LX_W_BF16, w, nullptr, 1.0f};
-  if (m.prefill_w == LX_W_BF16) return out;
-  if (m.prefill_w == LX_W_INT8 && q) return lx_weight{LX_W_INT8, q, scale, 1.0f};
-  out.type = m.prefill_w;
-  if (m.prefill_w == LX_W_NVFP4) {
-    out.data = m.alloc<uint8_t>(static_cast<size_t>(rows) * cols / 2);
-    out.scale = m.alloc<uint8_t>(static_cast<size_t>(rows) * cols / 16);
-  } else {
-    out.data = m.alloc<uint8_t>(static_cast<size_t>(rows) * cols);
-    out.scale = m.alloc<float>(rows);
+// The math a product with a weight in format `w` runs in, when the plan asks for `want`: the requested math
+// where the format can be multiplied in it (kernels.h, lx_math), else the next one down that it can, which for
+// every format is BF16 math (the weight expanded in the kernel, activations bf16).
+lx_math math_for(lx_wtype w, lx_math want) {
+  switch (want) {
+    case LX_MATH_INT8: return w == LX_W_INT8 ? LX_MATH_INT8 : LX_MATH_BF16;
+    case LX_MATH_FP8: return w == LX_W_FP8 || w == LX_W_NVFP4 ? LX_MATH_FP8 : LX_MATH_BF16;
+    case LX_MATH_FP4: return w == LX_W_NVFP4 ? LX_MATH_FP4 : w == LX_W_FP8 ? LX_MATH_FP8 : LX_MATH_BF16;
+    default: return LX_MATH_BF16;
   }
-  LX_CHECK(lx_quantize_weight(w, &out, rows, static_cast<int>(cols), nullptr));
-  return out;
 }
 
 // The lossless compressed copy of a bf16 tensor ([rows, K]), for decode.
@@ -276,52 +254,71 @@ void* encode_bf16x(Impl& m, const void* w, int64_t rows, int64_t K) {
   return out;
 }
 
-// A projection from the checkpoint; with `quantize`, also its int8 decode copy, unless its name
-// contains a fragment of LX_W8_KEEP (for measuring what quantizing each part costs). With LX_BF16X,
-// every projection whose rows the format makes smaller gets a lossless copy instead, whatever
-// `quantize` says (lossless, so the Mamba out_proj too).
-Linear make_linear(Impl& m, const WeightLookup& lw, const std::string& weight, const std::string& bias, int64_t N,
-                   int64_t K, bool quantize) {
+// A weight must be held in the format the plan chose for its kind, or in BF16 (the recipes keep some
+// projections wider than their kind: the Mamba-2 out_proj, the pass LoRA, parts of the depth memory).
+void check_format(const std::string& name, lx_wtype held, lx_wtype planned) {
+  if (held == planned || held == LX_W_BF16) return;
+  throw std::runtime_error(name + " is held as " + format_name(held) + ", but the model was asked to run its kind as " +
+                           format_name(planned) + ": load the weights in the plan's format");
+}
+
+// Whether the BF16X encoding of rows of K values is smaller than the bf16 rows (it is not for tiny K).
+bool bf16x_smaller(int64_t K) {
+  const int64_t row = lx_bf16x_row_bytes(static_cast<int>(K));
+  return row > 0 && row < 2 * K;
+}
+
+// A projection [N, K] from the checkpoint (`name` without ".weight", as ModelWeights names it), in the format
+// the weights hold it, which must be `planned` or BF16. With bf16x_decode and a BF16 kind, a BF16 projection
+// also gets the lossless copy decode reads (lossless, so the wide ones too).
+Linear make_linear(Impl& m, const ModelWeights& weights, const std::string& name, const std::string& bias, int64_t N,
+                   int64_t K, lx_wtype planned) {
+  const lx_weight* w = weights.projection(name);
+  if (!w || !w->data) throw std::runtime_error("missing weight " + name);
+  const ModelWeights::Shape s = weights.projection_shape(name);
+  if (s.stack || s.N != N || s.K != K)
+    throw std::runtime_error("weight " + name + " has shape [" + std::to_string(s.N) + ", " + std::to_string(s.K) +
+                             "], expected [" + std::to_string(N) + ", " + std::to_string(K) + "]");
+  check_format(name, w->type, planned);
+  if (w->type == LX_W_BF16X && !m.bf16x_kernels)
+    throw std::runtime_error(name + " is BF16X: this backend has no BF16X kernels");
   Linear l;
-  l.w = need(lw, weight, LX_BF16, {N, K});
-  if (!bias.empty()) l.bias = need(lw, bias, LX_BF16, {N});
+  l.w = *w;
+  if (!bias.empty()) l.bias = need(weights, bias, LX_BF16, {N});
   l.N = static_cast<int>(N);
   l.K = static_cast<int>(K);
-  // A host-resident weight up to kStageMaxBytes is staged for prefill; a larger one (the tied head's
-  // embedding table, 335 MB on Logos, read by prefill only when every row's logits are wanted) is
-  // read across PCIe where it lies rather than doubling its size in VRAM buffers.
-  constexpr size_t kStageMaxBytes = 128ull << 20;
-  const size_t bytes = static_cast<size_t>(N) * static_cast<size_t>(K) * 2;
-  if (lx_rt_is_host_memory(l.w) && bytes <= kStageMaxBytes) {
-    l.host = true;
-    m.stage_bytes = std::max(m.stage_bytes, bytes);
-  }
-  if (m.bf16x) {
-    if (lx_bf16x_row_bytes(static_cast<int>(K)) < 2 * K) l.x16 = encode_bf16x(m, l.w, N, K);
-  } else if (quantize && !kept_bf16(m, weight)) {
-    l.q = m.alloc<int8_t>(static_cast<size_t>(N) * K);
-    l.scale = m.alloc<float>(N);
-    LX_CHECK(lx_quantize_w8(l.w, l.q, l.scale, N, static_cast<int>(K), nullptr));
-  } else if (m.keep_bf16x && lx_bf16x_row_bytes(static_cast<int>(K)) < 2 * K) {
-    l.x16 = encode_bf16x(m, l.w, N, K);
-  }
-  l.pw = lx_weight{LX_W_BF16, l.w, nullptr, 1.0f};
-  if (quantize && !listed(m.prefill_keep, weight)) l.pw = prefill_weight(m, l.w, l.q, l.scale, N, K);
+  if (m.formats.bf16x_decode && planned == LX_W_BF16 && w->type == LX_W_BF16 && bf16x_smaller(K))
+    l.x16 = encode_bf16x(m, w->data, N, K);
+  if (w->type == LX_W_BF16X) m.unpack_bytes = std::max(m.unpack_bytes, static_cast<size_t>(N) * K * 2);
   return l;
+}
+
+// An expert stack [E, N, K] from the checkpoint, in the format the weights hold it (`planned` or BF16).
+lx_weight expert_stack(const Impl& m, const ModelWeights& weights, const std::string& name, int64_t E, int64_t N,
+                       int64_t K, lx_wtype planned) {
+  const lx_weight* w = weights.projection(name);
+  if (!w || !w->data) throw std::runtime_error("missing weight " + name);
+  const ModelWeights::Shape s = weights.projection_shape(name);
+  if (!s.stack || s.E != E || s.N != N || s.K != K)
+    throw std::runtime_error("expert stack " + name + " does not have the shape the config gives");
+  check_format(name, w->type, planned);
+  if (w->type == LX_W_BF16X && !m.bf16x_kernels)
+    throw std::runtime_error(name + " is BF16X: this backend has no BF16X kernels");
+  return *w;
 }
 
 // The Sinkhorn mix, read and write weights of one hyper-connection for every pass. They depend
 // only on the weights and the pass, so they are computed once, here, as the reference computes
 // them: the controller in bf16, everything after it in f32.
-float* connection_params(Impl& m, const WeightLookup& lookup, const std::string& prefix, const MetisConfig& c,
+float* connection_params(Impl& m, const ModelWeights& weights, const std::string& prefix, const MetisConfig& c,
                          const std::vector<float>& pass_embeddings) {
   const int S = c.n_streams, E = c.mhc_pass_embedding_dim, out = S * S + 2 * S;
-  auto W = host_values(lookup(prefix + ".controller.weight"));
-  auto b = host_values(lookup(prefix + ".controller.bias"));
-  auto mix = host_values(lookup(prefix + ".mix_logits"));
-  auto read_logits = host_values(lookup(prefix + ".read_logits"));
-  auto write_logits = host_values(lookup(prefix + ".write_logits"));
-  need(lookup, prefix + ".controller.weight", LX_BF16, {out, E});
+  need(weights, prefix + ".controller.weight", LX_BF16, {out, E});
+  auto W = host_values(weights, prefix + ".controller.weight");
+  auto b = host_values(weights, prefix + ".controller.bias");
+  auto mix = host_values(weights, prefix + ".mix_logits");
+  auto read_logits = host_values(weights, prefix + ".read_logits");
+  auto write_logits = host_values(weights, prefix + ".write_logits");
   std::vector<float> params(static_cast<size_t>(c.num_passes) * out);
   for (int p = 0; p < c.num_passes; ++p) {
     std::vector<double> delta(out);
@@ -368,8 +365,8 @@ float* connection_params(Impl& m, const WeightLookup& lookup, const std::string&
 
 }  // namespace
 
-MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slots, int kv_capacity,
-                       int max_tokens, offload::ExpertOffload* experts, bool speculative)
+MetisModel::MetisModel(const MetisConfig& c, const ModelWeights& weights, const ModelFormats& formats, int max_slots,
+                       int kv_capacity, int max_tokens, offload::ExpertOffload* experts, bool speculative)
     : cfg_(c), slot_len_(max_slots, 0), folded_(max_slots, 0), pending_(max_slots, 0), impl_(new Impl) {
   // A constructor that throws (a device allocation that fails, say) never reaches the destructor, so the device
   // memory this build took would stay allocated for the life of the process: free it on the way out.
@@ -419,130 +416,113 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
   m.kv_capacity = kv_capacity;
   const int D = m.D, S = m.S, V = c.vocab_size, R = m.R, Mm = m.M, E = m.E, Lat = m.Lat;
 
-  // Decode reads int8 copies of every large projection except the Mamba-2 output projection: it is
-  // the one part of Metis that int8 visibly hurts (alone it takes the tool-prompt KL from 0.014 to
-  // 0.026), as it was for the GGUF, FP8 and MLX releases. LX_W8_KEEP overrides the list.
-  m.w8_keep = std::getenv("LX_W8_KEEP") ? std::getenv("LX_W8_KEEP") : "out_proj";
-  if (std::getenv("LX_NO_W8")) m.w8_keep = "layers,depth_memory,embedding";
-  m.prefill_keep = std::getenv("LX_PREFILL_KEEP") ? std::getenv("LX_PREFILL_KEEP")
-                                                  : "out_proj,embedding,depth_memory,latent_down,latent_up,shared_expert";
-  m.grouped_experts = std::getenv("LX_OLD_EXPERTS") == nullptr;
+  // The formats are the plan's, and so is the prefill math. LX_PREFILL overrides the math alone, for
+  // measuring one math against another on the same weights: it never changes what a weight is stored as.
+  m.formats = formats;
+  m.dense_math = formats.prefill_math;
+  m.expert_math = formats.expert_math;
   if (const char* p = std::getenv("LX_PREFILL")) {
     const std::string v = p;
     struct Mode {
       const char* name;
-      lx_wtype w;
       lx_math math;
     };
-    const Mode modes[] = {{"bf16", LX_W_BF16, LX_MATH_BF16},   {"w8a16", LX_W_INT8, LX_MATH_BF16},
-                          {"w8a16f", LX_W_FP8, LX_MATH_BF16},  {"w4a16", LX_W_NVFP4, LX_MATH_BF16},
-                          {"int8", LX_W_INT8, LX_MATH_INT8},   {"fp8", LX_W_FP8, LX_MATH_FP8},
-                          {"w4a8", LX_W_NVFP4, LX_MATH_FP8},   {"fp4", LX_W_NVFP4, LX_MATH_FP4}};
+    const Mode modes[] = {{"bf16", LX_MATH_BF16}, {"int8", LX_MATH_INT8}, {"fp8", LX_MATH_FP8}, {"fp4", LX_MATH_FP4}};
     bool found = false;
     for (const Mode& mode : modes)
       if (v == mode.name) {
-        m.prefill_w = mode.w;
-        m.prefill_math = mode.math;
+        m.dense_math = m.expert_math = mode.math;
         found = true;
       }
-    if (!found) throw std::runtime_error("LX_PREFILL: unknown mode " + v);
+    if (!found) throw std::runtime_error("LX_PREFILL: unknown math " + v + " (bf16, int8, fp8 or fp4)");
   }
-  // LX_W_BF16X (bf16x.cu) is lossless, so either switch keeps the logits of the path it replaces to
-  // the bit. LX_BF16X: every decode projection is read compressed instead of int8 or bf16 (BF16
-  // logits). LX_KEEP_BF16X: int8 stays, and what stays bf16 (LX_W8_KEEP) is read compressed.
-  // LX_DECODE_BF16 (for measuring the format against the same kernels): plain bf16 experts through
-  // bf16x.cu's expert kernels. Its GEMV runs lx_gemv's own order, so lx_gemv is already that baseline.
-  m.bf16x = std::getenv("LX_BF16X") != nullptr;
-  m.keep_bf16x = std::getenv("LX_KEEP_BF16X") != nullptr;
-  m.decode_bf16 = std::getenv("LX_DECODE_BF16") != nullptr;
-  m.embedding = need(lw, "embedding.weight", LX_BF16, {V, D});
-  m.head = make_linear(m, lw, "embedding.weight", "", V, D, true);
-  m.stream_emb = need(lw, "stream_embeddings", LX_BF16, {S, D});
-  m.final_norm = need(lw, "final_norm.weight", LX_BF16, {D});
-  const auto pass_embeddings = host_values(lw("pass_embeddings"));
-  need(lw, "pass_embeddings", LX_BF16, {c.max_passes, c.mhc_pass_embedding_dim});
+  m.bf16x_kernels = lx_bf16x_row_bytes(1024) > 0;
+  if (formats.bf16x_decode && !m.bf16x_kernels)
+    throw std::runtime_error("bf16x_decode: this backend has no BF16X kernels");
+
+  // Every kind but the routed experts and latent_up is formats.dense; the recipe keeps some of them BF16.
+  const lx_wtype dense = formats.dense;
+  m.embedding = need(weights, "embedding.weight", LX_BF16, {V, D});  // the gather table, bf16 in every format
+  m.head = make_linear(m, weights, "lm_head", "", V, D, dense);
+  m.stream_emb = need(weights, "stream_embeddings", LX_BF16, {S, D});
+  m.final_norm = need(weights, "final_norm.weight", LX_BF16, {D});
+  need(weights, "pass_embeddings", LX_BF16, {c.max_passes, c.mhc_pass_embedding_dim});
+  const auto pass_embeddings = host_values(weights, "pass_embeddings");
 
   const std::string dm = "depth_memory.";
-  m.m_state = make_linear(m, lw, dm + "state_write.weight", dm + "state_write.bias", Mm, D, true);
-  m.m_meta = make_linear(m, lw, dm + "metadata_write.weight", dm + "metadata_write.bias", Mm, R + 4, false);
-  m.m_pass_emb = need(lw, dm + "pass_embeddings", LX_BF16, {c.max_passes, Mm});
-  m.m_anchor_emb =
-      need(lw, dm + "anchor_embeddings", LX_BF16, {static_cast<int64_t>(c.attention_layer_indices.size() + 1), Mm});
-  m.m_query = make_linear(m, lw, dm + "query.weight", dm + "query.bias", Mm, D, true);
-  m.m_key = make_linear(m, lw, dm + "key.weight", dm + "key.bias", Mm, Mm, false);
-  m.m_value = make_linear(m, lw, dm + "value.weight", dm + "value.bias", Mm, Mm, false);
-  m.m_out = make_linear(m, lw, dm + "output.weight", dm + "output.bias", D, Mm, true);
-  m.m_route = make_linear(m, lw, dm + "route_projection.weight", dm + "route_projection.bias", R, 3 * D + R, true);
-  m.m_gate = need(lw, dm + "stream_gate", LX_BF16, {S, D});
-  m.m_gate_b = need(lw, dm + "stream_gate_bias", LX_BF16, {S});
-  m.c_hidden_w = static_cast<const float*>(need(lw, "continuation.hidden.weight", LX_F32, {R, 3 * D + R}));
-  m.c_hidden_b = static_cast<const float*>(need(lw, "continuation.hidden.bias", LX_F32, {R}));
-  m.c_out_w = static_cast<const float*>(need(lw, "continuation.output.weight", LX_F32, {1, R}));
-  m.c_out_b = static_cast<const float*>(need(lw, "continuation.output.bias", LX_F32, {1}));
+  m.m_state = make_linear(m, weights, dm + "state_write", dm + "state_write.bias", Mm, D, dense);
+  m.m_meta = make_linear(m, weights, dm + "metadata_write", dm + "metadata_write.bias", Mm, R + 4, dense);
+  m.m_pass_emb = need(weights, dm + "pass_embeddings", LX_BF16, {c.max_passes, Mm});
+  m.m_anchor_emb = need(weights, dm + "anchor_embeddings", LX_BF16,
+                        {static_cast<int64_t>(c.attention_layer_indices.size() + 1), Mm});
+  m.m_query = make_linear(m, weights, dm + "query", dm + "query.bias", Mm, D, dense);
+  m.m_key = make_linear(m, weights, dm + "key", dm + "key.bias", Mm, Mm, dense);
+  m.m_value = make_linear(m, weights, dm + "value", dm + "value.bias", Mm, Mm, dense);
+  m.m_out = make_linear(m, weights, dm + "output", dm + "output.bias", D, Mm, dense);
+  m.m_route = make_linear(m, weights, dm + "route_projection", dm + "route_projection.bias", R, 3 * D + R, dense);
+  m.m_gate = need(weights, dm + "stream_gate", LX_BF16, {S, D});
+  m.m_gate_b = need(weights, dm + "stream_gate_bias", LX_BF16, {S});
+  m.c_hidden_w = static_cast<const float*>(need(weights, "continuation.hidden.weight", LX_F32, {R, 3 * D + R}));
+  m.c_hidden_b = static_cast<const float*>(need(weights, "continuation.hidden.bias", LX_F32, {R}));
+  m.c_out_w = static_cast<const float*>(need(weights, "continuation.output.weight", LX_F32, {1, R}));
+  m.c_out_b = static_cast<const float*>(need(weights, "continuation.output.bias", LX_F32, {1}));
 
+  size_t unpack_experts = 0;  // the bf16 bytes of an expert layer's BF16X stacks, expanded for prefill
   for (int i = 0; i < m.L_layers; ++i) {
     Impl::Layer layer{};
     const std::string p = "layers." + std::to_string(i) + ".";
     layer.attention = c.is_attention(i);
     if (layer.attention) {
       const std::string a = p + "mixer.";
-      layer.qkv = make_linear(m, lw, a + "qkv.weight", "", m.qkv_width, D, true);
-      layer.out = make_linear(m, lw, a + "out.weight", "", D, m.AH * m.Dh, true);
-      layer.lora_down = make_linear(m, lw, a + "pass_lora_down.weight", "", m.rank, D, false);
-      layer.lora_up = make_linear(m, lw, a + "pass_lora_up.weight", "", m.qkv_width, m.rank, false);
-      auto gates = host_values(lw(a + "pass_gates"));
-      need(lw, a + "pass_gates", LX_BF16, {c.max_passes});
+      layer.qkv = make_linear(m, weights, a + "qkv", "", m.qkv_width, D, dense);
+      layer.out = make_linear(m, weights, a + "out", "", D, m.AH * m.Dh, dense);
+      layer.lora_down = make_linear(m, weights, a + "pass_lora_down", "", m.rank, D, dense);
+      layer.lora_up = make_linear(m, weights, a + "pass_lora_up", "", m.qkv_width, m.rank, dense);
+      need(weights, a + "pass_gates", LX_BF16, {c.max_passes});
+      auto gates = host_values(weights, a + "pass_gates");
       for (int pass = 0; pass < m.P_passes; ++pass) layer.pass_gate.push_back(round_bf16(std::tanh(gates[pass])));
     } else {
       const std::string a = p + "mixer.impl.mixer.";
-      layer.in_proj = make_linear(m, lw, a + "in_proj.weight", "", m.proj, D, true);
-      layer.conv_w = need(lw, a + "conv1d.weight", LX_BF16, {m.conv_dim, 1, m.W});
-      layer.conv_b = need(lw, a + "conv1d.bias", LX_BF16, {m.conv_dim});
-      layer.norm_w = need(lw, a + "norm.weight", LX_BF16, {m.I});
-      layer.out_proj = make_linear(m, lw, a + "out_proj.weight", "", D, m.I, true);
-      layer.A_log = static_cast<const float*>(need(lw, a + "A_log", LX_F32, {m.H}));
-      layer.D = static_cast<const float*>(need(lw, a + "D", LX_F32, {m.H}));
-      layer.dt_bias = static_cast<const float*>(need(lw, a + "dt_bias", LX_F32, {m.H}));
+      layer.in_proj = make_linear(m, weights, a + "in_proj", "", m.proj, D, dense);
+      layer.conv_w = need(weights, a + "conv1d.weight", LX_BF16, {m.conv_dim, 1, m.W});
+      layer.conv_b = need(weights, a + "conv1d.bias", LX_BF16, {m.conv_dim});
+      layer.norm_w = need(weights, a + "norm.weight", LX_BF16, {m.I});
+      layer.out_proj = make_linear(m, weights, a + "out_proj", "", D, m.I, dense);
+      layer.A_log = static_cast<const float*>(need(weights, a + "A_log", LX_F32, {m.H}));
+      layer.D = static_cast<const float*>(need(weights, a + "D", LX_F32, {m.H}));
+      layer.dt_bias = static_cast<const float*>(need(weights, a + "dt_bias", LX_F32, {m.H}));
     }
     const std::string e = p + "moe.";
-    layer.latent_down = make_linear(m, lw, e + "latent_down.weight", "", Lat, D, true);
-    layer.latent_up = make_linear(m, lw, e + "latent_up.weight", "", D, Lat, true);
-    layer.expert_emb = need(lw, e + "expert_embeddings", LX_BF16, {E, R});
+    layer.latent_down = make_linear(m, weights, e + "latent_down", "", Lat, D, dense);
+    layer.latent_up = make_linear(m, weights, e + "latent_up", "", D, Lat, formats.latent_up);
+    layer.expert_emb = need(weights, e + "expert_embeddings", LX_BF16, {E, R});
+    layer.shared_gate_up = make_linear(m, weights, e + "shared_expert.gate_up", "", 2 * m.Ishared, Lat, dense);
+    layer.shared_down = make_linear(m, weights, e + "shared_expert.down", "", Lat, m.Ishared, dense);
     if (!m.offload) {
-      layer.gate_up = need(lw, e + "local_experts.gate_up.weight", LX_BF16, {E, 2 * m.Iexp, Lat});
-      layer.down = need(lw, e + "local_experts.down.weight", LX_BF16, {E, Lat, m.Iexp});
-    }
-    layer.shared_gate_up = make_linear(m, lw, e + "shared_expert.gate_up.weight", "", 2 * m.Ishared, Lat, true);
-    layer.shared_down = make_linear(m, lw, e + "shared_expert.down.weight", "", Lat, m.Ishared, true);
-    if (!m.offload && (m.bf16x || (m.keep_bf16x && kept_bf16(m, e + "local_experts.gate_up.weight")))) {
-      layer.gate_up_x16 = encode_bf16x(m, layer.gate_up, static_cast<int64_t>(E) * 2 * m.Iexp, Lat);
-      layer.down_x16 = encode_bf16x(m, layer.down, static_cast<int64_t>(E) * Lat, m.Iexp);
-    } else if (!m.offload && !kept_bf16(m, e + "local_experts.gate_up.weight")) {
       const int64_t gu_rows = static_cast<int64_t>(E) * 2 * m.Iexp, dn_rows = static_cast<int64_t>(E) * Lat;
-      layer.gate_up_q = m.alloc<int8_t>(gu_rows * Lat);
-      layer.gate_up_scale = m.alloc<float>(gu_rows);
-      layer.down_q = m.alloc<int8_t>(dn_rows * m.Iexp);
-      layer.down_scale = m.alloc<float>(dn_rows);
-      LX_CHECK(lx_quantize_w8(layer.gate_up, layer.gate_up_q, layer.gate_up_scale, gu_rows, Lat, nullptr));
-      LX_CHECK(lx_quantize_w8(layer.down, layer.down_q, layer.down_scale, dn_rows, m.Iexp, nullptr));
+      layer.gate_up = expert_stack(m, weights, e + "local_experts.gate_up", E, 2 * m.Iexp, Lat, formats.experts);
+      layer.down = expert_stack(m, weights, e + "local_experts.down", E, Lat, m.Iexp, formats.experts);
+      if (formats.bf16x_decode && formats.experts == LX_W_BF16 && layer.gate_up.type == LX_W_BF16 &&
+          layer.down.type == LX_W_BF16) {
+        layer.gate_up_x16 = encode_bf16x(m, layer.gate_up.data, gu_rows, Lat);
+        layer.down_x16 = encode_bf16x(m, layer.down.data, dn_rows, m.Iexp);
+      }
+      size_t unpack = 0;
+      if (layer.gate_up.type == LX_W_BF16X) unpack += (static_cast<size_t>(gu_rows) * Lat * 2 + 255) / 256 * 256;
+      if (layer.down.type == LX_W_BF16X) unpack += static_cast<size_t>(dn_rows) * m.Iexp * 2;
+      unpack_experts = std::max(unpack_experts, unpack);
     }
-    if (listed(m.prefill_keep, e + "local_experts.gate_up.weight")) {
-      layer.gate_up_pw = lx_weight{LX_W_BF16, layer.gate_up, nullptr, 1.0f};
-      layer.down_pw = lx_weight{LX_W_BF16, layer.down, nullptr, 1.0f};
-    } else {
-      layer.gate_up_pw = prefill_weight(m, layer.gate_up, layer.gate_up_q, layer.gate_up_scale,
-                                        static_cast<int64_t>(E) * 2 * m.Iexp, Lat);
-      layer.down_pw = prefill_weight(m, layer.down, layer.down_q, layer.down_scale, static_cast<int64_t>(E) * Lat, m.Iexp);
-    }
-    layer.router_w = static_cast<const float*>(need(lw, e + "expert_router.weight", LX_F32, {E, Lat + R}));
-    layer.router_b = static_cast<const float*>(need(lw, e + "expert_router.bias", LX_F32, {E}));
-    layer.selection_bias = static_cast<const float*>(need(lw, e + "selection_bias", LX_F32, {E}));
-    layer.mixer_conn.norm = need(lw, p + "mixer_connection.norm.weight", LX_BF16, {D});
-    layer.mixer_conn.params = connection_params(m, lw, p + "mixer_connection", c, pass_embeddings);
-    layer.moe_conn.norm = need(lw, p + "moe_connection.norm.weight", LX_BF16, {D});
-    layer.moe_conn.params = connection_params(m, lw, p + "moe_connection", c, pass_embeddings);
+    layer.router_w = static_cast<const float*>(need(weights, e + "expert_router.weight", LX_F32, {E, Lat + R}));
+    layer.router_b = static_cast<const float*>(need(weights, e + "expert_router.bias", LX_F32, {E}));
+    layer.selection_bias = static_cast<const float*>(need(weights, e + "selection_bias", LX_F32, {E}));
+    layer.mixer_conn.norm = need(weights, p + "mixer_connection.norm.weight", LX_BF16, {D});
+    layer.mixer_conn.params = connection_params(m, weights, p + "mixer_connection", c, pass_embeddings);
+    layer.moe_conn.norm = need(weights, p + "moe_connection.norm.weight", LX_BF16, {D});
+    layer.moe_conn.params = connection_params(m, weights, p + "moe_connection", c, pass_embeddings);
     m.layers.push_back(std::move(layer));
   }
+  m.unpack_bytes = std::max(m.unpack_bytes, unpack_experts);
+  if (m.unpack_bytes) m.unpack = m.alloc<char>(m.unpack_bytes);
 
   // persistent state, one per (pass, layer)
   for (int pass = 0; pass < m.P_passes; ++pass) {
@@ -619,16 +599,27 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
   m.last_rows = m.alloc<float>(static_cast<size_t>(max_slots) * D);
   m.cast_capacity = TS * static_cast<size_t>(std::max({3 * D + R, m.I, m.proj, D}));
   m.cast_bf = m.alloc<uint16_t>(m.cast_capacity);
-  m.moe_workspace = m.alloc<char>(static_cast<size_t>(std::max(lx_moe_workspace_bytes(Impl::kGemvRows, m.Iexp, m.K),
-                                                                 lx_moe_bf16x_workspace_bytes(Impl::kGemvRows, m.Iexp, m.K))));
+  // The decode experts' workspace serves every format (a backend without the BF16X kernels reports 0 for them).
+  const int64_t decode_ws = std::max(lx_moe_decode_workspace_bytes(Impl::kGemvRows, m.Iexp, m.K),
+                                     lx_moe_bf16x_workspace_bytes(Impl::kGemvRows, m.Iexp, m.K));
+  m.moe_workspace = m.alloc<char>(static_cast<size_t>(decode_ws));
   {
-    const int kmax = std::max({3 * D + R, m.I, m.proj, D, Lat, m.Ishared, m.AH * m.Dh});
-    const int rows = static_cast<int>(T);
-    const int64_t ws =
-        std::max(lx_gemm_workspace_bytes(rows, kmax, m.prefill_math), lx_gemm_workspace_bytes(rows, kmax, LX_MATH_BF16));
+    // The prefill products' workspaces, for every math they can run in: the one in force, the one a format
+    // falls back to (math_for), and BF16. Most products have T rows; the depth memory's query and output have
+    // one row per stream.
+    const int kmax = std::max({3 * D + R, m.I, m.proj, D, Lat, m.Ishared, m.AH * m.Dh, Mm});
+    const int rows = static_cast<int>(T), stream_rows = static_cast<int>(TS);
+    std::vector<lx_math> dense_maths = {LX_MATH_BF16, m.dense_math}, expert_maths = {LX_MATH_BF16, m.expert_math};
+    if (m.dense_math == LX_MATH_FP4) dense_maths.push_back(LX_MATH_FP8);
+    if (m.expert_math == LX_MATH_FP4) expert_maths.push_back(LX_MATH_FP8);
+    int64_t ws = 0, grouped = 0;
+    for (lx_math math : dense_maths)
+      ws = std::max({ws, lx_gemm_workspace_bytes(rows, kmax, math),
+                     lx_gemm_workspace_bytes(stream_rows, std::max(D, Mm), math)});
+    for (lx_math math : expert_maths)
+      grouped = std::max(grouped, lx_moe_grouped_workspace_bytes(rows, Lat, m.Iexp, E, m.K, math));
     m.gemm_ws = m.alloc<char>(static_cast<size_t>(ws));
-    m.moe_grouped_ws =
-        m.alloc<char>(static_cast<size_t>(lx_moe_grouped_workspace_bytes(rows, Lat, m.Iexp, E, m.K, m.prefill_math)));
+    m.moe_grouped_ws = m.alloc<char>(static_cast<size_t>(grouped));
   }
   m.meta_count = T + (max_slots + 1) + 5 * static_cast<size_t>(max_slots);
   m.d_meta = m.alloc<int32_t>(m.meta_count);
@@ -664,14 +655,6 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
       m.fork_events.push_back(a);
       m.join_events.push_back(b);
     }
-  }
-  if (m.stage_bytes) {
-    for (int b = 0; b < 2; ++b) {
-      m.stage[b] = m.alloc<uint16_t>(m.stage_bytes / 2);
-      check(lx_rt_event_create(&m.stage_copied[b]), "event create");
-      check(lx_rt_event_create(&m.stage_free[b]), "event create");
-    }
-    check(lx_rt_stream_create(&m.stage_stream), "stream create");
   }
   m.use_graphs = std::getenv("LX_NO_GRAPHS") == nullptr && !m.route_trace;
   free_on_throw.armed = false;
@@ -730,7 +713,11 @@ int MetisModel::feature_dim() const { return impl_->tap_dim; }
 const float* MetisModel::features() const { return impl_->tap_out; }
 
 MetisModel::HeadWeights MetisModel::head_weights() const {
-  return {impl_->head.w, impl_->head.q, impl_->head.scale};
+  HeadWeights h;
+  h.embedding = impl_->embedding;
+  h.head = impl_->head.w;
+  h.head_bf16x = impl_->head.x16;
+  return h;
 }
 
 namespace {
@@ -798,11 +785,14 @@ void MetisModel::restore_slot(int slot, const void* src, int length, void* strea
 
 namespace {
 
-// y = alpha * (x @ W^T + bias) + beta * y for M rows of x (f32 or bf16). Decode-sized products run
-// as GEMVs on the int8 copy when there is one, reading x as it is; larger ones go to the dense GEMM on
-// the bf16 weight, through a bf16 copy of x when x is f32. `rows_per_token` > 1 marks a product
-// with that many rows per token (the depth memory's per-stream rows): in a decode-sized step those
-// stay GEMVs, 8 rows at a time, so that a token's rows get the same bits whatever the step's size.
+// y = alpha * (x @ W^T + bias) + beta * y for M rows of x (f32 or bf16), on the projection's one weight.
+// Decode-sized products run as GEMVs, weight-only, reading x as it is: lx_gemv_w on the quantized formats
+// and BF16X; a bf16 weight through bf16x.cu's kernel, on its BF16X copy when the model made one and on the
+// plain rows otherwise (the same kernel, so the same bits either way). Larger ones go to the tensor-core
+// GEMM in the prefill math (math_for: the plan's, where the weight's format can run it), bf16 weights under
+// BF16 math through cuBLASLt on a bf16 copy of x when x is f32. `rows_per_token` > 1 marks a product with
+// that many rows per token (the depth memory's per-stream rows): in a decode-sized step those stay GEMVs,
+// 8 rows at a time, so that a token's rows get the same bits whatever the step's size.
 void linear(Impl& m, const Linear& l, const void* x, lx_dtype x_dtype, int ld_x, void* y, lx_dtype y_dtype, int ld_y,
             int M, void* s, float alpha = 1.0f, float beta = 0.0f, int rows_per_token = 1) {
   const bool decode_step = M / rows_per_token <= Impl::kGemvRows;
@@ -814,16 +804,23 @@ void linear(Impl& m, const Linear& l, const void* x, lx_dtype x_dtype, int ld_x,
       void* yr = static_cast<char*>(y) + ys * r0 * ld_y;
       if (l.x16)
         LX_CHECK(lx_gemv_bf16x(xr, x_dtype, ld_x, l.x16, l.bias, LX_BF16, yr, y_dtype, ld_y, rows, l.N, l.K, alpha, beta, s));
+      else if (m.bf16x_kernels && l.w.type == LX_W_BF16)
+        LX_CHECK(lx_gemv_decode_bf16(xr, x_dtype, ld_x, l.w.data, l.bias, LX_BF16, yr, y_dtype, ld_y, rows, l.N, l.K,
+                                     alpha, beta, s));
       else
-        LX_CHECK(lx_gemv(xr, x_dtype, ld_x, l.q ? static_cast<const void*>(l.q) : l.w, l.q ? LX_W_INT8 : LX_W_BF16,
-                         l.scale, l.bias, LX_BF16, yr, y_dtype, ld_y, rows, l.N, l.K, alpha, beta, s));
+        LX_CHECK(
+            lx_gemv_w(xr, x_dtype, ld_x, &l.w, l.bias, LX_BF16, yr, y_dtype, ld_y, rows, l.N, l.K, alpha, beta, s));
     }
     return;
   }
-  if (l.pw.type != LX_W_BF16 || m.prefill_math != LX_MATH_BF16) {
-    // a weight kept bf16 multiplies under BF16 math whatever the mode
-    const lx_math math = l.pw.type == LX_W_BF16 ? LX_MATH_BF16 : m.prefill_math;
-    LX_CHECK(lx_gemm_w(x, x_dtype, ld_x, &l.pw, math, l.bias, LX_BF16, y, y_dtype, ld_y, M, l.N, l.K, alpha, beta,
+  lx_weight w = l.w;
+  if (w.type == LX_W_BF16X) {  // no GEMM reads the lossless format: expand the weight to bf16 first
+    LX_CHECK(lx_bf16x_decode(w.data, l.N, l.K, m.unpack, s));
+    w = lx_weight{LX_W_BF16, m.unpack, nullptr, 1.0f, nullptr};
+  }
+  const lx_math math = math_for(w.type, m.dense_math);
+  if (w.type != LX_W_BF16 || math != LX_MATH_BF16) {
+    LX_CHECK(lx_gemm_w(x, x_dtype, ld_x, &w, math, l.bias, LX_BF16, y, y_dtype, ld_y, M, l.N, l.K, alpha, beta,
                        m.gemm_ws, s));
     return;
   }
@@ -833,20 +830,44 @@ void linear(Impl& m, const Linear& l, const void* x, lx_dtype x_dtype, int ld_x,
     x = m.cast_bf;
     ld_x = l.K;
   }
-  if (l.host) {  // copy the weight in on the copy stream once the product that last used the buffer is done
-    const int b = m.stage_next;
-    m.stage_next ^= 1;
-    check(lx_rt_stream_wait(m.stage_stream, m.stage_free[b]), "stream wait");
-    check(lx_rt_copy(m.stage[b], l.w, static_cast<int64_t>(static_cast<size_t>(l.N) * l.K * 2), LX_COPY_H2D,
-                     m.stage_stream),
-          "weight staging copy");
-    check(lx_rt_event_record(m.stage_copied[b], m.stage_stream), "event record");
-    check(lx_rt_stream_wait(s, m.stage_copied[b]), "stream wait");
-    LX_CHECK(lx_gemm_bf16(x, ld_x, m.stage[b], l.bias, y, y_dtype, ld_y, M, l.N, l.K, alpha, beta, s));
-    check(lx_rt_event_record(m.stage_free[b], s), "event record");
+  LX_CHECK(lx_gemm_bf16(x, ld_x, w.data, l.bias, y, y_dtype, ld_y, M, l.N, l.K, alpha, beta, s));
+}
+
+// The routed experts of one MoE layer (not offloaded), on the stacks as the model holds them. A decode-sized
+// step reads only the chosen experts' rows, weight-only: bf16 stacks through bf16x.cu's kernels (their BF16X
+// copies when the model made them, the plain stacks otherwise: one kernel family, so the two give the same
+// bits), every other format through lx_moe_experts_decode. Larger steps group the tokens by expert on the
+// tensor cores in the expert math (math_for), BF16X stacks expanded to bf16 first.
+void routed_experts(Impl& m, const Impl::Layer& layer, int T, void* s) {
+  const int Lat = m.Lat, I = m.Iexp, E = m.E, K = m.K;
+  if (T <= Impl::kGemvRows) {
+    if (layer.gate_up_x16)
+      LX_CHECK(lx_moe_experts_bf16x(m.latent_bf, m.route_ids, m.route_w, layer.gate_up_x16, layer.down_x16, m.routed,
+                                    m.moe_workspace, T, Lat, I, K, s));
+    else if (m.bf16x_kernels && layer.gate_up.type == LX_W_BF16 && layer.down.type == LX_W_BF16)
+      LX_CHECK(lx_moe_experts_decode_bf16(m.latent_bf, m.route_ids, m.route_w, layer.gate_up.data, layer.down.data,
+                                          m.routed, m.moe_workspace, T, Lat, I, K, s));
+    else
+      LX_CHECK(lx_moe_experts_decode(m.latent_bf, m.route_ids, m.route_w, &layer.gate_up, &layer.down, m.routed,
+                                     m.moe_workspace, T, Lat, I, K, s));
     return;
   }
-  LX_CHECK(lx_gemm_bf16(x, ld_x, l.w, l.bias, y, y_dtype, ld_y, M, l.N, l.K, alpha, beta, s));
+  lx_weight gu = layer.gate_up, dn = layer.down;
+  if (gu.type == LX_W_BF16X) {
+    LX_CHECK(lx_bf16x_decode(gu.data, static_cast<int64_t>(E) * 2 * I, Lat, m.unpack, s));
+    gu = lx_weight{LX_W_BF16, m.unpack, nullptr, 1.0f, nullptr};
+  }
+  if (dn.type == LX_W_BF16X) {
+    char* at = static_cast<char*>(m.unpack);
+    if (layer.gate_up.type == LX_W_BF16X) at += (static_cast<size_t>(E) * 2 * I * Lat * 2 + 255) / 256 * 256;
+    LX_CHECK(lx_bf16x_decode(dn.data, static_cast<int64_t>(E) * Lat, I, at, s));
+    dn = lx_weight{LX_W_BF16, at, nullptr, 1.0f, nullptr};
+  }
+  // One math for both stages: the plan's where both stacks can run it, BF16 otherwise.
+  lx_math math = math_for(gu.type, m.expert_math);
+  if (math_for(dn.type, math) != math) math = LX_MATH_BF16;
+  LX_CHECK(lx_moe_experts_grouped(m.latent_bf, m.route_ids, m.route_w, &gu, &dn, math, m.routed, m.moe_grouped_ws, T,
+                                  Lat, I, E, K, s));
 }
 
 // The f32 products (routers, the depth head): batch invariant in decode-sized steps (kernels.h,
@@ -1175,22 +1196,9 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
           m.offload->decode(i, m.route_ids, m.route_w, m.latent_bf, m.routed, T, s);
         else
           m.offload->prefill(i, m.route_ids, m.route_w, m.latent_bf, m.routed, T, s);
-      } else if (T <= Impl::kGemvRows && layer.gate_up_x16)
-        LX_CHECK(lx_moe_experts_bf16x(m.latent_bf, m.route_ids, m.route_w, layer.gate_up_x16, layer.down_x16, m.routed,
-                                      m.moe_workspace, T, Lat, m.Iexp, m.K, s));
-      else if (T <= Impl::kGemvRows && m.decode_bf16 && !layer.gate_up_q)
-        LX_CHECK(lx_moe_experts_decode_bf16(m.latent_bf, m.route_ids, m.route_w, layer.gate_up, layer.down, m.routed,
-                                            m.moe_workspace, T, Lat, m.Iexp, m.K, s));
-      else if (T <= Impl::kGemvRows && layer.gate_up_q)
-        LX_CHECK(lx_moe_experts_w8(m.latent_bf, m.route_ids, m.route_w, layer.gate_up_q, layer.gate_up_scale,
-                                   layer.down_q, layer.down_scale, m.routed, m.moe_workspace, T, Lat, m.Iexp, m.K, s));
-      else if (m.grouped_experts && T > Impl::kGemvRows)  // decode-sized steps keep moe.cu's decode kernel
-        LX_CHECK(lx_moe_experts_grouped(m.latent_bf, m.route_ids, m.route_w, &layer.gate_up_pw, &layer.down_pw,
-                                        layer.gate_up_pw.type == LX_W_BF16 ? LX_MATH_BF16 : m.prefill_math, m.routed,
-                                        m.moe_grouped_ws, T, Lat, m.Iexp, E, m.K, s));
-      else
-        LX_CHECK(lx_moe_experts(m.latent_bf, m.route_ids, m.route_w, layer.gate_up, layer.down, m.routed, T, Lat,
-                                m.Iexp, m.K, s));
+      } else {
+        routed_experts(m, layer, T, s);
+      }
       linear(m, layer.shared_gate_up, m.latent_bf, LX_BF16, Lat, m.shared_gu, LX_F32, 2 * m.Ishared, T, s);
       LX_CHECK(lx_silu_mul(m.shared_gu, 2 * m.Ishared, m.shared_bf, LX_BF16, T, m.Ishared, s));
       linear(m, layer.shared_down, m.shared_bf, LX_BF16, m.Ishared, m.routed, LX_F32, Lat, T, s, 1.0f, 1.0f);

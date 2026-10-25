@@ -1,14 +1,12 @@
 #include "runtime/offload_model.h"
 
 #include <algorithm>
-#include <cmath>
+#include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <fstream>
 #include <nlohmann/json.hpp>
 #include <set>
 #include <stdexcept>
-#include <thread>
 
 namespace lx::offload {
 namespace {
@@ -53,81 +51,72 @@ std::map<std::string, FileOffset> file_offsets(const std::filesystem::path& dir)
   return out;
 }
 
-bool ends_with(const std::string& s, const std::string& suffix) {
-  return s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
-}
-
-// layers.N.moe.local_experts.{gate_up,down}.weight[_scale]
-bool expert_tensor(const std::string& name, int& layer, bool& gate_up, bool& scale) {
-  if (name.rfind("layers.", 0) != 0) return false;
-  const size_t dot = name.find('.', 7);
-  const std::string rest = name.substr(dot + 1);
-  for (const char* part : {"gate_up", "down"}) {
-    for (const char* suffix : {".weight", ".weight_scale"}) {
-      if (rest == std::string("moe.local_experts.") + part + suffix) {
-        layer = std::stoi(name.substr(7, dot - 7));
-        gate_up = std::strcmp(part, "gate_up") == 0;
-        scale = std::strcmp(suffix, ".weight_scale") == 0;
-        return true;
-      }
-    }
+const char* format_name(lx_wtype t) {
+  switch (t) {
+    case LX_W_BF16: return "BF16";
+    case LX_W_INT8: return "INT8";
+    case LX_W_FP8: return "FP8";
+    case LX_W_NVFP4: return "NVFP4";
+    case LX_W_BF16X: return "BF16X";
   }
-  return false;
+  return "?";
 }
 
-// The projections whose decode reads an int8 copy (metis.cpp builds one for every projection made with
-// quantize = true unless LX_W8_KEEP names it; the default keeps out_proj): their bf16 weights only
-// feed prefill GEMMs and the int8 quantization at load, so they can live in host memory.
-bool prefill_only(const std::string& name) {
-  static const char* suffixes[] = {"mixer.impl.mixer.in_proj.weight", "mixer.qkv.weight", "mixer.out.weight",
-                                   "moe.latent_down.weight", "moe.latent_up.weight",
-                                   "moe.shared_expert.gate_up.weight", "moe.shared_expert.down.weight",
-                                   "depth_memory.state_write.weight", "depth_memory.query.weight",
-                                   "depth_memory.output.weight", "depth_memory.route_projection.weight",
-                                   "embedding.weight"};
-  bool listed = false;
-  for (const char* s : suffixes) listed |= ends_with(name, s);
-  if (!listed) return false;
-  const char* keep_env = std::getenv("LX_W8_KEEP");
-  const std::string keep = keep_env ? keep_env : "out_proj";
-  for (size_t pos = 0; pos < keep.size();) {
-    const size_t end = keep.find(',', pos);
-    const std::string frag = keep.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
-    if (!frag.empty() && name.find(frag) != std::string::npos) return false;
-    pos = end == std::string::npos ? keep.size() : end + 1;
+// The format an expert stack has in the file, from its dtype.
+lx_wtype stored_format(DType d) {
+  switch (d) {
+    case DType::BF16: return LX_W_BF16;
+    case DType::F8_E4M3: return LX_W_FP8;
+    case DType::I8: return LX_W_INT8;
+    case DType::U8: return LX_W_NVFP4;
+    default: throw std::runtime_error("offload: experts stored as " + std::string(dtype_name(d)));
   }
-  return true;
 }
 
-float e4m3(uint8_t b) {
-  const int s = b >> 7, e = (b >> 3) & 15, m = b & 7;
-  float v = e == 0 ? std::ldexp(static_cast<float>(m), -9) : std::ldexp(1.0f + m / 8.0f, e - 7);
-  return s ? -v : v;
+void upload(void* dst, const void* src, size_t bytes) {
+  check(lx_rt_copy(dst, src, static_cast<int64_t>(bytes), LX_COPY_H2D, nullptr), "upload");
 }
 
-uint16_t to_bf16(float f) {
-  uint32_t u;
-  std::memcpy(&u, &f, 4);
-  u += 0x7FFFu + ((u >> 16) & 1u);
-  return static_cast<uint16_t>(u >> 16);
+// One expert stack of the checkpoint ([rows, cols]: E experts' rows; per-row f32 scales for INT8 / FP8) in
+// another format, on the host: through the GPU, dequantized to bf16 exactly when it is stored quantized, then
+// rounded to `to` with the engine's quantizer (lx_quantize_weight, as ModelWeights converts).
+struct HostStack {
+  std::vector<char> data;
+  std::vector<float> scale;  // [rows] for INT8 / FP8
+};
+HostStack convert_stack(const TensorInfo& w, const TensorInfo* scale, lx_wtype from, lx_wtype to, int64_t rows,
+                        int cols) {
+  const size_t n = static_cast<size_t>(rows) * cols;
+  DeviceBuffer src(w.bytes), src_scale, bf16, dst, dst_scale;
+  upload(src.data(), w.data, w.bytes);
+  const void* values = src.data();
+  if (from != LX_W_BF16) {
+    if (!scale || scale->bytes != static_cast<size_t>(rows) * 4)
+      throw std::runtime_error("offload: " + w.name + " needs one f32 scale per row");
+    src_scale = DeviceBuffer(scale->bytes);
+    upload(src_scale.data(), scale->data, scale->bytes);
+    bf16 = DeviceBuffer(n * 2);
+    const lx_weight q{from, src.data(), src_scale.data(), 1.0f, nullptr};
+    check(lx_dequantize_weight(&q, bf16.data(), rows, cols, nullptr), "dequantizing " + w.name);
+    values = bf16.data();
+  }
+  HostStack out;
+  if (to == LX_W_BF16) {
+    out.data.resize(n * 2);
+    check(lx_rt_copy(out.data.data(), values, static_cast<int64_t>(n * 2), LX_COPY_D2H, nullptr), "copy");
+  } else {
+    dst = DeviceBuffer(n);
+    dst_scale = DeviceBuffer(static_cast<size_t>(rows) * 4);
+    lx_weight q{to, dst.data(), dst_scale.data(), 1.0f, nullptr};
+    check(lx_quantize_weight(values, &q, rows, cols, nullptr), "quantizing " + w.name);
+    out.data.resize(n);
+    out.scale.resize(static_cast<size_t>(rows));
+    check(lx_rt_copy(out.data.data(), dst.data(), static_cast<int64_t>(n), LX_COPY_D2H, nullptr), "copy");
+    check(lx_rt_copy(out.scale.data(), dst_scale.data(), rows * 4, LX_COPY_D2H, nullptr), "copy");
+  }
+  check(lx_rt_stream_sync(nullptr), "sync");
+  return out;
 }
-
-// An FP8 projection [N, K] with per-row scales, dequantized to bf16 (the dense model runs in bf16 and
-// its int8 decode copies; the experts keep FP8).
-void dequant_fp8(const uint8_t* q, const float* scale, uint16_t* out, int64_t N, int64_t K) {
-  float lut[256];
-  for (int i = 0; i < 256; ++i) lut[i] = e4m3(static_cast<uint8_t>(i));
-  const int threads = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
-  std::vector<std::thread> pool;
-  for (int t = 0; t < threads; ++t)
-    pool.emplace_back([&, t] {
-      for (int64_t n = t; n < N; n += threads)
-        for (int64_t k = 0; k < K; ++k) out[n * K + k] = to_bf16(lut[q[n * K + k]] * scale[n]);
-    });
-  for (auto& th : pool) th.join();
-}
-
-int lx_dtype_of(DType d) { return d == DType::F32 ? LX_F32 : d == DType::BF16 ? LX_BF16 : -1; }
 
 }  // namespace
 
@@ -139,85 +128,29 @@ std::unique_ptr<OffloadedModel> OffloadedModel::load(const std::filesystem::path
   check(lx_rt_stream_sync(nullptr), "sync");  // the CUDA context exists from here
   if (const int64_t ctx = process_vram_bytes(); ctx >= 0)
     m->notes_.push_back("this process before loading (the CUDA context): " + std::to_string(ctx >> 20) + " MiB");
-  const auto& tensors = m->set_.tensors();
   if (!options.routing_stats.empty()) m->stats_ = RoutingStats::load(options.routing_stats);
   if (!m->stats_.empty() && (m->stats_.n_layers != c.num_hidden_layers || m->stats_.n_experts != c.n_routed_experts))
     throw std::runtime_error("routing stats do not match the model");
 
-  // Dense tensors: where each goes, and its bytes there.
-  struct Item {
-    const TensorInfo* info;
-    const TensorInfo* scale = nullptr;  // FP8 projections: dequantized to bf16
-    bool host = false;
-    size_t offset = 0, bytes = 0;
-  };
-  std::vector<Item> items;
-  size_t vram_total = 0, host_total = 0;
-  for (const auto& [name, t] : tensors) {
-    int layer;
-    bool gu, sc;
-    if (expert_tensor(name, layer, gu, sc)) continue;
-    if (ends_with(name, "_scale")) continue;  // consumed with its weight
-    if (name == "lm_head.weight" && c.tie_word_embeddings) continue;
-    Item it{&t};
-    if (t.dtype == DType::F8_E4M3) {
-      it.scale = m->set_.find(name + "_scale");
-      if (!it.scale) throw std::runtime_error(name + " is FP8 without a scale");
-      it.bytes = static_cast<size_t>(t.numel()) * 2;
-    } else {
-      it.bytes = t.bytes;
-    }
-    it.host = options.dense_prefill_on_host && options.w8_decode && prefill_only(name);
-    size_t& total = it.host ? host_total : vram_total;
-    it.offset = total;
-    total += (it.bytes + 255) / 256 * 256;
-    items.push_back(it);
-  }
-  void* vram = nullptr;
-  check(lx_rt_alloc(&vram, static_cast<int64_t>(std::max<size_t>(vram_total, 256))), "device allocation for weights");
-  m->device_blocks_.push_back(vram);
-  void *host = nullptr, *host_dev = nullptr;
-  if (host_total) {
-    check(lx_rt_host_alloc_mapped(&host, &host_dev, static_cast<int64_t>(host_total)), "pinned allocation for weights");
-    m->host_blocks_.push_back(host);
-  }
-  m->dense_vram_ = static_cast<int64_t>(vram_total);
-  m->dense_host_ = static_cast<int64_t>(host_total);
-  std::vector<uint16_t> deq;
-  for (const Item& it : items) {
-    const TensorInfo& t = *it.info;
-    const void* src = t.data;
-    if (it.scale) {
-      const int64_t N = t.shape[0], K = t.numel() / N;
-      deq.resize(static_cast<size_t>(t.numel()));
-      dequant_fp8(reinterpret_cast<const uint8_t*>(t.data), reinterpret_cast<const float*>(it.scale->data), deq.data(),
-                  N, K);
-      src = deq.data();
-    }
-    WeightView v;
-    v.dtype = it.scale ? LX_BF16 : lx_dtype_of(t.dtype);
-    v.shape = t.shape;
-    if (it.host) {
-      std::memcpy(static_cast<char*>(host) + it.offset, src, it.bytes);
-      v.data = static_cast<char*>(host_dev) + it.offset;
-    } else {
-      check(lx_rt_copy(static_cast<char*>(vram) + it.offset, src, static_cast<int64_t>(it.bytes), LX_COPY_H2D, nullptr),
-            "upload");
-      check(lx_rt_stream_sync(nullptr), "sync");
-      v.data = static_cast<char*>(vram) + it.offset;
-    }
-    m->views_[t.name] = v;
-  }
+  // Dense weights: ModelWeights in the plan's format, the routed experts left out (they live in the offload).
+  LoadOptions dense;
+  dense.target = options.weights < 0 ? ModelWeights::stored_format(dir) : static_cast<lx_wtype>(options.weights);
+  dense.skip_experts = true;
+  m->dense_ = ModelWeights::load(dir, c, dense);
+  m->dense_vram_ = static_cast<int64_t>(m->dense_.device_bytes());
+  m->notes_.push_back(std::string("dense weights: ") + format_name(dense.target));
 
-  // Experts.
+  // Experts, in the plan's format: the offload kernels read BF16, INT8 and FP8 (an expert with its per-row scales).
   const std::string first = "layers.0.moe.local_experts.gate_up.weight";
   const TensorInfo* g0 = m->set_.find(first);
   if (!g0) throw std::runtime_error("no routed experts in the checkpoint");
-  const lx_wtype stored = g0->dtype == DType::BF16 ? LX_W_BF16 : g0->dtype == DType::F8_E4M3 ? LX_W_FP8 : LX_W_NVFP4;
-  if (stored == LX_W_NVFP4) throw std::runtime_error("offload: experts stored as " + std::string(dtype_name(g0->dtype)));
+  const lx_wtype stored = stored_format(g0->dtype);
   const lx_wtype target = options.experts < 0 ? stored : static_cast<lx_wtype>(options.experts);
-  if (target != stored && !(stored == LX_W_BF16 && target == LX_W_INT8))
-    throw std::runtime_error("offload: experts convert only from BF16 to INT8");
+  if (target != LX_W_BF16 && target != LX_W_INT8 && target != LX_W_FP8)
+    throw std::runtime_error(std::string("offload: the experts cannot run as ") + format_name(target) +
+                             " (the offload kernels read BF16, INT8 and FP8)");
+  if (target != stored && stored == LX_W_NVFP4)
+    throw std::runtime_error("offload: NVFP4 experts cannot be converted (their per-block scales do not survive)");
   ExpertShape shape;
   shape.n_layers = c.num_hidden_layers;
   shape.n_experts = c.n_routed_experts;
@@ -242,10 +175,12 @@ std::unique_ptr<OffloadedModel> OffloadedModel::load(const std::filesystem::path
     if (!gu || !dn) throw std::runtime_error("missing experts of layer " + std::to_string(l));
     if (gu->shape != std::vector<int64_t>{E, 2 * I, L} || dn->shape != std::vector<int64_t>{E, L, I})
       throw std::runtime_error("experts of layer " + std::to_string(l) + " have an unexpected shape");
+    const bool scaled = stored == LX_W_INT8 || stored == LX_W_FP8;
+    const TensorInfo* gus = scaled ? m->set_.find(p + "gate_up.weight_scale") : nullptr;
+    const TensorInfo* dns = scaled ? m->set_.find(p + "down.weight_scale") : nullptr;
+    if (scaled && (!gus || !dns))
+      throw std::runtime_error("quantized experts without scales in layer " + std::to_string(l));
     if (target == stored) {
-      const TensorInfo* gus = stored == LX_W_FP8 ? m->set_.find(p + "gate_up.weight_scale") : nullptr;
-      const TensorInfo* dns = stored == LX_W_FP8 ? m->set_.find(p + "down.weight_scale") : nullptr;
-      if (stored == LX_W_FP8 && (!gus || !dns)) throw std::runtime_error("FP8 experts without scales");
       for (int e = 0; e < E; ++e) {
         ExpertSource s;
         s.gate_up = reinterpret_cast<const char*>(gu->data) + e * shape.gate_up_bytes();
@@ -266,33 +201,19 @@ std::unique_ptr<OffloadedModel> OffloadedModel::load(const std::filesystem::path
         off.add_expert(l, e, s, d);
       }
     } else {
-      // BF16 -> INT8 on the GPU, the engine's own quantizer, one layer at a time
-      void *d_gu = nullptr, *d_dn = nullptr, *q_gu = nullptr, *q_dn = nullptr, *s_gu = nullptr, *s_dn = nullptr;
+      // Another format: converted on the GPU one stack at a time, kept on the host (no NVMe tier: the drive
+      // holds the stored format)
       const int64_t gu_rows = static_cast<int64_t>(E) * 2 * I, dn_rows = static_cast<int64_t>(E) * L;
-      check(lx_rt_alloc(&d_gu, static_cast<int64_t>(gu->bytes)), "alloc");
-      check(lx_rt_alloc(&d_dn, static_cast<int64_t>(dn->bytes)), "alloc");
-      check(lx_rt_alloc(&q_gu, gu_rows * L), "alloc");
-      check(lx_rt_alloc(&q_dn, dn_rows * I), "alloc");
-      check(lx_rt_alloc(&s_gu, gu_rows * 4), "alloc");
-      check(lx_rt_alloc(&s_dn, dn_rows * 4), "alloc");
-      check(lx_rt_copy(d_gu, gu->data, static_cast<int64_t>(gu->bytes), LX_COPY_H2D, nullptr), "copy");
-      check(lx_rt_copy(d_dn, dn->data, static_cast<int64_t>(dn->bytes), LX_COPY_H2D, nullptr), "copy");
-      check(lx_quantize_w8(d_gu, static_cast<int8_t*>(q_gu), static_cast<float*>(s_gu), gu_rows, L, nullptr), "quantize");
-      check(lx_quantize_w8(d_dn, static_cast<int8_t*>(q_dn), static_cast<float*>(s_dn), dn_rows, I, nullptr), "quantize");
-      std::vector<char> h_gu(gu_rows * L), h_dn(dn_rows * I);
-      std::vector<float> h_sgu(gu_rows), h_sdn(dn_rows);
-      check(lx_rt_copy(h_gu.data(), q_gu, gu_rows * L, LX_COPY_D2H, nullptr), "copy");
-      check(lx_rt_copy(h_dn.data(), q_dn, dn_rows * I, LX_COPY_D2H, nullptr), "copy");
-      check(lx_rt_copy(h_sgu.data(), s_gu, gu_rows * 4, LX_COPY_D2H, nullptr), "copy");
-      check(lx_rt_copy(h_sdn.data(), s_dn, dn_rows * 4, LX_COPY_D2H, nullptr), "copy");
-      check(lx_rt_stream_sync(nullptr), "sync");
-      for (void* ptr : {d_gu, d_dn, q_gu, q_dn, s_gu, s_dn}) lx_rt_free(ptr);
+      const HostStack hg = convert_stack(*gu, gus, stored, target, gu_rows, L);
+      const HostStack hd = convert_stack(*dn, dns, stored, target, dn_rows, I);
       for (int e = 0; e < E; ++e) {
         ExpertSource s;
-        s.gate_up = h_gu.data() + e * shape.gate_up_bytes();
-        s.down = h_dn.data() + e * shape.down_bytes();
-        s.gate_up_scale = h_sgu.data() + static_cast<int64_t>(e) * 2 * I;
-        s.down_scale = h_sdn.data() + static_cast<int64_t>(e) * L;
+        s.gate_up = hg.data.data() + e * shape.gate_up_bytes();
+        s.down = hd.data.data() + e * shape.down_bytes();
+        if (!hg.scale.empty()) {
+          s.gate_up_scale = hg.scale.data() + static_cast<int64_t>(e) * 2 * I;
+          s.down_scale = hd.scale.data() + static_cast<int64_t>(e) * L;
+        }
         off.add_expert(l, e, s, DiskLocation{});
       }
     }
@@ -300,18 +221,7 @@ std::unique_ptr<OffloadedModel> OffloadedModel::load(const std::filesystem::path
   return m;
 }
 
-OffloadedModel::~OffloadedModel() {
-  offload_.reset();
-  for (void* p : device_blocks_) lx_rt_free(p);
-  for (void* p : host_blocks_) lx_rt_host_free(p);
-}
-
-WeightLookup OffloadedModel::lookup() const {
-  return [this](const std::string& name) {
-    const auto it = views_.find(name);
-    return it == views_.end() ? WeightView{} : it->second;
-  };
-}
+OffloadedModel::~OffloadedModel() { offload_.reset(); }
 
 void OffloadedModel::finalize() {
   int64_t free_b = 0, total_b = 0;
@@ -337,8 +247,7 @@ void OffloadedModel::finalize() {
 std::string OffloadedModel::describe() const {
   std::string s;
   char buf[256];
-  std::snprintf(buf, sizeof(buf), "dense weights: %.2f GB in VRAM, %.2f GB in pinned RAM (read by prefill only)\n",
-                dense_vram_ / 1e9, dense_host_ / 1e9);
+  std::snprintf(buf, sizeof(buf), "dense weights: %.2f GB in VRAM\n", dense_vram_ / 1e9);
   s += buf;
   for (const auto& n : notes_) s += n + "\n";
   s += offload_->describe();

@@ -7,7 +7,8 @@
 //                       (plain,ngram). ngram and block pick each draft's length from the verify cost
 //                       (block from its confidence head); the -fixed ones always draft the most
 //     --draft-head DIR  the lernex.block/1 drafter for `block` (tools/draft/train_block.py)
-//     --bf16-draft      the block drafter reads bf16 weights (its own and the head) instead of int8
+//     --bf16-draft      the block drafter reads bf16 weights (its own, and the target's bf16 embedding
+//                       as its head) instead of int8 copies of its own and the head as the target holds it
 //     --cost LIST       verify cost of T = 1, 2, .. tokens in plain steps (default: the 5070 Ti, Praxis)
 //     --draft DIR       the draft model for `model` (a Metis model with the same tokenizer)
 //     --temp T --top-p P --top-k K --min-p P --seed S    sampling (temp 0, the default, is greedy)
@@ -46,9 +47,8 @@
 #include <string>
 #include <vector>
 
+#include "core/checkpoint.h"
 #include "core/config.h"
-#include "core/device.h"
-#include "core/safetensors.h"
 #include "cuda/kernels.h"
 #include "model/metis.h"
 #include "runtime/block_drafter.h"
@@ -56,31 +56,18 @@
 
 namespace {
 
-lx::WeightLookup lookup_for(const lx::Weights& weights) {
-  return [&weights](const std::string& name) {
-    lx::WeightView view;
-    const lx::Tensor* t = weights.find(name);
-    if (!t) return view;
-    view.data = t->data;
-    view.dtype = t->dtype == lx::DType::F32 ? LX_F32 : t->dtype == lx::DType::BF16 ? LX_BF16 : -1;
-    view.shape = t->shape;
-    return view;
-  };
-}
-
 struct Loaded {
   lx::MetisConfig config;
-  std::unique_ptr<lx::SafetensorsSet> set;
-  std::unique_ptr<lx::Weights> weights;
+  std::unique_ptr<lx::ModelWeights> weights;
   std::unique_ptr<lx::MetisModel> model;
 };
 
 Loaded load(const std::string& dir, int slots, int max_tokens) {
   Loaded l;
   l.config = lx::load_config(dir);
-  l.set = std::make_unique<lx::SafetensorsSet>(lx::SafetensorsSet::open(dir));
-  l.weights = std::make_unique<lx::Weights>(lx::Weights::upload(*l.set));
-  l.model = std::make_unique<lx::MetisModel>(l.config, lookup_for(*l.weights), slots, 8192, max_tokens, nullptr, true);
+  l.weights = std::make_unique<lx::ModelWeights>(lx::ModelWeights::load(dir, l.config, lx::LoadOptions{LX_W_BF16}));
+  l.model = std::make_unique<lx::MetisModel>(l.config, *l.weights, lx::ModelFormats{}, slots, 8192, max_tokens,
+                                             nullptr, true);
   return l;
 }
 

@@ -85,9 +85,11 @@ struct BlockDrafter::Impl {
   Lin fc, conf;
   const void *fc_norm, *mask, *norm, *conf_b;
   bool int8 = true;
-  const void* head_bf16 = nullptr;
-  const int8_t* head_q = nullptr;
-  const float* head_scale = nullptr;
+  // The target's tied embedding: its bf16 gather table (the anchor's row), and the LM head the logits read,
+  // as the target holds it (or its BF16X decode copy), or the bf16 table itself for a bf16 drafter.
+  const void* embedding = nullptr;
+  lx_weight head{LX_W_BF16, nullptr, nullptr, 1.0f, nullptr};
+  const void* head_bf16x = nullptr;
 
   // context: per layer, keys and values of the last W committed positions, f32 [W, KVH Dh], slot
   // = position mod W (attention does not care about their order)
@@ -200,8 +202,13 @@ BlockDrafter::BlockDrafter(const std::string& dir, const MetisModel& target, lx_
     m.ring_v.push_back(m.alloc<float>(static_cast<size_t>(m.W) * KVH * Dh));
   }
   const MetisModel::HeadWeights head = target.head_weights();
-  m.head_bf16 = head.bf16;
-  if (!bf16 && head.int8) m.head_q = head.int8, m.head_scale = head.scale;
+  m.embedding = head.embedding;
+  if (bf16) {
+    m.head = lx_weight{LX_W_BF16, head.embedding, nullptr, 1.0f, nullptr};
+  } else {
+    m.head = head.head;
+    m.head_bf16x = head.head_bf16x;
+  }
 
   const size_t B = m.B, V = m.V;
   m.fused = m.alloc<float>(kRows * D);
@@ -313,7 +320,7 @@ Draft BlockDrafter::propose(const DraftRequest& r) {
   const int32_t anchor = ctx.back();
   void* s = r.stream;
   LX_CHECK(lx_rt_copy(m.x, m.x_init, static_cast<int64_t>(sizeof(float) * B * D), LX_COPY_D2D, s));
-  LX_CHECK(lx_copy2d(static_cast<const uint16_t*>(m.head_bf16) + static_cast<int64_t>(anchor) * D, LX_BF16, D, m.x,
+  LX_CHECK(lx_copy2d(static_cast<const uint16_t*>(m.embedding) + static_cast<int64_t>(anchor) * D, LX_BF16, D, m.x,
                      LX_F32, D, 1, D, s));
   const int n_ctx = static_cast<int>(std::min<int64_t>(m.committed, m.W));
   const int qw = m.H * m.Dh, kvw = m.KVH * m.Dh;
@@ -333,7 +340,12 @@ Draft BlockDrafter::propose(const DraftRequest& r) {
     m.gemv(m.act_b, m.I, layer.down, m.x, D, B, 1.0f, s);
   }
   LX_CHECK(lx_rmsnorm(m.x + D, LX_F32, m.norm, m.out_b, LX_BF16, rows, D, m.eps, s));
-  m.gemv(m.out_b, D, Impl::Lin{m.head_bf16, m.head_q, m.head_scale, m.V, m.D}, m.logits, m.V, rows, 0.0f, s);
+  if (m.head_bf16x)
+    LX_CHECK(lx_gemv_bf16x(m.out_b, LX_BF16, D, m.head_bf16x, nullptr, LX_BF16, m.logits, LX_F32, m.V, rows, m.V, m.D,
+                           1.0f, 0.0f, s));
+  else
+    LX_CHECK(lx_gemv_w(m.out_b, LX_BF16, D, &m.head, nullptr, LX_BF16, m.logits, LX_F32, m.V, rows, m.V, m.D, 1.0f,
+                       0.0f, s));
   m.gemv(m.out_b, D, m.conf, m.conf_out, 2, rows, 0.0f, s, m.conf_b);
 
   const bool greedy = !(filter_.temperature > 0.0f);

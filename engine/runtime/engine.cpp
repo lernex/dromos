@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <thread>
 
+#include "core/checkpoint.h"
 #include "core/device.h"
 #include "core/safetensors.h"
 #include "cuda/kernels.h"
@@ -28,18 +29,6 @@ using Clock = std::chrono::steady_clock;
 // Every backend call returns 0 on success; anything else throws, with the backend's text for the code.
 void check(int status, const char* what) {
   if (status != 0) throw std::runtime_error(std::string(what) + " failed: " + lx_rt_error_string(status));
-}
-
-lx::WeightLookup lookup_for(const lx::Weights& weights) {
-  return [&weights](const std::string& name) {
-    lx::WeightView view;
-    const lx::Tensor* t = weights.find(name);
-    if (!t) return view;
-    view.data = t->data;
-    view.dtype = t->dtype == lx::DType::F32 ? LX_F32 : t->dtype == lx::DType::BF16 ? LX_BF16 : -1;
-    view.shape = t->shape;
-    return view;
-  };
 }
 
 // Pinned host memory, so the step's copies are asynchronous.
@@ -118,9 +107,9 @@ struct Engine::Impl {
     if (options.load_tokenizer) tokenizer = lx::text::Tokenizer::load(dir);
 
     check(lx_rt_stream_create(&stream), "stream creation");
-    const lx::SafetensorsSet set = lx::SafetensorsSet::open(dir);
-    weights = std::make_unique<lx::Weights>(lx::Weights::upload(set));
-    model = std::make_unique<lx::MetisModel>(config, lookup_for(*weights), max_slots, kv_capacity, max_step_tokens);
+    weights = std::make_unique<lx::ModelWeights>(lx::ModelWeights::load(dir, config, lx::LoadOptions{LX_W_BF16}));
+    model = std::make_unique<lx::MetisModel>(config, *weights, lx::ModelFormats{}, max_slots, kv_capacity,
+                                             max_step_tokens);
 #ifdef LX_SLOT_STATE
     if (options.prefix_cache && plan.prefix_device_bytes + plan.prefix_host_bytes > 0)
       cache = std::make_unique<PrefixCache>(plan.prefix_device_bytes, plan.prefix_host_bytes, stream);
@@ -188,7 +177,7 @@ struct Engine::Impl {
   void snapshot(const std::shared_ptr<Sequence>& s, int length, const std::vector<int32_t>& tokens);
 
   lx::MetisConfig config;
-  std::unique_ptr<lx::Weights> weights;
+  std::unique_ptr<lx::ModelWeights> weights;
   std::unique_ptr<lx::MetisModel> model;
   std::unique_ptr<PrefixCache> cache;  // null when prefix reuse is off or the model lacks slot state
   std::vector<std::string> token_texts;  // every token's text, for the tool grammar's masks

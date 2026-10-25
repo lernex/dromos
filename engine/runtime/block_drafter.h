@@ -36,10 +36,11 @@ namespace lx::runtime {
 class BlockDrafter final : public Drafter {
  public:
   // dir: config.json and model.safetensors. The target's head serves as the drafter's embedding and
-  // LM head. The drafter's products read int8 copies of its weights and the target's int8 head
-  // (per-row scales, as the target's decode does), or with bf16 the bf16 weights themselves (what
-  // the checks against PyTorch use). filter: the target's sampling (greedy when temperature <= 0);
-  // sampled proposals are drawn with it.
+  // LM head. The drafter's products read int8 copies of its own weights and the target's head as the
+  // target holds it (MetisModel::head_weights: its format, or its BF16X decode copy), or with bf16 the
+  // bf16 weights themselves and the target's bf16 embedding table (what the checks against PyTorch
+  // use). filter: the target's sampling (greedy when temperature <= 0); sampled proposals are drawn
+  // with it.
   BlockDrafter(const std::string& dir, const MetisModel& target, lx_spec_filter filter, uint64_t seed,
                DraftCost cost = DraftCost::rtx5070ti_praxis(), bool bf16 = false);
   ~BlockDrafter() override;

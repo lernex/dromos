@@ -86,7 +86,7 @@ done
 # 3. eval features, once
 if [ ! -f "$WORK/eval-shards/DONE" ]; then
   log "eval features"
-  gpu env LX_NO_W8=1 build/lernex features "$target" "$WORK/eval.jsonl" "$WORK/eval-shards" --taps "$taps" \
+  gpu build/lernex features "$target" "$WORK/eval.jsonl" "$WORK/eval-shards" --taps "$taps" \
     --queue 1000000 --max-len "$MAX_LEN" --shard-tokens "$SHARD_TOKENS"
 fi
 
@@ -106,7 +106,7 @@ train() {
   rm -rf "$queue_dir"
   mkdir -p "$queue_dir"
   # the producer marks the queue FAILED if it dies, so the trainer stops instead of waiting
-  ( LX_NO_W8=1 build/lernex features "$target" "$WORK/train.jsonl" "$queue_dir" --taps "$taps" --epochs "$EPOCHS" \
+  ( build/lernex features "$target" "$WORK/train.jsonl" "$queue_dir" --taps "$taps" --epochs "$EPOCHS" \
       --queue "$QUEUE" --max-len "$MAX_LEN" --shard-tokens "$SHARD_TOKENS" --skip-seqs "$seen" \
       > "$WORK/features.log" 2>&1 || touch "$queue_dir/FAILED" ) &
   local producer=$!

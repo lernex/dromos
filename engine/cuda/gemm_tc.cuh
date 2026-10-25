@@ -492,7 +492,7 @@ __device__ __forceinline__ void gemm_body(const typename Prob::Params& pp, const
   mma::cp_async_wait<0>();
 
   const int r = fr, q = fq;
-  const float global = pp.b_global;
+  const float global = Prob::b_global(pp, t);
   auto col_scale = [&](int tc) -> float {
     if constexpr (T::kColScale) return tc < t.cols ? t.b_scale[Prob::b_row(pp, t, tc)] : 0.0f;
     else return 1.0f;

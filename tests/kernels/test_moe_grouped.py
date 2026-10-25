@@ -83,9 +83,11 @@ def call_grouped(lx, latent, ids, weights, gu, dn, math, out, ws, T, L, I, E, to
 
 
 def expert(w, e):
-    """Expert e of a stacked weight, dequantized to float64 (one expert at a time keeps memory small)."""
+    """Expert e of a stacked weight, dequantized to float64 (one expert at a time keeps memory small), with
+    its own global when the stack carries one per expert."""
     scale = w.scale[e] if w.scale is not None else None
-    return dequant_weight(Weight(w.wtype, w.data[e], scale, w.glob))
+    globs = getattr(w, "globs", None)
+    return dequant_weight(Weight(w.wtype, w.data[e], scale, globs[e] if globs else w.glob))
 
 
 def reference(latent, ids, weights, gu, dn, math):
@@ -168,6 +170,32 @@ def test_moe_grouped_praxis_skewed(lx, name, wtype, math, oldest, T):
         pytest.skip("not on this GPU")
     L, I, E, top_k = 1024, 512, 128, 4
     case = make_case(T, L, I, E, top_k, wtype, seed=T + math, skew=True)
+    status, out = run(lx, case, math, T, L, I, E, top_k)
+    assert status == 0, f"lx_moe_experts_grouped returned CUDA error {status}"
+    check(out, case, math)
+
+
+def per_expert_nvfp4(E, N, K, seed):
+    """An NVFP4 stack quantized one expert at a time, so each expert has its own global (expert_global), as
+    checkpoints carry them and the loader's conversion makes them. The experts' magnitudes differ by up to 46x,
+    so a kernel that applies one expert's global to the others is far off."""
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    parts = [quantize_weight((torch.randn(N, K, generator=g) * (1 + 3 * e) / K**0.5).cuda(), W_NVFP4) for e in range(E)]
+    w = Weight(W_NVFP4, torch.stack([p.data for p in parts]), torch.stack([p.scale for p in parts]), parts[0].glob)
+    w.globs = [p.glob for p in parts]
+    w.expert_globals = torch.tensor(w.globs, dtype=torch.float32, device="cuda")
+    w.struct.expert_global = w.expert_globals.data_ptr()
+    return w
+
+
+@pytest.mark.parametrize("name,wtype,math,oldest", [p for p in PAIRS if p[1] == W_NVFP4])
+def test_moe_grouped_nvfp4_expert_globals(lx, name, wtype, math, oldest):
+    # Every NVFP4 kind reads each expert's own global, as lx_moe_experts_decode does.
+    if native_arch(lx) < oldest:
+        pytest.skip("not on this GPU")
+    T, L, I, E, top_k = 37, 512, 256, 16, 3
+    latent, ids, weights, _, _ = make_case(T, L, I, E, top_k, W_BF16, seed=17)
+    case = (latent, ids, weights, per_expert_nvfp4(E, 2 * I, L, 1), per_expert_nvfp4(E, L, I, 2))
     status, out = run(lx, case, math, T, L, I, E, top_k)
     assert status == 0, f"lx_moe_experts_grouped returned CUDA error {status}"
     check(out, case, math)

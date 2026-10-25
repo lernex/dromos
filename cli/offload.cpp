@@ -1,19 +1,18 @@
 // lernex offload: run a model larger than the GPU, and measure what offloading has to work with.
 //
-//   lernex offload probe [FILE]                       the machine's bandwidths (PCIe, RAM, NVMe, CPU experts)
+//   lernex offload probe [FILE]                       the machine's bandwidths (PCIe, RAM, NVMe, CPU experts;
+//                                                     LX_EXPERTS=bf16|int8|fp8 picks the expert format measured)
 //   lernex offload eval MODEL PROMPTS OUT [N]         like `lernex eval`, with the experts offloaded (OUT "-"
 //                                                     writes nothing: for LX_ROUTE_TRACE runs)
 //   lernex offload bench MODEL PROMPTS [N] [REPEAT]   single-stream decode speed: prefill N tokens of each
 //                                                     prompt, then decode the rest one token at a time
 //
-// The plan comes from the environment:
+// The weights load as BF16, the dense ones and the experts (OffloadLoadOptions carries the plan's formats).
+// The rest of the plan comes from the environment:
 //   LX_VRAM_BUDGET_GB   everything this process may hold on the GPU, its context included (default:
 //                       the card); other processes only limit it through the memory they leave free
 //   LX_RAM_BUDGET_GB    pinned RAM for experts (default: all of them; the rest stay on NVMe)
-//   LX_EXPERTS          bf16 | int8 | fp8 (default: the checkpoint's format; int8 converts from BF16)
 //   LX_ROUTING_STATS    per-layer expert frequencies (tools/routing_stats.py); placement uses them
-//   LX_OFFLOAD_DENSE_HOST=1   the bf16 projections decode reads as int8 copies stay in pinned RAM:
-//                       prefill copies each into VRAM while the product before it runs
 //   LX_OFFLOAD_DYNAMIC  share of the VRAM slots under LRU, the rest pinned by frequency (default 1: on
 //                       held-out routing LRU beats any pinned share, see tools/routing_stats.py)
 //   LX_OFFLOAD_CPU_FRACTION, LX_OFFLOAD_CPU_PAIRS   the CPU lane's share of misses, pairs per step
@@ -60,16 +59,11 @@ double env_double(const char* name, double fallback) {
 
 off::OffloadLoadOptions options_from_env() {
   off::OffloadLoadOptions o;
-  if (const char* e = std::getenv("LX_EXPERTS")) {
-    const std::string s = e;
-    o.experts = s == "bf16" ? LX_W_BF16 : s == "int8" ? LX_W_INT8 : s == "fp8" ? LX_W_FP8 : -1;
-    if (o.experts < 0) throw std::runtime_error("LX_EXPERTS must be bf16, int8 or fp8");
-  }
+  o.weights = LX_W_BF16;
+  o.experts = LX_W_BF16;
   o.vram_budget = off::vram_budget_bytes();
   o.ram_budget = off::ram_budget_bytes();
   if (const char* p = std::getenv("LX_ROUTING_STATS")) o.routing_stats = p;
-  o.dense_prefill_on_host = env_double("LX_OFFLOAD_DENSE_HOST", 0) != 0;
-  o.w8_decode = std::getenv("LX_NO_W8") == nullptr;
   o.policy.dynamic_fraction = env_double("LX_OFFLOAD_DYNAMIC", 1.0);
   o.policy.cpu_fraction = env_double("LX_OFFLOAD_CPU_FRACTION", 0);
   o.policy.max_cpu_pairs = static_cast<int>(env_double("LX_OFFLOAD_CPU_PAIRS", 0));
@@ -87,7 +81,8 @@ Loaded load(const std::string& dir, int max_tokens) {
   const lx::MetisConfig config = lx::load_config(dir);
   Loaded l;
   l.weights = off::OffloadedModel::load(dir, config, options_from_env());
-  l.model = std::make_unique<lx::MetisModel>(config, l.weights->lookup(), 1, 4096, max_tokens, &l.weights->experts());
+  l.model = std::make_unique<lx::MetisModel>(config, l.weights->weights(), lx::ModelFormats{}, 1, 4096, max_tokens,
+                                             &l.weights->experts());
   l.weights->finalize();
   std::printf("loaded in %.1f s\n%s", seconds_since(t0), l.weights->describe().c_str());
   return l;

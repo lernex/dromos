@@ -55,6 +55,7 @@ struct GroupedParams {
   const uint8_t* b_sf;  // NVFP4 block scales, ld_bsf bytes per row, b_sf_stride per expert
   int64_t ld_bsf, b_sf_stride;
   float b_global;
+  const float* b_expert_global;  // NVFP4 stacks: each expert's own global [E], or null when b_global serves all
   const int2* tiles;  // the tile table for this kernel's BM
   int N, K, tiles_n;
   int half_n;  // gate_up: I, where the up rows start
@@ -76,6 +77,11 @@ __device__ __forceinline__ bool grouped_tile(const GroupedParams& p, Tile& t, in
   t.b_sf = p.b_sf ? p.b_sf + ex * p.b_sf_stride : nullptr;
   t.b_scale = p.b_scale ? p.b_scale + ex * p.b_scale_stride : nullptr;
   return true;
+}
+
+// The weight global of a tile's expert: an NVFP4 stack carries one per expert (kernels.h, "Weight formats").
+__device__ __forceinline__ float grouped_global(const GroupedParams& p, const Tile& t) {
+  return p.b_expert_global ? __ldg(p.b_expert_global + t.expert) : p.b_global;
 }
 
 // gate_up: A rows gathered by token, B rows interleaved gate / up in blocks of 8.
@@ -103,6 +109,7 @@ struct GateUpProb {
     const int i = (t.n0 >> 1) + (blk >> 1) * 8 + (c & 7);
     return (blk & 1) ? p.half_n + i : i;
   }
+  static __device__ __forceinline__ float b_global(const Params& p, const Tile& t) { return grouped_global(p, t); }
 };
 
 // down: A in sorted order, B rows as stored.
@@ -122,6 +129,7 @@ struct DownProb {
     return __ldg(p.a_scale + t.m0 + r);
   }
   static __device__ __forceinline__ int64_t b_row(const Params&, const Tile& t, int c) { return t.n0 + c; }
+  static __device__ __forceinline__ float b_global(const Params& p, const Tile& t) { return grouped_global(p, t); }
 };
 
 // ---- epilogues --------------------------------------------------------------------------------------

@@ -10,27 +10,14 @@
 #include <string>
 #include <vector>
 
+#include "core/checkpoint.h"
 #include "core/config.h"
-#include "core/device.h"
-#include "core/safetensors.h"
 #include "cuda/kernels.h"
 #include "model/metis.h"
 
 namespace {
 
 using Clock = std::chrono::steady_clock;
-
-lx::WeightLookup lookup_for(const lx::Weights& weights) {
-  return [&weights](const std::string& name) {
-    lx::WeightView view;
-    const lx::Tensor* t = weights.find(name);
-    if (!t) return view;
-    view.data = t->data;
-    view.dtype = t->dtype == lx::DType::F32 ? LX_F32 : t->dtype == lx::DType::BF16 ? LX_BF16 : -1;
-    view.shape = t->shape;
-    return view;
-  };
-}
 
 }  // namespace
 
@@ -48,11 +35,10 @@ int cmd_eval(int argc, char** argv) {
     std::ifstream(argv[2]) >> prompts;
 
     const lx::MetisConfig config = lx::load_config(dir);
-    const lx::SafetensorsSet set = lx::SafetensorsSet::open(dir);
-    const lx::Weights weights = lx::Weights::upload(set);
+    const lx::ModelWeights weights = lx::ModelWeights::load(dir, config, lx::LoadOptions{LX_W_BF16});
     size_t longest = 1;
     for (auto& [name, ids] : prompts.items()) longest = std::max(longest, ids.size());
-    lx::MetisModel model(config, lookup_for(weights), 1, 4096, static_cast<int>(longest));
+    lx::MetisModel model(config, weights, lx::ModelFormats{}, 1, 4096, static_cast<int>(longest));
 
     const int V = config.vocab_size;
     float* d_logits = nullptr;

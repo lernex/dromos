@@ -15,8 +15,8 @@
 // A shard appears whole (written as .tmp, then renamed). When Q shards are waiting, the command
 // waits for the consumer (the trainer deletes each shard it has read), so a corpus far larger than
 // the disk streams through a bounded window. DONE marks the end. --skip-seqs N resumes a stream:
-// the first N sequences it would have written (over all epochs, same seed) are skipped. Run it with
-// LX_NO_W8=1: prefill reads the bf16 weights, and the int8 decode copies would only take memory.
+// the first N sequences it would have written (over all epochs, same seed) are skipped. The model runs
+// the checkpoint's BF16 weights, the ones drafters are trained against.
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -31,9 +31,8 @@
 #include <thread>
 #include <vector>
 
+#include "core/checkpoint.h"
 #include "core/config.h"
-#include "core/device.h"
-#include "core/safetensors.h"
 #include "cuda/kernels.h"
 #include "model/metis.h"
 
@@ -128,18 +127,8 @@ int cmd_features(int argc, char** argv) {
     fs::remove(out / "DONE");
 
     const lx::MetisConfig config = lx::load_config(dir);
-    const lx::SafetensorsSet set = lx::SafetensorsSet::open(dir);
-    const lx::Weights weights = lx::Weights::upload(set);
-    auto lookup = [&weights](const std::string& name) {
-      lx::WeightView view;
-      const lx::Tensor* t = weights.find(name);
-      if (!t) return view;
-      view.data = t->data;
-      view.dtype = t->dtype == lx::DType::F32 ? LX_F32 : t->dtype == lx::DType::BF16 ? LX_BF16 : -1;
-      view.shape = t->shape;
-      return view;
-    };
-    lx::MetisModel model(config, lookup, 1, max_len, max_len);
+    const lx::ModelWeights weights = lx::ModelWeights::load(dir, config, lx::LoadOptions{LX_W_BF16});
+    lx::MetisModel model(config, weights, lx::ModelFormats{}, 1, max_len, max_len);
     model.set_feature_taps(taps);
     const int F = model.feature_dim(), V = config.vocab_size;
     float* d_logits = device_alloc<float>(static_cast<size_t>(V));

@@ -9,9 +9,8 @@
 #include <string>
 #include <vector>
 
+#include "core/checkpoint.h"
 #include "core/config.h"
-#include "core/device.h"
-#include "core/safetensors.h"
 #include "cuda/kernels.h"
 #include "model/metis.h"
 
@@ -34,18 +33,8 @@ int cmd_prefill(int argc, char** argv) {
     for (int i = 0; i < T; ++i) tokens[i] = text[i % text.size()];
 
     const lx::MetisConfig config = lx::load_config(dir);
-    const lx::SafetensorsSet set = lx::SafetensorsSet::open(dir);
-    const lx::Weights weights = lx::Weights::upload(set);
-    auto lookup = [&weights](const std::string& name) {
-      lx::WeightView view;
-      const lx::Tensor* t = weights.find(name);
-      if (!t) return view;
-      view.data = t->data;
-      view.dtype = t->dtype == lx::DType::F32 ? LX_F32 : t->dtype == lx::DType::BF16 ? LX_BF16 : -1;
-      view.shape = t->shape;
-      return view;
-    };
-    lx::MetisModel model(config, lookup, 1, std::max(4096, T), T);
+    const lx::ModelWeights weights = lx::ModelWeights::load(dir, config, lx::LoadOptions{LX_W_BF16});
+    lx::MetisModel model(config, weights, lx::ModelFormats{}, 1, std::max(4096, T), T);
     float* d_logits = nullptr;
     const int64_t logit_bytes = static_cast<int64_t>(sizeof(float) * config.vocab_size);
     if (lx_rt_alloc(reinterpret_cast<void**>(&d_logits), logit_bytes) != 0)
