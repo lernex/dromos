@@ -477,10 +477,10 @@ int lx_program_ssm(lx_program* p, const lx_ssm_args* a) {
                               wr(a->head_ss, static_cast<size_t>(M) * a->H * 4)};
   const int step = p->add(d, std::move(regs), state_bytes * 2.0);
   if (step < 0) return -1;
-  OpDesc c = blank(kConvBC, M);
+  OpDesc c = blank(kConvBC, M * kConvParts);
   c.ssm = d.ssm;
   std::vector<Region> cregs = {rd(a->zxbcdt, span(M, a->ld, a->ld, 4)), rd(a->conv_state, 1), wr(a->conv_state, 1)};
-  if (p->add(c, std::move(cregs), 4096.0) < 0) return -1;
+  if (p->add(c, std::move(cregs), 4096.0 / kConvParts) < 0) return -1;
   return step;
 }
 
@@ -608,7 +608,7 @@ int lx_program_experts(lx_program* p, const lx_experts_args* a) {
 int lx_program_attention(lx_program* p, const lx_attention_args* a) {
   if (!p || !a || a->KVH < 1 || a->H % a->KVH || a->H / a->KVH > 8 || a->Dh % 8 || kComputeThreads % a->Dh) return -1;
   const int M = p->M, G = a->H / a->KVH;
-  OpDesc d = blank(kAttention, M * a->KVH);
+  OpDesc d = blank(kAttention, M * a->H);  // one task per token and query head
   d.attn = {a->qkv, a->k_cache, a->v_cache, a->out, a->scale, a->ld_qkv, a->capacity, a->H, a->KVH, a->Dh};
   p->x_need = std::max(p->x_need, (G * a->Dh + kComputeThreads * G) * 4);
   std::vector<Region> regs = {rd(a->qkv, span(M, a->ld_qkv, (a->H + 2 * a->KVH) * a->Dh, 4)), rd(a->k_cache, 1),
@@ -777,10 +777,12 @@ int lx_program_build(lx_program* p) {
     }
     if (r) turn = (order[r - 1] + 1) % B;
   }
-  // Each dependency carries its op's block count, so a block waits for it from its descriptor alone.
+  // Each dependency carries its op's block count, so a block waits for it from its descriptor alone;
+  // an op that some op waits on is marked, the others signal nothing.
   for (OpDesc& d : p->ops)
     for (int k = 0; k < d.ndeps; ++k) {
       const int dep = d.deps[k];
+      p->ops[dep].waited = 1;
       d.deps[k] = dep | p->ops[dep].nblocks << 16;
     }
   // The flattened lists; per block its prefetch spans (adjacent ones merged up to 32 KB) and per

@@ -23,6 +23,7 @@ constexpr int kTileBytes = 16384;            // weight bytes of one product task
 constexpr int kMaxTileRows = 64;             // rows of a product task
 constexpr int kScratchFloats = 6144;         // per-block reduction space
 constexpr int kDescBytes = 512;              // shared-memory copy of an op's descriptor
+constexpr int kConvParts = 8;                // tasks per token of a B and C conv-state update
 
 // The kernel's shared memory: fixed slots, then the x buffer (as large as the rest allows).
 constexpr int kCtxBytes = 128;
@@ -207,10 +208,11 @@ struct Continuation {
 };
 
 // nblocks: the blocks that run any of the op's tasks. Each signals the op's counter once, after its
-// last task of the op, so an op is complete when its counter reaches nblocks. Copied to shared
-// memory 16 bytes at a time, so its size is a multiple of 16.
+// last task of the op, so an op is complete when its counter reaches nblocks. waited: another op
+// waits on this one's counter (an op nothing waits on signals nothing). Copied to shared memory 16
+// bytes at a time, so its size is a multiple of 16.
 struct alignas(16) OpDesc {
-  int32_t kind, ntasks, nblocks, ndeps, pool, dyn_dep;
+  int32_t kind, ntasks, nblocks, ndeps, pool, dyn_dep, waited;
   int32_t deps[kMaxDeps];  // op | (that op's nblocks << 16): the counters a task waits for
   union {
     Gemv gemv;

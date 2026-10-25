@@ -1228,13 +1228,16 @@ __device__ __noinline__ void ssm_task(int task) {
   }
 }
 // The conv state of a token's B and C channels moves on by one input, after every head has read it.
-__device__ __noinline__ void conv_bc_task(int m) {
+// A token's channels are split over kConvParts tasks (each channel's state is its own).
+__device__ __noinline__ void conv_bc_task(int task) {
   const Ssm& a = desc().ssm;
   const int gn = a.G * a.N, conv_dim = a.I + 2 * gn, W = a.W;
+  const int m = task / kConvParts, chunk = (2 * gn + kConvParts - 1) / kConvParts;
+  const int c0 = a.I + task % kConvParts * chunk, c1 = min(conv_dim, c0 + chunk);
   const bool has = ctx().has_state[m] != 0;
   float* cst = a.conv_state + static_cast<int64_t>(ctx().slots[m]) * (W - 1) * conv_dim;
   const float* zrow = a.zxbcdt + static_cast<int64_t>(m) * a.ld;
-  for (int c = a.I + threadIdx.x; c < conv_dim; c += kCT) {
+  for (int c = c0 + threadIdx.x; c < c1; c += kCT) {
     float old[8];
 #pragma unroll
     for (int k = 0; k < 7; ++k)
@@ -1635,13 +1638,14 @@ __device__ __noinline__ void expdown_run(int op, const uint32_t* entries, int co
 
 // ---- Attention ----------------------------------------------------------------------------------
 
-// One (token, kv head): writes the token's k and v to the caches, then attends over positions
-// 0 .. start_pos in chunks of kCT positions with an online softmax across chunks.
+// One (token, query head): writes the token's k and v to the caches (every head's task writes the same
+// bytes for its kv head, and reads back only its own write), then attends over positions 0 .. start_pos
+// in chunks of kCT positions with an online softmax across chunks.
 __device__ __noinline__ void attention_task(int task) {
   const Attention& a = desc().attn;
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-  const int KVH = a.KVH, Dh = a.Dh, H = a.H, G = H / KVH;
-  const int m = task / KVH, kvh = task % KVH;
+  const int KVH = a.KVH, Dh = a.Dh, H = a.H, G = 1;
+  const int m = task / H, h = task % H, kvh = h / (H / KVH);
   const int pos = ctx().start_pos[m], L = pos + 1;
   const int64_t slot = ctx().slots[m];
   const float* row = a.qkv + static_cast<int64_t>(m) * a.ld_qkv;
@@ -1651,7 +1655,7 @@ __device__ __noinline__ void attention_task(int task) {
   float* qs = xbuf();               // [G][Dh], scaled
   float* sc = qs + G * Dh;        // [kCT][G] scores, then weights; reused by the final merge
   float* run = scratch() + 256;  // running max [G], running sum [G], new max [G], correction [G]
-  for (int i = tid; i < G * Dh; i += kCT) qs[i] = __ldcg(row + kvh * G * Dh + i) * a.scale;
+  for (int i = tid; i < Dh; i += kCT) qs[i] = __ldcg(row + h * Dh + i) * a.scale;
   for (int i = tid; i < Dh; i += kCT) {
     kc[pos * pstride + i] = __float2bfloat16_rn(__ldcg(row + H * Dh + kvh * Dh + i));
     vc[pos * pstride + i] = __float2bfloat16_rn(__ldcg(row + H * Dh + KVH * Dh + kvh * Dh + i));
@@ -1746,7 +1750,7 @@ __device__ __noinline__ void attention_task(int task) {
   float* mg = sc;  // [pg_count][G][Dh]
   for (int g = 0; g < G; ++g) mg[(pg * G + g) * Dh + d] = acc[g];
   csync();
-  bf16* out = static_cast<bf16*>(a.out) + static_cast<int64_t>(m) * H * Dh + kvh * G * Dh;
+  bf16* out = static_cast<bf16*>(a.out) + static_cast<int64_t>(m) * H * Dh + h * Dh;
   for (int i = tid; i < G * Dh; i += kCT) {
     const int g = i / Dh, dd = i % Dh;
     float s = 0.0f;
@@ -1960,7 +1964,8 @@ __device__ __forceinline__ void work(const Program& P, int block) {
     csync();
     // Everything the previous run wrote is visible to this thread through the barrier; the release
     // carries it to the SMs that acquire the counter (CUTLASS's semaphore pattern).
-    if (tid == 0 && prev >= 0 && !more) red_release_add(&P.done[prev], 1u);
+    // An op nothing waits on signals nothing: the descriptor still in shared memory is the previous op's.
+    if (tid == 0 && prev >= 0 && !more && desc().waited) red_release_add(&P.done[prev], 1u);
     // While warp 0 waits for the dependencies, warp 1 has L2 fetch the weights of the coming runs, up
     // to the budget past this one's start, so DRAM keeps streaming through waits and small ops.
     if (tid >> 5 == 1 && budget) {
@@ -2007,7 +2012,7 @@ __device__ __forceinline__ void work(const Program& P, int block) {
   }
   csync();
   if (tid == 0) {
-    if (prev >= 0) red_release_add(&P.done[prev], 1u);
+    if (prev >= 0 && desc().waited) red_release_add(&P.done[prev], 1u);
     // The last block out resets the counters for the next step.
     __threadfence();
     const uint32_t blocks_done = atomicAdd(&P.done[P.nops], 1u);
