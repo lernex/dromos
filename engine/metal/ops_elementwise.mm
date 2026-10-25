@@ -108,4 +108,35 @@ int lx_gather_last(const float* src, const int32_t* cu, float* out, int n_seq, i
   return k.launch(stream, a, size1(n_seq), size1(row_threads(D, 256)));
 }
 
+int lx_concat4_bf16(const float* a, const float* b, const float* c, const float* d, void* out, int D, int R, int T,
+                    void* stream) {
+  static Kernel k("concat4_bf16");
+  const int W = 3 * D + R;
+  if (T <= 0 || W <= 0) return kOk;
+  Concat4Args g{addr(stream, a, span(T, D, D, 4)), addr(stream, b, span(T, D, D, 4)),
+                addr(stream, c, span(T, D, D, 4)), addr(stream, d, span(T, R, R, 4)),
+                addr_w(stream, out, span(T, W, W, 2)), D, R, T};
+  return k.launch(stream, g, size3(ceil_div(W, kThreads), T, 1), size1(kThreads));
+}
+
+int lx_pack_router(float* router_in, void* latent, const float* features, int Lat, int R, int T, void* stream) {
+  static Kernel k("pack_router");
+  const int W = Lat + R;
+  if (T <= 0 || W <= 0) return kOk;
+  PackRouterArgs g{addr_w(stream, router_in, span(T, W, W, 4)), addr_w(stream, latent, span(T, Lat, Lat, 2)),
+                   addr(stream, features, span(T, R, R, 4)), Lat, R, T};
+  return k.launch(stream, g, size3(ceil_div(W, kThreads), T, 1), size1(kThreads));
+}
+
+int lx_meta_entry(const float* summary, const float* entropy, const float* confidence, const float* continuation,
+                  float mean_k, float inv_log_experts, void* meta, int R, int T, void* stream) {
+  static Kernel k("meta_entry");
+  const int ld = R + 4;
+  if (T <= 0 || R <= 0) return kOk;
+  MetaEntryArgs g{addr(stream, summary, span(T, R, R, 4)), addr(stream, entropy, size_t(T) * 4),
+                  addr(stream, confidence, size_t(T) * 4), addr(stream, continuation, size_t(T) * 4),
+                  addr_w(stream, meta, span(T, ld, ld, 2)), mean_k, inv_log_experts, R, T};
+  return k.launch(stream, g, size3(ceil_div(ld, kThreads), T, 1), size1(kThreads));
+}
+
 }  // extern "C"

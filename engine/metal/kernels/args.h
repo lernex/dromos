@@ -85,6 +85,29 @@ struct GatherLastArgs {
   LX_PTR(float) out;
   int D;
 };
+struct Concat4Args {
+  LX_CPTR(float) a;
+  LX_CPTR(float) b;
+  LX_CPTR(float) c;
+  LX_CPTR(float) d;
+  LX_PTR(ushort) out;
+  int D, R, T;
+};
+struct PackRouterArgs {
+  LX_PTR(float) router_in;
+  LX_PTR(ushort) latent;
+  LX_CPTR(float) features;
+  int Lat, R, T;
+};
+struct MetaEntryArgs {
+  LX_CPTR(float) summary;
+  LX_CPTR(float) entropy;
+  LX_CPTR(float) confidence;
+  LX_CPTR(float) continuation;
+  LX_PTR(ushort) meta;
+  float mean_k, inv_log_experts;
+  int R, T;
+};
 
 // ---- streams --------------------------------------------------------------------------------
 struct EmbedArgs {

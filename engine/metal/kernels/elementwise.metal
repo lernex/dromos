@@ -95,3 +95,33 @@ kernel void gather_last(constant GatherLastArgs& a [[buffer(0)]], uint i [[threa
   const long row = a.cu[i + 1] - 1;
   for (int d = tid; d < a.D; d += threads) a.out[long(i) * a.D + d] = a.src[row * a.D + d];
 }
+
+// The model's fused row kernels (the glue ops in kernels.h); columns run over x, tokens over y (one group per token).
+kernel void concat4_bf16(constant Concat4Args& p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
+  const int j = int(gid.x), t = int(gid.y), W = 3 * p.D + p.R;
+  if (j >= W || t >= p.T) return;
+  float v;
+  if (j < p.D) v = p.a[long(t) * p.D + j];
+  else if (j < 2 * p.D) v = p.b[long(t) * p.D + (j - p.D)];
+  else if (j < 3 * p.D) v = p.c[long(t) * p.D + (j - 2 * p.D)];
+  else v = p.d[long(t) * p.R + (j - 3 * p.D)];
+  p.out[long(t) * W + j] = to_bf(v);
+}
+
+kernel void pack_router(constant PackRouterArgs& p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
+  const int j = int(gid.x), t = int(gid.y), W = p.Lat + p.R;
+  if (j >= W || t >= p.T) return;
+  if (j < p.Lat) p.latent[long(t) * p.Lat + j] = to_bf(p.router_in[long(t) * W + j]);
+  else p.router_in[long(t) * W + j] = p.features[long(t) * p.R + (j - p.Lat)];
+}
+
+kernel void meta_entry(constant MetaEntryArgs& p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
+  const int j = int(gid.x), t = int(gid.y), ld = p.R + 4;
+  if (j >= ld || t >= p.T) return;
+  device ushort* row = p.meta + long(t) * ld;
+  if (j < p.R) row[j] = to_bf(p.summary[long(t) * p.R + j]);
+  else if (j == p.R) row[j] = to_bf(p.mean_k);
+  else if (j == p.R + 1) row[j] = to_bf(p.entropy[t] * p.inv_log_experts);
+  else if (j == p.R + 2) row[j] = to_bf(p.confidence[t]);
+  else row[j] = to_bf(p.continuation[t]);
+}

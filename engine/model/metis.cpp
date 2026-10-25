@@ -1073,10 +1073,6 @@ void gemm_f32(const float* x, int ld_x, const float* w, const float* bias, float
     LX_CHECK(lx_gemm_f32(x, ld_x, w, bias, y, ld_y, M, N, K, s));
 }
 
-void to_bf16(const float* src, int ld_src, void* dst, int ld_dst, int rows, int cols, void* s) {
-  LX_CHECK(lx_copy2d(src, LX_F32, ld_src, dst, LX_BF16, ld_dst, rows, cols, s));
-}
-
 void copy_f32(const float* src, int ld_src, float* dst, int ld_dst, int rows, int cols, void* s) {
   LX_CHECK(lx_copy2d(src, LX_F32, ld_src, dst, LX_F32, ld_dst, rows, cols, s));
 }
@@ -1099,6 +1095,10 @@ void memory_retrieve(Impl& m, int T, int n_entries, void* s) {
 void concat4(Impl& m, const float* a, const float* b, const float* c, const float* d, void* out, lx_dtype dtype,
              int T, void* s) {
   const int D = m.D, R = m.R, ld = 3 * D + R;
+  if (dtype == LX_BF16) {  // the four segments in one launch
+    LX_CHECK(lx_concat4_bf16(a, b, c, d, out, D, R, T, s));
+    return;
+  }
   const size_t es = dtype == LX_F32 ? 4 : 2;
   char* o = static_cast<char*>(out);
   LX_CHECK(lx_copy2d(a, LX_F32, D, o, dtype, ld, T, D, s));
@@ -1119,10 +1119,10 @@ void memory_write(Impl& m, const MetisConfig& c, int T, int pass, int anchor, in
   const int D = m.D, R = m.R, Mm = m.M;
   LX_CHECK(lx_stream_mean(m.streams, m.state, T, m.S, D, s));
   linear(m, m.m_state, m.state, LX_F32, D, m.entry, LX_F32, Mm, T, s);
-  LX_CHECK(lx_copy2d(m.summary, LX_F32, R, m.meta_bf, LX_BF16, R + 4, T, R, s));
   const float mean_k = static_cast<float>(c.num_experts_per_tok) / static_cast<float>(c.max_routed_k);
   const float inv_log_e = c.n_routed_experts > 1 ? 1.0f / std::log(static_cast<float>(c.n_routed_experts)) : 1.0f;
-  LX_CHECK(glue::meta_scalars(m.entropy, m.confidence, m.continuation, mean_k, inv_log_e, m.meta_bf, R + 4, R, T, s));
+  // the summary's bf16 copy and the four scalars, in one launch
+  LX_CHECK(lx_meta_entry(m.summary, m.entropy, m.confidence, m.continuation, mean_k, inv_log_e, m.meta_bf, R, T, s));
   linear(m, m.m_meta, m.meta_bf, LX_BF16, R + 4, m.entry, LX_F32, Mm, T, s, 1.0f, 1.0f);
   LX_CHECK(lx_add_row_bf16(m.entry, static_cast<const uint16_t*>(m.m_pass_emb) + pass * Mm, T, Mm, s));
   LX_CHECK(lx_add_row_bf16(m.entry, static_cast<const uint16_t*>(m.m_anchor_emb) + anchor * Mm, T, Mm, s));
@@ -1786,9 +1786,9 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
       LX_CHECK(lx_mhc_read(m.streams, ec, ec + S * S, layer.moe_conn.norm, c.rms_norm_eps, m.mixed, m.h_bf, T, S, D, s));
       // the latent lands in the router's input: [latent | features], one row of Lat + R per token
       linear(m, layer.latent_down, m.h_bf, LX_BF16, D, m.router_in, LX_F32, Lat + R, T, s);
-      to_bf16(m.router_in, Lat + R, m.latent_bf, Lat, T, Lat, s);
       if (beside) check(lx_rt_stream_wait(s, m.route_join), "stream wait");
-      copy_f32(m.features, R, m.router_in + Lat, Lat + R, T, R, s);
+      // the latent's bf16 copy, and the features into the router's input (one launch)
+      LX_CHECK(lx_pack_router(m.router_in, m.latent_bf, m.features, Lat, R, T, s));
       gemm_f32(m.router_in, Lat + R, layer.router_w, layer.router_b, m.router_logits, E, T, E, Lat + R, s);
       LX_CHECK(lx_moe_route(m.router_logits, layer.selection_bias, m.route_ids, m.route_w, m.entropy, m.confidence, T,
                             E, m.K, s));

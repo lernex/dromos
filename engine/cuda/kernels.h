@@ -214,6 +214,18 @@ LX_API int lx_meta_scalars(const float* entropy, const float* confidence, const 
                            float inv_log_experts, void* meta, int ld, int col, int T, void* stream);
 // out[i, :] = src[cu[i + 1] - 1, :] for each of n_seq sequences (cu on the device).
 LX_API int lx_gather_last(const float* src, const int32_t* cu, float* out, int n_seq, int D, void* stream);
+// out[t, :] = bf16 of [a[t] | b[t] | c[t] | d[t]]: a, b and c are D wide, d is R wide, each an f32 row of its
+// own width, and out is one row of 3 * D + R bf16 per token (the routing features' input).
+LX_API int lx_concat4_bf16(const float* a, const float* b, const float* c, const float* d, void* out, int D, int R,
+                           int T, void* stream);
+// The router's input once the features are ready: latent[t, :Lat] = bf16(router_in[t, :Lat]), then
+// router_in[t, Lat :] = features[t, :R] (f32). router_in is one row of Lat + R f32 per token.
+LX_API int lx_pack_router(float* router_in, void* latent, const float* features, int Lat, int R, int T, void* stream);
+// A memory entry's metadata, one row of R + 4 bf16 per token: meta[t, :R] = bf16(summary[t, :R]), then the four
+// scalars of lx_meta_scalars (mean_k, entropy * inv_log_experts, confidence, continuation).
+LX_API int lx_meta_entry(const float* summary, const float* entropy, const float* confidence,
+                         const float* continuation, float mean_k, float inv_log_experts, void* meta, int R, int T,
+                         void* stream);
 
 // ---- Runtime (every backend) ----------------------------------------------------------------
 // The kernels.h ABI is the backend interface: the CUDA, HIP, Metal and CPU backends are each one
