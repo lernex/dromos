@@ -6,61 +6,69 @@ namespace {
 
 // ---- Causal conv ----------------------------------------------------------------------------
 
-// Each output depends on the W inputs ending at its own token, never on another output, so the
-// tokens of a sequence are spread over the block's rows. A block is 32 channels by 8 token lanes,
-// so a warp reads 32 consecutive floats per token.
-__global__ void conv1d_out_kernel(const float* __restrict__ x, int ld_x, const __nv_bfloat16* __restrict__ w,
-                                  const __nv_bfloat16* __restrict__ bias, const float* __restrict__ state,
-                                  const int32_t* __restrict__ slot_ids, const int32_t* __restrict__ has_state,
-                                  const int32_t* __restrict__ cu, float* __restrict__ out, int C, int W) {
+constexpr int kConvMaxW = 8;  // widest conv the kernel takes: W - 1 <= 7 old rows per channel
+constexpr int kConvCh = 32;   // channels per block: one warp's lanes
+
+// One block owns 32 channels of one sequence and does both halves of the update. The outputs read the
+// old state, and the update rewrites it, so the old rows of the block's channels are staged in shared
+// memory first; the outputs and the new state then read the staged copy, and the state writes go to
+// columns no other block touches. Each output depends on the W inputs ending at its own token, never on
+// another output, so the tokens of a sequence are spread over the block's eight token lanes (threadIdx.y).
+// Every product sums in the same order as the two kernels it replaces, so the bits do not change.
+__global__ void conv1d_kernel(const float* __restrict__ x, int ld_x, const __nv_bfloat16* __restrict__ w,
+                              const __nv_bfloat16* __restrict__ bias, float* __restrict__ state,
+                              const int32_t* __restrict__ slot_ids, const int32_t* __restrict__ has_state,
+                              const int32_t* __restrict__ cu, float* __restrict__ out, int C, int W) {
+  __shared__ float old[kConvMaxW - 1][kConvCh];  // the old state rows of this block's channels (0 when none)
+  const int tx = threadIdx.x, ty = threadIdx.y;
   const int s = blockIdx.y;
-  const int c = blockIdx.x * blockDim.x + threadIdx.x;
-  if (c >= C) return;
-  const int start = cu[s], len = cu[s + 1] - start;
-  const bool has = has_state[s] != 0;
-  const float* st = state + static_cast<int64_t>(slot_ids[s]) * (W - 1) * C;
-
-  // Unrolled to a fixed bound so the taps stay in registers.
-  float wk[8];
-#pragma unroll
-  for (int k = 0; k < 8; ++k) wk[k] = k < W ? __bfloat162float(w[c * W + k]) : 0.0f;
-  const float b = __bfloat162float(bias[c]);
-
-  for (int t = threadIdx.y; t < len; t += blockDim.y) {
-    float acc = b;
-#pragma unroll
-    for (int k = 0; k < 8; ++k) {
-      if (k < W) {
-        // Position relative to the sequence start; negative positions are the carried state.
-        const int p = t - (W - 1) + k;
-        float v = 0.0f;
-        if (p >= 0) v = x[static_cast<int64_t>(start + p) * ld_x + c];
-        else if (has) v = st[(p + W - 1) * C + c];
-        acc = fmaf(wk[k], v, acc);
-      }
-    }
-    out[static_cast<int64_t>(start + t) * C + c] = lx::silu(acc);
-  }
-}
-
-// The new state is the last W - 1 inputs of [old state rows, x rows]. One thread owns one channel
-// of one slot and writes its rows in order. Row j takes combined input len + j. An old row m is
-// read before it is written, since m > j whenever len > 0, and len = 0 rereads the same row.
-__global__ void conv1d_state_kernel(const float* __restrict__ x, int ld_x, float* __restrict__ state,
-                                    const int32_t* __restrict__ slot_ids, const int32_t* __restrict__ has_state,
-                                    const int32_t* __restrict__ cu, int C, int W) {
-  const int s = blockIdx.y;
-  const int c = blockIdx.x * blockDim.x + threadIdx.x;
-  if (c >= C) return;
+  const int ch0 = blockIdx.x * kConvCh;
+  const int c = ch0 + tx;
+  const bool live = c < C;  // no early return: every thread reaches the barrier
   const int start = cu[s], len = cu[s + 1] - start;
   const bool has = has_state[s] != 0;
   float* st = state + static_cast<int64_t>(slot_ids[s]) * (W - 1) * C;
-  for (int j = 0; j < W - 1; ++j) {
-    const int m = len + j;
-    float v = 0.0f;
-    if (m >= W - 1) v = x[static_cast<int64_t>(start + m - (W - 1)) * ld_x + c];
-    else if (has) v = st[m * C + c];
-    st[j * C + c] = v;
+
+  for (int i = ty * kConvCh + tx; i < (W - 1) * kConvCh; i += 8 * kConvCh) {
+    const int r = i / kConvCh, cc = i % kConvCh, ch = ch0 + cc;
+    old[r][cc] = (has && ch < C) ? st[static_cast<int64_t>(r) * C + ch] : 0.0f;
+  }
+  __syncthreads();
+
+  if (live) {
+    // Unrolled to a fixed bound so the taps stay in registers.
+    float wk[kConvMaxW];
+#pragma unroll
+    for (int k = 0; k < kConvMaxW; ++k) wk[k] = k < W ? __bfloat162float(w[c * W + k]) : 0.0f;
+    const float b = __bfloat162float(bias[c]);
+
+    for (int t = ty; t < len; t += 8) {
+      float acc = b;
+#pragma unroll
+      for (int k = 0; k < kConvMaxW; ++k) {
+        if (k < W) {
+          // Position relative to the sequence start; negative positions are the carried state.
+          const int p = t - (W - 1) + k;
+          float v = 0.0f;
+          if (p >= 0) v = x[static_cast<int64_t>(start + p) * ld_x + c];
+          else v = old[p + W - 1][tx];
+          acc = fmaf(wk[k], v, acc);
+        }
+      }
+      out[static_cast<int64_t>(start + t) * C + c] = lx::silu(acc);
+    }
+
+    // The new state is the last W - 1 inputs of [old state rows, x rows]. Row j takes combined input
+    // len + j; a row below W - 1 is an old row, and every old row is in the staged copy.
+    if (ty == 0) {
+      for (int j = 0; j < W - 1; ++j) {
+        const int m = len + j;
+        float v = 0.0f;
+        if (m >= W - 1) v = x[static_cast<int64_t>(start + m - (W - 1)) * ld_x + c];
+        else v = old[m][tx];
+        st[static_cast<int64_t>(j) * C + c] = v;
+      }
+    }
   }
 }
 
@@ -264,12 +272,9 @@ extern "C" int lx_conv1d_varlen(const float* x, int ld_x, const void* w, const v
   if (n_seq <= 0) return 0;
   if (C <= 0 || W < 1 || W > 8 || ld_x < C || n_seq > 65535) return static_cast<int>(cudaErrorInvalidValue);
   auto s = static_cast<cudaStream_t>(stream);
-  // The outputs read the old state, so they launch before the state update.
-  conv1d_out_kernel<<<dim3((C + 31) / 32, n_seq), dim3(32, 8), 0, s>>>(
-      x, ld_x, static_cast<const __nv_bfloat16*>(w), static_cast<const __nv_bfloat16*>(bias), conv_state,
-      slot_ids, has_state, cu_seqlens, out, C, W);
-  conv1d_state_kernel<<<dim3((C + 127) / 128, n_seq), 128, 0, s>>>(x, ld_x, conv_state, slot_ids, has_state,
-                                                                  cu_seqlens, C, W);
+  conv1d_kernel<<<dim3((C + kConvCh - 1) / kConvCh, n_seq), dim3(kConvCh, 8), 0, s>>>(
+      x, ld_x, static_cast<const __nv_bfloat16*>(w), static_cast<const __nv_bfloat16*>(bias), conv_state, slot_ids,
+      has_state, cu_seqlens, out, C, W);
   return lx::launch_status();
 }
 
