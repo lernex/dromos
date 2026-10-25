@@ -27,10 +27,7 @@ namespace {
 using bf16 = __hip_bfloat16;
 
 constexpr int kThreads = 256;             // 8 warps per block
-constexpr int kWarps = kThreads / LX_WARP;  // wavefronts per block (device code; host: warps_per_block())
-
-// Wavefronts per block on the current device, for the host's grid sizes.
-inline int warps_per_block() { return kThreads / lx_warp_size(); }
+constexpr int kWarps = kThreads / 32;
 constexpr int kMaxTopK = 8;               // stage 2 holds routing weights in registers up to this
 constexpr int kMaxVecChunks = 4;          // vector paths cover rows of up to 4 * 512 bytes
 constexpr size_t kMaxSmem = 48 * 1024;    // default dynamic shared memory limit
@@ -69,11 +66,12 @@ __host__ __device__ inline int64_t chain_offset(int P, int I) {
   return (2 * static_cast<int64_t>(P) * I + 15) / 16 * 16;
 }
 
-// 16-byte global to shared copy, used by stage 2 to stage weights before the wait. A synchronous copy
-// in the HIP port (lx_hip.h): the wait after it is a no-op, and the barrier before the reads orders it.
+// Asynchronous 16-byte global to shared copy, used by stage 2 to stage weights before the wait.
 __device__ __forceinline__ void cp_async16(void* smem, const void* gmem) {
-  lx_pipeline_memcpy_async(smem, gmem, 16);
+  const uint32_t dst = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(gmem) : "memory");
 }
+__device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wait_all;" ::: "memory"); }
 
 // Stage 1, decode form, vector path: one pair per block row, NC chunks of 512 bytes per row. Each lane
 // owns 16 bytes per chunk, so a warp reads 512 contiguous bytes per load. Requires L % 16 == 0.
@@ -84,11 +82,11 @@ __global__ void __launch_bounds__(kThreads, kMinBlocksA) w8_gate_up_pair_vec(con
                                                                              const float* __restrict__ gate_up_scale,
                                                                              bf16* __restrict__ inter, int L,
                                                                              int I, int top_k, int rows) {
-  lx_pdl_trigger();  // stage 2 may start its prologue now
+  lx::pdl_trigger();  // stage 2 may start its prologue now
   const int p = blockIdx.x / rows;
-  const int i = (blockIdx.x % rows) * kWarps + (threadIdx.x / LX_WARP);
+  const int i = (blockIdx.x % rows) * kWarps + (threadIdx.x >> 5);
   if (i >= I) return;
-  const int lane = threadIdx.x & (LX_WARP - 1);
+  const int lane = threadIdx.x & 31;
   const int e = ids[p];
 
   // gate_up[e] is [2I, L]: row i the gate and row I + i the up projection.
@@ -96,7 +94,7 @@ __global__ void __launch_bounds__(kThreads, kMinBlocksA) w8_gate_up_pair_vec(con
   uint4 wg[NC], wu[NC];
 #pragma unroll
   for (int c = 0; c < NC; ++c) {
-    const int col = 16 * LX_WARP * c + 16 * lane;
+    const int col = 512 * c + 16 * lane;
     wg[c] = make_uint4(0, 0, 0, 0);
     wu[c] = make_uint4(0, 0, 0, 0);
     if (col < L) {
@@ -109,7 +107,7 @@ __global__ void __launch_bounds__(kThreads, kMinBlocksA) w8_gate_up_pair_vec(con
   float g = 0.0f, u = 0.0f;
 #pragma unroll
   for (int c = 0; c < NC; ++c) {
-    const int col = 16 * LX_WARP * c + 16 * lane;
+    const int col = 512 * c + 16 * lane;
     if (col < L) {
       const uint4 xa = load16(x + col);
       const uint4 xb = load16(x + col + 8);
@@ -133,17 +131,17 @@ __global__ void __launch_bounds__(kThreads) w8_gate_up_pair_scalar(const bf16* _
                                                                    const float* __restrict__ gate_up_scale,
                                                                    bf16* __restrict__ inter, int L, int I,
                                                                    int top_k, int rows) {
-  lx_pdl_trigger();
+  lx::pdl_trigger();
   const int p = blockIdx.x / rows;
-  const int i = (blockIdx.x % rows) * kWarps + (threadIdx.x / LX_WARP);
+  const int i = (blockIdx.x % rows) * kWarps + (threadIdx.x >> 5);
   if (i >= I) return;
-  const int lane = threadIdx.x & (LX_WARP - 1);
+  const int lane = threadIdx.x & 31;
   const int e = ids[p];
   const int8_t* gate = gate_up + (static_cast<int64_t>(e) * 2 * I + i) * L;
   const int8_t* up = gate + static_cast<int64_t>(I) * L;
   const bf16* x = latent + static_cast<int64_t>(p / top_k) * L;
   float g = 0.0f, u = 0.0f;
-  for (int c = lane; c < L; c += LX_WARP) {
+  for (int c = lane; c < L; c += 32) {
     const float xv = lx::to_f32(x[c]);
     g = fmaf(static_cast<float>(gate[c]), xv, g);
     u = fmaf(static_cast<float>(up[c]), xv, u);
@@ -190,18 +188,18 @@ __global__ void __launch_bounds__(kThreads, kMinBlocksA) w8_gate_up_chain_vec(co
                                                                               const int32_t* __restrict__ next,
                                                                               const int32_t* __restrict__ lead,
                                                                               int L, int I, int top_k, int rows) {
-  lx_pdl_trigger();
+  lx::pdl_trigger();
   const int p = blockIdx.x / rows;
-  const int i = (blockIdx.x % rows) * kWarps + (threadIdx.x / LX_WARP);
+  const int i = (blockIdx.x % rows) * kWarps + (threadIdx.x >> 5);
   if (!lead[p] || i >= I) return;
-  const int lane = threadIdx.x & (LX_WARP - 1);
+  const int lane = threadIdx.x & 31;
   const int e = ids[p];
 
   const int64_t gate_row = (static_cast<int64_t>(e) * 2 * I + i) * L;
   uint4 wg[NC], wu[NC];
 #pragma unroll
   for (int c = 0; c < NC; ++c) {
-    const int col = 16 * LX_WARP * c + 16 * lane;
+    const int col = 512 * c + 16 * lane;
     wg[c] = make_uint4(0, 0, 0, 0);
     wu[c] = make_uint4(0, 0, 0, 0);
     if (col < L) {
@@ -217,7 +215,7 @@ __global__ void __launch_bounds__(kThreads, kMinBlocksA) w8_gate_up_chain_vec(co
     float g = 0.0f, u = 0.0f;
 #pragma unroll
     for (int c = 0; c < NC; ++c) {
-      const int col = 16 * LX_WARP * c + 16 * lane;
+      const int col = 512 * c + 16 * lane;
       if (col < L) {
         const uint4 xa = load16(x + col);
         const uint4 xb = load16(x + col + 8);
@@ -240,11 +238,11 @@ __global__ void __launch_bounds__(kThreads) w8_gate_up_chain_scalar(const bf16* 
                                                                     const int32_t* __restrict__ next,
                                                                     const int32_t* __restrict__ lead, int L, int I,
                                                                     int top_k, int rows) {
-  lx_pdl_trigger();
+  lx::pdl_trigger();
   const int p = blockIdx.x / rows;
-  const int i = (blockIdx.x % rows) * kWarps + (threadIdx.x / LX_WARP);
+  const int i = (blockIdx.x % rows) * kWarps + (threadIdx.x >> 5);
   if (!lead[p] || i >= I) return;
-  const int lane = threadIdx.x & (LX_WARP - 1);
+  const int lane = threadIdx.x & 31;
   const int e = ids[p];
   const int8_t* gate = gate_up + (static_cast<int64_t>(e) * 2 * I + i) * L;
   const int8_t* up = gate + static_cast<int64_t>(I) * L;
@@ -254,7 +252,7 @@ __global__ void __launch_bounds__(kThreads) w8_gate_up_chain_scalar(const bf16* 
   for (int q = p; q >= 0; q = next[q]) {
     const bf16* x = latent + static_cast<int64_t>(q / top_k) * L;
     float g = 0.0f, u = 0.0f;
-    for (int c = lane; c < L; c += LX_WARP) {
+    for (int c = lane; c < L; c += 32) {
       const float xv = lx::to_f32(x[c]);
       g = fmaf(static_cast<float>(gate[c]), xv, g);
       u = fmaf(static_cast<float>(up[c]), xv, u);
@@ -279,7 +277,7 @@ __global__ void __launch_bounds__(kThreads, kMinBlocksB) w8_down_vec(const bf16*
                                                                      int I, int top_k) {
   extern __shared__ __align__(16) unsigned char smem_raw[];
   bf16* h = reinterpret_cast<bf16*>(smem_raw);  // this token's top_k intermediates
-  const int warp = threadIdx.x / LX_WARP, lane = threadIdx.x & (LX_WARP - 1);
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   int8_t* rows = reinterpret_cast<int8_t*>(h + top_k * I) + warp * top_k * I;  // this warp's rows
   const int t = blockIdx.x % T;
   const int l = (blockIdx.x / T) * kWarps + warp;
@@ -294,12 +292,12 @@ __global__ void __launch_bounds__(kThreads, kMinBlocksB) w8_down_vec(const bf16*
       const int p = t * top_k + k;
       const int64_t row = static_cast<int64_t>(ids[p]) * L + l;
       c[k] = weights[p] * down_scale[row];
-      for (int v = lane; v < I / 16; v += LX_WARP) cp_async16(rows + k * I + 16 * v, down + row * I + 16 * v);
+      for (int v = lane; v < I / 16; v += 32) cp_async16(rows + k * I + 16 * v, down + row * I + 16 * v);
     }
   }
 
-  lx_pdl_wait();  // stage 1 has written the intermediates
-  lx_pipeline_wait_prior(0);              // this thread's rows have landed
+  lx::pdl_wait();  // stage 1 has written the intermediates
+  cp_async_wait_all();              // this thread's rows have landed
   const uint4* src = reinterpret_cast<const uint4*>(inter + static_cast<int64_t>(t) * top_k * I);
   uint4* dst = reinterpret_cast<uint4*>(h);
   for (int v = threadIdx.x; v < top_k * I / 8; v += kThreads) dst[v] = src[v];
@@ -310,7 +308,7 @@ __global__ void __launch_bounds__(kThreads, kMinBlocksB) w8_down_vec(const bf16*
 #pragma unroll
   for (int k = 0; k < kMaxTopK; ++k) {
     if (k < top_k) {
-      for (int col = 16 * lane; col < I; col += 16 * LX_WARP) {
+      for (int col = 16 * lane; col < I; col += 512) {
         const uint4 xa = *reinterpret_cast<const uint4*>(h + k * I + col);
         const uint4 xb = *reinterpret_cast<const uint4*>(h + k * I + col + 8);
         const uint4 w = *reinterpret_cast<const uint4*>(rows + k * I + col);
@@ -333,11 +331,11 @@ __global__ void __launch_bounds__(kThreads) w8_down_scalar(const bf16* __restric
   extern __shared__ __align__(16) unsigned char smem_raw[];
   bf16* h = reinterpret_cast<bf16*>(smem_raw);
   const int t = blockIdx.x % T;
-  const int l = (blockIdx.x / T) * kWarps + (threadIdx.x / LX_WARP);
-  const int lane = threadIdx.x & (LX_WARP - 1);
+  const int l = (blockIdx.x / T) * kWarps + (threadIdx.x >> 5);
+  const int lane = threadIdx.x & 31;
   const bool live = l < L;
 
-  lx_pdl_wait();
+  lx::pdl_wait();
   for (int v = threadIdx.x; v < top_k * I; v += kThreads) h[v] = inter[static_cast<int64_t>(t) * top_k * I + v];
   __syncthreads();
   if (!live) return;
@@ -348,7 +346,7 @@ __global__ void __launch_bounds__(kThreads) w8_down_scalar(const bf16* __restric
     const int64_t row = static_cast<int64_t>(ids[p]) * L + l;
     const float ck = weights[p] * down_scale[row];
     float dot = 0.0f;
-    for (int col = lane; col < I; col += LX_WARP) {
+    for (int col = lane; col < I; col += 32) {
       dot = fmaf(static_cast<float>(down[row * I + col]), lx::to_f32(h[k * I + col]), dot);
     }
     acc = fmaf(ck, dot, acc);
@@ -372,7 +370,7 @@ hipError_t launch_kernel(void (*kernel)(Params...), unsigned int grid, size_t sm
   cfg.dynamicSmemBytes = smem;
   cfg.stream = s;
   cfg.attrs = &attr;
-  cfg.numAttrs = dependent ? 1 : 0;
+  cfg.numAttrs = dependent && lx::pdl_available() ? 1 : 0;  // below sm_90 an ordinary launch: stream order holds
   return lx_launch_kernel_ex(&cfg, kernel, args...);
 }
 
@@ -384,11 +382,10 @@ extern "C" int lx_moe_experts_w8(const void* latent, const int32_t* ids, const f
                                  int top_k, void* stream) {
   if (T <= 0) return 0;
   const int64_t pairs = static_cast<int64_t>(T) * top_k;
-  const int wpb = warps_per_block();
-  const int64_t rows_a = (I + wpb - 1) / wpb;  // stage 1 blocks per pair
-  const int64_t rows_b = (L + wpb - 1) / wpb;  // stage 2 blocks per token
+  const int64_t rows_a = (I + kWarps - 1) / kWarps;  // stage 1 blocks per pair
+  const int64_t rows_b = (L + kWarps - 1) / kWarps;  // stage 2 blocks per token
   const size_t smem = sizeof(bf16) * static_cast<size_t>(top_k) * static_cast<size_t>(I > 0 ? I : 0);
-  const size_t smem_vec = static_cast<size_t>(2 + wpb) * static_cast<size_t>(top_k) * static_cast<size_t>(I > 0 ? I : 0);
+  const size_t smem_vec = static_cast<size_t>(2 + kWarps) * static_cast<size_t>(top_k) * static_cast<size_t>(I > 0 ? I : 0);
   // The intermediates are read back as 16-byte vectors, so the workspace must be 16-byte aligned.
   if (L <= 0 || I <= 0 || top_k < 1 || top_k > kMaxTopK || smem > kMaxSmem || workspace == nullptr ||
       (reinterpret_cast<uintptr_t>(workspace) & 15) != 0 || pairs * rows_a > INT32_MAX ||
@@ -401,8 +398,7 @@ extern "C" int lx_moe_experts_w8(const void* latent, const int32_t* ids, const f
   const int P = static_cast<int>(pairs);
   const int ra = static_cast<int>(rows_a);
   const auto grid_a = static_cast<unsigned int>(pairs * rows_a);
-  const int chunk = 16 * lx_warp_size();  // bytes one wavefront covers per vector load
-  const int nca = (L + chunk - 1) / chunk;
+  const int nca = (L + 511) / 512;
   const int vec_a = L % 16 == 0 && nca <= kMaxVecChunks ? nca : 0;
 
   // Stage 1 is a plain launch: it reads the routing, which the stream has already finished.

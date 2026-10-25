@@ -458,13 +458,13 @@ LX_API int lx_bf16x_decode(const void* data, int64_t rows, int K, void* w, void*
 
 // lx_gemv for LX_W_BF16X weights w ([N, K] encoded, 8-byte aligned): the same contract (x, bias, y,
 // alpha, beta, M <= 8, f32 accumulation, deterministic, programmatic dependent launch), and y equal
-// bit for bit to lx_gemv on the bf16 weights the encoding came from.
+// bit for bit to lx_gemv on the bf16 weights the encoding came from. It runs the bf16 order class of the
+// shape, so like lx_gemv a row's bits do not depend on M.
 LX_API int lx_gemv_bf16x(const void* x, lx_dtype x_dtype, int ld_x, const void* w, const void* bias,
                          lx_dtype bias_dtype, void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K, float alpha,
                          float beta, void* stream);
-// The same kernel on plain bf16 weights ([N, K], 16-byte aligned for the vector path): the
-// like-for-like baseline the format is measured against, and itself bit-identical to lx_gemv. Built
-// per M bucket, it is faster than lx_gemv at M = 1 on every Praxis shape, not at M = 8.
+// The bf16 baseline the format is measured against: lx_gemv on LX_W_BF16 weights, kept as an entry
+// point for callers built against it.
 LX_API int lx_gemv_decode_bf16(const void* x, lx_dtype x_dtype, int ld_x, const void* w, const void* bias,
                                lx_dtype bias_dtype, void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K,
                                float alpha, float beta, void* stream);

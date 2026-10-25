@@ -126,7 +126,12 @@ def floor_us():
 
 
 # The Praxis decode products (N x K), and the logits projection.
-SHAPES = [(10304, 2048), (2048, 4096), (3072, 2048), (2048, 2048), (1024, 2048), (2048, 1024), (65536, 2048)]
+SHAPES = [
+    (10304, 2048), (2048, 4096), (3072, 2048), (2048, 2048), (1024, 2048), (2048, 1024), (65536, 2048),
+    # the rest of a Praxis decode step: shared expert gate_up and down, the depth memory's state, query and
+    # route projections, and the attention pass LoRA's down projection
+    (1024, 1024), (1024, 512), (256, 2048), (256, 6400), (8, 2048),
+]
 
 
 def main():

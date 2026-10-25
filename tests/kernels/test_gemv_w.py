@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from conftest import BF16, DTYPE, F32, close
+from conftest import BACKEND, BF16, DTYPE, F32, close
 from formats import FORMATS, W_BF16, W_FP8, W_INT8, W_NVFP4, random_weight
 
 FMT_NAMES = list(FORMATS)
@@ -26,6 +26,11 @@ METIS_SHAPES = [  # (N, K): the Praxis decode products
     (1024, 2048),
     (2048, 1024),
     (65536, 2048),
+    (1024, 1024),
+    (1024, 512),
+    (256, 2048),
+    (256, 6400),
+    (8, 2048),
 ]
 
 
@@ -202,6 +207,8 @@ def test_gemv_w_every_variant(lx, fmt, x_dtype):
     setup_tuner(lib)
     kernel = f"gemv_w_{fmt}".encode()
     variants = lib.lx_tune_variants(kernel)
+    if variants == 0 and BACKEND != "cuda":
+        pytest.skip("this backend's GEMV has one variant (the CPU's products have one order)")
     assert variants > 0
     try:
         for M, N, K in [(1, 300, 1040), (3, 77, 2048), (8, 129, 1024), (5, 50, 1296), (2, 64, 528)]:
@@ -288,6 +295,8 @@ def test_order_class_is_the_same_for_every_batch_size(lx, fmt, N, K):
     setup_tuner(lib)
     key = f"gemv_w_{fmt}".encode()
     count = lib.lx_tune_variants(key)
+    if count == 0 and BACKEND != "cuda":
+        pytest.skip("this backend's GEMV has one variant (the CPU's products have one order)")
     admitted = {}
     try:
         for M in (1, 2, 4, 8):

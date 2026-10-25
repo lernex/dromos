@@ -9,11 +9,31 @@
 namespace lx::cpu {
 
 // A weight's format as the kernels read it: kernels.h's lx_wtype, plus f32 (the routers, the depth head).
-enum : int { kW_BF16 = 0, kW_INT8 = 1, kW_FP8 = 2, kW_NVFP4 = 3, kW_F32 = 4 };
+enum : int { kW_BF16 = 0, kW_INT8 = 1, kW_FP8 = 2, kW_NVFP4 = 3, kW_BF16X = 4, kW_F32 = 5 };
+
+// The LX_W_BF16X layout (kernels.h, "Weight formats"; cuda/bf16x.cuh has it in full). Every function is
+// static: this header is compiled once per ISA level, and nothing in it may get external linkage.
+namespace bf16x {
+constexpr int kBlock = 128;        // values per block (one base exponent)
+constexpr int kBlockBytes = 192;   // 128 sign|mantissa bytes, then 64 bytes of 4-bit codes
+constexpr int kCodes = 128;        // offset of the codes in a block
+constexpr uint32_t kNoPatch = 0xffffffffu;
+constexpr int kMaxK = 1 << 23;     // patch positions are 23 bits
+static constexpr int blocks(int64_t K) { return static_cast<int>((K + kBlock - 1) / kBlock); }
+// At least 2 + K / 2048 patch slots, and as many more as fit in the header's padding to 8 bytes.
+static constexpr int header_bytes(int64_t K) {
+  return static_cast<int>((4 * (2 + K / 2048) + blocks(K) + 7) / 8 * 8);
+}
+static constexpr int patch_slots(int64_t K) { return (header_bytes(K) - blocks(K)) / 4; }
+static constexpr int base_offset(int64_t K) { return 4 * patch_slots(K); }
+static constexpr int64_t row_bytes(int64_t K) {
+  return header_bytes(K) + static_cast<int64_t>(kBlockBytes) * blocks(K);
+}
+}  // namespace bf16x
 
 // One [N, K] matrix in its format (the rows of one expert, for a stack). The per-row factor (the INT8 /
 // FP8 row scale, the NVFP4 global) is never applied by the dot kernels: their callers apply it once per
-// output, so sum_k x * (q * s) = s * sum_k x * q.
+// output, so sum_k x * (q * s) = s * sum_k x * q. BF16X rows are bf16x::row_bytes(K) apart.
 struct WeightRef {
   int type;
   const void* data;
@@ -23,6 +43,8 @@ struct WeightRef {
 // sums[m, n] = sum_k x[m, k] * w[n, k] (NVFP4 block scales applied) for f32 activations.
 // Accumulation is in f32, lane-wise over the vector width, in k order, then one fixed horizontal sum,
 // so a row's result never depends on M, on the tile it falls in or on the thread that computes it.
+// With out_d, the sums are exact instead, in double, written to out_d (out is unused): for the FP8 and
+// FP4 maths, whose operands are quantized values with exact f32 products (FP8 and NVFP4 weights only).
 struct DotF32 {
   const float* x;  // [M, K] f32, row stride ld_x
   int64_t ld_x;
@@ -32,6 +54,7 @@ struct DotF32 {
   int64_t ld_out;
   float* panel;  // per-thread scratch for decoded weight rows (panel_floats f32), or null
   int64_t panel_floats;
+  double* out_d = nullptr;  // exact sums, laid out as out
 };
 
 // sums[m, n] = sum_k x[m, k] * w[n, k] for int8 activations and int8 weights, exact in int32, written

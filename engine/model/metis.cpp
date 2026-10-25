@@ -191,7 +191,7 @@ struct MetisModel::Impl {
   std::string w8_keep;  // LX_W8_KEEP: comma-separated name fragments that stay bf16 for decode
   bool bf16x = false;        // LX_BF16X: decode reads lossless compressed bf16 copies (no int8)
   bool keep_bf16x = false;   // LX_KEEP_BF16X: what decode would read as plain bf16 it reads as LX_W_BF16X
-  bool decode_bf16 = false;  // LX_DECODE_BF16: plain bf16 decode products run on bf16x.cu's kernels
+  bool decode_bf16 = false;  // LX_DECODE_BF16: plain bf16 decode experts run on bf16x.cu's expert kernels
   void *streams_bf, *retrieved_bf, *feat_in_bf, *h_bf, *normed_bf, *lora_bf, *att_bf, *latent_bf, *shared_bf,
       *routed_bf, *entry_bf, *meta_bf, *out_bf;
 
@@ -574,7 +574,8 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
   // LX_W_BF16X (bf16x.cu) is lossless, so either switch keeps the logits of the path it replaces to
   // the bit. LX_BF16X: every decode projection is read compressed instead of int8 or bf16 (BF16
   // logits). LX_KEEP_BF16X: int8 stays, and what stays bf16 (LX_W8_KEEP) is read compressed.
-  // LX_DECODE_BF16 (for measuring the format against the same kernels): plain bf16 through them.
+  // LX_DECODE_BF16 (for measuring the format against the same kernels): plain bf16 experts through
+  // bf16x.cu's expert kernels. Its GEMV runs lx_gemv's own order, so lx_gemv is already that baseline.
   m.bf16x = std::getenv("LX_BF16X") != nullptr;
   m.keep_bf16x = std::getenv("LX_KEEP_BF16X") != nullptr;
   m.decode_bf16 = std::getenv("LX_DECODE_BF16") != nullptr;
@@ -961,9 +962,6 @@ void linear(Impl& m, const Linear& l, const void* x, lx_dtype x_dtype, int ld_x,
       void* yr = static_cast<char*>(y) + ys * r0 * ld_y;
       if (l.x16)
         LX_CHECK(lx_gemv_bf16x(xr, x_dtype, ld_x, l.x16, l.bias, LX_BF16, yr, y_dtype, ld_y, rows, l.N, l.K, alpha, beta, s));
-      else if (m.decode_bf16 && !l.q)
-        LX_CHECK(lx_gemv_decode_bf16(xr, x_dtype, ld_x, l.w, l.bias, LX_BF16, yr, y_dtype, ld_y, rows, l.N, l.K, alpha,
-                                     beta, s));
       else
         LX_CHECK(lx_gemv(xr, x_dtype, ld_x, l.q ? static_cast<const void*>(l.q) : l.w, l.q ? LX_W_INT8 : LX_W_BF16,
                          l.scale, l.bias, LX_BF16, yr, y_dtype, ld_y, rows, l.N, l.K, alpha, beta, s));
@@ -1738,7 +1736,7 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
       else if (T <= Impl::kGemvRows && layer.gate_up_q)
         LX_CHECK(lx_moe_experts_w8(m.latent_bf, m.route_ids, m.route_w, layer.gate_up_q, layer.gate_up_scale,
                                    layer.down_q, layer.down_scale, m.routed, m.moe_workspace, T, Lat, m.Iexp, m.K, s));
-      else if (m.grouped_experts)
+      else if (m.grouped_experts && T > Impl::kGemvRows)  // decode-sized steps keep moe.cu's decode kernel
         LX_CHECK(lx_moe_experts_grouped(m.latent_bf, m.route_ids, m.route_w, &layer.gate_up_pw, &layer.down_pw,
                                         layer.gate_up_pw.type == LX_W_BF16 ? LX_MATH_BF16 : m.prefill_math, m.routed,
                                         m.moe_grouped_ws, T, Lat, m.Iexp, E, m.K, s));
