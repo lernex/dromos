@@ -1,0 +1,10 @@
+// The order class of a decode GEMV (gemv.cu): the split-K S that a (format, N, K) runs with at every
+// batch size. It is the one launch choice that sets the order a row's sums run in, so a kernel that must
+// reproduce lx_gemv_w's bits (bf16x.cu, for LX_W_BF16) takes its split from here and cannot disagree.
+#pragma once
+
+namespace lx {
+
+int gemv_order_class(int format, int N, int K);  // format: an lx_wtype
+
+}  // namespace lx

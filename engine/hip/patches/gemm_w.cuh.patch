@@ -1,0 +1,25 @@
+--- a/gemm_w.cuh
++++ b/gemm_w.cuh
+@@ -144,19 +144,9 @@
+     kernel<<<grid, C::kThreads, C::kSmem, s>>>(pp, ep);
+     return lx::launch_status();
+   } else {
+-    lx_launch_config cfg{};
+-    cfg.gridDim = dim3(grid);
+-    cfg.blockDim = dim3(C::kThreads);
+-    cfg.dynamicSmemBytes = C::kSmem;
+-    cfg.stream = s;
+-    lx_launch_attr a[1];
+-    a[0].id = hipLaunchAttributeClusterDimension;
+-    a[0].val.clusterDim.x = kSplit;
+-    a[0].val.clusterDim.y = 1;
+-    a[0].val.clusterDim.z = 1;
+-    cfg.attrs = a;
+-    cfg.numAttrs = 1;
+-    return static_cast<int>(lx_launch_kernel_ex(&cfg, kernel, pp, ep));
++    // HIP has no thread-block clusters, so the split variants are never offered (common.cuh: kNoClusterArch)
++    // and this branch is not launched; it reports that instead of running a kernel without its cluster.
++    return static_cast<int>(hipErrorNotSupported);
+   }
+ }
+ 

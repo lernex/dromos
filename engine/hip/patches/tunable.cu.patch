@@ -1,14 +1,6 @@
 --- a/tunable.cu
 +++ b/tunable.cu
-@@ -5,6 +5,7 @@
- #include "lx_hip.h"
- 
- #include <cstdlib>
-+#include <cstring>
- #include <map>
- #include <mutex>
- #include <string>
-@@ -20,12 +21,32 @@
+@@ -35,12 +35,32 @@
  
  int g_override = -1;  // -1: not read from the environment yet
  
@@ -27,14 +19,14 @@
  int device_arch() {
 -  int dev = 0, major = 0, minor = 0;
 -  hipGetDevice(&dev);
--  hipDeviceGetAttribute(&major, hipDevAttrComputeCapabilityMajor, dev);
--  hipDeviceGetAttribute(&minor, hipDevAttrComputeCapabilityMinor, dev);
+-  hipDeviceGetAttribute(&major, hipDeviceAttributeComputeCapabilityMajor, dev);
+-  hipDeviceGetAttribute(&minor, hipDeviceAttributeComputeCapabilityMinor, dev);
 +  int dev = 0;
 +  if (hipGetDevice(&dev) != hipSuccess) return 0;
 +#if defined(LX_NVIDIA_SHIM)
 +  int major = 0, minor = 0;
-+  if (hipDeviceGetAttribute(&major, hipDevAttrComputeCapabilityMajor, dev) != hipSuccess ||
-+      hipDeviceGetAttribute(&minor, hipDevAttrComputeCapabilityMinor, dev) != hipSuccess)
++  if (hipDeviceGetAttribute(&major, hipDeviceAttributeComputeCapabilityMajor, dev) != hipSuccess ||
++      hipDeviceGetAttribute(&minor, hipDeviceAttributeComputeCapabilityMinor, dev) != hipSuccess)
 +    return 0;
    return major * 10 + minor;
 +#else
@@ -45,12 +37,3 @@
  }
  
  std::map<std::string, std::vector<std::string>>& registry() {
-@@ -52,7 +73,7 @@
- int lx_arch(void) {
-   static thread_local int cached_dev = -1, cached_real = 0;
-   int dev = 0;
--  hipGetDevice(&dev);
-+  if (hipGetDevice(&dev) != hipSuccess) return 0;
-   if (dev != cached_dev) {
-     cached_dev = dev;
-     cached_real = device_arch();

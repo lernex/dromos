@@ -3,6 +3,11 @@
 // The runtime half of the backend ABI (kernels.h, "Runtime"), on the CUDA runtime.
 #include "lx_hip.h"
 
+#include <dlfcn.h>
+#include <unistd.h>
+
+#include <cstdio>
+
 #include "kernels.h"
 
 namespace {
@@ -45,9 +50,10 @@ int lx_rt_memset(void* ptr, int value, int64_t bytes, void* stream) {
 
 int lx_rt_copy(void* dst, const void* src, int64_t bytes, lx_copy_kind kind, void* stream) {
   if (bytes <= 0) return 0;
-  const hipMemcpyKind k = kind == LX_COPY_H2D   ? hipMemcpyHostToDevice
-                           : kind == LX_COPY_D2H ? hipMemcpyDeviceToHost
-                                                 : hipMemcpyDeviceToDevice;
+  const hipMemcpyKind k = kind == LX_COPY_H2D      ? hipMemcpyHostToDevice
+                           : kind == LX_COPY_D2H    ? hipMemcpyDeviceToHost
+                           : kind == LX_COPY_DEFAULT ? hipMemcpyDefault
+                                                    : hipMemcpyDeviceToDevice;
   return status(hipMemcpyAsync(dst, src, static_cast<size_t>(bytes), k, as_stream(stream)));
 }
 
@@ -94,5 +100,94 @@ int lx_rt_graph_launch(void* graph, void* stream) {
 }
 int lx_rt_graph_destroy(void* graph) { return status(hipGraphExecDestroy(static_cast<hipGraphExec_t>(graph))); }
 int lx_rt_last_error(void) { return status(hipGetLastError()); }
+
+int lx_rt_event_create_timed(void** event) {
+  hipEvent_t e = nullptr;
+  const int r = status(hipEventCreate(&e));
+  *event = e;
+  return r;
+}
+
+int lx_rt_event_elapsed(void* start, void* stop, float* ms) {
+  return status(hipEventElapsedTime(ms, static_cast<hipEvent_t>(start), static_cast<hipEvent_t>(stop)));
+}
+
+int lx_rt_device_sync(void) { return status(hipDeviceSynchronize()); }
+
+const char* lx_rt_error_string(int code) { return hipGetErrorString(static_cast<hipError_t>(code)); }
+
+int lx_rt_is_host_memory(const void* ptr) {
+  hipPointerAttribute_t attr{};
+  return hipPointerGetAttributes(&attr, ptr) == hipSuccess && attr.type == hipMemoryTypeHost ? 1 : 0;
+}
+
+int lx_rt_device_props(int ordinal, lx_device_props* props) {
+  hipDeviceProp_t prop{};
+  if (hipError_t e = hipGetDeviceProperties(&prop, ordinal); e != hipSuccess) return status(e);
+  std::snprintf(props->name, sizeof(props->name), "%s", prop.name);
+  // The attributes in lx_device_props order: capability major and minor, SMs, L2, memory clock, bus width.
+  const hipDeviceAttribute_t attrs[6] = {hipDeviceAttributeComputeCapabilityMajor, hipDeviceAttributeComputeCapabilityMinor,
+                                   hipDeviceAttributeMultiprocessorCount,    hipDeviceAttributeL2CacheSize,
+                                   hipDeviceAttributeMemoryClockRate,        hipDeviceAttributeMemoryBusWidth};
+  int v[6] = {};
+  for (int i = 0; i < 6; ++i)
+    if (hipError_t e = hipDeviceGetAttribute(&v[i], attrs[i], ordinal); e != hipSuccess) return status(e);
+  props->cc_major = v[0];
+  props->cc_minor = v[1];
+  props->sms = v[2];
+  props->l2_bytes = v[3];
+  props->mem_clock_khz = v[4];
+  props->bus_bits = v[5];
+  int driver = 0, runtime = 0;
+  hipDriverGetVersion(&driver);
+  hipRuntimeGetVersion(&runtime);
+  props->driver_version = driver;
+  props->runtime_version = runtime;
+  return 0;
+}
+
+int lx_rt_process_memory(int64_t* bytes) {
+  // NVML, loaded by path so nothing links against it: the GPU memory the driver charges this process,
+  // summed over the devices it has a context on.
+  struct ProcessInfo {  // nvmlProcessInfo_v2_st
+    unsigned int pid;
+    unsigned long long used;
+    unsigned int gpu_instance, compute_instance;
+  };
+  using InitFn = int (*)();
+  using CountFn = int (*)(unsigned int*);
+  using HandleFn = int (*)(unsigned int, void**);
+  using ProcsFn = int (*)(void*, unsigned int*, ProcessInfo*);
+  static void* lib = dlopen("libnvidia-ml.so.1", RTLD_NOW | RTLD_LOCAL);
+  if (!lib) return LX_ERR_NOT_SUPPORTED;
+  static const bool ready = [] {
+    auto init = reinterpret_cast<InitFn>(dlsym(lib, "nvmlInit_v2"));
+    return init && init() == 0;
+  }();
+  auto count_fn = reinterpret_cast<CountFn>(dlsym(lib, "nvmlDeviceGetCount_v2"));
+  auto handle_fn = reinterpret_cast<HandleFn>(dlsym(lib, "nvmlDeviceGetHandleByIndex_v2"));
+  auto procs_fn = reinterpret_cast<ProcsFn>(dlsym(lib, "nvmlDeviceGetComputeRunningProcesses_v3"));
+  if (!ready || !count_fn || !handle_fn || !procs_fn) return LX_ERR_NOT_SUPPORTED;
+  unsigned int devices = 0;
+  if (count_fn(&devices) != 0) return LX_ERR_NOT_SUPPORTED;
+  const unsigned int pid = static_cast<unsigned int>(getpid());
+  int64_t total = 0;
+  bool found = false;
+  for (unsigned int d = 0; d < devices; ++d) {
+    void* h = nullptr;
+    if (handle_fn(d, &h) != 0) continue;
+    ProcessInfo info[64];
+    unsigned int n = 64;
+    if (procs_fn(h, &n, info) != 0) continue;
+    for (unsigned int i = 0; i < n; ++i)
+      if (info[i].pid == pid && info[i].used != ~0ull) {  // ~0: NVML_VALUE_NOT_AVAILABLE
+        total += static_cast<int64_t>(info[i].used);
+        found = true;
+      }
+  }
+  if (!found) return LX_ERR_NOT_SUPPORTED;
+  *bytes = total;
+  return 0;
+}
 
 }  // extern "C"

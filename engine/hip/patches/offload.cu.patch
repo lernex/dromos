@@ -1,0 +1,23 @@
+--- a/offload.cu
++++ b/offload.cu
+@@ -495,17 +495,9 @@
+   st.slot_prefetched[v] = prefetched ? 1 : 0;
+ }
+ 
+-__device__ __forceinline__ uint64_t global_ns() {
+-  uint64_t t;
+-  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+-  return t;
+-}
+-
+-__device__ __forceinline__ uint32_t load_acquire_sys(const volatile uint32_t* p) {
+-  uint32_t v;
+-  asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+-  return v;
+-}
++__device__ __forceinline__ uint64_t global_ns() { return lx_global_ns(); }
++
++__device__ __forceinline__ uint32_t load_acquire_sys(const volatile uint32_t* p) { return lx_load_acquire_sys(p); }
+ 
+ __global__ void ox_plan(const int32_t* __restrict__ ids, const float* __restrict__ weights,
+                         const bf16* __restrict__ latent, int layer, lx_offload_state* sp, lx_expert_ref* src,

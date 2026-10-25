@@ -95,9 +95,8 @@ constexpr int kRowMax = 64 + 2 * 256 + 4;
 
 __host__ __device__ constexpr int round4(int v) { return (v + 3) & ~3; }
 
-// The CUDA build stages these with cp.async and waits before the barrier. The HIP port copies in
-// place: the stage is written before the barrier that precedes every read of it, which is the same
-// ordering the wait gave.
+// The CUDA build stages these with cp.async and waits before the barrier. The HIP port copies in place:
+// the stage is written before the barrier that precedes every read of it, which is the ordering the wait gave.
 __device__ __forceinline__ void cp_async_f32(float* smem, const float* gmem) { *smem = *gmem; }
 __device__ __forceinline__ void cp_async_commit() {}
 __device__ __forceinline__ void cp_async_wait_all() {}
@@ -209,7 +208,7 @@ __global__ void __launch_bounds__(256) ssm_scan_kernel(const ScanArgs a) {
       }
       float y = (acc[0] + acc[1]) + (acc[2] + acc[3]);
 #pragma unroll
-      for (int o = 1; o < 4; o <<= 1) y += __shfl_xor_sync(LX_FULL_MASK, y, o);
+      for (int o = 1; o < 4; o <<= 1) y += lx_shfl_xor_sync(0xffffffffu, y, o);
       if (valid && q == 0) a.y[(static_cast<int64_t>(start + c * kChunk + tok) * a.H + h) * P + p] = y + Dh * xp;
     }
     cp_async_wait_all();
@@ -286,8 +285,7 @@ extern "C" int lx_ssm_scan_varlen(const float* x, int ld_x, const float* dt_raw,
   if (ld_x < H * P || ld_dt < H || ld_bc < G * N) return static_cast<int>(hipErrorInvalidValue);
 
   // Four lanes per row, rounded up to a whole warp; rows past P are idle.
-  const int wave = lx_warp_size();
-  const int threads = (4 * P + wave - 1) / wave * wave;
+  const int threads = (4 * P + 31) / 32 * 32;
   // N/4 column chunks, dealt to the four lanes of a row: NI chunks each (up to 16 for N = 256).
   const int ni = ((N + 3) / 4 + 3) / 4;
   const ScanArgs args{x,      ld_x,     dt_raw,  ld_dt,  B,        C,     ld_bc,   A_log,
@@ -305,8 +303,7 @@ extern "C" int lx_gated_rmsnorm(const float* y, const float* z, int ld_z, const 
   if (T <= 0) return 0;
   if (I <= 0 || groups <= 0 || I % groups != 0 || ld_z < I) return static_cast<int>(hipErrorInvalidValue);
   const int K = I / groups;
-  const int wave = lx_warp_size();
-  const int threads = K >= 256 ? 256 : ((K + wave - 1) / wave) * wave;
+  const int threads = K >= 256 ? 256 : ((K + 31) / 32) * 32;
   auto s = static_cast<hipStream_t>(stream);
   gated_rmsnorm_kernel<<<T * groups, threads, 0, s>>>(y, z, ld_z, static_cast<const __hip_bfloat16*>(w),
                                                       static_cast<__hip_bfloat16*>(out), I, groups, eps);

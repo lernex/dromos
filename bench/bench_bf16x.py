@@ -1,9 +1,10 @@
 """Lossless BF16 (LX_W_BF16X) decode benchmark: lx_gemv_bf16x against lx_gemv on the same bf16 weights,
 and lx_moe_experts_bf16x against the bf16 expert kernels, at every Praxis decode shape.
 
-Each table has two baselines: what decode runs on bf16 today (lx_gemv, moe.cu) and the same kernels as
-the format's on plain bf16 (lx_gemv_decode_bf16, lx_moe_experts_decode_bf16). The first is the speedup
-a switch to the format buys; the second isolates what the bytes alone buy.
+The GEMV baseline is lx_gemv on the same bf16 weights, which is also the order lx_gemv_bf16x follows,
+so the ratio is what the bytes buy. The experts table has two baselines: what decode runs on bf16
+today (moe.cu) and the format's kernels on plain bf16 (lx_moe_experts_decode_bf16). The first is the
+speedup a switch to the format buys; the second isolates what the bytes alone buy.
 
 GEMV: every launch reads its own weight copy (Gaussian, so patches occur at Praxis's rate), and the
 copies together are several times the 48 MB L2, so reads come from DRAM. The launches are captured in
@@ -17,7 +18,8 @@ what decode runs on bf16 today) and lx_moe_experts_decode_bf16 (this file's kern
 like-for-like comparison).
 
 Run: scripts/remote.sh SLOT x '$PY bench/bench_bf16x.py [--sweep]'
-  --sweep  also time every GEMV variant per shape (rows per warp, steps in flight)
+  --sweep  also time every gemv_bf16x variant per shape (rows, ring depth, loop form; the split-K
+           is the shape's bf16 order class from gemv.cu and is not swept)
 """
 
 import ctypes
@@ -39,12 +41,11 @@ lib.lx_gemv.argtypes = [
     c.c_void_p, c.c_int, c.c_int, c.c_void_p, c.c_int, c.c_void_p, c.c_void_p, c.c_int,
     c.c_void_p, c.c_int, c.c_int, c.c_int, c.c_int, c.c_int, c.c_float, c.c_float, c.c_void_p,
 ]
-for name in ("lx_gemv_bf16x", "lx_gemv_decode_bf16"):
-    getattr(lib, name).restype = c.c_int
-    getattr(lib, name).argtypes = [
-        c.c_void_p, c.c_int, c.c_int, c.c_void_p, c.c_void_p, c.c_int,
-        c.c_void_p, c.c_int, c.c_int, c.c_int, c.c_int, c.c_int, c.c_float, c.c_float, c.c_void_p,
-    ]
+lib.lx_gemv_bf16x.restype = c.c_int
+lib.lx_gemv_bf16x.argtypes = [
+    c.c_void_p, c.c_int, c.c_int, c.c_void_p, c.c_void_p, c.c_int,
+    c.c_void_p, c.c_int, c.c_int, c.c_int, c.c_int, c.c_int, c.c_float, c.c_float, c.c_void_p,
+]
 lib.lx_bf16x_bytes.restype = c.c_int64
 lib.lx_bf16x_bytes.argtypes = [c.c_void_p, c.c_int64, c.c_int, c.c_void_p]
 lib.lx_bf16x_encode.argtypes = [c.c_void_p, c.c_int64, c.c_int, c.c_void_p, c.c_int64, c.c_void_p]
@@ -122,10 +123,6 @@ class GemvShape:
         if fmt == "bf16":
             fs = [lambda w=w: ok(lib.lx_gemv(x.data_ptr(), x_dtype, K, w.data_ptr(), W_BF16, None, None, F32,
                                              y.data_ptr(), F32, N, M, N, K, 1.0, 0.0, stream())) for w in self.w]
-        elif fmt == "decode_bf16":
-            fs = [lambda w=w: ok(lib.lx_gemv_decode_bf16(x.data_ptr(), x_dtype, K, w.data_ptr(), None, F32,
-                                                         y.data_ptr(), F32, N, M, N, K, 1.0, 0.0, stream()))
-                  for w in self.w]
         else:
             fs = [lambda w=w: ok(lib.lx_gemv_bf16x(x.data_ptr(), x_dtype, K, w.data_ptr(), None, F32, y.data_ptr(),
                                                    F32, N, M, N, K, 1.0, 0.0, stream())) for w in self.x16]
@@ -151,20 +148,17 @@ SHAPES = [  # (N, K, what) of every Praxis decode GEMV
 def gemv_table(sweep):
     name = b"gemv_bf16x"
     nvar = lib.lx_tune_variants(name)
-    print("| N x K | product | M | x | lx_gemv us | lx_gemv GB/s | decode bf16 us | decode bf16 GB/s | BF16X us | "
-          "BF16X GB/s | BF16X % | vs lx_gemv | vs decode bf16 |")
-    print("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    print("| N x K | product | M | x | lx_gemv us | lx_gemv GB/s | BF16X us | BF16X GB/s | BF16X % | vs lx_gemv |")
+    print("|---|---|---|---|---|---|---|---|---|---|")
     for N, K, what in SHAPES:
         shape = GemvShape(N, K)
         for M, x_dtype in ((1, BF16), (1, F32), (4, BF16), (4, F32), (8, BF16)):
             lib.lx_tune_clear()
             t16 = shape.time("bf16", M, x_dtype)
-            td = shape.time("decode_bf16", M, x_dtype)
             tx = shape.time("bf16x", M, x_dtype)
-            g16, gd, gx = gbps(shape.bytes_bf16, t16), gbps(shape.bytes_bf16, td), gbps(shape.bytes_x, tx)
+            g16, gx = gbps(shape.bytes_bf16, t16), gbps(shape.bytes_x, tx)
             print(f"| {N} x {K} | {what} | {M} | {'bf16' if x_dtype == BF16 else 'f32'} | {t16:.2f} | {g16:.0f} | "
-                  f"{td:.2f} | {gd:.0f} | {tx:.2f} | {gx:.0f} | {100 * gx / DRAM_GBPS:.1f} | {t16 / tx:.3f}x | "
-                  f"{td / tx:.3f}x |", flush=True)
+                  f"{tx:.2f} | {gx:.0f} | {100 * gx / DRAM_GBPS:.1f} | {t16 / tx:.3f}x |", flush=True)
             if sweep:
                 row = []
                 for v in range(nvar):
