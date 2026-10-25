@@ -20,22 +20,27 @@ using bf16x::kCodes;
 using bf16x::kMaxK;
 using bf16x::kNoPatch;
 
-inline uint32_t exponent(uint16_t v) { return (v >> 7) & 0xffu; }
-
-// The largest exponent of each block of a row (padding past K counts as 0).
-void block_bases(const uint16_t* w, int K, uint8_t* bases) {
-  for (int b = 0; b < bf16x::blocks(K); ++b) {
-    uint32_t e0 = 0;
-    for (int k = b * kBlock, end = std::min(K, (b + 1) * kBlock); k < end; ++k) e0 = std::max(e0, exponent(w[k]));
-    bases[b] = static_cast<uint8_t>(e0);
-  }
+// One block's exponents (padding past the row's end is 0) and their largest. Plain loops over a block, which
+// the compiler vectorizes.
+inline uint8_t block_exponents(const uint16_t* w, int n, uint8_t* e) {
+  uint8_t e0 = 0;
+  for (int i = 0; i < n; ++i) e[i] = static_cast<uint8_t>(w[i] >> 7);  // the sign falls off the byte
+  for (int i = n; i < kBlock; ++i) e[i] = 0;
+  for (int i = 0; i < kBlock; ++i) e0 = std::max(e0, e[i]);
+  return e0;
 }
 
 // Values more than 15 binades below their block's largest exponent: the row's patches.
-int64_t count_patches(const uint16_t* w, int K, uint8_t* bases) {
-  block_bases(w, K, bases);
+int64_t count_patches(const uint16_t* w, int K) {
   int64_t n = 0;
-  for (int k = 0; k < K; ++k) n += bases[k / kBlock] - exponent(w[k]) > 15u;
+  alignas(64) uint8_t e[kBlock];
+  for (int k0 = 0; k0 < K; k0 += kBlock) {
+    const int m = std::min(kBlock, K - k0);
+    const uint8_t e0 = block_exponents(w + k0, m, e);
+    int c = 0;
+    for (int i = 0; i < m; ++i) c += static_cast<uint8_t>(e0 - e[i]) > 15;
+    n += c;
+  }
   return n;
 }
 
@@ -54,7 +59,6 @@ void encode_row(const uint16_t* w, int K, uint8_t* rec, int64_t patches, int64_t
   const int P = bf16x::patch_slots(K), B = bf16x::blocks(K), H = bf16x::header_bytes(K);
   uint8_t* bases = rec + bf16x::base_offset(K);
   memset(rec, 0, static_cast<size_t>(H));
-  block_bases(w, K, bases);
   uint8_t* slots = rec;
   for (int s = 0; s < P; ++s) put32(slots + 4 * s, kNoPatch);
   uint8_t* list = slots;  // where the patches go: the slots, or the overflow record's entries
@@ -67,25 +71,27 @@ void encode_row(const uint16_t* w, int K, uint8_t* rec, int64_t patches, int64_t
     list = r + 4;
   }
   int64_t at = 0;
+  alignas(64) uint8_t e[kBlock], code[kBlock];
   for (int b = 0; b < B; ++b) {
     uint8_t* blk = rec + H + static_cast<int64_t>(b) * kBlockBytes;
-    memset(blk, 0, kBlockBytes);
-    const uint32_t e0 = bases[b];
-    for (int i = 0; i < kBlock; ++i) {
-      const int k = b * kBlock + i;
-      if (k >= K) break;
-      const uint16_t v = w[k];
-      const uint32_t e = exponent(v);
-      blk[i] = static_cast<uint8_t>(((v >> 8) & 0x80u) | (v & 0x7fu));
-      uint32_t code = e0 - e;
-      if (code > 15u) {
-        put32(list + 4 * at++, (static_cast<uint32_t>(k) << 8) | e);
-        code = 0;
+    const int k0 = b * kBlock, n = std::min(kBlock, K - k0);
+    const uint16_t* v = w + k0;
+    const uint8_t e0 = block_exponents(v, n, e);
+    bases[b] = e0;
+    for (int i = 0; i < n; ++i) blk[i] = static_cast<uint8_t>(((v[i] >> 8) & 0x80u) | (v[i] & 0x7fu));
+    for (int i = n; i < kBlock; ++i) blk[i] = 0;
+    for (int i = 0; i < kBlock; ++i) code[i] = static_cast<uint8_t>(e0 - e[i]);
+    // Patches (rare): the value's exponent goes in the list and its code is 0. Padding has no patch.
+    for (int i = 0; i < n; ++i)
+      if (code[i] > 15u) {
+        put32(list + 4 * at++, (static_cast<uint32_t>(k0 + i) << 8) | e[i]);
+        code[i] = 0;
       }
-      // Code word g covers values 8g .. 8g + 7: byte b of it holds value 8g + b low, 8g + 4 + b high.
-      uint8_t& cb = blk[kCodes + (i >> 3) * 4 + (i & 3)];
-      cb = static_cast<uint8_t>(cb | ((i & 4) ? code << 4 : code));
-    }
+    for (int i = n; i < kBlock; ++i) code[i] = 0;
+    // Code word g covers values 8g .. 8g + 7: byte j of it holds value 8g + j low, 8g + 4 + j high.
+    for (int g = 0; g < kBlock / 8; ++g)
+      for (int j = 0; j < 4; ++j)
+        blk[kCodes + 4 * g + j] = static_cast<uint8_t>(code[8 * g + j] | code[8 * g + 4 + j] << 4);
   }
 }
 
@@ -94,10 +100,8 @@ void encode_row(const uint16_t* w, int K, uint8_t* rec, int64_t patches, int64_t
 int64_t layout(const uint16_t* w, int64_t rows, int K, std::vector<int64_t>& counts, std::vector<int64_t>& rec_at) {
   counts.assign(static_cast<size_t>(rows), 0);
   rec_at.assign(static_cast<size_t>(rows), -1);
-  const int B = bf16x::blocks(K);
   parallel_for(rows, grain_for(rows, std::max<int64_t>(1, 65536 / K)), [&](int64_t r0, int64_t r1) {
-    uint8_t* bases = static_cast<uint8_t*>(scratch(static_cast<size_t>(B), 0));
-    for (int64_t r = r0; r < r1; ++r) counts[r] = count_patches(w + r * K, K, bases);
+    for (int64_t r = r0; r < r1; ++r) counts[r] = count_patches(w + r * K, K);
   });
   const int P = bf16x::patch_slots(K);
   int64_t area = 0;
@@ -162,13 +166,15 @@ int lx_bf16x_decode(const void* data, int64_t rows, int K, void* w, void* stream
       const uint8_t* rec = d + r * rb;
       const uint8_t* bases = rec + bf16x::base_offset(K);
       uint16_t* row = dst + r * K;
-      for (int k = 0; k < K; ++k) {
-        const uint8_t* blk = rec + H + static_cast<int64_t>(k / kBlock) * kBlockBytes;
-        const int i = k % kBlock;
-        const uint32_t c = blk[kCodes + (i >> 3) * 4 + (i & 3)];
-        const uint32_t e = (bases[k / kBlock] - ((i & 4) ? c >> 4 : c & 15u)) & 0xffu;
-        const uint32_t v = blk[i];
-        row[k] = static_cast<uint16_t>(((v & 0x80u) << 8) | (e << 7) | (v & 0x7fu));
+      for (int k0 = 0, b = 0; k0 < K; k0 += kBlock, ++b) {
+        const uint8_t* blk = rec + H + static_cast<int64_t>(b) * kBlockBytes;
+        const int n = std::min(kBlock, K - k0);
+        for (int i = 0; i < n; ++i) {
+          const uint32_t c = blk[kCodes + (i >> 3) * 4 + (i & 3)];
+          const uint32_t e = (bases[b] - ((i & 4) ? c >> 4 : c & 15u)) & 0xffu;
+          const uint32_t v = blk[i];
+          row[k0 + i] = static_cast<uint16_t>(((v & 0x80u) << 8) | (e << 7) | (v & 0x7fu));
+        }
       }
       // The patches: the slots, or the overflow record they point to.
       const uint8_t* list = rec;

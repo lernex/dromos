@@ -97,13 +97,16 @@ struct Row<kW_NVFP4> {
 // row's patch cursor.
 template <>
 struct Row<kW_BF16X> {
-  static constexpr int kSpan = kSpanBF16;  // divides 32
+  // A span is decoded in registers (bf16x_span_f32) unless a patch falls in it; load() and the patched
+  // spans decode 32 values into buf and read them as bf16.
+  static constexpr int kSpan = kSpanBF16X;
   static constexpr float kPost = 1.0f;
   const uint8_t* blk;   // the row's first block
   const uint8_t* base;  // its base exponents
   const uint32_t* p0;   // its patches, ascending position
   const uint32_t* pend;
   mutable const uint32_t* pp;  // the first patch not yet passed
+  mutable int64_t next_pk;     // its position (an unused slot's, past any k, when the row has no more)
   mutable int64_t at_k;        // the first value in buf
   alignas(64) mutable uint16_t buf[32];
 
@@ -122,6 +125,7 @@ struct Row<kW_BF16X> {
       pend = slots + bf16x::patch_slots(K);
     }
     pp = p0;
+    next_pk = pp < pend ? static_cast<int64_t>(*pp >> 8) : INT64_MAX;
     at_k = -1;
   }
   void decode(int64_t k0) const {
@@ -133,6 +137,7 @@ struct Row<kW_BF16X> {
       const int64_t i = static_cast<int64_t>(*pp >> 8) - k0;
       buf[i] = static_cast<uint16_t>((buf[i] & 0x807fu) | ((*pp & 0xffu) << 7));
     }
+    next_pk = pp < pend ? static_cast<int64_t>(*pp >> 8) : INT64_MAX;
     at_k = k0;
   }
   V load(int64_t k) const {
@@ -140,10 +145,16 @@ struct Row<kW_BF16X> {
     if (k0 != at_k) decode(k0);
     return load_bf16(buf + (k - k0));
   }
+  // k is a multiple of 32.
   void span(int64_t k, V* out) const {
-    const int64_t k0 = k & ~int64_t{31};
-    if (k0 != at_k) decode(k0);
-    span_bf16(buf + (k - k0), out);
+    if (k + kSpan <= next_pk) {
+      const int64_t b = k >> 7, j = k & 127;
+      const uint8_t* bp = blk + b * bf16x::kBlockBytes;
+      bf16x_span_f32(bp + j, bp + bf16x::kCodes + j / 2, base[b], out);
+      return;
+    }
+    decode(k);
+    for (int i = 0; i < kSpan / W; ++i) out[i] = load_bf16(buf + i * W);
   }
   float at(int64_t k) const {
     const int64_t b = k >> 7, i = k & 127;
@@ -200,21 +211,32 @@ inline void tile(const float* x, int64_t ld_x, const Row<F>* rows, int64_t K, fl
   int64_t k = 0;
   // Wide decodes for decode-sized tiles (a few rows of x, so the span's x vectors fit beside the
   // accumulators). Each accumulator still takes its k in order, so the sums are the narrow loop's.
+  // BF16X decodes its spans at every MR, since a decode costs more than the x loads it saves: past two
+  // rows of x those come from L1 with each multiply instead of being held.
   constexpr int SV = Row<F>::kSpan / W;
-  if constexpr (SV > 1 && MR <= 2) {
+  if constexpr (SV > 1 && (MR <= 2 || F == kW_BF16X)) {
     for (; k + Row<F>::kSpan <= K; k += Row<F>::kSpan) {
       if (pf && pf < pf_end) {
         for (int l = 0; l < SV * kLines; ++l) __builtin_prefetch(pf + 64 * l, 0, 3);
         pf += 64 * SV * kLines;
       }
-      V xv[MR][SV];
-      for (int m = 0; m < MR; ++m)
-        for (int j = 0; j < SV; ++j) xv[m][j] = vload(x + m * ld_x + k + j * W);
-      for (int r = 0; r < NR; ++r) {
-        V wv[SV];
-        rows[r].span(k, wv);
-        for (int j = 0; j < SV; ++j)
-          for (int m = 0; m < MR; ++m) acc[m][r] = vfma(xv[m][j], wv[j], acc[m][r]);
+      if constexpr (MR <= 2) {
+        V xv[MR][SV];
+        for (int m = 0; m < MR; ++m)
+          for (int j = 0; j < SV; ++j) xv[m][j] = vload(x + m * ld_x + k + j * W);
+        for (int r = 0; r < NR; ++r) {
+          V wv[SV];
+          rows[r].span(k, wv);
+          for (int j = 0; j < SV; ++j)
+            for (int m = 0; m < MR; ++m) acc[m][r] = vfma(xv[m][j], wv[j], acc[m][r]);
+        }
+      } else {
+        for (int r = 0; r < NR; ++r) {
+          V wv[SV];
+          rows[r].span(k, wv);
+          for (int j = 0; j < SV; ++j)
+            for (int m = 0; m < MR; ++m) acc[m][r] = vfma(vload(x + m * ld_x + k + j * W), wv[j], acc[m][r]);
+        }
       }
     }
   }

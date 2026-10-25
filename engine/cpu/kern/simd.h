@@ -552,4 +552,74 @@ static inline void bf16x_span32(const uint8_t* sm, const uint8_t* codes, uint32_
 }
 #endif
 
+// The same 32 values as f32 vectors, in k order (kSpanBF16X / W of them), straight from the bytes in
+// registers: what the decode products read. Patched values come out with the base exponent, as above.
+constexpr int kSpanBF16X = 32;
+#if LX_ISA_CODE >= 10 && LX_ISA_CODE < 20
+// The code words already hold the values in the order the f32 vectors come out of two in-lane unpacks:
+// the low nibbles of words 0-3 are values 0-3, 8-11, 16-19 and 24-27, the high nibbles 4-7, 12-15, 20-23 and
+// 28-31. So the codes go in as they are, the sign|mantissa bytes take the same dword order with one
+// permute, and interleaving the low and high bf16 bytes, then zeros below them, gives the four vectors.
+static inline void bf16x_span_f32(const uint8_t* sm, const uint8_t* codes, uint32_t base, V* out) {
+  const __m128i c = _mm_loadu_si128(reinterpret_cast<const __m128i*>(codes));
+  const __m128i nib = _mm_set1_epi8(15);
+  const __m256i code = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(c, 4), nib), _mm_and_si128(c, nib));
+  const __m256i e = _mm256_sub_epi8(_mm256_set1_epi8(static_cast<char>(base)), code);
+  const __m256i v = _mm256_permutevar8x32_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(sm)),
+                                                _mm256_setr_epi32(0, 2, 4, 6, 1, 3, 5, 7));
+  const __m256i m80 = _mm256_set1_epi8(static_cast<char>(0x80)), m7f = _mm256_set1_epi8(0x7f);
+  const __m256i hb = _mm256_or_si256(_mm256_and_si256(v, m80), _mm256_and_si256(_mm256_srli_epi16(e, 1), m7f));
+  const __m256i lb = _mm256_or_si256(_mm256_and_si256(v, m7f), _mm256_and_si256(_mm256_slli_epi16(e, 7), m80));
+  const __m256i wl = _mm256_unpacklo_epi8(lb, hb);  // lane L: bf16 of bytes 16L + 0..7
+  const __m256i wh = _mm256_unpackhi_epi8(lb, hb);  // bytes 16L + 8..15
+  const __m256i z = _mm256_setzero_si256();
+  out[0] = _mm256_castsi256_ps(_mm256_unpacklo_epi16(z, wl));  // values 0-3 | 4-7
+  out[1] = _mm256_castsi256_ps(_mm256_unpackhi_epi16(z, wl));  // 8-11 | 12-15
+  out[2] = _mm256_castsi256_ps(_mm256_unpacklo_epi16(z, wh));  // 16-19 | 20-23
+  out[3] = _mm256_castsi256_ps(_mm256_unpackhi_epi16(z, wh));  // 24-27 | 28-31
+}
+#elif LX_ISA_CODE >= 20 && LX_ISA_CODE < 50
+// The bf16 bits in k order (bf16x_span32's arithmetic, kept in registers), widened sixteen at a time.
+static inline void bf16x_span_f32(const uint8_t* sm, const uint8_t* codes, uint32_t base, V* out) {
+  const __m128i c = _mm_loadu_si128(reinterpret_cast<const __m128i*>(codes));
+  const __m128i nib = _mm_set1_epi8(15);
+  const __m128i lo = _mm_and_si128(c, nib), hi = _mm_and_si128(_mm_srli_epi16(c, 4), nib);
+  const __m256i code = _mm256_set_m128i(_mm_unpackhi_epi32(lo, hi), _mm_unpacklo_epi32(lo, hi));
+  const __m256i e = _mm256_sub_epi8(_mm256_set1_epi8(static_cast<char>(base)), code);
+  const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(sm));
+  const __m256i m80 = _mm256_set1_epi8(static_cast<char>(0x80));
+  // hb = v & 0x80 | (e >> 1) & 0x7f, lb = v & 0x7f | (e << 7) & 0x80: bit selects (0xca: a ? b : c) on 0x80.
+  const __m256i hb = _mm256_ternarylogic_epi32(m80, v, _mm256_srli_epi16(e, 1), 0xca);
+  const __m256i lb = _mm256_ternarylogic_epi32(m80, _mm256_slli_epi16(e, 7), v, 0xca);
+  const __m256i a = _mm256_unpacklo_epi8(lb, hb);  // values 0-7 | 16-23
+  const __m256i b = _mm256_unpackhi_epi8(lb, hb);  // values 8-15 | 24-31
+  out[0] = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_permute2x128_si256(a, b, 0x20)), 16));
+  out[1] = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_permute2x128_si256(a, b, 0x31)), 16));
+}
+#elif LX_ISA_CODE >= 50
+static inline void bf16x_span_f32(const uint8_t* sm, const uint8_t* codes, uint32_t base, V* out) {
+  const uint8x16_t c = vld1q_u8(codes);
+  const uint32x4_t lo = vreinterpretq_u32_u8(vandq_u8(c, vdupq_n_u8(15)));
+  const uint32x4_t hi = vreinterpretq_u32_u8(vshrq_n_u8(c, 4));
+  const uint8x16_t code[2] = {vreinterpretq_u8_u32(vzip1q_u32(lo, hi)), vreinterpretq_u8_u32(vzip2q_u32(lo, hi))};
+  const uint8x16_t b = vdupq_n_u8(static_cast<uint8_t>(base)), m80 = vdupq_n_u8(0x80);
+  for (int h = 0; h < 2; ++h) {
+    const uint8x16_t v = vld1q_u8(sm + 16 * h), e = vsubq_u8(b, code[h]);
+    const uint8x16_t hb = vbslq_u8(m80, v, vshrq_n_u8(e, 1));
+    const uint8x16_t lb = vbslq_u8(m80, vshlq_n_u8(e, 7), v);
+    const uint16x8_t w0 = vreinterpretq_u16_u8(vzip1q_u8(lb, hb)), w1 = vreinterpretq_u16_u8(vzip2q_u8(lb, hb));
+    out[4 * h + 0] = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(w0), 16));
+    out[4 * h + 1] = vreinterpretq_f32_u32(vshll_high_n_u16(w0, 16));
+    out[4 * h + 2] = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(w1), 16));
+    out[4 * h + 3] = vreinterpretq_f32_u32(vshll_high_n_u16(w1, 16));
+  }
+}
+#else
+static inline void bf16x_span_f32(const uint8_t* sm, const uint8_t* codes, uint32_t base, V* out) {
+  alignas(64) uint16_t buf[kSpanBF16X];
+  bf16x_span32(sm, codes, base, buf);
+  for (int i = 0; i < kSpanBF16X / W; ++i) out[i] = load_bf16(buf + i * W);
+}
+#endif
+
 }  // namespace lx::cpu::LX_ISA

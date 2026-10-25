@@ -666,6 +666,84 @@ void mixers() {
   }
 }
 
+// ---- Lossless BF16 -------------------------------------------------------------------------------------
+
+// bf16 rows with values far below their block's largest (zeros and tiny values): the encoding's patches.
+// Row 3 has more patches than slots, so its patches live in the overflow record.
+std::vector<uint16_t> patchy_bf16(Rng& r, int64_t rows, int64_t K, float std) {
+  std::vector<uint16_t> w = bf16_vec(r, static_cast<size_t>(rows * K), std);
+  for (int64_t n = 0; n < rows; ++n)
+    for (int64_t k = 0; k < K; ++k) {
+      const uint64_t u = r.next() % 1000;
+      const bool dense = n == 3 && k % 7 == 0;
+      if (u < 3 || dense) w[n * K + k] = u & 1 ? 0 : to_bf(std * 1e-7f * (r.uniform() - 0.5f));
+    }
+  return w;
+}
+
+struct Bf16x {
+  std::vector<uint16_t> w;  // the bf16 values
+  std::vector<uint64_t> enc;  // their encoding (8-byte aligned)
+};
+std::shared_ptr<Bf16x> make_bf16x(Rng& r, int64_t rows, int64_t K, float std) {
+  auto b = std::make_shared<Bf16x>();
+  b->w = patchy_bf16(r, rows, K, std);
+  const int64_t bytes = lx_bf16x_bytes(b->w.data(), rows, static_cast<int>(K), nullptr);
+  b->enc.resize(static_cast<size_t>((bytes + 7) / 8));
+  CALL(lx_bf16x_encode(b->w.data(), rows, static_cast<int>(K), b->enc.data(), bytes, nullptr));
+  return b;
+}
+
+void bf16x() {
+  // The decode GEMV on the encoding equals the bf16 GEMV bit for bit at every level: M = 1 and 2 (the
+  // spans decoded in registers), 3 and 8 (the buffered reads), K with partial spans and partial vectors.
+  for (int K : {2048, 1040, 1037, 96}) {
+    const int N = 37;
+    Rng r(K);
+    auto b = make_bf16x(r, N, K, 1.0f / sqrtf(K));
+    for (int M : {1, 2, 3, 8}) {
+      auto x = std::make_shared<std::vector<uint16_t>>(bf16_vec(r, static_cast<size_t>(M) * K, 1.0f));
+      invariant("gemv_bf16x = gemv bf16 M=" + std::to_string(M) + " K=" + std::to_string(K), [=] {
+        std::vector<float> a(static_cast<size_t>(M) * N, 0.25f), c = a;
+        lx_gemv_bf16x(x->data(), LX_BF16, K, b->enc.data(), nullptr, LX_F32, a.data(), LX_F32, N, M, N, K, 1.0f, 0.5f,
+                      nullptr);
+        const lx_weight v{LX_W_BF16, b->w.data(), nullptr, 1.0f, nullptr};
+        lx_gemv_w(x->data(), LX_BF16, K, &v, nullptr, LX_F32, c.data(), LX_F32, N, M, N, K, 1.0f, 0.5f, nullptr);
+        return memcmp(a.data(), c.data(), 4 * a.size()) == 0;
+      });
+    }
+  }
+
+  // The encoding decodes back to its values.
+  invariant("bf16x_decode round trip", [] {
+    Rng r(11);
+    const int64_t rows = 9, K = 1037;
+    auto b = make_bf16x(r, rows, K, 0.02f);
+    std::vector<uint16_t> back(static_cast<size_t>(rows * K));
+    lx_bf16x_decode(b->enc.data(), rows, static_cast<int>(K), back.data(), nullptr);
+    return back == b->w;
+  });
+
+  // Routed experts on encoded stacks equal the bf16 experts bit for bit.
+  for (int T : {1, 2, 4}) {
+    const int E = 16, L = 256, I = 128, top_k = 4;
+    Rng r(300 + T);
+    auto gu = make_bf16x(r, int64_t{E} * 2 * I, L, 1.0f / sqrtf(L));
+    auto dn = make_bf16x(r, int64_t{E} * L, I, 1.0f / sqrtf(I));
+    auto latent = std::make_shared<std::vector<uint16_t>>(bf16_vec(r, static_cast<size_t>(T) * L, 1.0f));
+    auto rt = std::make_shared<Routing>(route(r, T, E, top_k));
+    invariant("moe_experts_bf16x = moe_experts bf16 T=" + std::to_string(T), [=] {
+      std::vector<float> a(static_cast<size_t>(T) * L), c(a.size());
+      std::vector<uint8_t> ws(static_cast<size_t>(lx_moe_bf16x_workspace_bytes(T, I, top_k)) + 64);
+      lx_moe_experts_bf16x(latent->data(), rt->ids.data(), rt->weights.data(), gu->enc.data(), dn->enc.data(), a.data(),
+                           ws.data(), T, L, I, top_k, nullptr);
+      lx_moe_experts(latent->data(), rt->ids.data(), rt->weights.data(), gu->w.data(), dn->w.data(), c.data(), T, L, I,
+                     top_k, nullptr);
+      return memcmp(a.data(), c.data(), 4 * a.size()) == 0;
+    });
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -681,6 +759,7 @@ int main(int argc, char** argv) {
   products();
   experts();
   mixers();
+  bf16x();
   printf("%d checks, %d failed\n", g_checks, g_failures);
   return g_failures ? 1 : 0;
 }

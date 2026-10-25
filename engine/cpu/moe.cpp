@@ -497,11 +497,17 @@ int lx_moe_experts_decode(const void* latent, const int32_t* ids, const float* w
                           void* stream) {
   LX_PROFILE("moe_experts_decode");
   (void)stream;
-  (void)workspace;
   if (T <= 0) return kOk;
   if (T > 8 || top_k > 8) return fail(kInvalid);
   if (int e = check_common(latent, ids, weights, out, L, I, top_k)) return e;
-  if (!gate_up || !down || !valid_stack(*gate_up, L) || !valid_stack(*down, I)) return fail(kInvalid);
+  if (!gate_up || !down) return fail(kInvalid);
+  if (gate_up->type == LX_W_BF16X || down->type == LX_W_BF16X) {
+    // Lossless stacks have their own entry point; both must be encoded, a mixed pair has no kernel.
+    if (gate_up->type != LX_W_BF16X || down->type != LX_W_BF16X) return fail(kNotSupported);
+    return lx_moe_experts_bf16x(latent, ids, weights, gate_up->data, down->data, out, workspace, T, L, I, top_k,
+                                stream);
+  }
+  if (!valid_stack(*gate_up, L) || !valid_stack(*down, I)) return fail(kInvalid);
   const Job j{static_cast<const uint16_t*>(latent), ids, weights, *gate_up, *down, T, L, I, top_k, 0, kMathWeightOnly,
               out};
   return run(j);

@@ -351,7 +351,10 @@ int lx_gemv_w(const void* x, lx_dtype x_dtype, int ld_x, const lx_weight* w, con
               void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K, float alpha, float beta, void* stream) {
   LX_PROFILE("gemv_w");
   (void)stream;
-  if (!w || w->type == LX_W_BF16X) return fail(kInvalid);  // BF16X has its own entry points
+  if (!w) return fail(kInvalid);
+  // Lossless bf16: the same contract, y equal bit for bit to the bf16 weights it encodes.
+  if (w->type == LX_W_BF16X)
+    return lx_gemv_bf16x(x, x_dtype, ld_x, w->data, bias, bias_dtype, y, y_dtype, ld_y, M, N, K, alpha, beta, stream);
   return gemv_any(x, x_dtype, ld_x, *w, bias, bias_dtype, y, y_dtype, ld_y, M, N, K, alpha, beta);
 }
 

@@ -225,6 +225,13 @@ int lx_quantize_weight(const void* w, lx_weight* out, int64_t rows, int cols, vo
   void* data = const_cast<void*>(out->data);
   void* scale = const_cast<void*>(out->scale);
   switch (out->type) {
+    case LX_W_BF16X: {
+      // Lossless: the encoding of the bf16 matrix, sized by lx_bf16x_bytes.
+      if (!data) return fail(kInvalid);
+      const int64_t bytes = lx_bf16x_bytes(w, rows, cols, stream);
+      if (bytes < 0) return fail(static_cast<int>(-bytes));
+      return lx_bf16x_encode(w, rows, cols, data, bytes, stream);
+    }
     case LX_W_INT8:
       if (!data || !scale) return fail(kInvalid);
       return quantize_int8(bf16_ptr(w), static_cast<int8_t*>(data), static_cast<float*>(scale), rows, cols);
@@ -245,11 +252,13 @@ int lx_dequantize_weight(const lx_weight* w, void* out, int64_t rows, int cols, 
   if (!w || !w->data || !out) return fail(kInvalid);
   if (rows <= 0) return kOk;
   if (cols <= 0) return fail(kInvalid);
-  if (w->type != LX_W_BF16 && w->type != LX_W_INT8 && w->type != LX_W_FP8 && w->type != LX_W_NVFP4)
+  if (w->type != LX_W_BF16 && w->type != LX_W_BF16X && w->type != LX_W_INT8 && w->type != LX_W_FP8 &&
+      w->type != LX_W_NVFP4)
     return fail(kInvalid);
-  if (w->type != LX_W_BF16 && !w->scale) return fail(kInvalid);
+  if (w->type != LX_W_BF16 && w->type != LX_W_BF16X && !w->scale) return fail(kInvalid);
   if (w->type == LX_W_NVFP4 && cols % 16 != 0) return fail(kInvalid);
   if (w->type == LX_W_BF16) return lx_rt_copy(out, w->data, 2 * rows * cols, LX_COPY_D2D, stream);
+  if (w->type == LX_W_BF16X) return lx_bf16x_decode(w->data, rows, cols, out, stream);
   uint16_t* o = static_cast<uint16_t*>(out);
   const lx_weight wt = *w;
   parallel_for(rows, grain_for(rows, 16), [&](int64_t r0, int64_t r1) {

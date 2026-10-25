@@ -166,7 +166,9 @@ DeviceInfo query_device(int ordinal) {
   d.fp8_mma = cc >= 89;
   d.fp4_mma = cc == 100 || cc == 120;
   d.clusters = cc >= kClusterArch;
-  d.built = kernels_built_for(d.real_cc());
+  // The architecture list is the CUDA build's. The other backends cover their whole device family (Metal
+  // compiles its kernels for the GPU at run time).
+  d.built = lx_rt_backend() != LX_BACKEND_CUDA || kernels_built_for(d.real_cc());
 
   const int driver = props.driver_version, runtime = props.runtime_version;
   d.driver = driver;
