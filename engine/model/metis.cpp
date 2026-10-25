@@ -167,6 +167,10 @@ struct MetisModel::Impl {
   // the same way and copies the top n predicted experts that are not in VRAM ahead of the layer.
   int prefetch = 0;
   void* side = nullptr;
+  // Decode steps: the routing features run on route_side, beside the mixer (see run)
+  void *route_side = nullptr, *route_fork = nullptr, *route_join = nullptr;
+  // Decode steps: the shared expert's gate-up and activation run on shared_side, beside the routed experts
+  void *shared_side = nullptr, *shared_fork = nullptr, *shared_join = nullptr;
   std::vector<void*> fork_events, join_events;  // per (pass, layer)
   // Projections kept in host memory (offload, LX_OFFLOAD_DENSE_HOST): a prefill product copies its
   // weight into one of two VRAM buffers on a copy stream, so the next weight crosses PCIe while this
@@ -229,6 +233,12 @@ struct MetisModel::Impl {
     for (void* e : fork_events) lx_rt_event_destroy(e);
     for (void* e : join_events) lx_rt_event_destroy(e);
     if (side) lx_rt_stream_destroy(side);
+    if (route_side) lx_rt_stream_destroy(route_side);
+    if (route_fork) lx_rt_event_destroy(route_fork);
+    if (route_join) lx_rt_event_destroy(route_join);
+    if (shared_side) lx_rt_stream_destroy(shared_side);
+    if (shared_fork) lx_rt_event_destroy(shared_fork);
+    if (shared_join) lx_rt_event_destroy(shared_join);
     for (int b = 0; b < 2; ++b) {
       if (stage_copied[b]) lx_rt_event_destroy(stage_copied[b]);
       if (stage_free[b]) lx_rt_event_destroy(stage_free[b]);
@@ -791,6 +801,12 @@ MetisModel::MetisModel(const MetisConfig& c, const WeightLookup& lw, int max_slo
   check(lx_rt_host_alloc(&pinned, static_cast<int64_t>(m.meta_count * 4)), "pinned host allocation");
   m.h_meta = static_cast<int32_t*>(pinned);
   check(lx_rt_event_create(&m.meta_copied), "event create");
+  check(lx_rt_stream_create(&m.route_side), "stream create");
+  check(lx_rt_event_create(&m.route_fork), "event create");
+  check(lx_rt_event_create(&m.route_join), "event create");
+  check(lx_rt_stream_create(&m.shared_side), "stream create");
+  check(lx_rt_event_create(&m.shared_fork), "event create");
+  check(lx_rt_event_create(&m.shared_join), "event create");
   if (m.offload && std::getenv("LX_OFFLOAD_PREFETCH")) m.prefetch = std::atoi(std::getenv("LX_OFFLOAD_PREFETCH"));
   if (m.route_trace || m.prefetch > 0) {
     m.pred_mixed = m.alloc<float>(TS * D);
@@ -1657,10 +1673,19 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
       const int slot_index = pass * m.L_layers + i;
       const int params = S * S + 2 * S;
 
-      // depth-memory read and routing features
+      // depth-memory read, then the routing features beside the mixer. They read the streams as the read
+      // left them and write nothing the mixer touches, so on a decode-sized step they run on route_side and
+      // join before the MoE reads them. A larger step keeps its order: its GEMMs share one workspace.
       memory_retrieve(m, T, n_entries, s);
-      LX_CHECK(lx_stream_mean(m.streams, m.state, T, S, D, s));
-      routing_features(m, T, s);
+      const bool beside = T <= Impl::kGemvRows;
+      void* rs = beside ? m.route_side : s;
+      if (beside) {
+        check(lx_rt_event_record(m.route_fork, s), "event record");
+        check(lx_rt_stream_wait(rs, m.route_fork), "stream wait");
+      }
+      LX_CHECK(lx_stream_mean(m.streams, m.state, T, S, D, rs));
+      routing_features(m, T, rs);
+      if (beside) check(lx_rt_event_record(m.route_join, rs), "event record");
 
       // mixer
       const float* mc = layer.mixer_conn.params + pass * params;
@@ -1706,6 +1731,7 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
       // the latent lands in the router's input: [latent | features], one row of Lat + R per token
       linear(m, layer.latent_down, m.h_bf, LX_BF16, D, m.router_in, LX_F32, Lat + R, T, s);
       to_bf16(m.router_in, Lat + R, m.latent_bf, Lat, T, Lat, s);
+      if (beside) check(lx_rt_stream_wait(s, m.route_join), "stream wait");
       copy_f32(m.features, R, m.router_in + Lat, Lat + R, T, R, s);
       gemm_f32(m.router_in, Lat + R, layer.router_w, layer.router_b, m.router_logits, E, T, E, Lat + R, s);
       LX_CHECK(lx_moe_route(m.router_logits, layer.selection_bias, m.route_ids, m.route_w, m.entropy, m.confidence, T,
@@ -1718,6 +1744,16 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
         const int32_t head[3] = {pass, i, T};
         std::fwrite(head, 4, 3, m.route_trace);
         std::fwrite(ids.data(), 4, ids.size(), m.route_trace);
+      }
+      // The shared expert's gate-up and activation read only latent_bf, so on a decode-sized step they run on
+      // shared_side while the routed experts run, and join before shared_down adds into routed.
+      const bool shared_beside = T <= Impl::kGemvRows;
+      if (shared_beside) {
+        check(lx_rt_event_record(m.shared_fork, s), "event record");
+        check(lx_rt_stream_wait(m.shared_side, m.shared_fork), "stream wait");
+        linear(m, layer.shared_gate_up, m.latent_bf, LX_BF16, Lat, m.shared_gu, LX_F32, 2 * m.Ishared, T, m.shared_side);
+        LX_CHECK(lx_silu_mul(m.shared_gu, 2 * m.Ishared, m.shared_bf, LX_BF16, T, m.Ishared, m.shared_side));
+        check(lx_rt_event_record(m.shared_join, m.shared_side), "event record");
       }
       const bool prefetching = m.prefetch > 0 && T <= Impl::kGemvRows;
       if (m.offload) {
@@ -1743,8 +1779,12 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
       else
         LX_CHECK(lx_moe_experts(m.latent_bf, m.route_ids, m.route_w, layer.gate_up, layer.down, m.routed, T, Lat,
                                 m.Iexp, m.K, s));
-      linear(m, layer.shared_gate_up, m.latent_bf, LX_BF16, Lat, m.shared_gu, LX_F32, 2 * m.Ishared, T, s);
-      LX_CHECK(lx_silu_mul(m.shared_gu, 2 * m.Ishared, m.shared_bf, LX_BF16, T, m.Ishared, s));
+      if (shared_beside) {
+        check(lx_rt_stream_wait(s, m.shared_join), "stream wait");
+      } else {
+        linear(m, layer.shared_gate_up, m.latent_bf, LX_BF16, Lat, m.shared_gu, LX_F32, 2 * m.Ishared, T, s);
+        LX_CHECK(lx_silu_mul(m.shared_gu, 2 * m.Ishared, m.shared_bf, LX_BF16, T, m.Ishared, s));
+      }
       linear(m, layer.shared_down, m.shared_bf, LX_BF16, m.Ishared, m.routed, LX_F32, Lat, T, s, 1.0f, 1.0f);
       linear(m, layer.latent_up, m.routed, LX_F32, Lat, m.update, LX_F32, D, T, s);
       LX_CHECK(lx_moe_summary(m.route_ids, m.route_w, layer.expert_emb, m.summary, T, R, m.K, s));
