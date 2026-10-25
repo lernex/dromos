@@ -11,9 +11,14 @@
 // experts    Praxis' routed experts for one decode token (4 of 128) in every format, the same way
 // gemm       a prefill-sized product (512 tokens) in every math, in GFLOP/s
 // overhead   what a small op costs per call (decode makes hundreds of them per token)
+// ab N K     one decode GEMV shape in BF16, BF16X and INT8, timed interleaved (a call of each in turn), so
+//            load from other processes falls on all three alike: median, spread, and the speed against BF16
+// hot N K    the same three with the matrices resident in the last-level cache: the kernel's own speed,
+//            with no DRAM in it (the gap to ab is what memory adds)
 //
 // Times are the median of --reps runs after a warm-up; buffers are larger than the last-level cache, and
 // rotate between calls where one copy would fit in it.
+#include <ctype.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -280,6 +285,97 @@ void gemv() {
   }
 }
 
+// One shape in three formats, interleaved: each round runs BF16, then BF16X, then INT8, each on its own next
+// copy (so every call reads from DRAM), and the medians come from the same moments for all three.
+void ab(int N, int K) {
+  const int64_t rb = lx_bf16x_row_bytes(K);
+  const int copies = static_cast<int>(std::max<int64_t>(2, (256ll << 20) / (2ll * N * K) + 1));
+  Weights bf = make(LX_W_BF16, int64_t{N} * copies, K), i8 = make(LX_W_INT8, int64_t{N} * copies, K);
+  Encoded x16 = make_bf16x(int64_t{N} * copies, K, 0.02f);
+  std::vector<uint16_t> x(K, 0x3f80);
+  std::vector<float> y(N);
+  const int rounds = std::max(g_reps * 20, copies * 10);
+  std::vector<double> t[3];
+  for (int r = -copies; r < rounds; ++r) {
+    const int c = (r + copies) % copies;
+    for (int f = 0; f < 3; ++f) {
+      const auto t0 = Clock::now();
+      if (f == 0) {
+        const lx_weight v = bf.view(int64_t{c} * N);
+        lx_gemv_w(x.data(), LX_BF16, K, &v, nullptr, LX_F32, y.data(), LX_F32, N, 1, N, K, 1.0f, 0.0f, nullptr);
+      } else if (f == 1) {
+        lx_gemv_bf16x(x.data(), LX_BF16, K, static_cast<const char*>(x16.data) + int64_t{c} * N * rb, nullptr, LX_F32,
+                      y.data(), LX_F32, N, 1, N, K, 1.0f, 0.0f, nullptr);
+      } else {
+        const lx_weight v = i8.view(int64_t{c} * N);
+        lx_gemv_w(x.data(), LX_BF16, K, &v, nullptr, LX_F32, y.data(), LX_F32, N, 1, N, K, 1.0f, 0.0f, nullptr);
+      }
+      if (r >= 0) t[f].push_back(seconds_since(t0));
+    }
+  }
+  const double bytes[3] = {2.0 * N * K, static_cast<double>(rb) * N, N * (K + 4.0)};
+  const char* names[3] = {"BF16", "BF16X", "INT8"};
+  double med[3];
+  printf("decode GEMV %d x %d, M = 1, %d interleaved rounds\n", N, K, rounds);
+  for (int f = 0; f < 3; ++f) {
+    std::sort(t[f].begin(), t[f].end());
+    const size_t n = t[f].size();
+    med[f] = t[f][n / 2];
+    const double gbs = bytes[f] / med[f] / 1e9;
+    printf("  %-5s  %8.1f us  (p10 %7.1f, p90 %7.1f)  %6.1f GB/s", names[f], med[f] * 1e6, t[f][n / 10] * 1e6,
+           t[f][n * 9 / 10] * 1e6, gbs);
+    if (g_bandwidth > 0) printf("  %3.0f%% of read bandwidth", 100 * gbs / g_bandwidth);
+    if (f) printf("  %.2fx BF16", med[0] / med[f]);
+    printf("\n");
+  }
+  release(bf);
+  release(i8);
+  lx_rt_free(x16.data);
+}
+
+// One shape with all three matrices resident in the last-level cache: the same rows on every call, so the time is
+// the kernel's own (decode and FMA) and not DRAM's. Interleaved, so the medians come from the same moments.
+void hot(int N, int K) {
+  const int64_t rb = lx_bf16x_row_bytes(K);
+  Weights bf = make(LX_W_BF16, N, K), i8 = make(LX_W_INT8, N, K);
+  Encoded x16 = make_bf16x(N, K, 0.02f);
+  std::vector<uint16_t> x(K, 0x3f80);
+  std::vector<float> y(N);
+  const int rounds = 400;
+  std::vector<double> t[3];
+  for (int r = -20; r < rounds; ++r) {
+    for (int f = 0; f < 3; ++f) {
+      const auto t0 = Clock::now();
+      if (f == 0) {
+        const lx_weight v = bf.view(0);
+        lx_gemv_w(x.data(), LX_BF16, K, &v, nullptr, LX_F32, y.data(), LX_F32, N, 1, N, K, 1.0f, 0.0f, nullptr);
+      } else if (f == 1) {
+        lx_gemv_bf16x(x.data(), LX_BF16, K, x16.data, nullptr, LX_F32, y.data(), LX_F32, N, 1, N, K, 1.0f, 0.0f,
+                      nullptr);
+      } else {
+        const lx_weight v = i8.view(0);
+        lx_gemv_w(x.data(), LX_BF16, K, &v, nullptr, LX_F32, y.data(), LX_F32, N, 1, N, K, 1.0f, 0.0f, nullptr);
+      }
+      if (r >= 0) t[f].push_back(seconds_since(t0));
+    }
+  }
+  const double bytes[3] = {2.0 * N * K, static_cast<double>(rb) * N, N * (K + 4.0)};
+  const char* names[3] = {"BF16", "BF16X", "INT8"};
+  printf("cache-resident GEMV %d x %d, M = 1, %d interleaved rounds\n", N, K, rounds);
+  for (int f = 0; f < 3; ++f) {
+    std::sort(t[f].begin(), t[f].end());
+    const size_t n = t[f].size();
+    const double med = t[f][n / 2];
+    printf("  %-5s  %8.1f us  (p10 %7.1f, p90 %7.1f)  %6.1f GB/s", names[f], med * 1e6, t[f][n / 10] * 1e6,
+           t[f][n * 9 / 10] * 1e6, bytes[f] / med / 1e9);
+    if (f) printf("  %.2fx BF16", t[0][n / 2] / med);
+    printf("\n");
+  }
+  release(bf);
+  release(i8);
+  lx_rt_free(x16.data);
+}
+
 // ---- Experts ------------------------------------------------------------------------------------------------
 
 void experts() {
@@ -412,13 +508,31 @@ void overhead() {
 
 int main(int argc, char** argv) {
   std::string what = "all";
+  int ab_n = 2048, ab_k = 2048;
   for (int i = 1; i < argc; ++i) {
+    if (!strcmp(argv[i], "ab") && i + 2 < argc && isdigit(static_cast<unsigned char>(argv[i + 1][0]))) {
+      what = "ab";
+      ab_n = atoi(argv[++i]);
+      ab_k = atoi(argv[++i]);
+      continue;
+    }
+    if (!strcmp(argv[i], "hot") && i + 2 < argc && isdigit(static_cast<unsigned char>(argv[i + 1][0]))) {
+      what = "hot";
+      ab_n = atoi(argv[++i]);
+      ab_k = atoi(argv[++i]);
+      continue;
+    }
     if (!strcmp(argv[i], "--mib") && i + 1 < argc) g_mib = atoll(argv[++i]);
     else if (!strcmp(argv[i], "--reps") && i + 1 < argc) g_reps = atoi(argv[++i]);
     else what = argv[i];
   }
   printf("lernex_cpu bench: level %d, %d threads\n", lx_arch(), lx_cpu_threads());
   if (what == "bandwidth" || what == "all" || what == "gemv" || what == "experts") bandwidth();
+  if (what == "hot") hot(ab_n, ab_k);
+  if (what == "ab") {
+    bandwidth();
+    ab(ab_n, ab_k);
+  }
   if (what == "gemv" || what == "all") gemv();
   if (what == "experts" || what == "all") experts();
   if (what == "gemm" || what == "all") gemm();

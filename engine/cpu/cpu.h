@@ -87,6 +87,12 @@ const Kern& kern();
 // The highest level this CPU supports and the library was built with: lx_arch before any override.
 int real_level();
 
+// A level's instruction set, in words; the maths the level in effect multiplies with instructions of its own
+// (lx_device_props.native_math); and whether the chip has AMX tiles the OS lets programs use.
+const char* level_isa(int code);
+int native_math();
+bool amx_present();
+
 // ---- Threads ------------------------------------------------------------------------------------
 
 // Worker threads plus the caller. LX_THREADS overrides the default (the machine's physical cores).

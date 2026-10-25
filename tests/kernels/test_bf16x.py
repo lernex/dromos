@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from conftest import DTYPE, F32
+from conftest import BACKEND, DTYPE, F32
 
 W_BF16 = 0
 METIS_SHAPES = [  # (N, K) of every Praxis decode product
@@ -369,6 +369,8 @@ def test_gemv_every_tuned_variant(lx, x_dtype):
     setup_tuner(lib)
     kernel = b"gemv_w_bf16"
     variants = lib.lx_tune_variants(kernel)
+    if variants == 0 and BACKEND != "cuda":
+        pytest.skip("this backend's GEMV has one variant (the CPU's products have one order)")
     assert variants > 0
     try:
         for M, N, K in [(1, 300, 1040), (3, 77, 2048), (8, 129, 1024), (5, 50, 1296), (2, 64, 528), (4, 33, 4096)]:
@@ -396,6 +398,8 @@ def test_gemv_every_own_variant(lx, x_dtype):
     lib = lx.lib
     setup_tuner(lib)
     variants = lib.lx_tune_variants(b"gemv_bf16x")
+    if variants == 0 and BACKEND != "cuda":
+        pytest.skip("this backend's BF16X GEMV has one variant (the CPU's products have one order)")
     assert variants > 0
     try:
         for M, N, K in [(1, 300, 1040), (3, 77, 2048), (8, 129, 1024), (5, 50, 1296), (2, 7, 528), (8, 33, 4096)]:

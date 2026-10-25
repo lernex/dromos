@@ -268,6 +268,12 @@ LX_API int lx_rt_is_host_memory(const void* ptr);
 // sms its multiprocessor count, l2_bytes its L2 cache, mem_clock_khz and bus_bits the memory clock
 // and bus width (peak bandwidth is clock * 2 * bus_bits / 8). The versions use the CUDA encoding,
 // 1000 * major + 10 * minor, of the driver and of the runtime; a backend without one reports 0.
+// The fields after those are what a backend can add, zero or empty where it has nothing to say (the GPU
+// backends leave them): l1_bytes one core's L1 data cache and l3_bytes the cache past L2; read_bandwidth
+// the bytes per second the backend measured its kernels reading memory at (the host takes it over the
+// peak that mem_clock_khz and bus_bits give); isa the instruction set the kernels run, in words; and
+// native_math bit (1 << m) set for each lx_math m whose products the hardware multiplies with an
+// instruction of its own rather than by expanding the operands.
 typedef struct {
   char name[256];
   int cc_major, cc_minor;
@@ -276,6 +282,10 @@ typedef struct {
   int64_t mem_clock_khz;
   int bus_bits;
   int driver_version, runtime_version;
+  int64_t l1_bytes, l3_bytes;
+  int64_t read_bandwidth;
+  char isa[192];
+  int native_math;
 } lx_device_props;
 LX_API int lx_rt_device_props(int ordinal, lx_device_props* props);
 // The device memory this process holds, its context included, summed over the devices, where the driver

@@ -80,7 +80,8 @@ int cmd_inspect(int argc, char** argv) {
     check(lx_rt_device_props(0, &props), "reading the device properties");
     int64_t free_before = 0, total_device = 0;
     check(lx_rt_mem_info(&free_before, &total_device), "reading the device memory");
-    std::printf("gpu      %s, %.2f GB free of %.2f GB\n", props.name, free_before / 1e9, total_device / 1e9);
+    std::printf("%s      %s, %.2f GB free of %.2f GB\n", lx_rt_backend() == LX_BACKEND_CPU ? "cpu" : "gpu", props.name,
+                free_before / 1e9, total_device / 1e9);
 
     const auto t_open = Clock::now();
     const lx::SafetensorsSet set = lx::SafetensorsSet::open(dir);
