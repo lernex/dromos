@@ -12,15 +12,23 @@
 //     from its quantized bytes) are rounded to the target with lx_quantize_weight, one expert at a time,
 //     so the peak device memory is the final footprint plus one expert's scratch.
 //
-// Recipes. The FP8 recipe is the published FP8 folder's own (the projections it quantizes: the Mamba
-// in_proj, the attention qkv and out, and the routed experts). The NVFP4 recipe is the published NVFP4
-// folder's, with two choices that follow the design: the MoE latent_up stays BF16, and the tied LM head
-// is FP8. The INT8 recipe is the engine's int8 policy (every large projection but the Mamba out_proj).
-// Whatever stays wide, stays wide in every target: the Mamba out_proj, the pass LoRA, and the depth
-// memory's key, value and metadata write (small, and their rounding is the most visible).
+// Recipes (recipe() below), each checked against the folder it describes:
+//   - FP8: the published FP8 folders (Praxis, Logos) quantize the Mamba in_proj, the attention qkv and out,
+//     and the routed experts; everything else is BF16, the tied head included.
+//   - NVFP4: the GPTQ NVFP4 folder (Praxis) quantizes the routed experts to NVFP4, the dense projections
+//     and the tied head to FP8, and keeps the MoE latent_up BF16.
+//   - INT8: the engine's int8 decode policy (metis.cpp: every projection made with quantize = true is int8
+//     unless LX_W8_KEEP names it, default out_proj). The projections the engine makes with quantize = false
+//     stay bf16 there too: the pass LoRA, and the depth memory's key, value and metadata write. So the INT8
+//     keep set is the Mamba out_proj and those five, all bf16 in every target.
 // The lossless target (BF16X) is no rounding at all: every projection the other targets quantize is held
 // in the lossless encoding of bf16x.cu, which reproduces the checkpoint's bf16 bits exactly. The wide ones
 // stay bf16 there too, as in every target.
+//
+// The NVFP4 path has no conversion: a stored NVFP4 folder is loaded as it is (GPTQ-rounded block scales and
+// all), and converting a BF16 or FP8 folder to NVFP4 is refused, because round-to-nearest fails its KL.
+// The folder's conversion_receipt.json files are the provenance of the BF16 source (their tensors are the
+// source's dtypes); they carry no list of projections kept wide, so no receipt is read for the recipe.
 #include "core/checkpoint.h"
 
 #include <algorithm>
@@ -113,9 +121,12 @@ bool is_scale_name(std::string_view name) {
          ends_with_part(name, "input_scale");
 }
 
+// The routed expert stacks, whose stored bytes a skip_experts load leaves off the device.
+bool is_expert(std::string_view key) { return contains(key, "local_experts."); }
+
 // The format a projection is held in for a target (see the recipes at the top of this file).
 lx_wtype recipe(lx_wtype target, std::string_view key) {
-  const bool expert = contains(key, "local_experts.");
+  const bool expert = is_expert(key);
   if (key == "embedding") {
     // The tied head: FP8 for NVFP4 (as the published folder), its own format otherwise. The FP8 folder
     // keeps it BF16, so FP8 is the one target that does too.
@@ -125,10 +136,14 @@ lx_wtype recipe(lx_wtype target, std::string_view key) {
       default: return target;
     }
   }
+  // Wide in every target: the Mamba-2 out_proj, the pass LoRA, and the depth memory's metadata write.
   if (ends_with_part(key, "mixer.impl.mixer.out_proj") || ends_with_part(key, "mixer.pass_lora_down") ||
-      ends_with_part(key, "mixer.pass_lora_up") || ends_with_part(key, "depth_memory.key") ||
-      ends_with_part(key, "depth_memory.value") || ends_with_part(key, "depth_memory.metadata_write"))
+      ends_with_part(key, "mixer.pass_lora_up") || ends_with_part(key, "depth_memory.metadata_write"))
     return LX_W_BF16;
+  // The depth memory's key and value: bf16 in the FP8 folder and in the engine's int8 policy, FP8 in the
+  // GPTQ NVFP4 folder.
+  if (ends_with_part(key, "depth_memory.key") || ends_with_part(key, "depth_memory.value"))
+    return target == LX_W_NVFP4 ? LX_W_FP8 : LX_W_BF16;
   switch (target) {
     case LX_W_BF16:
       return LX_W_BF16;
@@ -148,6 +163,37 @@ lx_wtype recipe(lx_wtype target, std::string_view key) {
     default:
       return LX_W_BF16;
   }
+}
+
+// The GPTQ NVFP4 checkpoint of each model family: the one NVFP4 is loaded from, since round-to-nearest
+// conversion is refused. A family with none is named as such in the refusal.
+struct GptqCheckpoint {
+  std::string_view family;
+  std::string_view path;
+};
+constexpr GptqCheckpoint kGptqNvfp4[] = {
+    {"praxis", "/home/aiadmin/kronos-scratch/logos/engines/praxis/nvfp4"},
+};
+
+// The refusal of a conversion to NVFP4 from a folder that is not NVFP4 (ModelWeights::load).
+std::string nvfp4_refusal(lx_wtype stored, const MetisConfig& config) {
+  std::string message = std::string("NVFP4 from ") + (stored == LX_W_FP8 ? "an FP8" : "a BF16") +
+                        " checkpoint is refused: round-to-nearest conversion fails its KL. ";
+  for (const GptqCheckpoint& g : kGptqNvfp4)
+    if (config.family == g.family)
+      return message + "Use the GPTQ NVFP4 checkpoint at " + std::string(g.path) + " instead.";
+  const std::string who = config.family.empty() ? std::string("this model") : config.family;
+  return message + "No GPTQ NVFP4 checkpoint of " + who + " exists yet.";
+}
+
+// The format a folder holds, from its tensors: see ModelWeights::stored_format.
+lx_wtype stored_format_of(const SafetensorsSet& set) {
+  bool fp8 = false;
+  for (const auto& [name, t] : set.tensors()) {
+    if (t.dtype == DType::U8 && ends_with_part(name, "weight")) return LX_W_NVFP4;
+    if (t.dtype == DType::F8_E4M3) fp8 = true;
+  }
+  return fp8 ? LX_W_FP8 : LX_W_BF16;
 }
 
 }  // namespace
@@ -171,6 +217,7 @@ struct CheckpointBuilder {
   lx_wtype target;
   lx_wtype stored;
   ModelWeights& out;
+  bool skip_experts = false;  // LoadOptions::skip_experts
 
   size_t live = 0, peak = 0;
   DeviceBuffer scratch_bf16, scratch_data, scratch_scale;
@@ -186,6 +233,32 @@ struct CheckpointBuilder {
   DeviceBuffer device(size_t bytes) {
     grow(bytes);
     return DeviceBuffer(bytes);
+  }
+
+  // The scale and global tensors of a quantized projection, against the layouts of "Weight formats"
+  // (kernels.h): FP8 has one f32 scale per row; NVFP4 has one e4m3 block scale per 16 inputs of each row
+  // (so K % 16 == 0) and one f32 global per expert (one for a matrix). A folder that does not match fails
+  // here, at load, rather than in a kernel.
+  static void check_layout(const std::string& name, const Projection& p) {
+    if (p.src == LX_W_BF16) return;
+    const int64_t rows = p.E * p.N;
+    if (p.src == LX_W_FP8) {
+      if (p.scale->dtype != DType::F32 || p.scale->numel() != rows)
+        throw std::runtime_error("FP8 projection " + name + " needs one f32 scale per row (" + std::to_string(rows) +
+                                 " values)");
+      return;
+    }
+    if (p.K % 16 != 0)
+      throw std::runtime_error("NVFP4 projection " + name + " has K = " + std::to_string(p.K) +
+                               ", not a multiple of 16");
+    if (p.scale->dtype != DType::F8_E4M3 || p.scale->numel() != rows * (p.K / 16))
+      throw std::runtime_error("NVFP4 projection " + name + " needs one e4m3 block scale per 16 inputs (" +
+                               std::to_string(rows * (p.K / 16)) + " values)");
+    if (!p.global) throw std::runtime_error("projection " + name + " has no weight_scale_2");
+    const int64_t globals_wanted = p.stack ? p.E : 1;
+    if (p.global->dtype != DType::F32 || p.global->numel() != globals_wanted)
+      throw std::runtime_error("NVFP4 projection " + name + " needs one f32 global per expert (" +
+                               std::to_string(globals_wanted) + " values)");
   }
 
   // Collects the projections of the folder, with their shapes checked against the config.
@@ -219,7 +292,7 @@ struct CheckpointBuilder {
       p.K = p.src == LX_W_NVFP4 ? 2 * t.shape.back() : t.shape.back();
       if (p.src != LX_W_BF16 && !p.scale)
         throw std::runtime_error("projection " + name + " is quantized but has no weight_scale");
-      if (p.src == LX_W_NVFP4 && !p.global) throw std::runtime_error("projection " + name + " has no weight_scale_2");
+      check_layout(name, p);
       p.dst = target == stored ? p.src : recipe(target, key);
       list.push_back(std::move(p));
     }
@@ -437,8 +510,14 @@ struct CheckpointBuilder {
       if (p.key == "embedding") head = &p;
     if (!head) throw std::runtime_error("the folder has no embedding.weight");
 
+    // What the device holds: every projection, or every one but the expert stacks when they are skipped. The
+    // scratch is sized for those uploads alone.
+    std::vector<Projection> held;
+    for (const Projection& p : list)
+      if (!(skip_experts && is_expert(p.key))) held.push_back(p);
+
     load_plain();
-    size_scratch(list);
+    size_scratch(held);
     // The gather table is BF16 on the device whatever the folder holds; the tied head comes from it.
     const void* gather = nullptr;
     if (head->src == LX_W_BF16) {
@@ -454,8 +533,10 @@ struct CheckpointBuilder {
 
     for (const Projection& p : list) {
       if (p.key == "embedding") continue;
-      out.projections_.emplace(p.key, p.dst == p.src ? as_is(p) : convert(p, nullptr));
       out.shapes_.emplace(p.key, ModelWeights::Shape{p.E, p.N, p.K, p.stack});
+      out.formats_.emplace(p.key, p.dst);
+      if (skip_experts && is_expert(p.key)) continue;  // its shape and format are kept; its bytes are not
+      out.projections_.emplace(p.key, p.dst == p.src ? as_is(p) : convert(p, nullptr));
     }
 
     // The tied head: its format from the recipe (or the folder's own, when the target is the folder's).
@@ -472,6 +553,7 @@ struct CheckpointBuilder {
     }
     out.projections_.emplace("lm_head", h);
     out.shapes_.emplace("lm_head", ModelWeights::Shape{1, head->N, head->K, false});
+    out.formats_.emplace("lm_head", h.type);
     out.peak_bytes_ = peak;
   }
 };
@@ -479,22 +561,19 @@ struct CheckpointBuilder {
 ModelWeights ModelWeights::load(const std::filesystem::path& dir, const MetisConfig& config,
                                 const LoadOptions& options) {
   const SafetensorsSet set = SafetensorsSet::open(dir);
-  const lx_wtype stored = stored_format(dir);
+  const lx_wtype stored = stored_format_of(set);
+  // Round-to-nearest to NVFP4 fails its KL, so a folder that is not NVFP4 is refused before any device work.
+  if (options.target == LX_W_NVFP4 && stored != LX_W_NVFP4) throw std::runtime_error(nvfp4_refusal(stored, config));
   ModelWeights out;
   out.format_ = options.target;
   CheckpointBuilder builder(set, config, options.target, stored, out);
+  builder.skip_experts = options.skip_experts;
   builder.run();
   return out;
 }
 
 lx_wtype ModelWeights::stored_format(const std::filesystem::path& dir) {
-  const SafetensorsSet set = SafetensorsSet::open(dir);
-  bool fp8 = false;
-  for (const auto& [name, t] : set.tensors()) {
-    if (t.dtype == DType::U8 && ends_with_part(name, "weight")) return LX_W_NVFP4;
-    if (t.dtype == DType::F8_E4M3) fp8 = true;
-  }
-  return fp8 ? LX_W_FP8 : LX_W_BF16;
+  return stored_format_of(SafetensorsSet::open(dir));
 }
 
 const lx_weight* ModelWeights::projection(const std::string& name) const {
@@ -517,7 +596,11 @@ ModelWeights::Shape ModelWeights::projection_shape(const std::string& name) cons
 
 lx_weight ModelWeights::projection_expert(const std::string& name, int64_t e) const {
   const lx_weight* w = projection(name);
-  if (!w) throw std::runtime_error("no projection " + name);
+  if (!w) {
+    if (formats_.count(projection_key(name)))
+      throw std::runtime_error(name + " is not on the device: skip_experts left it to the offload runtime");
+    throw std::runtime_error("no projection " + name);
+  }
   const Shape s = projection_shape(name);
   if (e < 0 || e >= s.E) throw std::runtime_error("expert " + std::to_string(e) + " is out of range for " + name);
   lx_weight v = *w;
@@ -536,11 +619,13 @@ lx_weight ModelWeights::projection_expert(const std::string& name, int64_t e) co
 }
 
 std::pair<size_t, size_t> ModelWeights::expert_bytes(const std::string& name) const {
-  const lx_weight* w = projection(name);
-  if (!w) throw std::runtime_error("no projection " + name);
-  const Shape s = projection_shape(name);
-  const size_t data = static_cast<size_t>(s.N) * row_bytes(w->type, s.K);
-  const size_t scale = w->scale ? static_cast<size_t>(s.N) * scale_row_bytes(w->type, s.K) : 0;
+  // From the target format and the shape, so a skipped stack reports the same sizes a loaded one does.
+  const std::string key = projection_key(name);
+  const auto format = formats_.find(key);
+  if (format == formats_.end()) throw std::runtime_error("no projection " + name);
+  const Shape s = shapes_.at(key);
+  const size_t data = static_cast<size_t>(s.N) * row_bytes(format->second, s.K);
+  const size_t scale = static_cast<size_t>(s.N) * scale_row_bytes(format->second, s.K);
   return {data, scale};
 }
 

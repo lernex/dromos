@@ -20,15 +20,22 @@
 namespace lx {
 
 struct LoadOptions {
-  lx_wtype target = LX_W_BF16;  // the format the large projections are held in
-  bool skip_experts = false;    // leave the routed expert stacks out (the offload runtime holds them)
+  // The format the large projections are held in. Explicit only: nothing picks a lossy format for the
+  // caller. INT8 is round-to-nearest from a BF16, FP8 or NVFP4 folder; FP8 keeps a stored FP8 folder as it is.
+  lx_wtype target = LX_W_BF16;
+  // Leave the routed expert stacks (layers.N.moe.local_experts.gate_up and .down, with their scales and
+  // globals) off the device. The offload runtime holds them: their shapes and byte sizes stay readable.
+  bool skip_experts = false;
 };
 
 class ModelWeights {
  public:
-  // What the folder holds, without loading it.
+  // What the folder holds, without loading it: BF16, FP8 (F8_E4M3 projections) or NVFP4 (U8 packed
+  // nibbles with e4m3 block scales and per-expert globals, as the GPTQ folder writes them).
   static lx_wtype stored_format(const std::filesystem::path& dir);
 
+  // Throws std::runtime_error for a request the loader refuses (NVFP4 from a folder that is not NVFP4:
+  // round-to-nearest fails its KL, so the message names the GPTQ NVFP4 checkpoint of that model).
   static ModelWeights load(const std::filesystem::path& dir, const MetisConfig& config, const LoadOptions& options);
 
   ModelWeights() = default;
@@ -41,20 +48,25 @@ class ModelWeights {
   // A plain tensor (norms, embeddings, f32 routers, biases), bf16 or f32 as the model expects it.
   WeightView find(const std::string& name) const;
   // A projection [N, K] or an expert stack [E, N, K], in the format it is held in. Which ones stay
-  // wider than the target (the Mamba-2 out_proj, and for NVFP4 the MoE latent_up) follows the
-  // checkpoints' recipe, so a converted model matches the published file's choices.
-  const lx_weight* projection(const std::string& name) const;  // null when absent
+  // wider than the target (the Mamba-2 out_proj, the pass LoRA, the depth memory's key, value and
+  // metadata write, and for NVFP4 the MoE latent_up) follows the recipe, so a converted model matches
+  // the published file's choices.
+  // Null when absent, and for an expert stack when LoadOptions::skip_experts left it off the device.
+  const lx_weight* projection(const std::string& name) const;
 
-  // Every projection's name ("layers.4.mixer.qkv", "lm_head"), and its shape as the folder states it.
+  // The projections on the device ("layers.4.mixer.qkv", "lm_head"; the expert stacks only when loaded).
   struct Shape {
     int64_t E = 1, N = 0, K = 0;  // E experts of [N, K]; a matrix is E = 1
     bool stack = false;
   };
   std::vector<std::string> projection_names() const;
+  // The shape of any projection in the folder, skipped expert stacks included.
   Shape projection_shape(const std::string& name) const;
-  // Expert e of a projection (0 for a matrix) as its own lx_weight: its rows, its scales and its global.
+  // Expert e of a loaded projection (0 for a matrix) as its own lx_weight: its rows, its scales and its
+  // global. Throws for a stack that skip_experts left off the device.
   lx_weight projection_expert(const std::string& name, int64_t e) const;
-  // The bytes one expert's data and its scales take in the device buffers.
+  // The bytes one expert's data and its scales take in the target format (the device buffers, or the
+  // size the offload runtime must hold for a skipped stack). Any projection in the folder.
   std::pair<size_t, size_t> expert_bytes(const std::string& name) const;
 
   lx_wtype format() const noexcept { return format_; }
@@ -68,8 +80,9 @@ class ModelWeights {
   lx_wtype format_ = LX_W_BF16;
   std::vector<DeviceBuffer> buffers_;
   std::map<std::string, WeightView> plain_;
-  std::map<std::string, lx_weight> projections_;
-  std::map<std::string, Shape> shapes_;
+  std::map<std::string, lx_weight> projections_;  // loaded projections only
+  std::map<std::string, Shape> shapes_;           // every projection, loaded or skipped
+  std::map<std::string, lx_wtype> formats_;       // every projection's target format, loaded or skipped
   size_t peak_bytes_ = 0;
 };
 
