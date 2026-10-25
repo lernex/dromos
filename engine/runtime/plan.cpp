@@ -644,7 +644,7 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
   auto faster = [&](double here) -> const FormatOption* {
     const FormatOption* best = nullptr;
     for (const FormatOption& o : options) {
-      if (!o.loadable || !o.fits || width_of(o.format) >= width_of(target) || o.decode_ceiling_tps <= here) continue;
+      if (!o.loadable || !o.fits || width_of(o.format) >= width_of(target) || o.decode_ceiling_tps <= here * 1.1) continue;  // 10%: a note names a format only when it is clearly faster
       const bool native = o.format == (d.fp8_mma ? LX_W_FP8 : LX_W_INT8);
       if (!best || native) best = &o;
       if (native) break;
