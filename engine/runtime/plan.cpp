@@ -58,8 +58,17 @@ std::string tps(double v) {
   std::snprintf(buf, sizeof buf, "%.0f", v);
   return buf;
 }
-
-std::string math_name(lx_math m) {
+std::string math_name(lx_math m, const DeviceInfo& d) {
+  if (d.cpu) {
+    const bool native = d.native_math & (1 << m);
+    switch (m) {
+      case LX_MATH_BF16: return native ? "BF16 dot products" : "f32 (BF16 widened)";
+      case LX_MATH_INT8: return native ? "INT8 dot products" : "INT8 (16-bit multiplies)";
+      case LX_MATH_FP8: return "FP8 (exact products, summed in double)";
+      case LX_MATH_FP4: return "FP4 (exact products, summed in double)";
+    }
+    return "?";
+  }
   switch (m) {
     case LX_MATH_BF16: return "BF16 tensor cores";
     case LX_MATH_INT8: return "INT8 tensor cores";
@@ -68,6 +77,8 @@ std::string math_name(lx_math m) {
   }
   return "?";
 }
+// The device as the notes name it.
+const char* this_device(const DeviceInfo& d) { return d.cpu ? "this machine" : "this GPU"; }
 
 // Bits per stored value: what "narrower" and "wider" mean between formats.
 int width_of(lx_wtype w) {
@@ -391,7 +402,7 @@ double decode_bytes_per_token(const MetisConfig& c, lx_wtype target, bool bf16x_
 // (Praxis on an RTX 5070 Ti, bench at one stream, 2026-10-24) times the bytes a token reads, over the card's bandwidth.
 // The decode estimates scale the card's bandwidth by these, so a note never promises more than the kernels deliver.
 double decode_efficiency(lx_wtype target, bool bf16x_decode) {
-  constexpr double kBF16 = 0.577, kBF16X = 0.512, kINT8 = 0.5, kFP8 = 0.5, kNVFP4 = 0.5;
+  constexpr double kBF16 = 0.62, kBF16X = 0.56, kINT8 = 0.48, kFP8 = 0.53, kNVFP4 = 0.49;
   switch (target) {
     case LX_W_BF16: return bf16x_decode ? kBF16X : kBF16;
     case LX_W_BF16X: return kBF16X;
@@ -694,7 +705,7 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
         notes.push_back("Weights in VRAM " + gb(p.weight_bytes) + " (" + recipe_text(target) + "), one sequence of " +
                         std::to_string(p.kv_capacity) + " tokens.");
         if (!p.bf16x_reason.empty()) notes.push_back(p.bf16x_reason);
-        notes.push_back("Dense products multiply in " + math_name(p.prefill_math) +
+        notes.push_back("Dense products multiply in " + math_name(p.prefill_math, d) +
                         "; offloaded experts weight-only, in BF16 math.");
         if (const FormatOption* o = faster(0.0))
           notes.push_back("--weights " + weights_flag(o->format) + " would fit on the GPU (" +
@@ -723,7 +734,7 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
       if (o.fits && o.format != target)
         why += "\n  " + format_name(o.format) + " fits (" + gb(o.weight_bytes) + "): " +
                (o.loadable ? "--weights " + weights_flag(o.format) + ", " + o.load : o.load);
-    throw std::runtime_error("the model does not run on this GPU as " + format_name(target) + ":" + why);
+    throw std::runtime_error("the model does not run on " + std::string(this_device(d)) + " as " + format_name(target) + ":" + why);
   }
 
   Plan p;
@@ -772,7 +783,7 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
   auto& n = p.notes;
   n.push_back("Holding the weights as " + format_name(target) + ", " + p.reason + ".");
   if (limited)
-    n.push_back("This GPU is small for the model: it runs " + std::to_string(p.max_slots) + " sequence" +
+    n.push_back(std::string(d.cpu ? "This machine's memory" : "This GPU") + " is small for the model: it runs " + std::to_string(p.max_slots) + " sequence" +
                 (p.max_slots == 1 ? "" : "s") + " of up to " + std::to_string(p.kv_capacity) + " tokens" +
                 (offload_why.empty() ? "" : " (offloading the experts does not apply: " + offload_why + ")") + ".");
   n.push_back("Weights " + gb(p.weight_bytes) + ": " + recipe_text(target) + ".");
@@ -781,11 +792,12 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
     n.push_back("  The copies cost " + std::to_string(plain_fit.slots) + " sequences of " +
                 std::to_string(plain_fit.context) + " tokens down to " + std::to_string(p.max_slots) + " of " +
                 std::to_string(p.kv_capacity) + "; --no-bf16x keeps them.");
-  n.push_back("Dense products multiply in " + math_name(p.prefill_math) + "; routed experts in " +
-              math_name(p.expert_math) + ".");
+  n.push_back("Dense products multiply in " + math_name(p.prefill_math, d) + "; routed experts in " +
+              math_name(p.expert_math, d) + ".");
   if (req.fast_math && p.prefill_math == LX_MATH_BF16 && p.recipe.dense != LX_W_BF16 && p.recipe.dense != LX_W_BF16X)
-    n.push_back("This GPU has no tensor-core instruction for " + format_name(p.recipe.dense) +
-                " math, so the weights are expanded in registers and multiplied in BF16.");
+    n.push_back(std::string(d.cpu ? "This CPU has no instruction for " : "This GPU has no tensor-core instruction for ") +
+                format_name(p.recipe.dense) + " math, so the weights are expanded in registers and multiplied in " +
+                (d.cpu ? "f32." : "BF16."));
   n.push_back("Up to " + std::to_string(p.max_slots) + " sequences, " + std::to_string(p.kv_capacity) +
               " tokens each (" + gb(p.state_bytes + p.kv_bytes) + " of state and cache)" +
               (req.sequences > p.max_slots ? ": " + std::to_string(req.sequences) + " were asked for" : "") + ".");

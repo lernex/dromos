@@ -13,6 +13,8 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <mutex>
 #include <unordered_map>
@@ -135,29 +137,78 @@ void cpu_name(char* out, size_t capacity) {
 #endif
 }
 
-// The L2 cache of one core, in bytes, or 0 where the system does not say.
-int64_t l2_bytes() {
+// The data (or unified) cache of one core at `level` (1, 2 or 3), in bytes, or 0 where the system does not
+// say. On a hybrid chip it is the first core's (a performance core); an L3 is shared by every core.
+int64_t cache_bytes(int level) {
 #if defined(__APPLE__)
-  // The performance cores' L2 (shared by a cluster), where the system lists levels; hw.l2cachesize else.
-  for (const char* name : {"hw.perflevel0.l2cachesize", "hw.l2cachesize"}) {
+  // The performance cores' caches (an L2 is shared by a cluster). Apple lists no L3.
+  const char* names[2][2] = {{"hw.perflevel0.l1dcachesize", "hw.l1dcachesize"},
+                             {"hw.perflevel0.l2cachesize", "hw.l2cachesize"}};
+  if (level < 1 || level > 2) return 0;
+  for (const char* name : names[level - 1]) {
     int64_t v = 0;
     size_t len = sizeof v;
     if (sysctlbyname(name, &v, &len, nullptr, 0) == 0 && v > 0) return v;
   }
   return 0;
-#elif defined(_SC_LEVEL2_CACHE_SIZE)
-  const long v = sysconf(_SC_LEVEL2_CACHE_SIZE);
-  if (v > 0) return v;
-  FILE* f = fopen("/sys/devices/system/cpu/cpu0/cache/index2/size", "r");
-  if (!f) return 0;
-  long kb = 0;
-  char unit = 0;
-  const int n = fscanf(f, "%ld%c", &kb, &unit);
-  fclose(f);
-  return n >= 1 ? static_cast<int64_t>(kb) * (unit == 'M' ? 1 << 20 : 1 << 10) : 0;
+#elif defined(__linux__)
+  for (int i = 0; i < 10; ++i) {
+    char path[96], type[32] = {}, size[32] = {};
+    int lv = 0;
+    auto read = [&](const char* leaf, const char* fmt, void* out) {
+      snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu0/cache/index%d/%s", i, leaf);
+      FILE* f = fopen(path, "r");
+      if (!f) return false;
+      const bool ok = fscanf(f, fmt, out) == 1;
+      fclose(f);
+      return ok;
+    };
+    if (!read("level", "%d", &lv)) break;
+    if (lv != level || !read("type", "%31s", type) || !strcmp(type, "Instruction") || !read("size", "%31s", size))
+      continue;
+    char* unit = nullptr;
+    const long v = strtol(size, &unit, 10);
+    return static_cast<int64_t>(v) * (unit && *unit == 'M' ? 1 << 20 : unit && *unit == 'K' ? 1 << 10 : 1);
+  }
+  return 0;
 #else
+  (void)level;
   return 0;
 #endif
+}
+
+// The read bandwidth the kernels see: every thread of the pool summing a buffer several times the last-level
+// cache, the best of a few passes. Measured once per process, in a few tens of milliseconds.
+int64_t read_bandwidth() {
+  static const int64_t measured = [] {
+    const int64_t bytes = std::min<int64_t>(int64_t{512} << 20, std::max<int64_t>(int64_t{128} << 20, 8 * cache_bytes(3)));
+    void* buf = nullptr;
+    if (alloc(&buf, bytes) != kOk) return int64_t{0};
+    // Written first: untouched pages would all read the one zero page.
+    uint64_t* w = static_cast<uint64_t*>(buf);
+    const int64_t words = bytes / 8;
+    parallel_for(words, grain_for(words, 1 << 16), [&](int64_t b, int64_t e) {
+      for (int64_t i = b; i < e; ++i) w[i] = static_cast<uint64_t>(i);
+    });
+    std::atomic<uint64_t> sink{0};
+    double best = 0;
+    for (int pass = 0; pass < 5; ++pass) {
+      const auto t0 = std::chrono::steady_clock::now();
+      parallel_for(words, grain_for(words, 1 << 16, 1), [&](int64_t b, int64_t e) {
+        uint64_t a[8] = {};
+        int64_t i = b;
+        for (; i + 8 <= e; i += 8)
+          for (int j = 0; j < 8; ++j) a[j] += w[i + j];
+        for (; i < e; ++i) a[0] += w[i];
+        sink.fetch_add(a[0] + a[1] + a[2] + a[3] + a[4] + a[5] + a[6] + a[7], std::memory_order_relaxed);
+      });
+      const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+      if (pass > 0 && (best == 0 || t < best)) best = t;  // the first pass also faults the pages in
+    }
+    release(buf);
+    return best > 0 && sink.load() != 1 ? static_cast<int64_t>(static_cast<double>(bytes) / best) : int64_t{0};
+  }();
+  return measured;
 }
 
 }  // namespace
@@ -355,9 +406,9 @@ int lx_rt_mem_info(int64_t* free_bytes, int64_t* total_bytes) {
 }
 
 // One device: this machine. Its compute capability is the ISA level (lx_arch's code before any override,
-// major * 10 + minor), its multiprocessors the threads the kernels run on. The memory clock and bus width
-// are not something a process can read, so they are 0 (and the host shows no peak bandwidth), as are the
-// driver and runtime versions, which do not exist here.
+// major * 10 + minor), its multiprocessors the threads the kernels run on, and its bandwidth what they
+// read at, measured. The memory clock and bus width are not something a process can read, so they are 0,
+// as are the driver and runtime versions, which do not exist here.
 int lx_rt_device_props(int ordinal, lx_device_props* props) {
   if (!props) return fail(kInvalid);
   if (ordinal != 0) return fail(kBadDevice);
@@ -367,7 +418,13 @@ int lx_rt_device_props(int ordinal, lx_device_props* props) {
   props->cc_major = level / 10;
   props->cc_minor = level % 10;
   props->sms = threads();
-  props->l2_bytes = l2_bytes();
+  props->l1_bytes = cache_bytes(1);
+  props->l2_bytes = cache_bytes(2);
+  props->l3_bytes = cache_bytes(3);
+  props->read_bandwidth = read_bandwidth();
+  snprintf(props->isa, sizeof props->isa, "%s%s", level_isa(kern().code),
+           amx_present() ? "; AMX tiles on the chip, which these kernels do not use" : "");
+  props->native_math = native_math();
   return kOk;
 }
 

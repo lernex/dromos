@@ -199,12 +199,12 @@ inline int64_t row_stride(int64_t K) {
 }
 
 // out[m * ld_out + r] = sum_k x[m, k] * row_r[k] for an MR x NR tile. With pf, the tile also pulls
-// the next tile's weight bytes (pf, the rows right after its own) toward the core as it goes, at the
-// rate it consumes its own, so when it moves on the next rows are arriving instead of starting cold.
+// the next tile's weight bytes (pf, the rows right after its own) toward the core as it goes: the bytes
+// are spread evenly over the tile's steps, so each step pulls its share and the rows arrive as the tile
+// reaches them, not in a burst at the start (the burst evicts the rows the tile is reading).
 template <int F, int MR, int NR>
 inline void tile(const float* x, int64_t ld_x, const Row<F>* rows, int64_t K, float* out, int64_t ld_out,
                  const char* pf = nullptr, const char* pf_end = nullptr) {
-  constexpr int kLines = (W * NR * kRowBytesX2<F> / 2 + 63) / 64;
   V acc[MR][NR];
   for (int m = 0; m < MR; ++m)
     for (int r = 0; r < NR; ++r) acc[m][r] = vzero();
@@ -214,12 +214,23 @@ inline void tile(const float* x, int64_t ld_x, const Row<F>* rows, int64_t K, fl
   // BF16X decodes its spans at every MR, since a decode costs more than the x loads it saves: past two
   // rows of x those come from L1 with each multiply instead of being held.
   constexpr int SV = Row<F>::kSpan / W;
+  // The prefetch's pace: the tile's steps (wide spans, then narrow vectors) share the bytes from pf to pf_end.
+  // pulled counts the bytes of that range prefetched so far, so no address leaves the range.
+  const int64_t pf_bytes = pf ? pf_end - pf : 0;
+  int64_t pstep = 0, pulled = 0;
+  if (pf) {
+    const int64_t wide = (SV > 1 && (MR <= 2 || F == kW_BF16X)) ? K / Row<F>::kSpan : 0;
+    const int64_t units = wide * SV + (K - wide * Row<F>::kSpan) / W;
+    pstep = units ? (pf_bytes + units - 1) / units : 0;
+  }
+  auto pf_to = [&](int64_t step_bytes) {
+    if (!pf) return;
+    const int64_t goal = lmin<int64_t>(pf_bytes, pulled + step_bytes);
+    for (; pulled < goal; pulled += 64) __builtin_prefetch(pf + pulled, 0, 3);
+  };
   if constexpr (SV > 1 && (MR <= 2 || F == kW_BF16X)) {
     for (; k + Row<F>::kSpan <= K; k += Row<F>::kSpan) {
-      if (pf && pf < pf_end) {
-        for (int l = 0; l < SV * kLines; ++l) __builtin_prefetch(pf + 64 * l, 0, 3);
-        pf += 64 * SV * kLines;
-      }
+      pf_to(pstep * SV);
       if constexpr (MR <= 2) {
         V xv[MR][SV];
         for (int m = 0; m < MR; ++m)
@@ -241,10 +252,7 @@ inline void tile(const float* x, int64_t ld_x, const Row<F>* rows, int64_t K, fl
     }
   }
   for (; k + W <= K; k += W) {
-    if (pf && pf < pf_end) {
-      for (int l = 0; l < kLines; ++l) __builtin_prefetch(pf + 64 * l, 0, 3);
-      pf += 64 * kLines;
-    }
+    pf_to(pstep);
     V wv[NR];
     for (int r = 0; r < NR; ++r) wv[r] = rows[r].load(k);
     for (int m = 0; m < MR; ++m) {

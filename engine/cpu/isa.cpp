@@ -208,6 +208,47 @@ const Kern& kern() {
   return k ? *k : *select();
 }
 
+const char* level_isa(int code) {
+  switch (code) {
+    case 10: return "AVX2, FMA, F16C";
+    case 11: return "AVX2, FMA, F16C, AVX-VNNI";
+    case 20: return "AVX-512 (F, BW, DQ, VL)";
+    case 21: return "AVX-512 (F, BW, DQ, VL), AVX512-VNNI";
+    case 22: return "AVX-512 (F, BW, DQ, VL), AVX512-VNNI, AVX512-BF16";
+    case 50: return "Advanced SIMD";
+    case 51: return "Advanced SIMD, dot product";
+    case 52: return "Advanced SIMD, dot product, I8MM, BF16";
+    default: return "portable C++";
+  }
+}
+
+int native_math() {
+  const Kern& k = kern();
+  int m = 0;
+  // VNNI and SDOT multiply int8 pairs into int32 sums; below them int8 goes through 16-bit multiplies.
+  if (k.code == 11 || k.code == 21 || k.code == 22 || k.code == 51 || k.code == 52) m |= 1 << LX_MATH_INT8;
+  // A bf16 dot instruction, where the level has one and uses it (the Mac takes the f32 path: select()).
+  if (k.dot_bf16) m |= 1 << LX_MATH_BF16;
+  return m;
+}
+
+bool amx_present() {
+#if defined(__x86_64__) || defined(_M_X64)
+  if (__get_cpuid_max(0, nullptr) < 7) return false;
+  unsigned a, b, c, d;
+  __cpuid_count(7, 0, a, b, c, d);
+  const bool tile = d & (1u << 24), bf16 = d & (1u << 22), int8 = d & (1u << 25);
+  if (!tile || !(bf16 || int8)) return false;
+  __get_cpuid(1, &a, &b, &c, &d);
+  if (!(c & (1u << 27))) return false;  // OSXSAVE
+  unsigned lo, hi;
+  __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+  return (lo & (3u << 17)) == (3u << 17);  // the OS saves the tile state
+#else
+  return false;
+#endif
+}
+
 }  // namespace lx::cpu
 
 extern "C" {

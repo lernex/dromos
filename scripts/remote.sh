@@ -29,7 +29,7 @@ if [ -n "${LX_ARCHS:-}" ]; then
 fi
 env="export PATH=/usr/local/cuda/bin:\$PATH; export LX_KERNELS=\$PWD/$bdir/liblernex_kernels.so; export PY=\$HOME/venvs/hfport/bin/python"
 build="cmake -S . -B $bdir -G Ninja -DCMAKE_BUILD_TYPE=Release $cfg >/dev/null && nice -n 5 cmake --build $bdir -j 6"
-q() { printf '%q ' "$@"; }
+q() { [ $# -eq 0 ] || printf '%q ' "$@"; }  # nothing for no arguments: an empty '' would be a path
 case "$verb" in
   build) ssh "$host" "cd $remote && $env && $build" ;;
   # The kernel tests allocate gigabytes on the card, so they hold the GPU lock as model runs do.

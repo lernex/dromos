@@ -22,7 +22,12 @@ struct DeviceInfo {
   int real_cc_major = 0, real_cc_minor = 0;
   int sms = 0;
   size_t total_bytes = 0, free_bytes = 0, l2_bytes = 0;
-  double bandwidth_gbs = 0;  // peak, from the memory clock and bus width
+  size_t l1_bytes = 0, l3_bytes = 0;  // where the backend reports them (a CPU's)
+  double bandwidth_gbs = 0;  // peak, from the memory clock and bus width, or measured (bandwidth_measured)
+  bool bandwidth_measured = false;
+  bool cpu = false;          // the CPU backend: host memory is the device's
+  std::string isa;           // the instruction set the kernels run, in words (a CPU's)
+  int native_math = 0;       // bit (1 << m): the hardware multiplies lx_math m with an instruction of its own
   bool bf16_mma = false, int8_mma = false, fp8_mma = false, fp4_mma = false, clusters = false;
   bool built = false;  // this binary has kernels for the architecture the engine runs as
   int driver = 0, runtime = 0;  // CUDA versions as integers: 13020 for 13.2
