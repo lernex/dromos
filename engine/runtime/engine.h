@@ -21,6 +21,10 @@
 #include "runtime/tool_grammar.h"
 #include "text/tokenizer.h"
 
+namespace lx::offload {
+struct OffloadLoadOptions;
+}  // namespace lx::offload
+
 namespace lx::runtime {
 
 constexpr int kMaxTopLogprobs = 20;
@@ -146,5 +150,9 @@ class Engine {
   std::unique_ptr<Impl> impl_;
   std::atomic<uint64_t> next_id_{1};
 };
+
+// The offload runtime's options for a plan: the dense weights' target and the experts' format, the VRAM and RAM budgets,
+// the CPU lane's share, and the LX_OFFLOAD_* knobs. Every offloaded run loads with them, spec-check included.
+lx::offload::OffloadLoadOptions offload_options(const Plan& plan);
 
 }  // namespace lx::runtime

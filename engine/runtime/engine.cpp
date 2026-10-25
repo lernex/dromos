@@ -70,6 +70,8 @@ size_t held_suffix(const std::string& text, const std::vector<std::string>& stri
   return hold;
 }
 
+}  // namespace
+
 // The offload runtime's options for a plan: its formats and budgets, the CPU lane's share as the plan placed it,
 // and the measurement knobs `lernex offload` reads (LX_ROUTING_STATS, LX_OFFLOAD_DYNAMIC, LX_OFFLOAD_CPU_FRACTION,
 // LX_OFFLOAD_CPU_PAIRS, LX_OFFLOAD_FILL), which win when set.
@@ -90,8 +92,6 @@ lx::offload::OffloadLoadOptions offload_options(const Plan& plan) {
   o.policy.fill = env("LX_OFFLOAD_FILL", 1) != 0;
   return o;
 }
-
-}  // namespace
 
 struct Sequence {
   uint64_t id = 0;

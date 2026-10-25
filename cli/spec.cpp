@@ -56,6 +56,8 @@
 #include "cuda/kernels.h"
 #include "model/metis.h"
 #include "runtime/block_drafter.h"
+#include "runtime/engine.h"
+#include "runtime/offload_model.h"
 #include "runtime/speculative.h"
 
 namespace {
@@ -63,13 +65,29 @@ namespace {
 struct Loaded {
   lx::MetisConfig config;
   std::unique_ptr<lx::ModelWeights> weights;
+  std::unique_ptr<lx::offload::OffloadedModel> offloaded;  // offloaded models: the dense weights and the experts
   std::unique_ptr<lx::MetisModel> model;
 };
 
-// The model in the folder's format, or the one the flags name, with the plan's maths for it on this GPU.
-Loaded load(const std::string& dir, int slots, int max_tokens, const lx::cli::FormatFlags& format = {}) {
+// The model in the folder's format, or the one the flags name, with the plan's maths for it on this GPU. With `offload`,
+// a model that does not fit the GPU runs as the engine runs it: its routed experts in the offload runtime, under the
+// plan's budgets, and the verify and one-token steps read the same expert copies.
+Loaded load(const std::string& dir, int slots, int max_tokens, const lx::cli::FormatFlags& format = {},
+            bool offload = false) {
   Loaded l;
   l.config = lx::load_config(dir);
+  if (offload) {
+    const lx::runtime::Plan plan =
+        lx::cli::plan_for(lx::cli::find_model(dir, false), slots, 8192, format.weights, 0.92, format.bf16x);
+    if (plan.offload.enabled) {
+      l.offloaded = lx::offload::OffloadedModel::load(dir, l.config, lx::runtime::offload_options(plan));
+      l.model = std::make_unique<lx::MetisModel>(l.config, l.offloaded->weights(), plan.formats(), slots, 8192,
+                                                 max_tokens, &l.offloaded->experts(), true);
+      l.offloaded->finalize();
+      std::fprintf(stderr, "%s", l.offloaded->describe().c_str());
+      return l;
+    }
+  }
   lx::cli::LoadedWeights w = lx::cli::load_weights(dir, l.config, format);
   std::fprintf(stderr, "%s\n", w.description.c_str());
   l.weights = std::move(w.weights);
@@ -98,7 +116,7 @@ int run_check(int argc, char** argv, const lx::cli::FormatFlags& format) {
   nlohmann::json prompts;
   std::ifstream(argv[2]) >> prompts;
   const int K = argc >= 4 ? std::stoi(argv[3]) : 96;
-  Loaded l = load(dir, 1, 512, format);
+  Loaded l = load(dir, 1, 512, format, true);
   lx::MetisModel& model = *l.model;
   const int V = model.vocab_size(), maxv = model.max_verify_tokens();
   float* d_logits = nullptr;
