@@ -4,13 +4,16 @@
 // kFlashRows / G tokens of one sequence with all G query heads of one kv head (kFlashRows query rows),
 // and reads each cache tile once for all of them.
 //
-// Per tile of kFlashKeys positions: S = Q K^T on the accelerators (bf16 operands, f32 scores) into
-// threadgroup memory; an online softmax over each row (two threads per row) writes P as bf16 and the
-// row's rescale factor; then O = O * corr + P V, O a cooperative f32 tensor that stays in registers.
+// Per tile of kFlashKeys positions: S = Q K^T on the accelerators (q in f32 against the bf16 cache, f32
+// scores) into threadgroup memory; an online softmax over each row (two threads per row) writes P as bf16 and the row's
+// rescale factor; then O = O * corr + P V, O a cooperative f32 tensor that stays in registers.
 // The next tile's K and V are loaded into registers while the current one is multiplied. Positions past
 // the block's last visible one are never read (they are zero in the staging), and each row masks the
 // positions past its own token. Head size 64 only (the host checks); the result matches the per-token
-// kernel to bf16 rounding of q and of the probabilities, as tensor-core flash attention does.
+// kernel to bf16 rounding of the probabilities, as tensor-core flash attention does.
+//
+// Threadgroup memory is exactly Metal's 32 KB: Q in f32, a K and a V tile, and the scores, whose
+// space P, the rescale factors and the row sums reuse once every thread holds its scores in registers.
 #include <metal_tensor>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 
@@ -34,15 +37,15 @@ kernel void attention_flash(constant AttnArgs& a [[buffer(0)]], threadgroup ucha
   const int T = a.cu[a.n_seq];
   if (!flash_takes(a, T)) return;
   const int KVH = a.KVH, H = a.H, G = H / KVH, BQ = R / G;
-  threadgroup bfloat* sQ = (threadgroup bfloat*)smem;           // [R][D]
-  threadgroup bfloat* sK = sQ + R * D;                          // [BK][D]
+  threadgroup float* sQ = (threadgroup float*)smem;             // [R][D]
+  threadgroup bfloat* sK = (threadgroup bfloat*)(sQ + R * D);   // [BK][D]
   threadgroup bfloat* sV = sK + BK * D;                         // [BK][D]
   threadgroup float* sS = (threadgroup float*)(sV + BK * D);    // [R][BK]
-  threadgroup bfloat* sP = (threadgroup bfloat*)(sS + R * BK);  // [R][BK]
-  threadgroup float* sCorr = (threadgroup float*)(sP + R * BK); // [R]
+  threadgroup bfloat* sP = (threadgroup bfloat*)sS;             // [R][BK], over the first half of sS
+  threadgroup float* sCorr = sS + R * BK / 2;                   // [R], in the second half
   threadgroup float* sL = sCorr + R;                            // [R]
 
-  using TQ = tensor<threadgroup bfloat, extents<int32_t, D, R>, tensor_inline>;
+  using TQ = tensor<threadgroup float, extents<int32_t, D, R>, tensor_inline>;
   using TK = tensor<threadgroup bfloat, extents<int32_t, D, BK>, tensor_inline>;
   using TS = tensor<threadgroup float, extents<int32_t, BK, R>, tensor_inline>;
   using TP = tensor<threadgroup bfloat, extents<int32_t, BK, R>, tensor_inline>;
@@ -78,13 +81,13 @@ kernel void attention_flash(constant AttnArgs& a [[buffer(0)]], threadgroup ucha
     const long slot = a.slot_ids[s];
     const int limit = p0 + min(r / G, ntok - 1);     // the last position row r sees
 
-    // Q rows r = token * G + head, scaled, in bf16.
+    // Q rows r = token * G + head, scaled.
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int i = int(tid); i < R * D; i += 128) {
       const int row = i / D, d = i % D, tok = row / G;
       float v = 0.0f;
       if (tok < ntok) v = a.qkv[long(t0 + tok) * a.ld_qkv + (kvh * G + row % G) * D + d] * a.scale;
-      sQ[i] = bfloat(v);
+      sQ[i] = v;
     }
 
     auto o = oop.template get_destination_cooperative_tensor<TP, TV, float>();
@@ -132,6 +135,7 @@ kernel void attention_flash(constant AttnArgs& a [[buffer(0)]], threadgroup ucha
         mx = max(mx, sv[j]);
       }
       mx = max(mx, simd_shuffle_xor(mx, 1));
+      threadgroup_barrier(mem_flags::mem_threadgroup);  // every row's scores are read: P may reuse them
       const float mn = max(m, mx);
       const float corr = mn == -INFINITY ? 1.0f : exp(m - mn);
       float sum = 0.0f;

@@ -126,8 +126,10 @@ int lx_attention_varlen(const float* qkv, int ld_qkv, void* k_cache, void* v_cac
   stream_of(stream)->again();
   if (int e = attn.launch(stream, a, size1(groups), size1(128), smem)) return e;
   if (a.flash) {
-    // Q (64 x 64) and the K, V tiles (32 x 64) in bf16, the scores (64 x 32) f32 and P bf16, two rows of 64.
-    constexpr NSUInteger kFlashSmem = (64 * 64 + 2 * 32 * 64) * 2 + 64 * 32 * 4 + 64 * 32 * 2 + 2 * 64 * 4;
+    // Q (64 x 64) in f32, the K, V tiles (32 x 64) in bf16, and the scores (64 x 32) f32, which P and the
+    // two rows of 64 reuse: 32 KB.
+    constexpr NSUInteger kFlashSmem = 64 * 64 * 4 + 2 * 32 * 64 * 2 + 64 * 32 * 4;
+    static_assert(kFlashSmem <= 32 * 1024, "the flash kernel's threadgroup memory");
     stream_of(stream)->again();
     if (int e = flash.launch(0, stream, a, size1(kAttnGroups), size1(128), kFlashSmem)) return e;
   }
