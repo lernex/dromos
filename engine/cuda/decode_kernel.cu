@@ -130,13 +130,59 @@ __device__ __forceinline__ int64_t trace_now() { return ctx().trace && threadIdx
 
 // Sums n values held by every compute thread (vals[0..n)) over the block in a fixed order, so every
 // block that runs the same reduction gets the same bits. The totals land in out[0..n). n <= 40.
-__device__ __forceinline__ void block_sums(float* vals, int n, float* red, float* out) {
-  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  for (int i = 0; i < n; ++i) vals[i] = lx::warp_sum(vals[i]);
-  if (lane == 0)
-    for (int i = 0; i < n; ++i) red[warp * 40 + i] = vals[i];
+// Each of N values (N a power of two, <= 32) summed over a warp's lanes in N - 1 + 5 - log2(N) shuffles
+// instead of 5 N: each round hands half of a lane's values to its partner, so after log2(N) rounds
+// lane l holds value (l >> (5 - log2 N)) summed over its group of lanes, and butterflies finish the
+// groups. Returns the lane's value; its index is warp_spread_index<N>().
+template <int N>
+__device__ __forceinline__ float warp_spread(float (&v)[N]) {
+  static_assert(N >= 1 && N <= 32 && (N & (N - 1)) == 0, "a power of two up to 32");
+  const int lane = threadIdx.x & 31;
+#pragma unroll
+  for (int o = 16, n = N; o >= 1; o >>= 1) {
+    if (n > 1) {
+      const bool up = lane & o;
+#pragma unroll
+      for (int i = 0; i < n / 2; ++i) {
+        const float send = up ? v[i] : v[i + n / 2], keep = up ? v[i + n / 2] : v[i];
+        v[i] = keep + __shfl_xor_sync(0xffffffffu, send, o);
+      }
+      n >>= 1;
+    } else {
+      v[0] += __shfl_xor_sync(0xffffffffu, v[0], o);
+    }
+  }
+  return v[0];
+}
+template <int N>
+__device__ __forceinline__ int warp_spread_index() {
+  constexpr int kBits = N >= 32 ? 5 : N >= 16 ? 4 : N >= 8 ? 3 : N >= 4 ? 2 : N >= 2 ? 1 : 0;
+  return (threadIdx.x & 31) >> (5 - kBits);
+}
+// Whether this lane writes its group's value (one lane per value).
+template <int N>
+__device__ __forceinline__ bool warp_spread_writer() {
+  return ((threadIdx.x & 31) & ((32 / N) - 1)) == 0;
+}
+
+// red[warp * 40 + i] = the warp's sum of vals[i], for i < N (N a power of two).
+template <int N>
+__device__ __forceinline__ void warp_sums_to(float (&vals)[N], float* red) {
+  const float v = warp_spread(vals);
+  if (warp_spread_writer<N>()) red[(threadIdx.x >> 5) * 40 + warp_spread_index<N>()] = v;
+}
+
+// out[i] = the block's sum of vals[i] (N <= 32): each warp's sum, then the warps in order.
+template <int N>
+__device__ __forceinline__ void block_sums(float (&vals)[N], float* red, float* out) {
+  constexpr int P = N <= 1 ? 1 : N <= 2 ? 2 : N <= 4 ? 4 : N <= 8 ? 8 : N <= 16 ? 16 : 32;
+  static_assert(N <= 32, "up to 32 values");
+  float v[P];
+#pragma unroll
+  for (int i = 0; i < P; ++i) v[i] = i < N ? vals[i] : 0.0f;
+  warp_sums_to(v, red);
   csync();
-  if (threadIdx.x < n) {
+  if (threadIdx.x < N) {
     float t = 0.0f;
     for (int w = 0; w < kComputeWarps; ++w) t += red[w * 40 + threadIdx.x];
     out[threadIdx.x] = t;
@@ -363,19 +409,22 @@ struct Chunk<LX_W_INT8> {
 };
 
 // A unit of the tensor-core reader, for one lane: its first chunks in rows g and g + 8 (null: the row
-// reads as zeros), the k of the unit's first value, and its steps (a step: four chunks per row).
+// reads as zeros), the k of the unit's first value, its steps (a step: four chunks per row), and the
+// first of the eight x rows its products' columns are (xr + j for column j).
 struct UnitRef {
   const uint4* a;
   const uint4* b;
-  int kb, steps;
+  int kb, steps, xr;
 };
 
 // Units of 16 rows by a run of steps: warp w takes units w, w + 16, ... < nunits; kU steps per lane
 // are in flight, across the ends of units. unit_of(u) gives a unit; sink(u, c) takes its products.
-// xs: token m's x at m * xst, 16-bit values.
-template <int kType, int kU, int kPlanes, class UnitOf, class Sink>
+// xs: the staged x, row r at r * xst (16-bit values), nx rows (past them x reads as zeros); with
+// kPlanes 2, a second plane of nx rows follows. Only the first kCols columns read x (the others are
+// zero), so a unit that wants one column (an expert's rows for one token) reads one row of x.
+template <int kType, int kU, int kPlanes, int kCols, class UnitOf, class Sink>
 __device__ __forceinline__ void dots_mma(int nunits, UnitOf&& unit_of, Sink&& sink, const uint16_t* xs, int xst,
-                                         int mc) {
+                                         int nx) {
   using C = Chunk<kType>;
   constexpr int kV = C::kValues, kR = kV / 2;
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
@@ -384,7 +433,8 @@ __device__ __forceinline__ void dots_mma(int nunits, UnitOf&& unit_of, Sink&& si
   int lv = 0, ls = 0;
   UnitRef lr = unit_of(warp);
   UnitRef ln = mine > 1 ? unit_of(warp + kComputeWarps) : lr;
-  // the lane's next chunks: the words, the x offset of the step (-1: none), the unit it ends (-1: none)
+  // the lane's next chunks: the words, the x offset of the step (-1: no step, the same in every lane;
+  // -2: this lane's column has no x), the unit it ends (-1: none)
   auto produce = [&](uint4& wa, uint4& wb, int& xo, int& end) {
     wa = make_uint4(0u, 0u, 0u, 0u);
     wb = wa;
@@ -393,7 +443,8 @@ __device__ __forceinline__ void dots_mma(int nunits, UnitOf&& unit_of, Sink&& si
     if (lv < mine) {
       if (lr.a) wa = ldg_chunk(lr.a + 4 * ls);
       if (lr.b) wb = ldg_chunk(lr.b + 4 * ls);
-      xo = lr.kb + (4 * ls + t) * kV;
+      const int row = lr.xr + g;
+      xo = g < kCols && row < nx ? row * xst + lr.kb + (4 * ls + t) * kV : -2;
       if (++ls == lr.steps) {
         end = warp + lv * kComputeWarps;
         ls = 0;
@@ -409,15 +460,13 @@ __device__ __forceinline__ void dots_mma(int nunits, UnitOf&& unit_of, Sink&& si
 #pragma unroll
   for (int u = 0; u < kU; ++u) produce(ba[u], bb[u], bx[u], be[u]);
   float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-  const bool has_x = g < mc;
-  const uint16_t* xg = xs + g * xst;
   for (int left = mine; left > 0;) {
 #pragma unroll
     for (int u = 0; u < kU; ++u) {
       const uint4 wa = ba[u], wb = bb[u];
       const int xo = bx[u], end = be[u];
       produce(ba[u], bb[u], bx[u], be[u]);
-      if (xo >= 0) {  // warp-uniform
+      if (xo != -1) {  // warp-uniform
         uint32_t ra[kR], rb[kR];
         C::decode(wa, ra);
         C::decode(wb, rb);
@@ -427,7 +476,7 @@ __device__ __forceinline__ void dots_mma(int nunits, UnitOf&& unit_of, Sink&& si
 #pragma unroll
           for (int i = 0; i < kR / 4; ++i) {
             const uint4 q =
-                has_x ? *reinterpret_cast<const uint4*>(xg + h * mc * xst + xo + 8 * i) : make_uint4(0u, 0u, 0u, 0u);
+                xo >= 0 ? *reinterpret_cast<const uint4*>(xs + h * nx * xst + xo + 8 * i) : make_uint4(0u, 0u, 0u, 0u);
             rx[4 * i] = q.x;
             rx[4 * i + 1] = q.y;
             rx[4 * i + 2] = q.z;
@@ -681,7 +730,7 @@ __device__ __forceinline__ void gemv_mma(const Gemv& g, int b0, int nb, int sh, 
   auto unit_of = [&](int u) -> UnitRef {
     const int r0 = (u >> sh) * 16 + gr, p = u & (S - 1);
     const int s0 = (p * spr) >> sh, s1 = ((p + 1) * spr) >> sh, kb = s0 * 4 * kV;
-    return {row_ptr(r0, kb), row_ptr(r0 + 8, kb), kb, s1 - s0};
+    return {row_ptr(r0, kb), row_ptr(r0 + 8, kb), kb, s1 - s0, 0};
   };
   auto sink = [&](int u, const float (&c)[4]) {
     const int r0 = (u >> sh) * 16 + gr, p = u & (S - 1), m0 = 2 * t;
@@ -695,8 +744,8 @@ __device__ __forceinline__ void gemv_mma(const Gemv& g, int b0, int nb, int sh, 
     }
   };
   const int units = ((nb + 15) >> 4) << sh;
-  dots_mma<kType, 4, kPlanes>(units, unit_of, sink, reinterpret_cast<const uint16_t*>(xbuf()),
-                     Kc + (kType == LX_W_BF16 ? 32 : 8), M);
+  dots_mma<kType, 4, kPlanes, 8>(units, unit_of, sink, reinterpret_cast<const uint16_t*>(xbuf()),
+                                 Kc + (kType == LX_W_BF16 ? 32 : 8), M);
 }
 
 // A block's run of tasks of one product: stage x once, then all its rows at once across the warps
@@ -825,111 +874,164 @@ __device__ __noinline__ void embed_task(int task) {
 
 // ---- Depth-memory read --------------------------------------------------------------------------
 
+// 16 bytes from global to shared memory without a register round trip (cp.async, sm_80).
+__device__ __forceinline__ void cp_async16(void* dst, const void* src) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(smem_addr(dst)), "l"(src) : "memory");
+}
+__device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wait_all;" ::: "memory"); }
+
+// Rows [0, n) of the token's entries at bank + off (D floats each, entry_stride apart) into the x
+// buffer, all in flight at once.
+__device__ __forceinline__ void stage_entries(const float* bank, int off, int n, int stride, int D) {
+  const int per = D / 4;
+  for (int e = 0; e < n; ++e)
+    for (int c = threadIdx.x; c < per; c += kCT)
+      cp_async16(xbuf() + e * D + 4 * c, bank + static_cast<int64_t>(e) * stride + off + 4 * c);
+}
+
+// One token's depth-memory read, in one block, so everything here is on the step's critical path: the
+// entries are staged in shared memory with all of their loads in flight together (keys, then values
+// over them), each phase's sums are one spread warp reduction, and what later phases read is loaded
+// while earlier ones compute.
 __device__ __noinline__ void memread_task(int m) {
   const MemRead& a = desc().mem;
   const int M = ctx().M;
   constexpr int kCh = 2;  // float4 columns per thread: D <= 4 * 2 * 512
+  constexpr int kE = kMaxEntries, kS = kMaxStreams;
+  static_assert(kE * kS == 32 && (kE + 1) * kS <= 40, "the scores fill one spread reduction, red holds 40");
   const int tid = threadIdx.x;
   const int S = a.S, D = a.D, ne = a.n_entries, chunks = D / 4;
   float* red = scratch();
   float* fin = scratch() + kComputeWarps * 40;
+  float* wts = fin + 40;  // [kS][kE] softmax weights, then [kS] norms and [kS] gates
   float* streams = a.streams + static_cast<int64_t>(m) * S * D;
-  float4 x[kCh][kMaxStreams];
+  const float* bank = a.bank + static_cast<int64_t>(m) * a.token_stride;
+  if (ne > 0) stage_entries(bank, 0, ne, a.entry_stride, D);  // the keys U_e
+  float4 x[kCh][kS];
 #pragma unroll
   for (int j = 0; j < kCh; ++j) {
     const int c = tid + j * kCT;
 #pragma unroll
-    for (int s = 0; s < kMaxStreams; ++s)
+    for (int s = 0; s < kS; ++s)
       x[j][s] = (c < chunks && s < S) ? ldcg4(streams + s * D + 4 * c) : make_float4(0.f, 0.f, 0.f, 0.f);
   }
+  float4 prev[kCh];  // the previous pass's mean, for the end-of-pass difference
+#pragma unroll
+  for (int j = 0; j < kCh; ++j) {
+    const int c = tid + j * kCT;
+    prev[j] = a.previous && c < chunks ? ldcg4(a.previous + static_cast<int64_t>(m) * D + 4 * c)
+                                       : make_float4(0.f, 0.f, 0.f, 0.f);
+  }
   if (ne > 0) {
-    const float* bank = a.bank + static_cast<int64_t>(m) * a.token_stride;
-    // Scores x[s] . U_e and the gate dots x[s] . gate[s] (on the streams before the update).
-    float dots[kMaxStreams * (kMaxEntries + 1)];
+    // Scores x[s] . U_e (values e * kS + s) and the gate dots x[s] . gate[s], on the streams before the
+    // update; then every warp's sums in one spread reduction each.
+    float dots[kE * kS], gates[kS];
 #pragma unroll
-    for (int i = 0; i < kMaxStreams * (kMaxEntries + 1); ++i) dots[i] = 0.0f;
+    for (int i = 0; i < kE * kS; ++i) dots[i] = 0.0f;
+#pragma unroll
+    for (int s = 0; s < kS; ++s) gates[s] = 0.0f;
+#pragma unroll
+    for (int j = 0; j < kCh; ++j) {
+      const int c = tid + j * kCT;
+      if (c < chunks)
+#pragma unroll
+        for (int s = 0; s < kS; ++s)
+          if (s < S) gates[s] += dot4(x[j][s], bf16x4(static_cast<const bf16*>(a.gate) + s * D + 4 * c));
+    }
+    float ce = 0.0f;  // entry tid's score offset, for the softmax
+    if (tid < ne) ce = __ldcg(bank + static_cast<int64_t>(tid) * a.entry_stride + 2 * D);
+    cp_async_wait_all();
+    csync();
+#pragma unroll
+    for (int e = 0; e < kE; ++e) {
+      if (e < ne) {
+#pragma unroll
+        for (int j = 0; j < kCh; ++j) {
+          const int c = tid + j * kCT;
+          if (c < chunks) {
+            const float4 u = *reinterpret_cast<const float4*>(xbuf() + e * D + 4 * c);
+#pragma unroll
+            for (int s = 0; s < kS; ++s)
+              if (s < S) dots[e * kS + s] += dot4(x[j][s], u);
+          }
+        }
+      }
+    }
+    warp_sums_to(dots, red);
+    {
+      float g4[kS];
+#pragma unroll
+      for (int s = 0; s < kS; ++s) g4[s] = gates[s];
+      const float v = warp_spread(g4);
+      if (warp_spread_writer<kS>()) red[(tid >> 5) * 40 + kE * kS + warp_spread_index<kS>()] = v;
+    }
+    if (tid < ne) wts[2 * kS + kS * kE + tid] = ce;  // past the weights, norms and gates
+    csync();  // every warp is done with the keys and has its sums in red
+    stage_entries(bank, D, ne, a.entry_stride, D);  // the values P_e, over the keys
+    if (tid < (kE + 1) * kS) {
+      float t = 0.0f;
+      for (int w = 0; w < kComputeWarps; ++w) t += red[w * 40 + tid];
+      fin[tid] = t;
+    }
+    csync();
+    // Softmax over the entries and the gate, per stream: one thread each.
+    if (tid < S) {
+      const int s = tid;
+      const float inv_m = rsqrtf(static_cast<float>(a.mem_dim));
+      const float inv_d = rsqrtf(static_cast<float>(D));
+      float w[kE], top = -INFINITY;
+#pragma unroll
+      for (int e = 0; e < kE; ++e)
+        if (e < ne) {
+          w[e] = (fin[e * kS + s] + wts[2 * kS + kS * kE + e]) * inv_m;
+          top = fmaxf(top, w[e]);
+        }
+      float total = 0.0f;
+#pragma unroll
+      for (int e = 0; e < kE; ++e)
+        if (e < ne) {
+          w[e] = expf(w[e] - top);
+          total += w[e];
+        }
+#pragma unroll
+      for (int e = 0; e < kE; ++e)
+        if (e < ne) wts[s * kE + e] = w[e];
+      wts[kS * kE + s] = 1.0f / total;
+      wts[kS * kE + kS + s] = sigmoid(fin[kE * kS + s] * inv_d + bf(a.gate_bias, s));
+    }
+    cp_async_wait_all();
+    csync();
 #pragma unroll
     for (int j = 0; j < kCh; ++j) {
       const int c = tid + j * kCT;
       if (c < chunks) {
+        float4 pr[kS];
 #pragma unroll
-        for (int e = 0; e < kMaxEntries; ++e) {
+        for (int s = 0; s < kS; ++s) pr[s] = make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+        for (int e = 0; e < kE; ++e) {
           if (e < ne) {
-            const float4 u = ldcg4(bank + static_cast<int64_t>(e) * a.entry_stride + 4 * c);
+            const float4 p = *reinterpret_cast<const float4*>(xbuf() + e * D + 4 * c);
 #pragma unroll
-            for (int s = 0; s < kMaxStreams; ++s)
-              if (s < S) dots[s * (kMaxEntries + 1) + e] += dot4(x[j][s], u);
-          }
-        }
-#pragma unroll
-        for (int s = 0; s < kMaxStreams; ++s)
-          if (s < S)
-            dots[s * (kMaxEntries + 1) + kMaxEntries] +=
-                dot4(x[j][s], bf16x4(static_cast<const bf16*>(a.gate) + s * D + 4 * c));
-      }
-    }
-    block_sums(dots, S * (kMaxEntries + 1), red, fin);
-    // Softmax over the entries, and the gate, per stream.
-    const float inv_m = rsqrtf(static_cast<float>(a.mem_dim));
-    const float inv_d = rsqrtf(static_cast<float>(D));
-    float w[kMaxStreams][kMaxEntries], norm[kMaxStreams], gs[kMaxStreams];
-#pragma unroll
-    for (int s = 0; s < kMaxStreams; ++s) {
-      norm[s] = 0.0f;
-      gs[s] = 0.0f;
-#pragma unroll
-      for (int e = 0; e < kMaxEntries; ++e) w[s][e] = 0.0f;
-      if (s < S) {
-        float top = -INFINITY;
-#pragma unroll
-        for (int e = 0; e < kMaxEntries; ++e) {
-          if (e < ne) {
-            const float c_e = __ldcg(bank + static_cast<int64_t>(e) * a.entry_stride + 2 * D);
-            w[s][e] = (fin[s * (kMaxEntries + 1) + e] + c_e) * inv_m;
-            top = fmaxf(top, w[s][e]);
-          }
-        }
-        float total = 0.0f;
-#pragma unroll
-        for (int e = 0; e < kMaxEntries; ++e) {
-          if (e < ne) {
-            w[s][e] = expf(w[s][e] - top);
-            total += w[s][e];
-          }
-        }
-        norm[s] = 1.0f / total;
-        gs[s] = sigmoid(fin[s * (kMaxEntries + 1) + kMaxEntries] * inv_d + bf(a.gate_bias, s));
-      }
-    }
-#pragma unroll
-    for (int j = 0; j < kCh; ++j) {
-      const int c = tid + j * kCT;
-      if (c < chunks) {
-        float4 pr[kMaxStreams];
-#pragma unroll
-        for (int s = 0; s < kMaxStreams; ++s) pr[s] = make_float4(0.f, 0.f, 0.f, 0.f);
-#pragma unroll
-        for (int e = 0; e < kMaxEntries; ++e) {
-          if (e < ne) {
-            const float4 p = ldcg4(bank + static_cast<int64_t>(e) * a.entry_stride + D + 4 * c);
-#pragma unroll
-            for (int s = 0; s < kMaxStreams; ++s) {
-              pr[s].x += w[s][e] * p.x;
-              pr[s].y += w[s][e] * p.y;
-              pr[s].z += w[s][e] * p.z;
-              pr[s].w += w[s][e] * p.w;
+            for (int s = 0; s < kS; ++s) {
+              const float w = wts[s * kE + e];
+              pr[s].x += w * p.x;
+              pr[s].y += w * p.y;
+              pr[s].z += w * p.z;
+              pr[s].w += w * p.w;
             }
           }
         }
         float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
 #pragma unroll
-        for (int s = 0; s < kMaxStreams; ++s) {
+        for (int s = 0; s < kS; ++s) {
           if (s < S) {
-            const float4 p = make_float4(pr[s].x * norm[s], pr[s].y * norm[s], pr[s].z * norm[s], pr[s].w * norm[s]);
-            x[j][s].x += gs[s] * p.x;
-            x[j][s].y += gs[s] * p.y;
-            x[j][s].z += gs[s] * p.z;
-            x[j][s].w += gs[s] * p.w;
+            const float norm = wts[kS * kE + s], gs = wts[kS * kE + kS + s];
+            const float4 p = make_float4(pr[s].x * norm, pr[s].y * norm, pr[s].z * norm, pr[s].w * norm);
+            x[j][s].x += gs * p.x;
+            x[j][s].y += gs * p.y;
+            x[j][s].z += gs * p.z;
+            x[j][s].w += gs * p.w;
             acc.x += p.x;
             acc.y += p.y;
             acc.z += p.z;
@@ -946,15 +1048,18 @@ __device__ __noinline__ void memread_task(int m) {
       *reinterpret_cast<float4*>(a.summary + static_cast<int64_t>(m) * D + 4 * c) = make_float4(0.f, 0.f, 0.f, 0.f);
   }
 
-  // The mean over the streams, its sum of squares, and the end-of-pass difference.
-  float sums[2] = {0.0f, 0.0f};
+  // The mean over the streams (and its sum of squares), the end-of-pass difference (and its), and the
+  // next read's input src (and its, for the norm): the three sums in one reduction.
+  float sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float4 src[kCh];
 #pragma unroll
   for (int j = 0; j < kCh; ++j) {
+    src[j] = make_float4(0.f, 0.f, 0.f, 0.f);
     const int c = tid + j * kCT;
     if (c < chunks) {
       float4 st = make_float4(0.f, 0.f, 0.f, 0.f);
 #pragma unroll
-      for (int s = 0; s < kMaxStreams; ++s) {
+      for (int s = 0; s < kS; ++s) {
         if (s < S) {
           st.x += x[j][s].x;
           st.y += x[j][s].y;
@@ -966,32 +1071,15 @@ __device__ __noinline__ void memread_task(int m) {
       *reinterpret_cast<float4*>(a.state + static_cast<int64_t>(m) * D + 4 * c) = st;
       sums[0] += dot4(st, st);
       if (a.previous) {
-        float* prev = a.previous + static_cast<int64_t>(m) * D + 4 * c;
-        const float4 p = ldcg4(prev);
+        const float4 p = prev[j];
         const float4 df = make_float4(st.x - p.x, st.y - p.y, st.z - p.z, st.w - p.w);
         *reinterpret_cast<float4*>(a.difference + static_cast<int64_t>(m) * D + 4 * c) = df;
-        *reinterpret_cast<float4*>(prev) = st;
+        *reinterpret_cast<float4*>(a.previous + static_cast<int64_t>(m) * D + 4 * c) = st;
         sums[1] += dot4(df, df);
       }
-    }
-  }
-  if (a.rms) {
-    block_sums(sums, 2, red, fin);
-    if (tid == 0) a.rms[m] = fin[0];
-    if (tid == 1 && a.previous) a.rms[M + m] = fin[1];
-  }
-
-  // The next read's normalized input, and the attention block's per-pass LoRA down product.
-  if (a.h) {
-    float ss[1] = {0.0f};
-    float4 src[kCh];
+      if (a.h) {
 #pragma unroll
-    for (int j = 0; j < kCh; ++j) {
-      src[j] = make_float4(0.f, 0.f, 0.f, 0.f);
-      const int c = tid + j * kCT;
-      if (c < chunks) {
-#pragma unroll
-        for (int s = 0; s < kMaxStreams; ++s) {
+        for (int s = 0; s < kS; ++s) {
           if (s < S) {
             const float r = __ldg(a.read + s);
             src[j].x += r * x[j][s].x;
@@ -1000,14 +1088,24 @@ __device__ __noinline__ void memread_task(int m) {
             src[j].w += r * x[j][s].w;
           }
         }
-        ss[0] += dot4(src[j], src[j]);
+        sums[2] += dot4(src[j], src[j]);
       }
     }
-    block_sums(ss, 1, red, fin);
-    const float scale = rsqrtf(fin[0] / D + a.eps);
-    float lora[kMaxEntries];
+  }
+  if (a.rms || a.h) {
+    block_sums(sums, red, fin);
+    if (a.rms) {
+      if (tid == 0) a.rms[m] = fin[0];
+      if (tid == 1 && a.previous) a.rms[M + m] = fin[1];
+    }
+  }
+
+  // The next read's normalized input, and the attention block's per-pass LoRA down product.
+  if (a.h) {
+    const float scale = rsqrtf(fin[2] / D + a.eps);
+    float lora[kE];
 #pragma unroll
-    for (int r = 0; r < kMaxEntries; ++r) lora[r] = 0.0f;
+    for (int r = 0; r < kE; ++r) lora[r] = 0.0f;
 #pragma unroll
     for (int j = 0; j < kCh; ++j) {
       const int c = tid + j * kCT;
@@ -1021,13 +1119,13 @@ __device__ __noinline__ void memread_task(int m) {
         dst[1] = __floats2bfloat162_rn(hv.z, hv.w);
         if (a.lora_down)
 #pragma unroll
-          for (int r = 0; r < kMaxEntries; ++r)
+          for (int r = 0; r < kE; ++r)
             if (r < a.rank)
               lora[r] += dot4(hv, bf16x4(static_cast<const bf16*>(a.lora_down) + static_cast<int64_t>(r) * D + 4 * c));
       }
     }
     if (a.lora_down) {
-      block_sums(lora, a.rank, red, fin);
+      block_sums(lora, red, fin);
       if (tid < a.rank) a.lora[static_cast<int64_t>(m) * a.rank + tid] = round_bf16(fin[tid]);
     }
   }
@@ -1150,8 +1248,10 @@ __device__ __noinline__ void conv_bc_task(int m) {
 
 // ---- Routing ------------------------------------------------------------------------------------
 
-// lx_moe_route for every token (one warp each), then the expert summary and the history.
+// lx_moe_route for every token (one warp each), then the expert summary and the history. A token's
+// logits and selection bias are read once, into registers (E <= 32 * kPer).
 __device__ __noinline__ void select_task() {
+  constexpr int kPer = 8;
   const Select& a = desc().sel;
   const int M = ctx().M;
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -1161,34 +1261,49 @@ __device__ __noinline__ void select_task() {
   if (warp < M) {
     const int t = warp;
     const float* row = a.logits + static_cast<int64_t>(t) * E;
+    float v[kPer], sb[kPer];
+#pragma unroll
+    for (int j = 0; j < kPer; ++j) {
+      const int i = lane + 32 * j;
+      v[j] = i < E ? __ldcg(row + i) : -INFINITY;
+      sb[j] = i < E && a.selection_bias ? __ldg(a.selection_bias + i) : 0.0f;
+    }
     float mx = -INFINITY;
-    for (int i = lane; i < E; i += 32) mx = fmaxf(mx, __ldcg(row + i));
+#pragma unroll
+    for (int j = 0; j < kPer; ++j)
+      if (lane + 32 * j < E) mx = fmaxf(mx, v[j]);
     mx = lx::warp_max(mx);
     float z = 0.0f;
-    for (int i = lane; i < E; i += 32) z += expf(__ldcg(row + i) - mx);
+#pragma unroll
+    for (int j = 0; j < kPer; ++j)
+      if (lane + 32 * j < E) z += expf(v[j] - mx);
     z = lx::warp_sum(z);
     float hs = 0.0f;
-    for (int i = lane; i < E; i += 32) {
-      const float pr = expf(__ldcg(row + i) - mx) / z;
-      hs -= pr * logf(fmaxf(pr, 1e-9f));
-    }
+#pragma unroll
+    for (int j = 0; j < kPer; ++j)
+      if (lane + 32 * j < E) {
+        const float pr = expf(v[j] - mx) / z;
+        hs -= pr * logf(fmaxf(pr, 1e-9f));
+      }
     hs = lx::warp_sum(hs);
     if (lane == 0) {
       a.entropy[t] = hs;
       a.confidence[t] = 1.0f / z;
     }
     int* pick = picks + t * 32;
+    unsigned taken = 0;  // this lane's values already picked, a bit per j
     for (int r = 0; r < top_k; ++r) {
       float best = -INFINITY;
       int best_i = E;
-      for (int i = lane; i < E; i += 32) {
-        bool taken = false;
-        for (int j = 0; j < r; ++j) taken |= pick[j] == i;
-        if (taken) continue;
-        const float v = __ldcg(row + i) + (a.selection_bias ? a.selection_bias[i] : 0.0f);
-        if (v > best || (v == best && i < best_i)) {
-          best = v;
-          best_i = i;
+#pragma unroll
+      for (int j = 0; j < kPer; ++j) {
+        const int i = lane + 32 * j;
+        if (i < E && !(taken >> j & 1u)) {
+          const float sv = v[j] + sb[j];
+          if (sv > best || (sv == best && i < best_i)) {
+            best = sv;
+            best_i = i;
+          }
         }
       }
       for (int o = 16; o > 0; o >>= 1) {
@@ -1199,12 +1314,18 @@ __device__ __noinline__ void select_task() {
           best_i = oi;
         }
       }
+      if (best_i < E && (best_i & 31) == lane) taken |= 1u << (best_i >> 5);
       if (lane == 0) pick[r] = best_i;
-      __syncwarp();
     }
+    __syncwarp();
     const bool live = lane < top_k;
     const int id = live ? pick[lane] : 0;
-    const float l = live ? __ldcg(row + id) : -INFINITY;
+    float l = -INFINITY;  // logit id, from the lane that holds it
+#pragma unroll
+    for (int j = 0; j < kPer; ++j) {
+      const float o = __shfl_sync(0xffffffffu, v[j], id & 31);
+      if (live && (id >> 5) == j) l = o;
+    }
     const float lmax = lx::warp_max(l);
     const float e = live ? expf(l - lmax) : 0.0f;
     const float esum = lx::warp_sum(e);
@@ -1235,15 +1356,15 @@ __device__ __forceinline__ void stage_bf16(const void* src, int count) {
   csync();
 }
 
-// Gate and up rows [i0, i0 + rows) of one expert: routed (task = pair * blocks_per_pair + row block,
-// x = the pair's token) or shared (task = row block, every token).
+// Gate and up rows [i0, i0 + rows) of one routed expert (task = pair * blocks_per_pair + row block,
+// x = the pair's token), on the FMA reader.
 template <int kType>
 __device__ __noinline__ void expup_task(int op, int task) {
   using F = typename Word<kType>::F;
   const ExpUp& a = desc().up;
   const int rb = task % a.blocks_per_pair, pair = task / a.blocks_per_pair, t = pair / a.top_k;
   const int i0 = rb * a.rows, rows = a.rows;
-  const int e = a.shared ? 0 : __ldcg(a.ids + pair);
+  const int e = __ldcg(a.ids + pair);
   if (misc() != op * 16 + t + 1) {  // the pair's token's latent row
     stage_bf16(static_cast<const bf16*>(a.latent) + static_cast<int64_t>(t) * a.L, a.L);
     if (threadIdx.x == 0) misc() = op * 16 + t + 1;
@@ -1303,6 +1424,212 @@ __device__ __noinline__ void expdown_task(int op, int task) {
     const int64_t at = static_cast<int64_t>(t) * a.L + l0 + i;
     if (a.add) acc += __ldcg(a.add + at);
     a.out[at] = acc;
+  }
+}
+
+// ---- Experts on the tensor cores ----------------------------------------------------------------
+//
+// A block's whole run of expert tasks at once, so all of its weight bytes are in flight together:
+// these rows are known only once the routing is, so nothing fetched them ahead. A unit is one
+// expert's 16 rows by one of 2^sh parts of k (fixed by the shape), and only its token's x column is
+// read. A block's tasks of an op are one ascending range (lx_program_build), so a run's tasks cover
+// a range of tokens, whose x rows are staged and whose picks are read once.
+
+constexpr int kExpReserve = 2 * kMaxM * 8;  // scratch floats at the end: the run's picks, route weights
+
+// Rows [r0, r1) of a bf16 matrix of n values a row (n % 8 == 0, 16-byte aligned) into the x buffer,
+// rows xst values apart: as bf16, or as f16 for the int8 reader (clamped to its range).
+template <bool kF16>
+__device__ __forceinline__ void stage_rows(const void* src, int r0, int r1, int n, int xst) {
+  const int per = n / 8;
+  const uint4* s = static_cast<const uint4*>(src) + static_cast<int64_t>(r0) * per;
+  for (int e = threadIdx.x; e < (r1 - r0) * per; e += kCT) {
+    const int r = e / per, c = e - r * per;
+    uint4 v = __ldcg(s + e);
+    if constexpr (kF16) {
+      constexpr float kMax = 65504.0f;
+      uint32_t w[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const float lo = fminf(fmaxf(__uint_as_float(w[i] << 16), -kMax), kMax);
+        const float hi = fminf(fmaxf(__uint_as_float(w[i] & 0xffff0000u), -kMax), kMax);
+        const __half2 h = __floats2half2_rn(lo, hi);
+        w[i] = *reinterpret_cast<const uint32_t*>(&h);
+      }
+      v = make_uint4(w[0], w[1], w[2], w[3]);
+    }
+    *reinterpret_cast<uint4*>(reinterpret_cast<uint16_t*>(xbuf()) + r * xst + c * 8) = v;
+  }
+}
+
+// Gate|up: a task is gate rows [i0, i0 + 8) of its pair's expert in A rows 0..7 and the same up rows
+// in A rows 8..15, so lane (g, 0) ends with gate and up of row i0 + g side by side.
+template <int kType>
+__device__ __noinline__ void expup_run(int op, const uint32_t* entries, int count, int index) {
+  constexpr int kV = Chunk<kType>::kValues;
+  const ExpUp& a = desc().up;
+  const int tid = threadIdx.x, lane = tid & 31, gr = lane >> 2, tq = lane & 3;
+  const int K = a.top_k, bpp = a.blocks_per_pair, L = a.L, I = a.I, sh = a.sh, S = 1 << sh;
+  const int xst = L + (kType == LX_W_BF16 ? 32 : 8), spr = L / (4 * kV), bpv = a.row_bytes / L;
+  const int64_t t0 = trace_now();
+  const uint16_t* tasks = run_tasks();
+  const int p0 = tasks[0] / bpp, p1 = tasks[count - 1] / bpp + 1;
+  const int tlo = p0 / K, thi = (p1 - 1) / K + 1;
+  int* eid = reinterpret_cast<int*>(scratch() + kScratchFloats - kExpReserve);  // pair p0 + i's expert
+  for (int i = tid; i < p1 - p0; i += kCT) eid[i] = __ldcg(a.ids + p0 + i);
+  stage_rows<kType == LX_W_INT8>(a.latent, tlo, thi, L, xst);
+  if (tid == 0) misc() = -1;
+  csync();
+  const int64_t t1 = trace_now();
+  const int cap = (kScratchFloats - kExpReserve) / (16 * S);  // tasks per batch
+  // the first batch's row scales, loaded while its products are read
+  float sg = 1.0f, su = 1.0f;
+  if constexpr (kRowScaled<kType>) {
+    if (tid < min(cap, count) * 8) {
+      const int task = tasks[tid >> 3], pair = task / bpp;
+      const int64_t row = static_cast<int64_t>(eid[pair - p0]) * 2 * I + (task % bpp) * 8 + (tid & 7);
+      const float* sc = static_cast<const float*>(a.w.scale) + row;
+      sg = __ldg(sc);
+      su = __ldg(sc + I);
+    }
+  }
+  const char* base = static_cast<const char*>(a.w.data);
+  const int64_t up_off = static_cast<int64_t>(I) * a.row_bytes;
+  for (int b0 = 0; b0 < count; b0 += cap) {
+    const int nb = min(cap, count - b0);
+    float* red = scratch();
+    auto unit_of = [&](int u) -> UnitRef {
+      const int task = tasks[b0 + (u >> sh)], p = u & (S - 1), pair = task / bpp;
+      const int64_t row = static_cast<int64_t>(eid[pair - p0]) * 2 * I + (task % bpp) * 8 + gr;
+      const int s0 = (p * spr) >> sh, s1 = ((p + 1) * spr) >> sh, kb = s0 * 4 * kV;
+      const char* pa = base + row * a.row_bytes + kb * bpv;
+      return {reinterpret_cast<const uint4*>(pa) + tq, reinterpret_cast<const uint4*>(pa + up_off) + tq, kb, s1 - s0,
+              pair / K - tlo};
+    };
+    auto sink = [&](int u, const float (&c)[4]) {
+      if (tq == 0) {
+        const int at = ((u >> sh) * 8 + gr) * 2 * S + (u & (S - 1));
+        red[at] = c[0];
+        red[at + S] = c[2];
+      }
+    };
+    dots_mma<kType, 4, 1, 1>(nb << sh, unit_of, sink, reinterpret_cast<const uint16_t*>(xbuf()), xst, thi - tlo);
+    csync();
+    for (int e = tid; e < nb * 8; e += kCT) {
+      const int task = tasks[b0 + (e >> 3)], pair = task / bpp, i = (task % bpp) * 8 + (e & 7);
+      float gt = 0.0f, up = 0.0f;
+      for (int p = 0; p < S; ++p) {
+        gt += red[e * 2 * S + p];
+        up += red[e * 2 * S + S + p];
+      }
+      if constexpr (kRowScaled<kType>) {
+        if (b0 == 0 && e == tid) {
+          gt *= sg;
+          up *= su;
+        } else {
+          const float* sc = static_cast<const float*>(a.w.scale) + static_cast<int64_t>(eid[pair - p0]) * 2 * I + i;
+          gt *= __ldg(sc);
+          up *= __ldg(sc + I);
+        }
+      }
+      static_cast<bf16*>(a.inter)[static_cast<int64_t>(pair) * I + i] = __float2bfloat16_rn(lx::silu(gt) * up);
+    }
+    if (b0 + cap < count) csync();  // the next batch reuses the scratch
+  }
+  if (ctx().trace) {
+    const int64_t t2 = global_ns();
+    for (int i = 0; i < count; ++i)
+      trace_task(index + i, op, static_cast<int>(__ldg(entries + i) & 0xffff), t0, t1, t2);
+  }
+}
+
+// Down: a task is rows [l0, l0 + 16) of each of its token's top_k experts, a unit per expert, summed
+// with the route weights in pick order, then the shared expert added.
+template <int kType>
+__device__ __noinline__ void expdown_run(int op, const uint32_t* entries, int count, int index) {
+  constexpr int kV = Chunk<kType>::kValues;
+  const ExpDown& a = desc().down;
+  const int tid = threadIdx.x, lane = tid & 31, gr = lane >> 2, tq = lane & 3;
+  const int K = a.top_k, bpt = a.blocks_per_token, L = a.L, I = a.I, sh = a.sh, S = 1 << sh;
+  const int xst = I + (kType == LX_W_BF16 ? 32 : 8), spr = I / (4 * kV), bpv = a.row_bytes / I;
+  const int64_t t0 = trace_now();
+  const uint16_t* tasks = run_tasks();
+  const int tlo = tasks[0] / bpt, thi = tasks[count - 1] / bpt + 1;
+  int* eid = reinterpret_cast<int*>(scratch() + kScratchFloats - kExpReserve);  // [(t - tlo) * K + k]
+  float* rw = scratch() + kScratchFloats - kExpReserve / 2;
+  for (int i = tid; i < (thi - tlo) * K; i += kCT) {
+    eid[i] = __ldcg(a.ids + tlo * K + i);
+    rw[i] = __ldcg(a.route_w + tlo * K + i);
+  }
+  stage_rows<kType == LX_W_INT8>(a.inter, tlo * K, thi * K, I, xst);
+  if (tid == 0) misc() = -1;
+  csync();
+  const int64_t t1 = trace_now();
+  const int cap = (kScratchFloats - kExpReserve) / (16 * K * S);  // tasks per batch
+  // the first batch's epilogue inputs (the shared expert's value, the row scales), ahead of its products
+  constexpr int kMaxK = 8;
+  float pre_add = 0.0f, pre_sc[kMaxK];
+#pragma unroll
+  for (int k = 0; k < kMaxK; ++k) pre_sc[k] = 1.0f;
+  if (tid < min(cap, count) * 16) {
+    const int task = tasks[tid >> 4], t = task / bpt, l = (task % bpt) * 16 + (tid & 15);
+    if (a.add) pre_add = __ldcg(a.add + static_cast<int64_t>(t) * L + l);
+    if constexpr (kRowScaled<kType>) {
+#pragma unroll
+      for (int k = 0; k < kMaxK; ++k)
+        if (k < K)
+          pre_sc[k] =
+              __ldg(static_cast<const float*>(a.w.scale) + static_cast<int64_t>(eid[(t - tlo) * K + k]) * L + l);
+    }
+  }
+  const char* base = static_cast<const char*>(a.w.data);
+  const int64_t half = 8ll * a.row_bytes;
+  for (int b0 = 0; b0 < count; b0 += cap) {
+    const int nb = min(cap, count - b0);
+    float* red = scratch();
+    auto unit_of = [&](int u) -> UnitRef {
+      const int q = u >> sh, p = u & (S - 1), task = tasks[b0 + q / K], k = q % K;
+      const int t = task / bpt, x = (t - tlo) * K + k;
+      const int64_t row = static_cast<int64_t>(eid[x]) * L + (task % bpt) * 16 + gr;
+      const int s0 = (p * spr) >> sh, s1 = ((p + 1) * spr) >> sh, kb = s0 * 4 * kV;
+      const char* pa = base + row * a.row_bytes + kb * bpv;
+      return {reinterpret_cast<const uint4*>(pa) + tq, reinterpret_cast<const uint4*>(pa + half) + tq, kb, s1 - s0, x};
+    };
+    auto sink = [&](int u, const float (&c)[4]) {
+      if (tq == 0) {
+        const int at = ((u >> sh) * 16 + gr) * S + (u & (S - 1));
+        red[at] = c[0];
+        red[at + 8 * S] = c[2];
+      }
+    };
+    dots_mma<kType, 4, 1, 1>((nb * K) << sh, unit_of, sink, reinterpret_cast<const uint16_t*>(xbuf()), xst,
+                             (thi - tlo) * K);
+    csync();
+    for (int e = tid; e < nb * 16; e += kCT) {
+      const int j = e >> 4, r = e & 15, task = tasks[b0 + j], t = task / bpt, l = (task % bpt) * 16 + r;
+      const bool pre = b0 == 0 && e == tid;
+      float acc = 0.0f;
+#pragma unroll
+      for (int k = 0; k < kMaxK; ++k) {
+        if (k >= K) break;
+        float c = rw[(t - tlo) * K + k];
+        if constexpr (kRowScaled<kType>)
+          c *= pre ? pre_sc[k]
+                   : __ldg(static_cast<const float*>(a.w.scale) + static_cast<int64_t>(eid[(t - tlo) * K + k]) * L + l);
+        float v = 0.0f;
+        for (int p = 0; p < S; ++p) v += red[((j * K + k) * 16 + r) * S + p];
+        acc += c * v;
+      }
+      const int64_t at = static_cast<int64_t>(t) * L + l;
+      if (a.add) acc += pre ? pre_add : __ldcg(a.add + at);
+      a.out[at] = acc;
+    }
+    if (b0 + cap < count) csync();
+  }
+  if (ctx().trace) {
+    const int64_t t2 = global_ns();
+    for (int i = 0; i < count; ++i)
+      trace_task(index + i, op, static_cast<int>(__ldg(entries + i) & 0xffff), t0, t1, t2);
   }
 }
 
@@ -1510,7 +1837,7 @@ __device__ __noinline__ void continuation_task() {
     for (int m = 0; m < kMaxM; ++m)
       if (m < M) part[m] += w * __ldcg(a.hidden + static_cast<int64_t>(m) * a.R + j);
   }
-  block_sums(part, M, red, fin);
+  block_sums(part, red, fin);
   if (threadIdx.x < M) {
     const int m = threadIdx.x;
     const float logit = fin[m] + a.b_out[0];
@@ -1574,7 +1901,10 @@ __device__ __noinline__ void run_segment(int op, const uint32_t* entries, int co
     const int64_t t0 = trace_now();
     switch (d.kind) {
       case kEmbed: embed_task(task); break;
-      case kMemRead: memread_task(task); break;
+      case kMemRead:
+        memread_task(task);
+        if (threadIdx.x == 0) misc() = -1;  // the x buffer held its entries
+        break;
       case kSsm: {
         const int lpr = kCT / d.ssm.P, ni = d.ssm.N / (4 * lpr);
         if (ni == 1) ssm_task<1>(task);
@@ -1660,8 +1990,17 @@ __device__ __forceinline__ void work(const Program& P, int block) {
     }
     if (run_rec) run_rec[1] = global_ns();
     csync();
-    if (desc().kind == kGemv) gemv_run(op, list + i, j - i, i);
-    else run_segment(op, list + i, j - i, i);
+    const OpDesc& od = desc();
+    if (od.kind == kGemv) gemv_run(op, list + i, j - i, i);
+    else if (od.kind == kExpUp && od.up.mma) {
+      if (od.up.wtype == LX_W_INT8) expup_run<LX_W_INT8>(op, list + i, j - i, i);
+      else expup_run<LX_W_BF16>(op, list + i, j - i, i);
+    } else if (od.kind == kExpDown && od.down.mma) {
+      if (od.down.wtype == LX_W_INT8) expdown_run<LX_W_INT8>(op, list + i, j - i, i);
+      else expdown_run<LX_W_BF16>(op, list + i, j - i, i);
+    } else {
+      run_segment(op, list + i, j - i, i);
+    }
     prev = op;
     i = j;
   }

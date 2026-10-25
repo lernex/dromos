@@ -146,17 +146,19 @@ struct Select {
   int E, top_k, R;
 };
 
-// Expert gate|up rows. Routed: task = (pair, row block), the expert from ids, x = the pair's token.
-// Shared: task = row block, every token.
+// Expert gate|up rows of a routed expert: task = (pair, row block), the expert from ids, x = the
+// pair's token. On the tensor cores (mma), a task is 8 gate rows and the same 8 up rows, one unit
+// whose k is read in 2^sh parts.
 struct ExpUp {
   const void* latent;
   const int32_t* ids;
-  lx_weight w;          // [E, 2I, L] (routed) or [2I, L] (shared)
-  void* inter;          // bf16 [pairs, I] (routed: pair = m * top_k + k; shared: pair = m)
-  int wtype, L, I, top_k, shared, rows, row_bytes, blocks_per_pair;
+  lx_weight w;          // [E, 2I, L]
+  void* inter;          // bf16 [pairs, I], pair = m * top_k + k
+  int wtype, L, I, top_k, mma, sh, rows, row_bytes, blocks_per_pair;
 };
 
-// Expert down rows for one token: rows [l0, l0 + rows) of each of the token's top_k experts.
+// Expert down rows for one token: rows [l0, l0 + rows) of each of the token's top_k experts. On the
+// tensor cores (mma), 16 rows: a unit per expert, k in 2^sh parts.
 struct ExpDown {
   const void* inter;
   const int32_t* ids;
@@ -164,7 +166,7 @@ struct ExpDown {
   lx_weight w;          // [E, L, I]
   float* out;           // f32 [M, L]
   const float* add;     // f32 [M, L] added after the routed sum (the shared expert), or null
-  int wtype, L, I, top_k, rows, row_bytes, blocks_per_token;
+  int wtype, L, I, top_k, mma, sh, rows, row_bytes, blocks_per_token;
 };
 
 struct Attention {

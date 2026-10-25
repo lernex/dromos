@@ -407,10 +407,15 @@ int lx_program_embed(lx_program* p, const void* table, const void* stream_emb, f
 
 int lx_program_memory_read(lx_program* p, const lx_memread_args* a) {
   if (!p || !a || a->S < 1 || a->S > kMaxStreams || a->D % 4 || a->D > 4 * 2 * kComputeThreads ||
-      a->n_entries < 0 || a->n_entries > kMaxEntries || (a->lora_down && (a->rank < 1 || a->rank > kMaxEntries)))
+      a->n_entries < 0 || a->n_entries > kMaxEntries || (a->lora_down && (a->rank < 1 || a->rank > kMaxEntries)) ||
+      a->entry_stride % 4 || a->token_stride % 4 || reinterpret_cast<uintptr_t>(a->bank) % 16)
     return -1;
+  // the token's entries are staged in the x buffer, one half (keys or values) at a time
+  if (a->n_entries * a->D * 4 > p->x_cap) return -1;
+  p->x_need = std::max(p->x_need, a->n_entries * a->D * 4);
   const int M = p->M, S = a->S, D = a->D;
   OpDesc d = blank(kMemRead, M);
+  d.pool = kStatic;  // its weights, and the token's bank entries and previous mean (rewritten rarely)
   MemRead& m = d.mem;
   m.streams = a->streams;
   m.bank = a->bank;
@@ -480,9 +485,10 @@ int lx_program_ssm(lx_program* p, const lx_ssm_args* a) {
 }
 
 int lx_program_select(lx_program* p, const lx_select_args* a) {
-  if (!p || !a || a->top_k < 1 || a->top_k > 32 || a->top_k > a->E) return -1;
+  if (!p || !a || a->top_k < 1 || a->top_k > 32 || a->top_k > a->E || a->E > 256) return -1;
   const int M = p->M;
   OpDesc d = blank(kSelect, 1);
+  d.pool = kStatic;  // the expert embeddings and the selection bias
   d.sel = {a->logits, a->selection_bias, a->ids, a->weights, a->entropy, a->confidence, a->expert_emb, a->summary,
            a->history, a->E, a->top_k, a->R};
   const size_t mk = static_cast<size_t>(M) * a->top_k * 4, mr = static_cast<size_t>(M) * a->R * 4;
@@ -531,38 +537,72 @@ int lx_program_experts(lx_program* p, const lx_experts_args* a) {
     fy.ld = L;
     if (lx_program_gemv(p, &fx, &a->shared_down, &fy, L, Is) < 0) return -1;
   }
-  // the routed experts: gate|up rows per (token, pick), then the down rows per token
+  // the routed experts: gate|up rows per (token, pick), then the down rows per token. On the tensor
+  // cores when the format and shape allow (16-byte chunks in whole steps), else on the FMA reader.
+  // The k split comes from the shape (and one token), never from M, so a row's sums are the same
+  // whatever the step's batch.
+  const bool fma = std::getenv("LX_PROGRAM_FMA") != nullptr;
+  auto tc_ok = [&](const lx_weight& w, int k) {
+    const int cv = w.type == LX_W_BF16 ? 8 : w.type == LX_W_INT8 ? 16 : 0;
+    return !fma && cv && k % (4 * cv) == 0 && reinterpret_cast<uintptr_t>(w.data) % 16 == 0;
+  };
+  // 2^sh parts per unit for the least time per warp (units per warp times steps per unit, plus about
+  // a step per unit), with a block's share of one token's units.
+  auto unit_split = [&](int units, int spr, int per_unit_floats) {
+    int sh = 0, best = 1 << 30;
+    for (int k = 0; (1 << k) <= spr && k <= 4; ++k) {
+      const int cost = ceil_div(static_cast<int64_t>(units) << k, kComputeWarps) * (ceil_div(spr, 1 << k) + 1);
+      if (cost < best && per_unit_floats << k <= kScratchFloats - 2 * kMaxM * 8) {
+        best = cost;
+        sh = k;
+      }
+    }
+    return sh;
+  };
   {
     const int rb = L * bytes_per_value(gt);
-    const int rows = tile_rows(I, rb, p->blocks, 2);
+    const bool tc = tc_ok(a->gate_up, L) && I % 8 == 0 && M * (L + 32) * 2 <= p->x_cap;
+    const int rows = tc ? 8 : tile_rows(I, rb, p->blocks, 2);
     if (I % rows) return -1;
     const int bpp = I / rows;
+    int sh = 0;
+    if (tc) {
+      const int spr = L / (gt == LX_W_BF16 ? 32 : 64);
+      sh = unit_split(ceil_div(K * bpp, p->blocks), spr, 16);
+    }
     OpDesc d = blank(kExpUp, M * K * bpp);
     d.pool = kDynamic;
     d.dyn_dep = select;
-    d.up = {a->latent, a->ids, a->gate_up, inter_r, gt, L, I, K, 0, rows, rb, bpp};
-    p->x_need = std::max(p->x_need, L * 2);
+    d.up = {a->latent, a->ids, a->gate_up, inter_r, gt, L, I, K, tc ? 1 : 0, sh, rows, rb, bpp};
+    p->x_need = std::max(p->x_need, tc ? M * (L + 32) * 2 : L * 2);
     std::vector<Region> regs = {rd(a->latent, lat), rd(a->ids, static_cast<size_t>(M) * K * 4),
                                 wr(inter_r, static_cast<size_t>(M) * K * I * 2)};
     if (p->add(d, std::move(regs), 2.0 * rows * rb) < 0) return -1;
   }
   {
     const int rb = I * bytes_per_value(dt);
-    const int rows = tile_rows(L, rb, p->blocks, K);
+    const bool tc = tc_ok(a->down, I) && L % 16 == 0 && M * K * (I + 32) * 2 <= p->x_cap;
+    const int rows = tc ? 16 : tile_rows(L, rb, p->blocks, K);
     if (L % rows) return -1;
     const int bpt = L / rows;
+    int sh = 0;
+    if (tc) {
+      const int spr = I / (dt == LX_W_BF16 ? 32 : 64);
+      sh = unit_split(ceil_div(bpt, p->blocks) * K, spr, 16 * K);
+    }
     OpDesc d = blank(kExpDown, M * bpt);
     d.pool = kDynamic;
     d.dyn_dep = select;
-    d.down = {inter_r, a->ids, a->weights, a->down, a->out, shared_out, dt, L, I, K, rows, rb, bpt};
-    p->x_need = std::max(p->x_need, K * I * 2);
+    d.down = {inter_r, a->ids, a->weights, a->down, a->out, shared_out, dt, L, I, K, tc ? 1 : 0, sh, rows, rb, bpt};
+    p->x_need = std::max(p->x_need, tc ? M * K * (I + 32) * 2 : K * I * 2);
     std::vector<Region> regs = {rd(inter_r, static_cast<size_t>(M) * K * I * 2),
                                 rd(a->ids, static_cast<size_t>(M) * K * 4),
                                 rd(a->weights, static_cast<size_t>(M) * K * 4),
                                 rd(shared_out, static_cast<size_t>(M) * L * 4),
                                 wr(a->out, static_cast<size_t>(M) * L * 4)};
-    return p->add(d, std::move(regs), static_cast<double>(K) * rows * rb);
+    if (p->add(d, std::move(regs), static_cast<double>(K) * rows * rb) < 0) return -1;
   }
+  return static_cast<int>(p->ops.size()) - 1;
 }
 
 int lx_program_attention(lx_program* p, const lx_attention_args* a) {
@@ -663,6 +703,27 @@ static void task_spans(const OpDesc& d, int task, std::vector<PfSpan>& out) {
       const Ssm& a = d.ssm;
       const int64_t head = static_cast<int64_t>(a.P) * a.N * 4;
       span(reinterpret_cast<const char*>(a.ssm_state) + (task % a.H) * head, head, task / a.H + 1, a.H * head);
+      break;
+    }
+    case kMemRead: {
+      // One token, one block: everything it reads from far away, so the block's single pass over it
+      // finds it in L2 (a prefetch is only a hint, so an entry written later in the step is fine).
+      const MemRead& a = d.mem;
+      const int64_t D = a.D;
+      if (a.n_entries > 0) {
+        span(static_cast<const float*>(a.bank) + static_cast<int64_t>(task) * a.token_stride,
+             static_cast<int64_t>(a.n_entries) * a.entry_stride * 4);
+        span(a.gate, a.S * D * 2);
+      }
+      if (a.previous) span(a.previous + task * D, D * 4);
+      if (a.h) span(a.norm_w, D * 2);
+      if (a.lora_down) span(a.lora_down, a.rank * D * 2);
+      break;
+    }
+    case kSelect: {
+      const Select& a = d.sel;
+      span(a.expert_emb, static_cast<int64_t>(a.E) * a.R * 2);
+      if (a.selection_bias) span(a.selection_bias, static_cast<int64_t>(a.E) * 4);
       break;
     }
     case kEntry: {

@@ -880,7 +880,7 @@ typedef struct {
 LX_API int lx_program_ssm(lx_program* p, const lx_ssm_args* a);
 
 // Routing on logits [M, E] as lx_moe_route, the expert summary as lx_moe_summary, and the routing
-// history: history = 0.5 * history + 0.5 * summary.
+// history: history = 0.5 * history + 0.5 * summary. E <= 256.
 typedef struct {
   const float* logits; const float* selection_bias; int32_t* ids; float* weights; float* entropy; float* confidence;
   const void* expert_emb; float* summary; float* history; int E, top_k, R;
@@ -891,6 +891,7 @@ LX_API int lx_program_select(lx_program* p, const lx_select_args* a);
 // lx_moe_experts (intermediates rounded to bf16); the shared expert's product is added to the routed sum.
 // latent bf16 [M, L]; gate_up [E, 2I, L], down [E, L, I], shared_gate_up [2Is, L], shared_down [L, Is].
 // The shared expert's ops wait only for the latent. Returns the last op (the routed down product).
+// A block reads all of its routed rows at once, on the tensor cores for BF16 and INT8 stacks.
 typedef struct {
   const void* latent; const int32_t* ids; const float* weights;
   lx_weight gate_up; lx_weight down; lx_weight shared_gate_up; lx_weight shared_down;
