@@ -14,22 +14,24 @@ namespace {
 constexpr int kGroups = 4;  // simdgroups per threadgroup
 constexpr int kMaxM = 8;
 
-// Variant index: format, x bf16, x vector loads, M bucket (1, 4, 8), scalar.
-int variant(int f, bool xb, bool xv, int mm, bool scalar) {
-  const int mb = mm == 1 ? 0 : mm == 4 ? 1 : 2;
-  return ((((f * 2 + xb) * 2 + (scalar ? 0 : xv)) * 3 + mb) * 2) + scalar;
-}
 // Rows per simdgroup (R in the kernel): one for a single x row, which streams the weight fastest, two
-// when several x rows share each weight chunk (measured on the M5, Praxis decode shapes).
+// when several x rows share each weight chunk (measured on the M5, Praxis decode shapes). R only changes
+// how the loads are issued, never a sum.
 int rows_for(int mm) { return mm == 1 ? 1 : 2; }
+// Variant index: format, x bf16, x vector loads, M bucket (1, 4, 8), scalar, rows per simdgroup (1, 2).
+int variant(int f, bool xb, bool xv, int mm, bool scalar, int R) {
+  const int mb = mm == 1 ? 0 : mm == 4 ? 1 : 2;
+  return (((((f * 2 + xb) * 2 + (scalar ? 0 : xv)) * 3 + mb) * 2) + scalar) * 2 + (R - 1);
+}
 std::string gemv_name(int i) {
-  const int scalar = i % 2, mb = (i / 2) % 3, xv = (i / 6) % 2, xb = (i / 12) % 2, f = i / 24;
+  const int R = i % 2 + 1, scalar = (i / 2) % 2, mb = (i / 4) % 3, xv = (i / 12) % 2, xb = (i / 24) % 2, f = i / 48;
   const int mm = mb == 0 ? 1 : mb == 1 ? 4 : 8;
   char name[64];
-  std::snprintf(name, sizeof(name), "gemv_%d_%d%d_%d_%d_%d", f, xb, xv, mm, rows_for(mm), scalar);
+  std::snprintf(name, sizeof(name), "gemv_%d_%d%d_%d_%d_%d", f, xb, xv, mm, R, scalar);
   return name;
 }
-KernelSet<144> g_gemv(gemv_name);  // the four formats, f32 weights (format 4), lossless bf16 (format 5)
+// The four formats, f32 weights (format 4), lossless bf16 (format 5, also with the other R).
+KernelSet<288> g_gemv(gemv_name);
 
 // The split S (simdgroups per row group) is a shape's order class: one while the row groups alone fill
 // the GPU, more for short outputs. It depends on N alone, so every batch size of a shape shares it.
@@ -50,6 +52,10 @@ const lx::TunableRegistration reg_bf16("gemv_w_bf16", {"s1", "s2", "s4"}, &admit
 const lx::TunableRegistration reg_int8("gemv_w_int8", {"s1", "s2", "s4"}, &admits);
 const lx::TunableRegistration reg_fp8("gemv_w_fp8", {"s1", "s2", "s4"}, &admits);
 const lx::TunableRegistration reg_nvfp4("gemv_w_nvfp4", {"s1", "s2", "s4"}, &admits);
+// The lossless GEMV's own knob, rows per simdgroup: it changes no sum, so every variant is admitted
+// everywhere. Its split is bf16's (gemv_w_bf16), which keeps it equal to lx_gemv.
+bool admits_any(int, int, int, int) { return true; }
+const lx::TunableRegistration reg_bf16x("gemv_bf16x", {"r1", "r2"}, &admits_any);
 
 // One launch over format f (0 .. 3 the lx_wtype, 4 f32 weights, 5 lossless bf16) once the arguments are
 // checked. Lossless bf16 takes every choice the bf16 weights it encodes would (their rows are 16-byte
@@ -89,10 +95,14 @@ int launch(int f, const void* data, const void* scale, float global, const void*
   a.bias_bf16 = bias_dtype == LX_BF16;
   a.y_bf16 = y_dtype == LX_BF16;
   a.split = S;
-  const int R = rows_for(mm);
+  int R = rows_for(mm);
+  if (lossless) {  // one row: the expansion's integer work leaves no room for a second (measured on the M5)
+    const int r = lx_tune_get("gemv_bf16x", M, N, K);
+    R = r == 0 || r == 1 ? r + 1 : 1;
+  }
   const int rows_per_group = R * kGroups / S;
   const NSUInteger red = S > 1 ? NSUInteger(kGroups * R * mm * 4) : 0;
-  return g_gemv.launch(variant(f, xb, xv, mm, scalar), stream, a, size1(ceil_div(N, rows_per_group)),
+  return g_gemv.launch(variant(f, xb, xv, mm, scalar, R), stream, a, size1(ceil_div(N, rows_per_group)),
                        size1(32 * kGroups), red);
 }
 

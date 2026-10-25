@@ -282,4 +282,5 @@ LX_GEMV_F(1)
 LX_GEMV_F(2)
 LX_GEMV_F(3)
 LX_GEMV_F(4)  // f32 weights: lx_gemm_f32 on a few rows
-LX_GEMV_F(5)  // lossless bf16
+LX_GEMV_F(5)  // lossless bf16, which may also take the other rows per simdgroup (gemv_bf16x)
+LX_GEMV_X(5, 1, 2) LX_GEMV_X(5, 4, 1) LX_GEMV_X(5, 8, 1)
