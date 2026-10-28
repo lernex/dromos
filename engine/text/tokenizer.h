@@ -36,6 +36,9 @@ class Tokenizer {
   virtual std::unique_ptr<Stream> stream(bool skip_special = false) const = 0;
 
   virtual int vocab_size() const = 0;
+  // The bytes a token stands for, as they are: a token may hold part of a UTF-8 character (decode would
+  // replace it), which the byte-level grammars need. Empty for an id outside the vocabulary.
+  virtual std::string token_bytes(int32_t id) const = 0;
   virtual int32_t token_id(std::string_view token) const = 0;  // -1 when absent
   virtual bool is_special(int32_t id) const = 0;
   virtual std::vector<int32_t> stop_ids() const = 0;  // end-of-turn / eos from the configs

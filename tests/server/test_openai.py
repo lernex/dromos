@@ -366,3 +366,72 @@ def test_a_disconnected_stream_is_cancelled(server, client):
     assert h["running"] == 0, h
     r = client.completions.create(model="praxis", prompt=PROMPT, max_tokens=6, temperature=0)
     assert r.choices[0].text == EXPECTED
+
+
+SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "year": {"type": "integer"},
+        "tags": {"type": "array", "items": {"type": "string"}, "maxItems": 5},
+    },
+    "required": ["title", "year", "tags"],
+    "additionalProperties": False,
+}
+
+
+def test_response_format_refusals_name_the_keyword(server):
+    base, _ = server
+
+    def post(response_format, extra=None):
+        body = {
+            "model": "praxis",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 8,
+            "chat_template_kwargs": {"enable_thinking": False},
+            "response_format": response_format,
+        }
+        body.update(extra or {})
+        return requests.post(base + "/v1/chat/completions", json=body)
+
+    r = post({"type": "json_schema", "json_schema": {"name": "x", "schema": {"type": "string", "pattern": "a+"}}})
+    assert r.status_code == 400, r.text
+    assert "pattern" in r.json()["error"]["message"]
+    r = post({"type": "grammar"})
+    assert r.status_code == 400 and "grammar" in r.json()["error"]["message"], r.text
+    r = post({"type": "json_schema", "json_schema": {"name": "x"}})
+    assert r.status_code == 400 and "schema" in r.json()["error"]["message"], r.text
+    tools = [{"type": "function", "function": {"name": "f", "parameters": {"type": "object", "properties": {}}}}]
+    r = post({"type": "json_object"}, {"tools": tools, "tool_choice": "required"})
+    assert r.status_code == 400, r.text
+
+
+def test_json_schema_reply_parses_and_matches(client):
+    r = client.chat.completions.create(
+        model="praxis",
+        messages=[{"role": "user", "content": "Describe the Rosetta Stone as JSON with a title, a year and tags."}],
+        max_tokens=160,
+        temperature=0,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        response_format={"type": "json_schema", "json_schema": {"name": "excerpt", "schema": SCHEMA}},
+    )
+    assert r.choices[0].finish_reason == "stop"
+    obj = json.loads(r.choices[0].message.content)
+    assert list(obj) == ["title", "year", "tags"]
+    assert isinstance(obj["title"], str) and isinstance(obj["year"], int)
+    assert isinstance(obj["tags"], list) and len(obj["tags"]) <= 5 and all(isinstance(t, str) for t in obj["tags"])
+
+
+def test_ignore_eos_on_chat_runs_to_max_tokens(server):
+    base, _ = server
+    body = {
+        "model": "praxis",
+        "messages": [{"role": "user", "content": "Count to ten."}],
+        "max_tokens": 12,
+        "temperature": 0,
+        "ignore_eos": True,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    r = requests.post(base + "/v1/chat/completions", json=body).json()
+    assert r["usage"]["completion_tokens"] == 12, r
+    assert r["choices"][0]["finish_reason"] == "length"

@@ -14,6 +14,7 @@
 
 #include "httplib.h"
 #include "nlohmann/json.hpp"
+#include "text/json.h"
 #include "text/tokenizer.h"
 
 namespace lx::server {
@@ -155,10 +156,6 @@ void read_common(const json& body, Job& job, const Sampling& d) {
     invalid("only n = 1 is supported", "n");
   if (body.contains("best_of") && !body["best_of"].is_null() && integer_in(body, "best_of", 1, 1, 1) != 1)
     invalid("only best_of = 1 is supported", "best_of");
-  if (body.contains("response_format") && !body["response_format"].is_null()) {
-    const std::string type = body["response_format"].value("type", "text");
-    if (type != "text") invalid("response_format " + type + " is not supported yet", "response_format");
-  }
   if (body.contains("stop") && !body["stop"].is_null()) {
     const json& stop = body["stop"];
     if (stop.is_string()) {
@@ -175,6 +172,35 @@ void read_common(const json& body, Job& job, const Sampling& d) {
   }
   for (const std::string& s : job.request.stop_strings)
     if (s.empty()) invalid("a stop sequence is empty", "stop");
+}
+
+// The response_format: text (nothing to constrain), json_object (any JSON object) or json_schema (its schema).
+// The schema is read in the request's own key order, which the grammar keeps (nlohmann sorts keys, so the body
+// is read again with the order-preserving parser). A schema the grammar cannot express is refused later, when the
+// engine compiles it, with the keyword named.
+void read_response_format(const std::string& raw, const json& body, Job& job) {
+  if (!body.contains("response_format") || body["response_format"].is_null()) return;
+  const json& rf = body["response_format"];
+  if (!rf.is_object()) invalid("response_format must be an object", "response_format");
+  const std::string type = rf.value("type", "text");
+  if (type == "text") return;
+  if (type != "json_object" && type != "json_schema")
+    invalid("response_format " + type + " is not supported; use text, json_object or json_schema", "response_format");
+  lx::text::JValue doc;
+  if (!lx::text::json_loads(raw, doc) || !doc.is_object()) invalid("the request body is not valid JSON", "");
+  const lx::text::JValue* format = doc.get("response_format");
+  if (!format || !format->is_object()) invalid("response_format must be an object", "response_format");
+  runtime::JsonFormat constrained;
+  if (type == "json_object") {
+    constrained.object = true;
+  } else {
+    const lx::text::JValue* holder = format->get("json_schema");
+    if (!holder || !holder->is_object()) invalid("response_format json_schema needs a json_schema object", "response_format");
+    const lx::text::JValue* schema = holder->get("schema");
+    if (!schema) invalid("response_format json_schema needs a schema", "response_format");
+    constrained.schema = lx::text::json_dumps(*schema);
+  }
+  job.request.json = std::move(constrained);
 }
 
 // The token limit: max_tokens (or max_completion_tokens for chat); the engine trims it to the context.
@@ -603,6 +629,14 @@ bool Server::run() {
   http_->Get("/health", [this](const httplib::Request&, httplib::Response& res) {
     const runtime::EngineStats st = engine_.stats();
     json health = {{"status", "ok"}, {"running", st.running}, {"waiting", st.waiting}, {"slots", st.slots}};
+    // Constrained decoding (response_format json_object or json_schema): how often it ran and what its masks cost.
+    health["constrained"] = {{"steps", st.constrained_steps},
+                             {"rows", st.constrained_rows},
+                             {"sole_token_rows", st.constrained_sole},
+                             {"mask_samples", st.mask_samples},
+                             {"mask_us_p50", st.mask_us_p50},
+                             {"mask_us_p99", st.mask_us_p99},
+                             {"compile_ms", st.grammar_compile_ms}};
     res.set_content(health.dump(), "application/json");
   });
 
@@ -630,6 +664,7 @@ bool Server::run() {
       if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object())
         thinking = body["chat_template_kwargs"].value("enable_thinking", true);
       read_common(body, job, thinking ? defaults.thinking : defaults.direct);
+      read_response_format(req.body, body, job);
       read_limit(body, job, body.contains("max_completion_tokens") ? "max_completion_tokens" : "max_tokens");
       job.stream = body.value("stream", false);
       job.include_usage = body.value("stream_options", json::object()).value("include_usage", false);
@@ -652,6 +687,8 @@ bool Server::run() {
       if (!body.contains("messages")) invalid("messages is required", "messages");
       const std::string prompt = lx::text::render_chat(read_messages(body["messages"]), options);
       job.request.tool_grammar = tool_grammar_for(body);
+      if (job.request.json && job.request.tool_grammar)
+        invalid("response_format cannot be combined with a required or named tool call", "response_format");
       job.request.tools_json = tools_text;
       if (!tokenizer) throw ApiError(500, "server_error", "this server has no tokenizer");
       job.request.prompt = tokenizer->encode(prompt, true);
@@ -675,6 +712,7 @@ bool Server::run() {
       job.chat = false;
       job.model = checked_model(body);
       read_common(body, job, defaults.thinking);
+      read_response_format(req.body, body, job);
       read_limit(body, job, "max_tokens");
       job.stream = body.value("stream", false);
       job.include_usage = body.value("stream_options", json::object()).value("include_usage", false);

@@ -230,6 +230,11 @@ class BpeTokenizer final : public Tokenizer {
 
   int vocab_size() const override { return static_cast<int>(id_bytes_.size()); }
 
+  std::string token_bytes(int32_t id) const override {
+    if (id < 0 || static_cast<size_t>(id) >= id_bytes_.size()) return std::string();
+    return id_bytes_[static_cast<size_t>(id)];
+  }
+
   int32_t token_id(std::string_view token) const override {
     const auto it = vocab_.find(std::string(token));
     return it == vocab_.end() ? -1 : it->second;

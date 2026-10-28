@@ -12,6 +12,7 @@
 #include <set>
 #include <stdexcept>
 #include <thread>
+#include <unordered_map>
 
 #include "core/checkpoint.h"
 #include "core/device.h"
@@ -22,6 +23,7 @@
 #include "runtime/prefix_cache.h"
 #include "runtime/scheduler.h"
 #include "runtime/speculative.h"
+#include "runtime/json_grammar.h"
 #include "runtime/tool_grammar.h"
 
 namespace lx::runtime {
@@ -98,6 +100,7 @@ struct Sequence {
   uint64_t id = 0;
   GenerateRequest request;
   std::unique_ptr<ToolGrammar> grammar;               // when the request must call a tool
+  std::unique_ptr<JsonGrammar> json;                  // when the reply must be JSON of a given shape
   RequestCallbacks callbacks;
   std::vector<int32_t> stop_ids;                       // the request's, plus the tokenizer's end ids
   std::unique_ptr<lx::text::Tokenizer::Stream> detok;  // null without a tokenizer
@@ -175,6 +178,9 @@ struct Engine::Impl {
     if (tokenizer) {
       token_texts.resize(static_cast<size_t>(V));
       for (int i = 0; i < V; ++i) token_texts[static_cast<size_t>(i)] = tokenizer->decode({i}, false);
+      std::vector<std::string> bytes(static_cast<size_t>(V));
+      for (int i = 0; i < V; ++i) bytes[static_cast<size_t>(i)] = tokenizer->token_bytes(i);
+      vocab_index = std::make_unique<VocabIndex>(bytes);
     }
     mask_words = (static_cast<size_t>(V) + 31) / 32;
     mask_rows = DeviceBuffer(sizeof(int32_t) * slots);
@@ -229,6 +235,12 @@ struct Engine::Impl {
   std::string placement;                                   // where the offloaded experts live, or ""
   std::unique_ptr<PrefixCache> cache;  // null when prefix reuse is off or the model lacks slot state
   std::vector<std::string> token_texts;  // every token's text, for the tool grammar's masks
+  std::unique_ptr<VocabIndex> vocab_index;  // every token's raw bytes as a trie, for the JSON grammar
+  std::mutex json_mu;                       // json_programs: filled by submit on the caller's thread
+  std::unordered_map<std::string, std::shared_ptr<JsonProgram>> json_programs;
+  std::vector<double> mask_ring = std::vector<double>(4096, 0.0);  // microseconds per timed step (under mu)
+  size_t mask_count = 0;
+  std::shared_ptr<JsonProgram> json_program(const JsonFormat& format);
   size_t mask_words = 0;                 // 32-bit words per token mask
   DeviceBuffer mask_rows, mask_bits;     // device staging for the masks of one step
   std::unique_ptr<PinnedArray<int32_t>> host_mask_rows;
@@ -328,6 +340,12 @@ uint64_t Engine::submit(GenerateRequest request, RequestCallbacks callbacks) {
     seq->detok = m.tokenizer->stream(false);
     seq->parser = std::make_unique<lx::text::OutputParser>(request.thinking, request.tools_json);
   }
+  if (request.json) {
+    if (!m.tokenizer) throw std::invalid_argument("a JSON grammar needs a tokenizer, and this engine has none");
+    JsonFormat format = *request.json;
+    format.thinking = request.thinking;
+    seq->json = std::make_unique<JsonGrammar>(m.json_program(format), *m.vocab_index);
+  }
   seq->request = std::move(request);
   seq->callbacks = std::move(callbacks);
   seq->submitted_at = m.now();
@@ -355,7 +373,36 @@ void Engine::cancel(uint64_t id) {
 
 EngineStats Engine::stats() const {
   std::lock_guard<std::mutex> lock(impl_->mu);
-  return impl_->stats;
+  EngineStats out = impl_->stats;
+  out.mask_samples = impl_->mask_count;
+  const size_t n = std::min(impl_->mask_count, impl_->mask_ring.size());
+  if (n > 0) {
+    std::vector<double> us(impl_->mask_ring.begin(), impl_->mask_ring.begin() + static_cast<std::ptrdiff_t>(n));
+    std::sort(us.begin(), us.end());
+    out.mask_us_p50 = us[n / 2];
+    out.mask_us_p99 = us[std::min(n - 1, n * 99 / 100)];
+  }
+  return out;
+}
+
+// The compiled schema for a format: compiled once per (thinking, schema) and shared by its requests. Throws what
+// compile_json throws for a schema it cannot express. Runs on the submitting thread.
+std::shared_ptr<JsonProgram> Engine::Impl::json_program(const JsonFormat& format) {
+  const std::string key = std::string(format.thinking ? "T" : "F") + (format.object ? "object" : "schema") + "\n" +
+                          format.schema;
+  std::lock_guard<std::mutex> lock(json_mu);
+  const auto found = json_programs.find(key);
+  if (found != json_programs.end()) return found->second;
+  const auto t0 = std::chrono::steady_clock::now();
+  std::shared_ptr<JsonProgram> program = compile_json(format);
+  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  {
+    std::lock_guard<std::mutex> stats_lock(mu);
+    stats.grammar_compile_ms = ms;
+  }
+  if (json_programs.size() >= 32) json_programs.clear();
+  json_programs.emplace(key, program);
+  return program;
 }
 
 // ---- the scheduler thread ------------------------------------------------------------------
@@ -528,17 +575,41 @@ void Engine::Impl::sample(const std::vector<int>& rows, const std::vector<std::s
   }
   // constrained rows: the logits of the tokens their grammar rules out become -inf before sampling
   int constrained = 0;
+  const auto mask_start = std::chrono::steady_clock::now();
+  uint64_t json_rows = 0, json_sole = 0;
   for (int j = 0; j < n; ++j) {
     Sequence& s = *seqs[j];
-    if (!s.grammar) continue;
-    const std::vector<uint32_t>& bits = s.grammar->mask(token_texts, s.stop_ids);
+    const bool json = static_cast<bool>(s.json);
+    if (!json && !s.grammar) continue;
+    const std::vector<uint32_t>& bits = json ? s.json->mask(s.stop_ids) : s.grammar->mask(token_texts, s.stop_ids);
     bool any = false;
     for (uint32_t w : bits) any = any || w != 0;
-    if (!any) throw std::runtime_error("the tool grammar allows no token in a reply");
+    if (!any) {
+      // A JSON reply with no token left is complete (or dead): the row stays unmasked, and accept() ends the reply.
+      if (json) continue;
+      throw std::runtime_error("the tool grammar allows no token in a reply");
+    }
+    if (json) {
+      json_rows += 1;
+      size_t allowed = 0;
+      for (uint32_t w : bits) allowed += static_cast<size_t>(__builtin_popcount(w));
+      for (int32_t id : s.stop_ids)
+        if (id >= 0 && id < V && (bits[static_cast<size_t>(id) / 32] >> (static_cast<size_t>(id) % 32) & 1u)) allowed -= 1;
+      if (allowed == 1) json_sole += 1;
+    }
     host_mask_rows->data()[constrained] = rows[j];
     std::memcpy(host_mask_bits->data() + static_cast<size_t>(constrained) * mask_words, bits.data(),
                 sizeof(uint32_t) * mask_words);
     constrained += 1;
+  }
+  if (json_rows > 0) {
+    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - mask_start).count();
+    std::lock_guard<std::mutex> lock(mu);
+    mask_ring[mask_count % mask_ring.size()] = us;
+    mask_count += 1;
+    stats.constrained_steps += 1;
+    stats.constrained_rows += json_rows;
+    stats.constrained_sole += json_sole;
   }
   if (constrained > 0) {
     check(lx_rt_copy(mask_rows.data(), host_mask_rows->data(), static_cast<int64_t>(sizeof(int32_t) * constrained),
@@ -598,6 +669,13 @@ bool Engine::Impl::accept(const std::shared_ptr<Sequence>& s, int32_t token, flo
   }
   if (q.grammar && !q.grammar->accept(token_texts[static_cast<size_t>(token)])) {
     end(s, FinishReason::Error, "the tool grammar rejected a sampled token", false);
+    return true;
+  }
+  if (q.json && !q.json->accept(vocab_index->bytes(token))) {
+    // Only a complete reply has no token left, so a rejected one ends it: as Stop when the value is complete (an
+    // unmasked row, from ignore_eos at the end of a value), as an error otherwise.
+    if (q.json->may_end()) end(s, FinishReason::Stop, "", true);
+    else end(s, FinishReason::Error, "the JSON grammar rejected a sampled token", false);
     return true;
   }
   q.generated += 1;

@@ -19,6 +19,7 @@
 #include "core/config.h"
 #include "model/traffic.h"
 #include "runtime/plan.h"
+#include "runtime/json_grammar.h"
 #include "runtime/tool_grammar.h"
 #include "text/tokenizer.h"
 
@@ -55,6 +56,9 @@ struct GenerateRequest {
   // or named). Needs a tokenizer.
   std::optional<ToolGrammarSpec> tool_grammar;
   std::string tools_json;           // the request's tools array (OpenAI shape): types each argument by its schema
+  // response_format json_object or json_schema: the reply is a JSON value of that shape (see json_grammar.h).
+  // Its thinking flag is the request's. Needs a tokenizer.
+  std::optional<JsonFormat> json;
 };
 
 // What one generated token brings to the caller. Text is what is now safe to show: the
@@ -117,6 +121,13 @@ struct EngineStats {
   uint64_t prefix_snapshots = 0;      // state snapshots taken
   uint64_t prefix_device_bytes = 0;   // snapshot bytes held now, in device memory and pinned host memory
   uint64_t prefix_host_bytes = 0;
+  uint64_t constrained_steps = 0;     // sampling steps that had a JSON-constrained row
+  uint64_t constrained_rows = 0;      // JSON-constrained rows sampled
+  uint64_t constrained_sole = 0;      // rows where exactly one non-stop token was allowed (a jump could have fed it)
+  uint64_t mask_samples = 0;          // steps timed for the constrained masks (the ring holds the last ones)
+  double mask_us_p50 = 0.0;           // CPU time to build a step's constrained masks: median and 99th percentile
+  double mask_us_p99 = 0.0;
+  double grammar_compile_ms = 0.0;    // the last schema compiled (cache misses only)
 };
 
 class Engine {
