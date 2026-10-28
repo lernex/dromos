@@ -33,6 +33,7 @@ int cmd_serve(int argc, char** argv) {
   cli::FormatFlags format;
   int port = 8080, context = 0, sequences = 0;
   bool prefix_cache = true;
+  bool speculate = true;
   double memory_fraction = 0.92;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -47,6 +48,7 @@ int cmd_serve(int argc, char** argv) {
     else if (a == "--context") context = std::stoi(value());
     else if (a == "--sequences") sequences = std::stoi(value());
     else if (a == "--no-prefix-cache") prefix_cache = false;
+    else if (a == "--no-spec") speculate = false;
     else if (a == "--memory-fraction") memory_fraction = std::stod(value());
     else if (name.empty() && a[0] != '-') name = a;
     else throw std::runtime_error("unknown option " + a);
@@ -55,7 +57,7 @@ int cmd_serve(int argc, char** argv) {
     std::fprintf(stderr,
                  "usage: lernex serve MODEL [--host 127.0.0.1] [--port 8080] [--name NAME]\n"
                  "                     %s\n"
-                 "                     [--context N] [--sequences N] [--no-prefix-cache]\n",
+                 "                     [--context N] [--sequences N] [--no-prefix-cache] [--no-spec]\n",
                  cli::kFormatUsage);
     return 2;
   }
@@ -64,6 +66,7 @@ int cmd_serve(int argc, char** argv) {
   const cli::Model model = cli::find_model(name, true);
   runtime::EngineOptions engine_options;
   engine_options.prefix_cache = prefix_cache;
+  engine_options.speculate = speculate;
   cli::StartedEngine started =
       cli::start_engine(model, sequences, context, format.weights, engine_options, memory_fraction, format.bf16x,
                         format.fast_math);

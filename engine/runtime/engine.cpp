@@ -21,6 +21,7 @@
 #include "runtime/offload_model.h"
 #include "runtime/prefix_cache.h"
 #include "runtime/scheduler.h"
+#include "runtime/speculative.h"
 #include "runtime/tool_grammar.h"
 
 namespace lx::runtime {
@@ -108,6 +109,8 @@ struct Sequence {
   int generated = 0;
   bool has_pending = false;  // a sampled token waits to be fed
   int32_t pending = 0;
+  std::vector<int32_t> history;                   // the prompt, then every token shown: the drafter's context
+  std::unique_ptr<NgramDrafter> drafter;          // prompt lookup for this sequence, made when it first speculates
   bool cancelled = false;
   bool ended = false;
   double submitted_at = 0.0, first_token_at = 0.0;
@@ -140,8 +143,11 @@ struct Engine::Impl {
       lx::LoadOptions load;
       load.target = plan.weights;
       weights = std::make_unique<lx::ModelWeights>(lx::ModelWeights::load(dir, config, load));
-      model = std::make_unique<lx::MetisModel>(config, *weights, formats, max_slots, kv_capacity, max_step_tokens);
+      model = std::make_unique<lx::MetisModel>(config, *weights, formats, max_slots, kv_capacity, max_step_tokens,
+                                               nullptr, options.speculate);
     }
+    if (options.speculate && !plan.offload.enabled && model->max_verify_tokens() > 1)
+      spec = std::make_unique<SpecDecoder>(*model);
 #ifdef LX_SLOT_STATE
     if (options.prefix_cache && plan.prefix_device_bytes + plan.prefix_host_bytes > 0)
       cache = std::make_unique<PrefixCache>(plan.prefix_device_bytes, plan.prefix_host_bytes, stream);
@@ -204,7 +210,9 @@ struct Engine::Impl {
   void step();
   void sample(const std::vector<int>& rows, const std::vector<std::shared_ptr<Sequence>>& seqs);
   bool accept(const std::shared_ptr<Sequence>& s, int32_t token, float logprob, const int32_t* top_ids_row,
-              const float* top_lp_row, int top_n);
+              const float* top_lp_row, int top_n, bool feed = true);
+  bool spec_eligible(const std::shared_ptr<Sequence>& s) const;
+  bool spec_step(const std::shared_ptr<Sequence>& s);
   void end(const std::shared_ptr<Sequence>& s, FinishReason reason, const std::string& error, bool show_held);
   void deliver(const std::shared_ptr<Sequence>& s, const TokenDelta& delta);
   void retire(const std::shared_ptr<Sequence>& s);
@@ -217,6 +225,7 @@ struct Engine::Impl {
   std::unique_ptr<lx::ModelWeights> weights;               // resident plans
   std::unique_ptr<lx::offload::OffloadedModel> offloaded;  // offloaded plans: the dense weights and the experts
   std::unique_ptr<lx::MetisModel> model;                   // declared after both, so it is destroyed first
+  std::unique_ptr<SpecDecoder> spec;                       // verify steps of a lone stream; null when speculation is off
   std::string placement;                                   // where the offloaded experts live, or ""
   std::unique_ptr<PrefixCache> cache;  // null when prefix reuse is off or the model lacks slot state
   std::vector<std::string> token_texts;  // every token's text, for the tool grammar's masks
@@ -419,6 +428,7 @@ void Engine::Impl::admit() {
     s->slot = free_slots.back();
     free_slots.pop_back();
     model->reset_slot(s->slot);
+    s->history = s->request.prompt;
     restore_prefix(s);
     check(lx_sampler_reset(static_cast<int32_t*>(seen.data()), static_cast<int32_t*>(out_counts.data()), s->slot,
                            V, stream),
@@ -436,6 +446,8 @@ void Engine::Impl::admit() {
 }
 
 void Engine::Impl::step() {
+  // A lone decoding stream verifies the drafts its own text proposes; without one, the plain step below runs.
+  if (running.size() == 1 && spec_eligible(running[0]) && spec_step(running[0])) return;
   std::vector<SchedSeq> view;
   view.reserve(running.size());
   for (const auto& s : running)
@@ -578,7 +590,7 @@ void Engine::Impl::sample(const std::vector<int>& rows, const std::vector<std::s
 // One sampled token of a sequence: it is shown (or ends the reply), and the sequence either
 // queues the token to feed next step or ends. Returns true when the sequence ended.
 bool Engine::Impl::accept(const std::shared_ptr<Sequence>& s, int32_t token, float logprob, const int32_t* top_ids_row,
-                          const float* top_lp_row, int top_n) {
+                          const float* top_lp_row, int top_n, bool feed) {
   Sequence& q = *s;
   if (std::find(q.stop_ids.begin(), q.stop_ids.end(), token) != q.stop_ids.end()) {
     end(s, FinishReason::Stop, "", true);
@@ -589,6 +601,7 @@ bool Engine::Impl::accept(const std::shared_ptr<Sequence>& s, int32_t token, flo
     return true;
   }
   q.generated += 1;
+  q.history.push_back(token);
   if (q.generated == 1) q.first_token_at = now();
   {
     std::lock_guard<std::mutex> lock(mu);
@@ -637,9 +650,74 @@ bool Engine::Impl::accept(const std::shared_ptr<Sequence>& s, int32_t token, flo
     end(s, FinishReason::Length, "", true);
     return true;
   }
-  q.pending = token;
-  q.has_pending = true;
+  if (feed) {
+    q.pending = token;
+    q.has_pending = true;
+  }
   return false;
+}
+
+// A decoding sequence may verify drafts: it has its first token, and nothing it asks for needs the sampler's penalties,
+// logprobs or a grammar (the verify step's sampling is the plain sampler's filter, without the penalties).
+bool Engine::Impl::spec_eligible(const std::shared_ptr<Sequence>& s) const {
+  if (!spec) return false;
+  const Sequence& q = *s;
+  const SamplingParams& sp = q.request.sampling;
+  return q.has_pending && !q.ended && !q.cancelled && !q.grammar && !sp.logprobs && sp.repetition_penalty == 1.0f &&
+         sp.presence_penalty == 0.0f && sp.frequency_penalty == 0.0f &&
+         q.prompt_fed == static_cast<int>(q.request.prompt.size());
+}
+
+// The lone stream's step as a verify step: its pending token and the drafts prompt lookup proposes from its history run
+// through the target in one step, and the rows are judged (SpecDecoder::verify). The accepted drafts are shown without
+// becoming pending (the step fed them); the token after them is pending, as a plain step's sample is. Returns false,
+// having run nothing, when there is no draft: the plain step runs instead.
+bool Engine::Impl::spec_step(const std::shared_ptr<Sequence>& s) {
+  Sequence& q = *s;
+  const SamplingParams& sp = q.request.sampling;
+  if (!q.drafter) {
+    q.drafter = std::make_unique<NgramDrafter>(4, 1, DraftCost::rtx5070ti_praxis());
+    q.drafter->begin(q.request.prompt, stream);
+  }
+  // Drafts go in the request's remaining tokens and the cache's remaining positions, and at most the verify step's rows.
+  const int room = q.request.max_tokens - q.generated;
+  const int cache_room = kv_capacity - model->slot_length(q.slot);
+  DraftRequest r;
+  r.context = &q.history;
+  r.max_drafts = std::min({6, model->max_verify_tokens() - 1, room - 1, cache_room - 1});
+  r.position = static_cast<uint64_t>(q.generated);
+  r.stream = stream;
+  Draft draft;
+  if (r.max_drafts > 0) draft = q.drafter->propose(r);
+  if (static_cast<int>(draft.tokens.size()) > r.max_drafts) draft.tokens.resize(static_cast<size_t>(r.max_drafts));
+  if (draft.tokens.empty()) {
+    q.drafter->observe(0, 0, stream);  // a step without drafts is a plain one: the adaptive length still learns from it
+    return false;
+  }
+
+  std::vector<int32_t> step{q.pending};
+  step.insert(step.end(), draft.tokens.begin(), draft.tokens.end());
+  q.has_pending = false;
+  SpecConfig config;
+  config.filter = lx_spec_filter{sp.temperature, sp.top_p, sp.top_k, sp.min_p};
+  config.seed = sp.seed;
+  config.stop_ids = q.stop_ids;
+  int accepted = 0;
+  int32_t next = 0;
+  spec->verify(q.slot, config, step, draft.q, r.position, accepted, next, stream);
+  q.drafter->observe(accepted, next, stream);
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    stats.steps += 1;
+    stats.decode_steps += 1;
+  }
+  for (int j = 1; j <= accepted; ++j)
+    if (accept(s, step[static_cast<size_t>(j)], 0.0f, nullptr, nullptr, 0, /*feed=*/false)) {
+      retire(s);
+      return true;
+    }
+  if (accept(s, next, 0.0f, nullptr, nullptr, 0, /*feed=*/true)) retire(s);
+  return true;
 }
 
 void Engine::Impl::deliver(const std::shared_ptr<Sequence>& s, const TokenDelta& delta) {

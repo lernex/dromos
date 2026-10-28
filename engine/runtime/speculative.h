@@ -162,6 +162,14 @@ class SpecDecoder {
   std::vector<int32_t> generate(Drafter* drafter, const std::vector<int32_t>& prompt, const SpecConfig& config,
                                 SpecStats& stats, void* stream);
 
+  // One verify step of a decoding sequence on `slot`, for the engine's serving loop (engine.cpp, spec_step). `step` is
+  // its pending token, then its drafts (1 to max rows). The rows are judged as generate judges them: greedy by the
+  // argmax, sampled by the standard acceptance under config's filter, drawn by (config.seed, position). `q` is the
+  // drafts' distribution, or null when they are point masses (prompt lookup). Afterwards the slot holds the pending
+  // token and the accepted drafts; the rest is truncated. `next` is the token after the accepted drafts.
+  void verify(int slot, const SpecConfig& config, const std::vector<int32_t>& step, const float* q, uint64_t position,
+              int& accepted, int32_t& next, void* stream);
+
  private:
   // Picks the step's tokens: accepted drafts and the final token. rows = 1 + drafts.
   void accept(const SpecConfig& config, const std::vector<int32_t>& step, const float* q, uint64_t position,

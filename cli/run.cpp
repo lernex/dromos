@@ -300,6 +300,7 @@ int cmd_run(int argc, char** argv) {
   int context = 0;
   bool thinking = true;
   bool prefix_cache = true;
+  bool speculate = true;
   double memory_fraction = 0.92;
   cli::FormatFlags format;
   for (int i = 1; i < argc; ++i) {
@@ -315,12 +316,13 @@ int cmd_run(int argc, char** argv) {
       thinking = v == "on";
     } else if (a == "--context") context = std::stoi(value());
     else if (a == "--no-prefix-cache") prefix_cache = false;
+    else if (a == "--no-spec") speculate = false;
     else if (a == "--memory-fraction") memory_fraction = std::stod(value());
     else if (name.empty() && a[0] != '-') name = a;
     else throw std::runtime_error("unknown option " + a);
   }
   if (name.empty()) {
-    std::fprintf(stderr, "usage: lernex run MODEL [--think on|off] [--context N] %s\n", cli::kFormatUsage);
+    std::fprintf(stderr, "usage: lernex run MODEL [--think on|off] [--context N] [--no-spec] %s\n", cli::kFormatUsage);
     return 2;
   }
 
@@ -328,6 +330,7 @@ int cmd_run(int argc, char** argv) {
   const cli::Model model = cli::find_model(name, true);
   runtime::EngineOptions engine_options;
   engine_options.prefix_cache = prefix_cache;
+  engine_options.speculate = speculate;
   cli::StartedEngine started =
       cli::start_engine(model, 1, context, format.weights, engine_options, memory_fraction, format.bf16x,
                         format.fast_math);

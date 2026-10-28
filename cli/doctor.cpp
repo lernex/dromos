@@ -175,6 +175,11 @@ void print_plan(const lx::runtime::Plan& plan) {
                 plan.decode_ceiling_tps);
   else
     std::printf("decode     set by the experts that miss the VRAM cache, which only a run measures\n");
+  if (plan.offload.enabled)
+    std::printf("speculate  off: the experts are offloaded, which the verify path does not yet support\n");
+  else
+    std::printf("speculate  on for one stream: prompt-lookup drafts are checked in one pass, output unchanged "
+                "(--no-spec turns it off)\n");
   std::printf("\nplan\n");
   for (const std::string& note : plan.notes) std::printf("  %s\n", note.c_str());
 }

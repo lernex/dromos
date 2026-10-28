@@ -1052,3 +1052,228 @@ int cmd_pass1(int argc, char** argv) {
   }
   return 0;
 }
+
+// lernex spec-exactness: the next token of one prompt, drawn DRAWS times by the verify path and DRAWS times by the plain
+// sampler, at the think setting (temperature 0.8, top-p 0.95, top-k 20). Speculation runs without penalties
+// (engine.cpp spec_eligible), so the distributions compared are the unpenalised ones. The verify path draws against a
+// forced draft: a point mass on one token, the way the n-gram drafter proposes (SpecDecoder::verify, q null). The
+// reference is make_dist, the host reading of sampler.cu's distribution. Each set uses its own seed, and speculative
+// positions are spaced 4 apart, so no two draws share a Philox key.
+namespace {
+
+// Upper tail of a chi-square at x with df degrees of freedom (Wilson-Hilferty).
+double chi_square_tail(double x, int df) {
+  const double k = static_cast<double>(df);
+  const double z = (std::cbrt(x / k) - (1.0 - 2.0 / (9.0 * k))) / std::sqrt(2.0 / (9.0 * k));
+  return 0.5 * std::erfc(z / std::sqrt(2.0));
+}
+
+// Chi-square of counts against a reference distribution. Tokens expected at least 5 times each form a bin, the rest
+// one bin. A draw outside the reference's support fails outright.
+double chi_square_p(const std::vector<long>& counts, const std::vector<double>& p, long draws) {
+  double x = 0.0, rest_expected = 0.0, rest_observed = 0.0;
+  int bins = 0;
+  for (size_t i = 0; i < p.size(); ++i) {
+    if (p[i] <= 0.0) {
+      if (counts[i] > 0) return 0.0;
+      continue;
+    }
+    const double e = p[i] * static_cast<double>(draws);
+    if (e >= 5.0) {
+      x += (counts[i] - e) * (counts[i] - e) / e;
+      ++bins;
+    } else {
+      rest_expected += e;
+      rest_observed += static_cast<double>(counts[i]);
+    }
+  }
+  if (rest_expected > 0.0) {
+    x += (rest_observed - rest_expected) * (rest_observed - rest_expected) / rest_expected;
+    ++bins;
+  }
+  if (bins < 2) return 1.0;
+  return chi_square_tail(x, bins - 1);
+}
+
+double tv_to_reference(const std::vector<long>& counts, const std::vector<double>& p, long draws) {
+  double s = 0.0;
+  for (size_t i = 0; i < p.size(); ++i) s += std::abs(static_cast<double>(counts[i]) / static_cast<double>(draws) - p[i]);
+  return 0.5 * s;
+}
+
+double tv_between(const std::vector<long>& a, const std::vector<long>& b, long na, long nb) {
+  double s = 0.0;
+  for (size_t i = 0; i < a.size(); ++i)
+    s += std::abs(static_cast<double>(a[i]) / static_cast<double>(na) - static_cast<double>(b[i]) / static_cast<double>(nb));
+  return 0.5 * s;
+}
+
+void check_rc(int rc, const char* what) {
+  if (rc != 0) throw std::runtime_error(std::string(what) + ": " + lx_rt_error_string(rc));
+}
+
+int run_exactness(const std::string& dir, const std::string& prompts_path, const std::string& name, int draws,
+                  const lx::cli::FormatFlags& format) {
+  nlohmann::json prompts;
+  std::ifstream(prompts_path) >> prompts;
+  if (!prompts.contains(name)) throw std::runtime_error("no prompt named " + name + " in " + prompts_path);
+  const std::vector<int32_t> ids = prompts[name].get<std::vector<int32_t>>();
+  if (ids.size() < 2) throw std::runtime_error("the prompt needs at least two tokens");
+  const std::vector<int32_t> prefix(ids.begin(), ids.end() - 1);
+  const int32_t last = ids.back();
+  const int N = static_cast<int>(prefix.size());
+  const Sampling sm{0.8, 0.95, 0.0, 1.0, 20, 0};  // temp, top_p, min_p, rep, top_k, seed (unused: the seeds below)
+
+  Loaded l = load(dir, 1, 512, format, false);
+  lx::MetisModel& model = *l.model;
+  const int V = model.vocab_size();
+  void* s = nullptr;
+  check_rc(lx_rt_stream_create(&s), "creating a device stream");
+  float* d_logits = nullptr;
+  check_rc(lx_rt_alloc(reinterpret_cast<void**>(&d_logits), static_cast<int64_t>(sizeof(float)) * 512 * V),
+           "device allocation for logits");
+  auto prefill = [&]() {
+    model.reset_slot(0);
+    for (int off = 0; off < N; off += 512) {
+      const int c = std::min(512, N - off);
+      model.forward({{prefix.begin() + off, prefix.begin() + off + c}, {0, c}, {0}}, d_logits, false, s);
+    }
+  };
+
+  // The reference: the next token's distribution after the prefix and the pending token.
+  prefill();
+  model.forward({{last}, {0, 1}, {0}}, d_logits, false, s);
+  std::vector<float> base(static_cast<size_t>(V));
+  check_rc(lx_rt_copy(base.data(), d_logits, static_cast<int64_t>(sizeof(float)) * V, LX_COPY_D2H, s), "copy of logits");
+  check_rc(lx_rt_stream_sync(s), "stream sync");
+  const Dist ref = make_dist(base.data(), V, std::vector<char>(static_cast<size_t>(V), 0), sm);
+
+  // The plain sampler (lx_sample) on the same logits, as the engine calls it.
+  float* d_base = nullptr;
+  int32_t *d_seen = nullptr, *d_counts = nullptr, *d_tok = nullptr;
+  float* d_work = nullptr;
+  lx_sampling* d_params = nullptr;
+  check_rc(lx_rt_alloc(reinterpret_cast<void**>(&d_base), static_cast<int64_t>(sizeof(float)) * V), "alloc");
+  check_rc(lx_rt_alloc(reinterpret_cast<void**>(&d_seen), static_cast<int64_t>(sizeof(int32_t)) * V), "alloc");
+  check_rc(lx_rt_alloc(reinterpret_cast<void**>(&d_counts), static_cast<int64_t>(sizeof(int32_t)) * V), "alloc");
+  check_rc(lx_rt_alloc(reinterpret_cast<void**>(&d_work), static_cast<int64_t>(sizeof(float)) * V), "alloc");
+  check_rc(lx_rt_alloc(reinterpret_cast<void**>(&d_tok), sizeof(int32_t)), "alloc");
+  check_rc(lx_rt_alloc(reinterpret_cast<void**>(&d_params), sizeof(lx_sampling)), "alloc");
+  check_rc(lx_rt_copy(d_base, base.data(), static_cast<int64_t>(sizeof(float)) * V, LX_COPY_H2D, s), "copy");
+  check_rc(lx_sampler_reset(d_seen, d_counts, 0, V, s), "sampler reset");
+  auto plain_draws = [&](uint64_t seed) {
+    std::vector<long> counts(static_cast<size_t>(V), 0);
+    for (int i = 0; i < draws; ++i) {
+      lx_sampling sp{};
+      sp.seed = seed;
+      sp.position = static_cast<uint64_t>(i);
+      sp.slot = 0;
+      sp.row = 0;
+      sp.temperature = static_cast<float>(sm.temp);
+      sp.top_p = static_cast<float>(sm.top_p);
+      sp.top_k = sm.top_k;
+      sp.min_p = 0.0f;
+      sp.repetition_penalty = 1.0f;
+      check_rc(lx_rt_copy(d_params, &sp, static_cast<int64_t>(sizeof(sp)), LX_COPY_H2D, s), "copy of params");
+      check_rc(lx_sample(d_base, V, d_params, 1, d_seen, d_counts, d_work, d_tok, nullptr, 0, nullptr, nullptr, s),
+               "lx_sample");
+      int32_t tok = 0;
+      check_rc(lx_rt_copy(&tok, d_tok, sizeof(int32_t), LX_COPY_D2H, s), "copy of a draw");
+      check_rc(lx_rt_stream_sync(s), "stream sync");
+      counts[static_cast<size_t>(tok)] += 1;
+    }
+    return counts;
+  };
+
+  // The verify path: the state after the prefix is restored before every draw, and the step is [pending, draft].
+  lx::runtime::SpecDecoder decoder(model);
+  lx::runtime::SpecConfig config;
+  config.filter = lx_spec_filter{static_cast<float>(sm.temp), static_cast<float>(sm.top_p), sm.top_k,
+                                 static_cast<float>(sm.min_p)};
+  config.seed = 3;
+  auto spec_draws = [&](int draft, long& accepted_total) {
+    std::vector<long> counts(static_cast<size_t>(V), 0);
+    prefill();
+    const int before = model.slot_length(0);
+    for (int i = 0; i < draws; ++i) {
+      model.truncate(0, before);
+      int accepted = 0;
+      int32_t next = 0;
+      decoder.verify(0, config, {last, static_cast<int32_t>(draft)}, nullptr, static_cast<uint64_t>(4 * i), accepted,
+                     next, s);
+      const int32_t first = accepted >= 1 ? static_cast<int32_t>(draft) : next;
+      counts[static_cast<size_t>(first)] += 1;
+      accepted_total += accepted;
+    }
+    return counts;
+  };
+
+  // Two forced drafts: the reference's second most likely token (often accepted) and its least likely kept token.
+  std::vector<int> kept;
+  for (int t = 0; t < V; ++t)
+    if (ref.p[static_cast<size_t>(t)] > 0.0) kept.push_back(t);
+  std::sort(kept.begin(), kept.end(), [&](int a, int b) {
+    return ref.p[static_cast<size_t>(a)] > ref.p[static_cast<size_t>(b)] ||
+           (ref.p[static_cast<size_t>(a)] == ref.p[static_cast<size_t>(b)] && a < b);
+  });
+  const int high = kept.size() > 1 ? kept[1] : kept[0];
+  const int low = kept.back();
+
+  const std::vector<long> plain_a = plain_draws(1);
+  const std::vector<long> plain_b = plain_draws(2);
+  long acc_high = 0, acc_low = 0;
+  const std::vector<long> spec_high = spec_draws(high, acc_high);
+  const std::vector<long> spec_low = spec_draws(low, acc_low);
+  if (const int err = lx_rt_last_error()) throw std::runtime_error(std::string(lx_rt_error_string(err)) + " during the check");
+
+  std::printf("%s: %d prefix tokens, the next token drawn %d times at temperature %.1f, top-p %.2f, top-k %d\n",
+              name.c_str(), N, draws, sm.temp, sm.top_p, sm.top_k);
+  std::printf("reference: %zu tokens kept, most likely %d (p %.3f)\n", kept.size(), kept[0],
+              ref.p[static_cast<size_t>(kept[0])]);
+  bool ok = true;
+  auto report = [&](const char* label, const std::vector<long>& c) {
+    const double p = chi_square_p(c, ref.p, draws);
+    ok = ok && p > 1e-3;
+    std::printf("  %-38s chi-square p %.3f   total variation to reference %.4f\n", label, p, tv_to_reference(c, ref.p, draws));
+    return p;
+  };
+  report("plain sampler (lx_sample), seed 1", plain_a);
+  report("plain sampler (lx_sample), seed 2", plain_b);
+  report("verify, forced draft: rank 2 token", spec_high);
+  report("verify, forced draft: least likely kept", spec_low);
+  const double floor = tv_between(plain_a, plain_b, draws, draws);
+  std::printf("  noise: total variation between the two plain sets %.4f; verify vs plain (rank 2) %.4f, (least likely) %.4f\n",
+              floor, tv_between(spec_high, plain_a, draws, draws), tv_between(spec_low, plain_a, draws, draws));
+  std::printf("  draft accepted in %.1f%% (rank 2) and %.1f%% (least likely) of draws\n",
+              100.0 * static_cast<double>(acc_high) / draws, 100.0 * static_cast<double>(acc_low) / draws);
+  std::printf("%s\n", ok ? "exact: every sample set follows the reference (chi-square p > 0.001)"
+                         : "NOT exact: a sample set departs from the reference");
+
+  lx_rt_free(d_base);
+  lx_rt_free(d_seen);
+  lx_rt_free(d_counts);
+  lx_rt_free(d_work);
+  lx_rt_free(d_tok);
+  lx_rt_free(d_params);
+  lx_rt_free(d_logits);
+  return ok ? 0 : 1;
+}
+
+}  // namespace
+
+int cmd_spec_exactness(int argc, char** argv) {
+  try {
+    lx::cli::FormatFlags format;
+    std::vector<char*> args = without_format_flags(argc, argv, format);
+    const int n = static_cast<int>(args.size());
+    if (n != 4 && n != 5) {
+      std::fprintf(stderr, "usage: lernex spec-exactness MODEL_DIR PROMPTS_JSON PROMPT [DRAWS] %s\n", lx::cli::kFormatUsage);
+      return 2;
+    }
+    const int draws = n == 5 ? std::stoi(args[4]) : 2000;
+    return run_exactness(args[1], args[2], args[3], draws, format);
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "error: %s\n", e.what());
+    return 1;
+  }
+}

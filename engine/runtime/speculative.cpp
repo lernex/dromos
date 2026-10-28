@@ -291,6 +291,19 @@ void SpecDecoder::accept(const SpecConfig& config, const std::vector<int32_t>& s
   next = h_out_[1];
 }
 
+void SpecDecoder::verify(int slot, const SpecConfig& config, const std::vector<int32_t>& step, const float* q,
+                         uint64_t position, int& accepted, int32_t& next, void* s) {
+  const int rows = static_cast<int>(step.size());
+  if (rows < 1 || rows > max_rows_)
+    throw std::runtime_error("a verify step takes 1 to " + std::to_string(max_rows_) + " rows");
+  const int before = target_.slot_length(slot);
+  const std::vector<lx_spec_filter> filters(rows, config.filter);
+  LX_CHECK(lx_rt_copy(d_filters_, filters.data(), static_cast<int64_t>(sizeof(lx_spec_filter) * rows), LX_COPY_H2D, s));
+  target_.forward_spec({step, {0, rows}, {slot}}, logits_, s);
+  accept(config, step, q, position, accepted, next, s);
+  target_.truncate(slot, before + accepted + 1);
+}
+
 std::vector<int32_t> SpecDecoder::generate(Drafter* drafter, const std::vector<int32_t>& prompt,
                                            const SpecConfig& config, SpecStats& stats, void* s) {
   if (prompt.empty()) throw std::runtime_error("empty prompt");
@@ -347,12 +360,14 @@ std::vector<int32_t> SpecDecoder::generate(Drafter* drafter, const std::vector<i
     const int k = static_cast<int>(step.size()) - 1;
     const int before = target_.slot_length(0);
     StepBatch b{step, {0, k + 1}, {0}};
-    if (drafter)
+    // A step with no drafts is a plain one-token step: a verify step of one token costs about 7% more on Praxis
+    // (spec-cost), so a drafter that sits out must not pay it on every step.
+    if (drafter && k > 0)
       target_.forward_spec(b, logits_, s);
     else
       target_.forward(b, logits_, false, s);
     accept(config, step, draft.q, out.size(), accepted, next, s);
-    if (drafter) target_.truncate(0, before + accepted + 1);
+    if (drafter && k > 0) target_.truncate(0, before + accepted + 1);
     if (F) {
       drafter->observe_features(target_.features(), accepted + 1, F, s);
       features = target_.features() + static_cast<size_t>(accepted) * F;

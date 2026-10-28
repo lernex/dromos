@@ -17,6 +17,7 @@ int cmd_list(int argc, char** argv);
 int cmd_offload(int argc, char** argv);
 int cmd_spec(int argc, char** argv);
 int cmd_spec_check(int argc, char** argv);
+int cmd_spec_exactness(int argc, char** argv);
 int cmd_spec_cost(int argc, char** argv);
 int cmd_pass1(int argc, char** argv);
 int cmd_features(int argc, char** argv);
@@ -49,6 +50,7 @@ void usage() {
                "  offload probe|eval|bench ...              run larger than the GPU (lernex offload for help)\n"
                "  spec MODEL_DIR PROMPTS_JSON [options]     speculative decoding against plain decoding\n"
                "  spec-check MODEL_DIR PROMPTS_JSON [N]     verify steps bit-identical to one-token steps\n"
+               "  spec-exactness MODEL_DIR PROMPTS_JSON PROMPT [DRAWS]  next-token draws of verify vs plain sampling\n"
                "  spec-cost MODEL_DIR [CONTEXT]             milliseconds per plain and per verify step\n"
                "  pass1 MODEL_DIR PROMPTS_JSON [options]    free drafters from the first pass: acceptance, runs, timing\n"
                "  features MODEL_DIR DATA_JSONL OUT_DIR     hidden-state shards for training draft models\n"
@@ -87,6 +89,7 @@ int main(int argc, char** argv) {
     if (!std::strcmp(cmd, "offload")) return cmd_offload(argc - 1, argv + 1);
     if (!std::strcmp(cmd, "spec")) return cmd_spec(argc - 1, argv + 1);
     if (!std::strcmp(cmd, "spec-check")) return cmd_spec_check(argc - 1, argv + 1);
+    if (!std::strcmp(cmd, "spec-exactness")) return cmd_spec_exactness(argc - 1, argv + 1);
     if (!std::strcmp(cmd, "spec-cost")) return cmd_spec_cost(argc - 1, argv + 1);
     if (!std::strcmp(cmd, "pass1")) return cmd_pass1(argc - 1, argv + 1);
     if (!std::strcmp(cmd, "features")) return cmd_features(argc - 1, argv + 1);

@@ -242,8 +242,17 @@ Definitions, for whoever fills it:
 
 | Scheme | Model and format | Draft length or pass depth | Tokens per weight sweep | Weight MB per sweep | Streams | Measured tok/s | Share of one-token ceiling | Acceptance or pass utilisation | Commit | Notes |
 |---|---|---|---|---|---|---|---|---|---|---|
+| Prompt lookup, lone stream | Praxis BF16 | up to 6 drafts, adaptive | 1.59 | 1827 | 1 | 418 | 89% | 0.48 accepted | this commit | 1.37x plain, chat mix, greedy |
+| Prompt lookup, lone stream | Praxis INT8 | up to 6 drafts, adaptive | 1.57 | 1340 | 1 | 476 | 75% | 0.49 accepted | this commit | 1.36x plain, chat mix, greedy |
+| Prompt lookup, lone stream | Logos FP8 | up to 6 drafts, adaptive | 1.59 | 3455 | 1 | 225 | 91% | 0.48 accepted | this commit | 1.38x plain, chat mix, greedy |
 
-Rows are not filled yet. They belong to the speculative and pass-pipelined work.
+Speculative rows are prompt-lookup drafts on a lone stream, from `lernex spec` on the chat mix (the five spec prompts, think and direct_tools, 512 tokens, two repeats). Tokens per weight sweep is tokens per decode step, verify and plain steps together. Weight MB per sweep is the bandwidth time in the roofline table times 853 GB/s. Speedups are chat-mix aggregates over plain decode of the same format, and greedy text is identical to plain on every prompt.
+
+- **Praxis BF16:** 1.37x greedy, 1.35x at temperature 0.3, 1.15x for think at 0.8.
+- **Praxis INT8:** 1.36x greedy, 1.35x at 0.3, 1.17x for think at 0.8.
+- **Logos FP8:** 1.38x greedy, 1.32x at 0.3, 1.23x for think at 0.8.
+
+The think numbers are unpenalised: the app sends no repetition penalty, and speculation is off for penalised requests. Pass-pipelined rows are not filled yet.
 
 ## Against other engines
 

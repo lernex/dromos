@@ -14,6 +14,7 @@
 
 #include "core/checkpoint.h"
 #include "core/safetensors.h"
+#include "cuda/kernels.h"  // LX_SPEC_MAX_PENDING
 #include "model/traffic.h"
 #include "lx_build_info.h"  // LX_BUILT_ARCHS, written by CMake
 #include "runtime/offload_plan.h"
@@ -473,6 +474,17 @@ size_t state_bytes_per_slot(const MetisConfig& c) {
   return static_cast<size_t>(c.num_passes) * static_cast<size_t>(mamba_layers(c)) * per_layer;
 }
 
+// The speculative history of one slot (kernels.h, Speculative decoding): per Mamba layer and pass, the conv inputs of up to
+// LX_SPEC_MAX_PENDING positions and each head's SSM inputs for them. The engine builds its model speculative, so a lone
+// stream can verify drafts in any slot: the history is reserved for every slot.
+size_t spec_history_bytes_per_slot(const MetisConfig& c) {
+  const int64_t I = c.mamba_intermediate(), H = c.mamba_heads(), Pd = c.mamba_head_dim, N = c.mamba_d_state;
+  const int64_t G = c.mamba_n_groups, conv_dim = I + 2 * G * N;
+  const int64_t row = (Pd + 3) / 4 * 4 + (N + 3) / 4 * 4 + 4;  // lx_spec_ssm_hist_floats: H * LX_SPEC_MAX_PENDING rows
+  const size_t per_layer = f32_bytes(LX_SPEC_MAX_PENDING * conv_dim) + f32_bytes(H * LX_SPEC_MAX_PENDING * row);
+  return static_cast<size_t>(c.num_passes) * static_cast<size_t>(mamba_layers(c)) * per_layer;
+}
+
 size_t kv_bytes_per_position(const MetisConfig& c) {
   // K and V, bf16, per attention layer and pass
   const size_t per_layer = 2 * static_cast<size_t>(c.num_key_value_heads) * c.head_dim * 2;
@@ -616,7 +628,7 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
   if (!can_load(target, stored, c, &how)) throw std::runtime_error(format_name(target) + " cannot be planned: " + how);
 
   const size_t budget = resident_budget(d, req);
-  const size_t per_slot_state = state_bytes_per_slot(c);
+  const size_t per_slot_state = state_bytes_per_slot(c) + (req.speculative ? spec_history_bytes_per_slot(c) : 0);
   const size_t per_position = kv_bytes_per_position(c);
   const int context_cap = c.max_position_embeddings > 0 ? c.max_position_embeddings : kDefaultContext;
   const int slot_cap = req.sequences > 0 ? req.sequences : kMaxSlots;

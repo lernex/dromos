@@ -1,5 +1,5 @@
 // lernex bench MODEL [--streams 1,8,32,64] [--prompt-tokens N] [--gen-tokens N]
-//                    [--weights bf16|int8|fp8|nvfp4|bf16x] [--no-bf16x]
+//                    [--weights bf16|int8|fp8|nvfp4|bf16x] [--no-bf16x] [--spec]
 //
 // The weights run in the format the file stores unless --weights names another, so a speed is always the speed
 // of a named format (the first line of the plan says which).
@@ -15,6 +15,8 @@
 //                   first, per stream (concurrency x 1000 / mean TPOT). The table publishes this one for every engine.
 // --sample draws with the model's own recommended settings (temperature 0.6, top-p 0.95, top-k 20)
 // instead of greedy, which is what a chat user gets.
+// Plain decode unless --spec: the roofline is the bandwidth ceiling of plain decode, which speculation on one stream beats.
+// --spec measures the serving path, prompt-lookup speculation included.
 //
 // The roofline columns (cli/roofline.h): the tokens per second the card's memory bandwidth allows for the streams at the
 // run's mean context (prompt plus half the generation), at the spec and at the measured read rate, and the run's share
@@ -48,6 +50,7 @@ struct BenchArgs {
   bool prefix_cache = true;  // --no-prefix-cache measures the cold path
   bool one_count = false;    // a child run: one stream count, the plan and its row (no header); see cmd_bench
   bool components = false;   // print the step's bytes by component at each stream count (the profile's byte floor)
+  bool speculate = false;    // --spec: prompt-lookup drafts for a lone stream, as serving does
   FormatFlags format;
 };
 
@@ -184,6 +187,7 @@ int cmd_bench(int argc, char** argv) {
     else if (a == "--prompt-tokens") args.prompt_tokens = std::stoi(value());
     else if (a == "--gen-tokens") args.gen_tokens = std::stoi(value());
     else if (a == "--sample") args.sample = true;
+    else if (a == "--spec") args.speculate = true;
     else if (a == "--no-prefix-cache") args.prefix_cache = false;
     else if (a == "--one-count") args.one_count = true;
     else if (a == "--components") args.components = true;
@@ -191,7 +195,7 @@ int cmd_bench(int argc, char** argv) {
     else throw std::runtime_error("unknown option " + a);
   }
   if (args.model.empty()) {
-    std::fprintf(stderr, "usage: lernex bench MODEL [--streams 1,8,32,64] [--prompt-tokens N] [--gen-tokens N] %s\n",
+    std::fprintf(stderr, "usage: lernex bench MODEL [--streams 1,8,32,64] [--prompt-tokens N] [--gen-tokens N] [--spec] %s\n",
                  kFormatUsage);
     return 2;
   }
@@ -243,6 +247,8 @@ int cmd_bench(int argc, char** argv) {
   // One stream count in this process: the probe first (its 1 GiB buffer is returned before the engine plans its memory).
   const int streams = args.streams.front();
   const int plan_context = args.prompt_tokens + args.gen_tokens + 16;
+  options.speculate = args.speculate;
+  // The probe first: its 1 GiB buffer is returned before the engine plans its memory.
   const lx::runtime::DeviceInfo device = lx::runtime::query_device(0);
   const lx::cli::Bandwidth bw = lx::cli::measure_bandwidth(device.bandwidth_gbs);
   const lx::cli::ComputePeak peak = device.cpu ? lx::cli::ComputePeak{} : lx::cli::compute_peak(device.cc());

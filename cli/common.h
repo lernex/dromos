@@ -40,7 +40,7 @@ extern const char* const kFormatUsage;
 // the share of the free memory the plan may use. LX_VRAM_BUDGET_GB and LX_RAM_BUDGET_GB, when set, bound the
 // GPU memory this process takes and the pinned RAM offloaded experts may take.
 runtime::Plan plan_for(const Model& model, int sequences, int context, int weights = -1, double memory_fraction = 0.92,
-                       bool bf16x = true, bool fast = false);
+                       bool bf16x = true, bool fast = false, bool speculative = true);
 
 // A model folder loaded for a command that runs MetisModel itself (eval, prefill, spec, features): in the file's
 // format or the one the flags name, under the plan's rules (runtime::can_load), with the formats and maths the plan

@@ -98,6 +98,10 @@ struct EngineOptions {
   // kept at those points. A request that starts from a snapshot then computes exactly what a cold
   // run computes. 0 feeds prompts in whole chunks, with no snapshots.
   int prefill_grid = 512;
+  // Prompt-lookup speculation for a lone decoding stream: its next tokens are drafted from its own text and checked
+  // in one verify step (speculative.h, SpecDecoder::verify). Exact: greedy output is the plain output, and sampling
+  // keeps the target's distribution. Off for offloaded plans. Several streams decode plainly.
+  bool speculate = true;
 };
 
 struct EngineStats {

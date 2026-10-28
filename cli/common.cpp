@@ -90,7 +90,7 @@ size_t env_gib(const char* name) {
 }  // namespace
 
 runtime::Plan plan_for(const Model& model, int sequences, int context, int weights, double memory_fraction,
-                       bool bf16x, bool fast) {
+                       bool bf16x, bool fast, bool speculative) {
   const MetisConfig config = load_config(model.dir.string());
   runtime::PlanRequest request;
   request.sequences = sequences;
@@ -98,6 +98,7 @@ runtime::Plan plan_for(const Model& model, int sequences, int context, int weigh
   request.weights = weights;
   request.bf16x = bf16x;
   request.fast_math = fast;
+  request.speculative = speculative;
   request.memory_fraction = memory_fraction;
   request.vram_budget = env_gib("LX_VRAM_BUDGET_GB");
   request.ram_budget = env_gib("LX_RAM_BUDGET_GB");
@@ -139,7 +140,7 @@ StartedEngine start_engine(const Model& model, int sequences, int context, int w
   int wanted = sequences;
   int format = weights;
   for (int attempt = 1;; ++attempt) {
-    runtime::Plan plan = plan_for(model, wanted, context, format, fraction, bf16x, fast);
+    runtime::Plan plan = plan_for(model, wanted, context, format, fraction, bf16x, fast, options.speculate);
     try {
       auto engine = std::make_unique<runtime::Engine>(model.dir.string(), plan, options);
       return StartedEngine{std::move(plan), std::move(engine)};
