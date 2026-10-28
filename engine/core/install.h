@@ -6,6 +6,8 @@
 
 namespace lx::install {
 
+// The running executable (symlinks resolved), or "".
+std::string executable_path();
 // The directory of the running executable, with symlinks resolved, or "" when it cannot be found.
 std::string executable_dir();
 

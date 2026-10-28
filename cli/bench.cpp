@@ -25,10 +25,12 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <sys/wait.h>
 #include <vector>
 
 #include "cli/common.h"
 #include "cli/roofline.h"
+#include "core/install.h"
 #include "model/traffic.h"
 #include "runtime/engine.h"
 
@@ -42,8 +44,19 @@ struct BenchArgs {
   int gen_tokens = 256;
   bool sample = false;
   bool prefix_cache = true;  // --no-prefix-cache measures the cold path
+  bool one_count = false;    // a child run: one stream count, the plan and its row (no header); see cmd_bench
   FormatFlags format;
 };
+
+// POSIX shell quoting of one argument.
+std::string shell_quote(const std::string& text) {
+  std::string out = "'";
+  for (const char c : text) {
+    if (c == '\'') out += "'\\''";
+    else out += c;
+  }
+  return out + "'";
+}
 
 std::vector<int> parse_list(const std::string& text) {
   std::vector<int> out;
@@ -160,6 +173,7 @@ int cmd_bench(int argc, char** argv) {
     else if (a == "--gen-tokens") args.gen_tokens = std::stoi(value());
     else if (a == "--sample") args.sample = true;
     else if (a == "--no-prefix-cache") args.prefix_cache = false;
+    else if (a == "--one-count") args.one_count = true;
     else if (args.model.empty() && a[0] != '-') args.model = a;
     else throw std::runtime_error("unknown option " + a);
   }
@@ -170,35 +184,77 @@ int cmd_bench(int argc, char** argv) {
   }
   if (args.streams.empty() || args.prompt_tokens < 1 || args.gen_tokens < 2)
     throw std::runtime_error("streams, prompt tokens and generated tokens must be positive (at least 2 generated)");
-  const int max_streams = *std::max_element(args.streams.begin(), args.streams.end());
 
   const Model model = find_model(args.model, false);
   EngineOptions options;
   options.load_tokenizer = false;
   options.prefix_cache = args.prefix_cache;
-  // The probe first: its 1 GiB buffer is returned before the engine plans its memory.
+  // A child run that refuses its count exits with this status: the plan holds fewer sequences than the count.
+  constexpr int kRefusedExit = 3;
+
+  if (!args.one_count) {
+    // Each stream count is a run of its own process, so its plan is the plan a standalone run at that count gets: the
+    // engines an earlier count loaded leave device memory in use, which the planner would count as taken. The child
+    // prints its plan, its roofline and its row; this process prints the header once and then each child's output.
+    std::printf("%s  (%s)\n", args.model.c_str(), model.dir.c_str());
+    std::printf("  %d prompt tokens, %d generated tokens per stream, %s\n", args.prompt_tokens, args.gen_tokens,
+                args.sample ? "sampled (temperature 0.6, top-p 0.95, top-k 20)" : "greedy");
+    std::printf("  each stream count loads its own engine, so it runs on the plan a standalone run at that count gets\n");
+    std::printf("%8s %12s %12s %10s %10s %13s %15s %9s %9s\n", "streams", "decode tok/s", "per stream", "TTFT p50",
+                "TTFT p90", "prefill tok/s", "roofline tok/s", "% of spec", "% of peak");
+    std::fflush(stdout);
+    bool refused = false;
+    for (int streams : args.streams) {
+      std::string command = shell_quote(lx::install::executable_path());
+      for (int i = 0; i < argc; ++i) {  // argv[0] is the subcommand, "bench": the child is run as this one
+        const std::string a = argv[i];
+        if (i > 0 && a == "--streams") {
+          ++i;  // the list is replaced by this count
+          continue;
+        }
+        command += " " + shell_quote(a);
+      }
+      command += " --streams " + std::to_string(streams) + " --one-count 2>&1";
+      FILE* child = popen(command.c_str(), "r");
+      if (!child) throw std::runtime_error("bench: cannot start a run at " + std::to_string(streams) + " streams");
+      char line[4096];
+      while (std::fgets(line, sizeof line, child)) std::fputs(line, stdout);
+      const int status = pclose(child);
+      if (WIFEXITED(status) && WEXITSTATUS(status) == kRefusedExit) refused = true;
+      else if (status != 0) throw std::runtime_error("bench: the run at " + std::to_string(streams) + " streams failed");
+      std::fflush(stdout);
+    }
+    return refused ? 1 : 0;
+  }
+
+  // One stream count in this process: the probe first (its 1 GiB buffer is returned before the engine plans its memory).
+  const int streams = args.streams.front();
+  const int plan_context = args.prompt_tokens + args.gen_tokens + 16;
   const lx::runtime::DeviceInfo device = lx::runtime::query_device(0);
   const lx::cli::Bandwidth bw = lx::cli::measure_bandwidth(device.bandwidth_gbs);
   const lx::cli::ComputePeak peak = device.cpu ? lx::cli::ComputePeak{} : lx::cli::compute_peak(device.cc());
   const double tflops = peak.known ? peak.bf16_tflops : 0.0;
-  lx::cli::StartedEngine started = lx::cli::start_engine(model, max_streams, args.prompt_tokens + args.gen_tokens + 16,
-                                                         args.format.weights, options, 0.92, args.format.bf16x,
-                                                         args.format.fast_math);
+  lx::cli::StartedEngine started = lx::cli::start_engine(model, streams, plan_context, args.format.weights, options, 0.92,
+                                                         args.format.bf16x, args.format.fast_math);
   const Plan& plan = started.plan;
   Engine& engine = *started.engine;
+  if (streams > plan.max_slots) {
+    // The queue would take the rest, and decode and prefill would then time the queue: refuse rather than measure it.
+    std::printf("%8d  refused: this plan holds %d sequences at this context, and the rest would wait in the queue\n",
+                streams, plan.max_slots);
+    std::fflush(stdout);
+    return kRefusedExit;
+  }
 
   const int context = args.prompt_tokens + args.gen_tokens / 2;  // the mean context a stream reads over the run
   const lx::DecodeTraffic traffic = engine.decode_traffic(context);
   // The roofline needs the whole model on the device: an offloaded plan's experts come over PCIe, which is another bound.
   const bool roofline_ok = !plan.offload.enabled && bw.measured_gbs > 0;
 
-  std::printf("%s  (%s)\n", args.model.c_str(), model.dir.c_str());
+  std::printf("\n%d streams: %d slots, %d-token context, %d tokens per step; %s\n", streams, plan.max_slots, plan.kv_capacity,
+              plan.max_step_tokens, plan.bf16x_reason.c_str());
   for (const std::string& note : plan.notes) std::printf("  %s\n", note.c_str());
   if (!engine.placement().empty()) std::printf("%s", engine.placement().c_str());
-  std::printf("  %d slots, %d-token context, %d tokens per step\n", plan.max_slots, plan.kv_capacity,
-              plan.max_step_tokens);
-  std::printf("  %d prompt tokens, %d generated tokens per stream, %s\n", args.prompt_tokens, args.gen_tokens,
-              args.sample ? "sampled (temperature 0.6, top-p 0.95, top-k 20)" : "greedy");
 
   // The traffic the engine counts, against the config's count for the same format: they must agree (traffic.h).
   const lx::DecodeTraffic from_config = lx::config_decode_traffic(engine.config(), plan.weights, plan.bf16x_decode, context);
@@ -219,36 +275,30 @@ int cmd_bench(int argc, char** argv) {
     std::printf("  roofline  not shown: %s\n", plan.offload.enabled ? "the routed experts are offloaded"
                                                                      : "no bandwidth measured");
   }
-  std::printf("\n");
 
-  std::printf("%8s %12s %12s %10s %10s %13s %15s %9s %9s\n", "streams", "decode tok/s", "per stream", "TTFT p50",
-              "TTFT p90", "prefill tok/s", "roofline tok/s", "% of spec", "% of peak");
-  for (int streams : args.streams) {
-    run_batch(engine, streams, std::min(args.prompt_tokens, 64), 8, engine.config().vocab_size, args.sample);  // warm up
-    const double submitted = engine.now();
-    const auto timings =
-        run_batch(engine, streams, args.prompt_tokens, args.gen_tokens, engine.config().vocab_size, args.sample);
-    const Row row = measure(timings, args.prompt_tokens, submitted);
-    // The ceilings for this many streams: at the spec, and at the measured read rate (the tighter one in practice).
-    const double spec_ceiling = roofline_ok && bw.spec_gbs > 0 ? lx::cli::ceiling_tps(traffic, streams, bw.spec_gbs, tflops) : 0;
-    const double peak_ceiling = roofline_ok ? lx::cli::ceiling_tps(traffic, streams, bw.measured_gbs, tflops) : 0;
-    std::string roof = "-", of_spec = "-", of_peak = "-";
-    if (peak_ceiling > 0) {
-      char buf[32];
-      std::snprintf(buf, sizeof buf, "%.0f", peak_ceiling);
-      roof = buf;
-      std::snprintf(buf, sizeof buf, "%.1f%%", 100.0 * row.decode_tps / peak_ceiling);
-      of_peak = buf;
-    }
-    if (spec_ceiling > 0) {
-      char buf[32];
-      std::snprintf(buf, sizeof buf, "%.1f%%", 100.0 * row.decode_tps / spec_ceiling);
-      of_spec = buf;
-    }
-    std::printf("%8d %12.1f %12.1f %10s %10s %13.0f %15s %9s %9s\n", row.streams, row.decode_tps, row.per_stream_tps,
-                human_seconds(row.ttft_p50).c_str(), human_seconds(row.ttft_p90).c_str(), row.prefill_tps, roof.c_str(),
-                of_spec.c_str(), of_peak.c_str());
-    std::fflush(stdout);
+  run_batch(engine, streams, std::min(args.prompt_tokens, 64), 8, engine.config().vocab_size, args.sample);  // warm up
+  const double submitted = engine.now();
+  const auto timings = run_batch(engine, streams, args.prompt_tokens, args.gen_tokens, engine.config().vocab_size, args.sample);
+  const Row row = measure(timings, args.prompt_tokens, submitted);
+  // The ceilings for this many streams: at the spec, and at the measured read rate (the tighter one in practice).
+  const double spec_ceiling = roofline_ok && bw.spec_gbs > 0 ? lx::cli::ceiling_tps(traffic, streams, bw.spec_gbs, tflops) : 0;
+  const double peak_ceiling = roofline_ok ? lx::cli::ceiling_tps(traffic, streams, bw.measured_gbs, tflops) : 0;
+  std::string roof = "-", of_spec = "-", of_peak = "-";
+  if (peak_ceiling > 0) {
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "%.0f", peak_ceiling);
+    roof = buf;
+    std::snprintf(buf, sizeof buf, "%.1f%%", 100.0 * row.decode_tps / peak_ceiling);
+    of_peak = buf;
   }
+  if (spec_ceiling > 0) {
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "%.1f%%", 100.0 * row.decode_tps / spec_ceiling);
+    of_spec = buf;
+  }
+  std::printf("%8d %12.1f %12.1f %10s %10s %13.0f %15s %9s %9s\n", row.streams, row.decode_tps, row.per_stream_tps,
+              human_seconds(row.ttft_p50).c_str(), human_seconds(row.ttft_p90).c_str(), row.prefill_tps, roof.c_str(),
+              of_spec.c_str(), of_peak.c_str());
+  std::fflush(stdout);
   return 0;
 }

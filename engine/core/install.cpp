@@ -13,7 +13,6 @@
 #endif
 
 namespace lx::install {
-namespace {
 
 // The executable's path with symlinks resolved, or "".
 std::string executable_path() {
@@ -30,8 +29,6 @@ std::string executable_path() {
   return std::string(buf, static_cast<size_t>(n));
 #endif
 }
-
-}  // namespace
 
 std::string executable_dir() {
   const std::string exe = executable_path();
