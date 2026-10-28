@@ -628,7 +628,8 @@ bool Server::run() {
 
   http_->Get("/health", [this](const httplib::Request&, httplib::Response& res) {
     const runtime::EngineStats st = engine_.stats();
-    json health = {{"status", "ok"}, {"running", st.running}, {"waiting", st.waiting}, {"slots", st.slots}};
+    json health = {{"status", "ok"}, {"running", st.running}, {"waiting", st.waiting}, {"slots", st.slots},
+                   {"steps", st.steps}, {"decode_steps", st.decode_steps}};
     // Constrained decoding (response_format json_object or json_schema): how often it ran and what its masks cost.
     health["constrained"] = {{"steps", st.constrained_steps},
                              {"rows", st.constrained_rows},
