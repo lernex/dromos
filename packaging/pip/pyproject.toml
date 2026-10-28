@@ -1,0 +1,30 @@
+# The lernex wheel. Built by build_wheel.py, which stages this directory with the release tree under
+# lernex/_bin and writes wheel.json (the version and the dependencies); setup.py reads that file.
+[build-system]
+requires = ["setuptools>=70.1", "wheel>=0.43"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lernex"
+dynamic = ["version", "dependencies"]
+description = "Lernex's inference engine for the Metis models: the lernex command, run locally."
+readme = { text = """Lernex's inference engine for the Metis models, run on your own machine.
+
+    pip install lernex
+    lernex run praxis       chat in the terminal
+    lernex serve logos      the OpenAI API on this machine
+
+The engine picks its backend when it starts: CUDA on an NVIDIA GPU (Linux x86_64; the CUDA runtime comes from
+NVIDIA's own wheels, which this package installs), Metal on Apple silicon (macOS 14 or later), and the CPU otherwise.
+""", content-type = "text/plain" }
+requires-python = ">=3.9"
+classifiers = [
+  "Environment :: GPU :: NVIDIA CUDA",
+  "Operating System :: MacOS :: MacOS X",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.scripts]
+lernex = "lernex.cli:main"
