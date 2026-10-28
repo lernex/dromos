@@ -1049,15 +1049,19 @@ int lx_rt_copy(void* dst, const void* src, int64_t bytes, lx_copy_kind kind, voi
   return note(kInvalidValue);
 }
 
+// Every stream is the one lane of the device: one command queue, in the order the host issues work. A
+// fork and join between streams then needs no GPU-side wait and no commit (a queue per stream cost a
+// cross-queue event and a commit at each end of every fork: 1.9 tok/s on Praxis, against 50 with one lane),
+// and the overlap the streams were for comes from the encoder, where dispatches run concurrently unless the
+// hazard tracker orders them. The lane also records as one graph, so a decode step replays whole.
 int lx_rt_stream_create(void** stream) {
   if (!stream) return note(kInvalidValue);
-  *stream = new Stream(Device::get().new_queue());
+  *stream = Device::get().default_stream();
   return kOk;
 }
 
 int lx_rt_stream_destroy(void* stream) {
-  if (!stream) return kOk;
-  delete static_cast<Stream*>(stream);
+  (void)stream;  // the lane lives as long as the device
   return kOk;
 }
 
