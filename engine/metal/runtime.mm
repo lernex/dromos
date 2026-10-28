@@ -1225,6 +1225,12 @@ int lx_rt_process_memory(int64_t* bytes) {
   return kOk;
 }
 
+// The probe is CUDA's and HIP's: Metal answers not supported, as the CPU does.
+int lx_bandwidth_probe(int64_t bytes, int reps, double* read_gbps, double* spec_gbps, void* stream) {
+  (void)bytes, (void)reps, (void)read_gbps, (void)spec_gbps, (void)stream;
+  return LX_ERR_NOT_SUPPORTED;
+}
+
 int lx_rt_host_alloc_mapped(void** host, void** device, int64_t bytes) {
   if (!host || !device) return note(kInvalidValue);
   *device = nullptr;

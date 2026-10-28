@@ -463,6 +463,12 @@ int lx_rt_process_memory(int64_t* bytes) {
 #endif
 }
 
+// The probe measures a device's memory: the CPU reads its own RAM through lx_device_props' read_bandwidth.
+int lx_bandwidth_probe(int64_t bytes, int reps, double* read_gbps, double* spec_gbps, void* stream) {
+  (void)bytes, (void)reps, (void)read_gbps, (void)spec_gbps, (void)stream;
+  return fail(kNotSupported);
+}
+
 // Nothing here is memory the device reads across a bus: the kernels read host memory directly.
 int lx_rt_is_host_memory(const void* ptr) {
   (void)ptr;

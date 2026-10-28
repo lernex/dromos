@@ -1,0 +1,162 @@
+// The memory read bandwidth the device sustains, measured, and the peak it is held against (kernels.h,
+// lx_bandwidth_probe). The roofline's denominator: a decode token's bytes over this rate is its ceiling.
+#include <cuda_runtime.h>
+
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+
+#include "cuda/kernels.h"
+
+namespace {
+
+constexpr int kThreads = 256;
+// The sentinel the reduction is compared with. The buffer is filled by hash_fill, and an xor of its words equals this
+// almost never, so the store that keeps the loads alive is practically never made.
+constexpr unsigned int kSentinel = 0x9E3779B9u;
+
+// One 16-byte load. ld.global.nc is the read-only path (__ldg); the .L1::no_allocate form streams the bytes past L1, so
+// the probe does not evict another kernel's lines from it. Both are one instruction each on the device.
+__device__ __forceinline__ uint4 load_nc(const uint4* p) { return __ldg(p); }
+
+__device__ __forceinline__ uint4 load_nc_na(const uint4* p) {
+#if defined(__CUDA_ARCH__)
+  uint4 v;
+  asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0, %1, %2, %3}, [%4];"
+               : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+               : "l"(p));
+  return v;
+#else
+  return __ldg(p);
+#endif
+}
+
+// Grid-stride read of n 16-byte words, kUnroll loads per thread in flight at a time. The xor of every word is kept, so
+// no load can be dropped, and it is written only when it equals the sentinel.
+template <bool kNoAllocate, int kUnroll>
+__global__ void read_kernel(const uint4* __restrict__ src, int64_t n, unsigned int* sink) {
+  const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  unsigned int acc = 0;
+  for (; i + (kUnroll - 1) * stride < n; i += kUnroll * stride) {
+    uint4 v[kUnroll];
+#pragma unroll
+    for (int u = 0; u < kUnroll; ++u)
+      v[u] = kNoAllocate ? load_nc_na(src + i + u * stride) : load_nc(src + i + u * stride);
+#pragma unroll
+    for (int u = 0; u < kUnroll; ++u) acc ^= v[u].x ^ v[u].y ^ v[u].z ^ v[u].w;
+  }
+  for (; i < n; i += stride) {
+    const uint4 v = kNoAllocate ? load_nc_na(src + i) : load_nc(src + i);
+    acc ^= v.x ^ v.y ^ v.z ^ v.w;
+  }
+  if (acc == kSentinel) *sink = acc;
+}
+
+// A hash of the element index, per 16-byte word: the probe reads what a weight matrix would hold, not zeros.
+__global__ void hash_fill(uint4* dst, int64_t n) {
+  const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += stride) {
+    uint64_t x = static_cast<uint64_t>(i) * 0x9E3779B97F4A7C15ull + 0x632BE59BD9B4E019ull;
+    x ^= x >> 31, x *= 0xBF58476D1CE4E5B9ull, x ^= x >> 29;
+    uint64_t y = x * 0x94D049BB133111EBull;
+    y ^= y >> 32;
+    dst[i] = make_uint4(static_cast<unsigned>(x), static_cast<unsigned>(x >> 32), static_cast<unsigned>(y),
+                        static_cast<unsigned>(y >> 32));
+  }
+}
+
+// The best of `reps` timed launches of one variant, after one warm-up, in GB/s. Blocks: as many as the variant can keep
+// resident on every SM, so the loads in flight saturate the memory system.
+template <bool kNoAllocate, int kUnroll>
+double run_variant(const uint4* src, int64_t n, unsigned int* sink, int sms, int reps, cudaStream_t stream,
+                   const char* name) {
+  int per_sm = 0;
+  cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, read_kernel<kNoAllocate, kUnroll>, kThreads, 0);
+  if (per_sm < 1) per_sm = 1;
+  const int grid = sms * per_sm;
+  cudaEvent_t a = nullptr, b = nullptr;
+  cudaEventCreate(&a);
+  cudaEventCreate(&b);
+  double best_ms = 1e300;
+  for (int r = 0; r <= reps; ++r) {  // run 0 is the warm-up
+    cudaEventRecord(a, stream);
+    read_kernel<kNoAllocate, kUnroll><<<grid, kThreads, 0, stream>>>(src, n, sink);
+    cudaEventRecord(b, stream);
+    cudaEventSynchronize(b);
+    float ms = 0;
+    cudaEventElapsedTime(&ms, a, b);
+    if (r > 0 && ms < best_ms) best_ms = ms;
+  }
+  cudaEventDestroy(a);
+  cudaEventDestroy(b);
+  const double gbs = static_cast<double>(n) * 16.0 / (best_ms * 1e-3) / 1e9;
+  if (std::getenv("LX_BANDWIDTH_TRACE"))
+    std::fprintf(stderr, "bandwidth probe: %-26s %8.1f GB/s (%d blocks of %d threads)\n", name, gbs, grid, kThreads);
+  return gbs;
+}
+
+}  // namespace
+
+extern "C" {
+
+int lx_bandwidth_probe(int64_t bytes, int reps, double* read_gbps, double* spec_gbps, void* stream) {
+  if (!read_gbps || !spec_gbps || bytes < (int64_t{1} << 16) || bytes % 16 != 0) return cudaErrorInvalidValue;
+  if (reps < 1) reps = 1;
+  int device = 0;
+  if (cudaError_t e = cudaGetDevice(&device); e != cudaSuccess) return static_cast<int>(e);
+  cudaDeviceProp prop{};
+  if (cudaError_t e = cudaGetDeviceProperties(&prop, device); e != cudaSuccess) return static_cast<int>(e);
+  int clock_khz = 0, bus_bits = 0;
+  if (cudaError_t e = cudaDeviceGetAttribute(&clock_khz, cudaDevAttrMemoryClockRate, device); e != cudaSuccess)
+    return static_cast<int>(e);
+  if (cudaError_t e = cudaDeviceGetAttribute(&bus_bits, cudaDevAttrGlobalMemoryBusWidth, device); e != cudaSuccess)
+    return static_cast<int>(e);
+  // Two transfers per memory clock, bus_bits / 8 bytes each.
+  double spec = clock_khz * 1e3 * 2.0 * (bus_bits / 8.0) / 1e9;
+  const bool trace = std::getenv("LX_BANDWIDTH_TRACE") != nullptr;
+  // The RTX 5070 Ti: 16 GB of GDDR7 at 28 Gbps on 256 bits is 896 GB/s. The attributes give 896.06 on that card, so
+  // this only corrects a driver that reports the memory clock another way.
+  if (prop.major == 12 && prop.minor == 0 && prop.totalGlobalMem <= (17ull << 30) && std::fabs(spec - 896.0) > 9.0) {
+    if (trace)
+      std::fprintf(stderr, "bandwidth probe: attributes give %.1f GB/s, the sm_120 16 GB spec is 896 GB/s: using 896\n",
+                   spec);
+    spec = 896.0;
+  }
+  if (trace) std::fprintf(stderr, "bandwidth probe: %s, spec %.1f GB/s (%d kHz, %d-bit bus)\n", prop.name, spec, clock_khz, bus_bits);
+
+  const int sms = prop.multiProcessorCount;
+  void* buffer = nullptr;
+  if (cudaError_t e = cudaMalloc(&buffer, static_cast<size_t>(bytes)); e != cudaSuccess) return static_cast<int>(e);
+  unsigned int* sink = nullptr;
+  if (cudaError_t e = cudaMalloc(&sink, sizeof(unsigned int)); e != cudaSuccess) {
+    cudaFree(buffer);
+    return static_cast<int>(e);
+  }
+  cudaStream_t s = static_cast<cudaStream_t>(stream);
+  const int64_t words = bytes / 16;
+  const int fill_blocks = sms * 8;
+  hash_fill<<<fill_blocks, kThreads, 0, s>>>(static_cast<uint4*>(buffer), words);
+  cudaError_t status = cudaGetLastError();  // the fill's
+  if (status == cudaSuccess) {
+    double best = 0;
+    const double v[4] = {
+        run_variant<false, 4>(static_cast<const uint4*>(buffer), words, sink, sms, reps, s, "ldg, 4 loads in flight"),
+        run_variant<false, 8>(static_cast<const uint4*>(buffer), words, sink, sms, reps, s, "ldg, 8 loads in flight"),
+        run_variant<true, 4>(static_cast<const uint4*>(buffer), words, sink, sms, reps, s,
+                             "nc no-allocate, 4 in flight"),
+        run_variant<true, 8>(static_cast<const uint4*>(buffer), words, sink, sms, reps, s,
+                             "nc no-allocate, 8 in flight"),
+    };
+    for (double gbs : v) best = gbs > best ? gbs : best;
+    *read_gbps = best;
+    *spec_gbps = spec;
+    status = cudaGetLastError();  // a launch of any variant that failed
+  }
+  cudaFree(sink);
+  cudaFree(buffer);
+  return static_cast<int>(status);
+}
+
+}  // extern "C"

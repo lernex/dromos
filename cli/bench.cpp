@@ -13,8 +13,14 @@
 //   prefill tok/s   prompt tokens of every stream, over the time until the last one starts decoding
 // --sample draws with the model's own recommended settings (temperature 0.6, top-p 0.95, top-k 20)
 // instead of greedy, which is what a chat user gets.
+//
+// The roofline columns (cli/roofline.h): the tokens per second the card's memory bandwidth allows for the streams at the
+// run's mean context (prompt plus half the generation), at the spec and at the measured read rate, and the run's share
+// of each. The bandwidth is probed before the engine takes its memory, and the traffic is the engine's own
+// (Engine::decode_traffic), checked against the config's count for this format.
 #include <algorithm>
 #include <condition_variable>
+#include <cmath>
 #include <cstdio>
 #include <mutex>
 #include <stdexcept>
@@ -22,6 +28,8 @@
 #include <vector>
 
 #include "cli/common.h"
+#include "cli/roofline.h"
+#include "model/traffic.h"
 #include "runtime/engine.h"
 
 namespace lx::cli {
@@ -168,30 +176,78 @@ int cmd_bench(int argc, char** argv) {
   EngineOptions options;
   options.load_tokenizer = false;
   options.prefix_cache = args.prefix_cache;
+  // The probe first: its 1 GiB buffer is returned before the engine plans its memory.
+  const lx::runtime::DeviceInfo device = lx::runtime::query_device(0);
+  const lx::cli::Bandwidth bw = lx::cli::measure_bandwidth(device.bandwidth_gbs);
+  const lx::cli::ComputePeak peak = device.cpu ? lx::cli::ComputePeak{} : lx::cli::compute_peak(device.cc());
+  const double tflops = peak.known ? peak.bf16_tflops : 0.0;
   lx::cli::StartedEngine started = lx::cli::start_engine(model, max_streams, args.prompt_tokens + args.gen_tokens + 16,
                                                          args.format.weights, options, 0.92, args.format.bf16x,
                                                          args.format.fast_math);
   const Plan& plan = started.plan;
   Engine& engine = *started.engine;
 
+  const int context = args.prompt_tokens + args.gen_tokens / 2;  // the mean context a stream reads over the run
+  const lx::DecodeTraffic traffic = engine.decode_traffic(context);
+  // The roofline needs the whole model on the device: an offloaded plan's experts come over PCIe, which is another bound.
+  const bool roofline_ok = !plan.offload.enabled && bw.measured_gbs > 0;
+
   std::printf("%s  (%s)\n", args.model.c_str(), model.dir.c_str());
   for (const std::string& note : plan.notes) std::printf("  %s\n", note.c_str());
   if (!engine.placement().empty()) std::printf("%s", engine.placement().c_str());
   std::printf("  %d slots, %d-token context, %d tokens per step\n", plan.max_slots, plan.kv_capacity,
               plan.max_step_tokens);
-  std::printf("  %d prompt tokens, %d generated tokens per stream, %s\n\n", args.prompt_tokens, args.gen_tokens,
+  std::printf("  %d prompt tokens, %d generated tokens per stream, %s\n", args.prompt_tokens, args.gen_tokens,
               args.sample ? "sampled (temperature 0.6, top-p 0.95, top-k 20)" : "greedy");
 
-  std::printf("%8s %12s %12s %10s %10s %13s\n", "streams", "decode tok/s", "per stream", "TTFT p50", "TTFT p90",
-              "prefill tok/s");
+  // The traffic the engine counts, against the config's count for the same format: they must agree (traffic.h).
+  const lx::DecodeTraffic from_config = lx::config_decode_traffic(engine.config(), plan.weights, plan.bf16x_decode, context);
+  bool agree = true;
+  for (int n : {1, 8, 32}) {
+    const double a = traffic.step_bytes(n), b = from_config.step_bytes(n);
+    agree = agree && std::fabs(a - b) <= 1e-9 * std::max(a, b);
+  }
+  agree = agree && std::fabs(traffic.macs_per_token() - from_config.macs_per_token()) <= 1e-9 * traffic.macs_per_token();
+  if (roofline_ok) {
+    std::printf("  roofline  %.0f GB/s spec, %.0f GB/s measured%s, %s, context %d (mean over the run)\n", bw.spec_gbs,
+                bw.measured_gbs, peak.known ? "" : ", no tensor peak for this device",
+                peak.known ? (std::to_string(static_cast<int>(tflops)) + " TFLOPS BF16 tensor").c_str() : "no compute bound",
+                context);
+    std::printf("  traffic   %.1f MB per token at one stream: %s\n", traffic.bytes_per_token() / 1e6,
+                agree ? "the model's count and the config's agree" : "MISMATCH: the model and the config count differently");
+  } else {
+    std::printf("  roofline  not shown: %s\n", plan.offload.enabled ? "the routed experts are offloaded"
+                                                                     : "no bandwidth measured");
+  }
+  std::printf("\n");
+
+  std::printf("%8s %12s %12s %10s %10s %13s %15s %9s %9s\n", "streams", "decode tok/s", "per stream", "TTFT p50",
+              "TTFT p90", "prefill tok/s", "roofline tok/s", "% of spec", "% of peak");
   for (int streams : args.streams) {
     run_batch(engine, streams, std::min(args.prompt_tokens, 64), 8, engine.config().vocab_size, args.sample);  // warm up
     const double submitted = engine.now();
     const auto timings =
         run_batch(engine, streams, args.prompt_tokens, args.gen_tokens, engine.config().vocab_size, args.sample);
     const Row row = measure(timings, args.prompt_tokens, submitted);
-    std::printf("%8d %12.1f %12.1f %10s %10s %13.0f\n", row.streams, row.decode_tps, row.per_stream_tps,
-                human_seconds(row.ttft_p50).c_str(), human_seconds(row.ttft_p90).c_str(), row.prefill_tps);
+    // The ceilings for this many streams: at the spec, and at the measured read rate (the tighter one in practice).
+    const double spec_ceiling = roofline_ok && bw.spec_gbs > 0 ? lx::cli::ceiling_tps(traffic, streams, bw.spec_gbs, tflops) : 0;
+    const double peak_ceiling = roofline_ok ? lx::cli::ceiling_tps(traffic, streams, bw.measured_gbs, tflops) : 0;
+    std::string roof = "-", of_spec = "-", of_peak = "-";
+    if (peak_ceiling > 0) {
+      char buf[32];
+      std::snprintf(buf, sizeof buf, "%.0f", peak_ceiling);
+      roof = buf;
+      std::snprintf(buf, sizeof buf, "%.1f%%", 100.0 * row.decode_tps / peak_ceiling);
+      of_peak = buf;
+    }
+    if (spec_ceiling > 0) {
+      char buf[32];
+      std::snprintf(buf, sizeof buf, "%.1f%%", 100.0 * row.decode_tps / spec_ceiling);
+      of_spec = buf;
+    }
+    std::printf("%8d %12.1f %12.1f %10s %10s %13.0f %15s %9s %9s\n", row.streams, row.decode_tps, row.per_stream_tps,
+                human_seconds(row.ttft_p50).c_str(), human_seconds(row.ttft_p90).c_str(), row.prefill_tps, roof.c_str(),
+                of_spec.c_str(), of_peak.c_str());
     std::fflush(stdout);
   }
   return 0;

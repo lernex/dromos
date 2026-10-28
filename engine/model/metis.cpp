@@ -104,6 +104,8 @@ struct MetisModel::Impl {
     Connection mixer_conn, moe_conn;
   };
   std::vector<Layer> layers;
+  // Every matrix the model holds, by its checkpoint name: the format it is read in and its decode copy (traffic.h).
+  std::map<std::string, MatrixDesc> decode_mats;
   const void *embedding, *stream_emb, *final_norm;
   Linear head;  // the tied LM head (the embedding)
   // depth memory
@@ -347,6 +349,7 @@ Linear make_linear(Impl& m, const ModelWeights& weights, const std::string& name
   if (bf16x_copy_made(m.formats, name) && w->type == LX_W_BF16 && bf16x_smaller(K)) l.x16 = encode_bf16x(m, w->data, N, K);
   if (w->type == LX_W_BF16X)
     m.unpack_bytes = std::max(m.unpack_bytes, static_cast<size_t>(N) * static_cast<size_t>(K) * 2);
+  m.decode_mats[name] = MatrixDesc{w->type, l.x16 != nullptr, 1, N, K};
   return l;
 }
 
@@ -704,6 +707,7 @@ MetisModel::MetisModel(const MetisConfig& c, const ModelWeights& weights, const 
   const lx_wtype dense = formats.dense;
   m.embedding = need(weights, "embedding.weight", LX_BF16, {V, D});  // the gather table, bf16 in every format
   m.head = make_linear(m, weights, "lm_head", "", V, D, dense);
+  m.decode_mats["embedding"] = m.decode_mats.at("lm_head");  // the checkpoint's name for the tied head
   m.stream_emb = need(weights, "stream_embeddings", LX_BF16, {S, D});
   m.final_norm = need(weights, "final_norm.weight", LX_BF16, {D});
   need(weights, "pass_embeddings", LX_BF16, {c.max_passes, c.mhc_pass_embedding_dim});
@@ -782,6 +786,10 @@ MetisModel::MetisModel(const MetisConfig& c, const ModelWeights& weights, const 
     layer.expert_emb = need(weights, e + "expert_embeddings", LX_BF16, {E, R});
     layer.shared_gate_up = make_linear(m, weights, e + "shared_expert.gate_up", "", 2 * m.Ishared, Lat, dense);
     layer.shared_down = make_linear(m, weights, e + "shared_expert.down", "", Lat, m.Ishared, dense);
+    if (m.offload) {
+      m.decode_mats[e + "local_experts.gate_up"] = MatrixDesc{formats.experts, false, E, 2 * m.Iexp, Lat};
+      m.decode_mats[e + "local_experts.down"] = MatrixDesc{formats.experts, false, E, Lat, m.Iexp};
+    }
     if (!m.offload) {
       const int64_t gu_rows = static_cast<int64_t>(E) * 2 * m.Iexp, dn_rows = static_cast<int64_t>(E) * Lat;
       layer.gate_up = expert_stack(m, weights, e + "local_experts.gate_up", E, 2 * m.Iexp, Lat, formats.experts);
@@ -790,6 +798,8 @@ MetisModel::MetisModel(const MetisConfig& c, const ModelWeights& weights, const 
         layer.gate_up_x16 = encode_bf16x(m, layer.gate_up.data, gu_rows, Lat);
         layer.down_x16 = encode_bf16x(m, layer.down.data, dn_rows, m.Iexp);
       }
+      m.decode_mats[e + "local_experts.gate_up"] = MatrixDesc{layer.gate_up.type, layer.gate_up_x16 != nullptr, E, 2 * m.Iexp, Lat};
+      m.decode_mats[e + "local_experts.down"] = MatrixDesc{layer.down.type, layer.down_x16 != nullptr, E, Lat, m.Iexp};
       size_t unpack = 0;
       if (layer.gate_up.type == LX_W_BF16X) unpack += (static_cast<size_t>(gu_rows) * Lat * 2 + 255) / 256 * 256;
       if (layer.down.type == LX_W_BF16X) unpack += static_cast<size_t>(dn_rows) * m.Iexp * 2;
@@ -1034,6 +1044,20 @@ void MetisModel::set_feature_taps(const std::vector<FeatureTap>& taps) {
 
 int MetisModel::feature_dim() const { return impl_->tap_dim; }
 const float* MetisModel::features() const { return impl_->tap_out; }
+
+DecodeTraffic MetisModel::decode_traffic(int context) const {
+  const Impl& m = *impl_;
+  return count_decode_traffic(
+      cfg_,
+      [&m](const std::string& name, int64_t E, int64_t N, int64_t K) {
+        const auto it = m.decode_mats.find(name);
+        if (it == m.decode_mats.end()) throw std::runtime_error("decode traffic: the model holds no " + name);
+        if (it->second.E != E || it->second.N != N || it->second.K != K)
+          throw std::runtime_error("decode traffic: " + name + " is not the shape its config gives");
+        return it->second;
+      },
+      context);
+}
 
 MetisModel::HeadWeights MetisModel::head_weights() const {
   HeadWeights h;

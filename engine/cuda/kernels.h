@@ -323,6 +323,18 @@ LX_API int lx_rt_device_props(int ordinal, lx_device_props* props);
 // reports it per process (NVML on CUDA). LX_ERR_NOT_SUPPORTED where the backend cannot tell.
 LX_API int lx_rt_process_memory(int64_t* bytes);
 
+// The memory read bandwidth the device sustains, measured. A read-only kernel over every SM reads `bytes` of device
+// memory on `stream` (16-byte loads, several in flight per thread, grid-stride) after one warm-up, `reps` times, and
+// *read_gbps is the best run (at least 1 rep). The buffer is pseudo-random words, not zeros: uniform memory can be
+// cheaper to read. Four variants are tried, the default load and the L1 no-allocate load, each unrolled 4 and 8 ways,
+// and the best is kept; LX_BANDWIDTH_TRACE=1 prints each one's rate to stderr. Pass bytes well past the L2 (1 GiB, the
+// roofline's probe) so the reads are DRAM's. bytes must be a multiple of 16 and at least 64 KiB.
+// *spec_gbps is the device's peak: memory clock x 2 x bus width / 8, from cudaDeviceGetAttribute. A 16 GB sm_120 card
+// whose attributes give another figure reports 896 GB/s instead, the RTX 5070 Ti's data rate (28 Gbps on a 256-bit
+// bus), since the attributes are not what the card's datasheet says there. CPU and Metal: LX_ERR_NOT_SUPPORTED (the
+// CPU's own reading is lx_device_props' read_bandwidth).
+LX_API int lx_bandwidth_probe(int64_t bytes, int reps, double* read_gbps, double* spec_gbps, void* stream);
+
 // ---- Weight formats ------------------------------------------------------------------------
 // A projection is held once, in one format, and every kernel that multiplies by it (the decode
 // GEMV, the tensor-core GEMM for prefill and batches, the expert kernels) reads that one copy.

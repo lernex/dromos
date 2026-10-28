@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "core/config.h"
+#include "model/traffic.h"
 #include "runtime/plan.h"
 #include "runtime/tool_grammar.h"
 #include "text/tokenizer.h"
@@ -129,6 +130,9 @@ class Engine {
   const Plan& plan() const { return plan_; }
   // Where an offloaded plan's experts live, in lines (empty for a resident plan).
   const std::string& placement() const;
+  // What one decode step moves through memory at `context` cache positions per stream, in this engine's formats
+  // (model/traffic.h). The roofline's numerator; an offloaded plan's experts are counted where they are not resident.
+  lx::DecodeTraffic decode_traffic(int context) const;
 
   // Queues a request. Throws std::invalid_argument for a request the engine cannot run (empty
   // prompt, a prompt longer than the context, out-of-range sampling values) and std::runtime_error

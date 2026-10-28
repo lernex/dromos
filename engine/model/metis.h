@@ -9,6 +9,7 @@
 
 #include "core/config.h"
 #include "cuda/kernels.h"
+#include "model/traffic.h"
 
 namespace lx {
 
@@ -137,6 +138,10 @@ class MetisModel {
   HeadWeights head_weights() const;
 
   int vocab_size() const { return cfg_.vocab_size; }
+
+  // What one decode step moves through memory with `context` cache positions per stream (traffic.h): the matrices this
+  // model loaded, in the formats and with the BF16X decode copies it reads, counted over the same events as decode.
+  DecodeTraffic decode_traffic(int context) const;
   const MetisConfig& config() const { return cfg_; }
 
   // The weights, state and scratch; defined in metis.cpp.

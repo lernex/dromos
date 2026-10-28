@@ -15,8 +15,10 @@
 #include <vector>
 
 #include "cli/common.h"
+#include "cli/roofline.h"
 #include "core/config.h"
 #include "dispatch/dispatch.h"
+#include "model/traffic.h"
 #include "runtime/plan.h"
 #include "runtime/tuner.h"
 
@@ -173,6 +175,93 @@ void print_plan(const lx::runtime::Plan& plan) {
   for (const std::string& note : plan.notes) std::printf("  %s\n", note.c_str());
 }
 
+// Tokens per second: whole numbers from ten up, one decimal below.
+std::string tps_text(double tps) {
+  char buf[32];
+  if (tps >= 10) std::snprintf(buf, sizeof buf, "%.0f", tps);
+  else std::snprintf(buf, sizeof buf, "%.1f", tps);
+  return buf;
+}
+
+// The roofline of a model folder in the plan's format: the bytes one decode step moves, against the card's bandwidth
+// and tensor throughput, as ceilings (bandwidth / bytes), with the binding limit named. Every loadable format gets a row.
+void print_roofline(const lx::MetisConfig& config, const lx::runtime::Plan& plan,
+                    const lx::runtime::DeviceInfo& device) {
+  using namespace lx::cli;
+  using lx::DecodeTraffic;
+  using lx::config_decode_traffic;
+  const int contexts[2] = {512, lx::runtime::kUsefulContext};
+  const Bandwidth bw = measure_bandwidth(device.bandwidth_gbs);
+  const ComputePeak peak = device.cpu ? ComputePeak{} : compute_peak(device.cc());
+  const double tflops = peak.known ? peak.bf16_tflops : 0.0;
+  const std::string spec = bw.spec_gbs > 0 ? std::to_string(static_cast<long>(bw.spec_gbs + 0.5)) + " GB/s" : "n/a";
+  const std::string measured = bw.measured_gbs > 0 ? std::to_string(static_cast<long>(bw.measured_gbs + 0.5)) + " GB/s" : "n/a";
+
+  std::printf("\nroofline   a decode step's memory traffic against the card (one stream unless said; passes included)\n");
+  std::printf("bandwidth  %s spec, %s measured%s%s\n", spec.c_str(), measured.c_str(),
+              bw.measured ? " (1 GiB read, best of 5)" : "", bw.note.empty() ? "" : (" (" + bw.note + ")").c_str());
+  if (peak.known)
+    std::printf("compute    %.1f TFLOPS BF16 tensor, dense with FP32 accumulate (%s, sm_%d; %s)\n", peak.bf16_tflops,
+                peak.card.c_str(), device.cc(), peak.source.c_str());
+  else
+    std::printf("compute    no tensor peak in the table for this device: the compute ceiling is not shown\n");
+
+  const DecodeTraffic at = config_decode_traffic(config, plan.weights, plan.bf16x_decode, contexts[0]);
+  const DecodeTraffic at_long = config_decode_traffic(config, plan.weights, plan.bf16x_decode, contexts[1]);
+  const std::string title = "components of " + lx::runtime::format_name(plan.weights) + (plan.bf16x_decode ? " (BF16X decode copies)" : "") +
+                            " at context " + std::to_string(contexts[0]) + ":";
+  print_components(at, title.c_str());
+  const ByteSplit parts = split(at);
+  std::printf("  reads: %.1f MB of weights and scales, %.1f MB of state, cache and per-stream rows (at context %d)\n",
+              parts.weights / 1e6, parts.per_stream / 1e6, contexts[0]);
+
+  // One stream: the ceilings at each context, from the card's peak and from the measured rate.
+  std::printf("\none stream   bytes per token      ceiling at spec     ceiling at measured\n");
+  for (int c = 0; c < 2; ++c) {
+    const DecodeTraffic& t = c == 0 ? at : at_long;
+    std::printf("  context %5d  %9.1f MB  %14s tok/s  %14s tok/s\n", contexts[c], t.bytes_per_token() / 1e6,
+                bw.spec_gbs > 0 ? tps_text(ceiling_tps(t, 1, bw.spec_gbs, 0)).c_str() : "n/a",
+                bw.measured_gbs > 0 ? tps_text(ceiling_tps(t, 1, bw.measured_gbs, 0)).c_str() : "n/a");
+  }
+  std::printf("  compute ceiling, any stream count: %s tok/s (%.2f GMAC per token)\n",
+              tflops > 0 ? tps_text(ceiling_tps(at, 1, 0, tflops)).c_str() : "n/a", at.macs_per_token() / 1e9);
+
+  // Batched: the routed experts a step reads are the union of the streams' choices, the dense weights are read once.
+  std::printf("\nbatched    streams  experts/layer-pass   step MB at 512   tok/s spec   tok/s measured   "
+              "step MB at %d   tok/s spec   tok/s measured   binds\n", contexts[1]);
+  for (int n : {8, 32, 64}) {
+    const double step = at.step_bytes(n), step_long = at_long.step_bytes(n);
+    const double bw_spec = bw.spec_gbs > 0 ? ceiling_tps(at, n, bw.spec_gbs, 0) : 0;
+    const double bw_meas = bw.measured_gbs > 0 ? ceiling_tps(at, n, bw.measured_gbs, 0) : 0;
+    const double bw_spec_long = bw.spec_gbs > 0 ? ceiling_tps(at_long, n, bw.spec_gbs, 0) : 0;
+    const double bw_meas_long = bw.measured_gbs > 0 ? ceiling_tps(at_long, n, bw.measured_gbs, 0) : 0;
+    const double compute = tflops > 0 ? ceiling_tps(at, n, 0, tflops) : 0;
+    const bool compute_binds = compute > 0 && bw_meas > 0 && compute < bw_meas;
+    std::printf("           %7d  %18.1f  %15.1f  %11s  %15s   %15.1f  %11s  %15s   %s\n", n, at.expected_experts(n),
+                step / 1e6, bw_spec > 0 ? tps_text(bw_spec).c_str() : "n/a",
+                bw_meas > 0 ? tps_text(bw_meas).c_str() : "n/a", step_long / 1e6,
+                bw_spec_long > 0 ? tps_text(bw_spec_long).c_str() : "n/a",
+                bw_meas_long > 0 ? tps_text(bw_meas_long).c_str() : "n/a",
+                compute_binds ? "compute" : "bandwidth");
+  }
+  std::printf("           the union is E (1 - (1 - k / E)^n) experts per layer-pass for uniform routing; real routing is\n"
+              "           more concentrated, so the union is an upper bound. Ceilings count the weights once per step.\n");
+
+  // Every format the model loads in, at one stream and context 512.
+  std::printf("\nformats    %-6s %14s %16s %16s   %s\n", "", "bytes per token", "ceiling at spec", "ceiling at measured",
+              "decode copies");
+  for (const lx::runtime::FormatOption& o : plan.options) {
+    if (!o.loadable) continue;
+    const bool copies = o.format != LX_W_BF16X && lx::runtime::bf16x_available();
+    const DecodeTraffic t = config_decode_traffic(config, o.format, copies, 512);
+    std::printf("           %-6s %11.1f MB %13s tok/s %13s tok/s   %s\n", lx::runtime::format_name(o.format).c_str(),
+                t.bytes_per_token() / 1e6,
+                bw.spec_gbs > 0 ? tps_text(ceiling_tps(t, 1, bw.spec_gbs, 0)).c_str() : "n/a",
+                bw.measured_gbs > 0 ? tps_text(ceiling_tps(t, 1, bw.measured_gbs, 0)).c_str() : "n/a",
+                copies ? "BF16X" : "as held");
+  }
+}
+
 }  // namespace
 
 int cmd_doctor(int argc, char** argv) {
@@ -220,7 +309,9 @@ int cmd_doctor(int argc, char** argv) {
       std::printf("checkpoint %s\n", checkpoint.description.c_str());
       if (const char* v = std::getenv("LX_VRAM_BUDGET_GB")) req.vram_budget = static_cast<size_t>(std::atof(v) * 1073741824.0);
       if (const char* v = std::getenv("LX_RAM_BUDGET_GB")) req.ram_budget = static_cast<size_t>(std::atof(v) * 1073741824.0);
-      print_plan(make_plan(device, config, checkpoint, req));
+      const Plan plan = make_plan(device, config, checkpoint, req);
+      print_plan(plan);
+      print_roofline(config, plan, device);
     }
   } catch (const std::exception& e) {
     std::fprintf(stderr, "error: %s\n", e.what());

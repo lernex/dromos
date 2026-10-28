@@ -279,6 +279,8 @@ double Engine::now() const { return impl_->now(); }
 
 const std::string& Engine::placement() const { return impl_->placement; }
 
+lx::DecodeTraffic Engine::decode_traffic(int context) const { return impl_->model->decode_traffic(context); }
+
 uint64_t Engine::submit(GenerateRequest request, RequestCallbacks callbacks) {
   Impl& m = *impl_;
   if (request.prompt.empty()) throw std::invalid_argument("the prompt has no tokens");
