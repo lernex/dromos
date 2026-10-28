@@ -695,15 +695,16 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
     options.push_back(o);
   }
   // The narrower format to name when this plan is slower than it needs to be: of the ones this file loads into
-  // and this GPU holds usefully, the 8-bit one the GPU multiplies natively (FP8 on sm_89 and up, INT8 below),
-  // else any narrower that fits.
+  // and this GPU holds usefully, the one that decodes fastest, INT8 on a tie. On Metis that is INT8 wherever it
+  // loads: it quantizes the tensors the FP8 recipe keeps wide, so it reads fewer bytes, and it measured closer to
+  // BF16 than FP8 on every reference prompt (Praxis, 2026-10-28).
   auto faster = [&](double here) -> const FormatOption* {
     const FormatOption* best = nullptr;
     for (const FormatOption& o : options) {
       if (!o.loadable || !o.fits || width_of(o.format) >= width_of(target) || o.decode_ceiling_tps <= here * 1.1) continue;  // 10%: a note names a format only when it is clearly faster
-      const bool native = o.format == (d.fp8_mma ? LX_W_FP8 : LX_W_INT8);
-      if (!best || native) best = &o;
-      if (native) break;
+      if (!best || o.decode_ceiling_tps > best->decode_ceiling_tps ||
+          (o.decode_ceiling_tps == best->decode_ceiling_tps && o.format == LX_W_INT8))
+        best = &o;
     }
     return best;
   };

@@ -324,7 +324,7 @@ TEST_CASE("the Praxis plan on the development card: BF16, the file's format, wit
   CHECK(p.decode_ceiling_tps > 100);
   CHECK(p.notes.size() >= 5);
   // the faster format is named, not taken
-  CHECK(has_note(p, "--weights fp8 would decode at about"));
+  CHECK(has_note(p, "--weights int8 would decode at about"));
   // with the BF16X decode copies (when this build's backend has them): budgeted, and faster
   if (!bf16x_available()) return;
   const Plan x = make_plan(d, praxis(), bf16_checkpoint(), PlanRequest{});
@@ -436,7 +436,7 @@ TEST_CASE("the default is the file's format: offloaded before anything narrower,
   CHECK(has_note(sm86, "--weights int8 would fit on the GPU"));
   const Plan sm89 = make_plan(simulated("RTX 4050 6GB", 89, 6, 272, 24), praxis(), bf16_checkpoint(), PlanRequest{});
   CHECK(sm89.weights == LX_W_BF16);
-  CHECK(has_note(sm89, "--weights fp8 would fit on the GPU"));
+  CHECK(has_note(sm89, "--weights int8 would fit on the GPU"));
   // Logos BF16 (about 21 GB) on a 16 GB card: offloaded BF16
   const Plan logos16 = make_plan(simulated("RTX 5070 Ti 16GB", 120, 16, 896, 70), logos(), bf16_checkpoint(), PlanRequest{});
   CHECK(logos16.weights == LX_W_BF16);
