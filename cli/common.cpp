@@ -162,15 +162,21 @@ StartedEngine start_engine(const Model& model, int sequences, int context, int w
   }
 }
 
-runtime::SamplingParams recommended_sampling(const Model& model) {
+runtime::SamplingParams recommended_sampling(const Model& model, bool thinking) {
   runtime::SamplingParams sp;
   std::ifstream in(model.dir / "generation_config.json");
   if (!in) return sp;
-  try {
-    const nlohmann::json j = nlohmann::json::parse(in);
+  const auto read = [&sp](const nlohmann::json& j) {
     sp.temperature = j.value("temperature", sp.temperature);
     sp.top_p = j.value("top_p", sp.top_p);
     sp.top_k = j.value("top_k", sp.top_k);
+    sp.min_p = j.value("min_p", sp.min_p);
+    sp.repetition_penalty = j.value("repetition_penalty", sp.repetition_penalty);
+  };
+  try {
+    const nlohmann::json j = nlohmann::json::parse(in);
+    read(j);
+    if (!thinking && j.contains("direct") && j["direct"].is_object()) read(j["direct"]);
   } catch (const std::exception&) {
   }
   return sp;

@@ -68,7 +68,8 @@ StartedEngine start_engine(const Model& model, int sequences, int context, int w
                            bool fast = false);
 
 // The sampling a model recommends (generation_config.json), for a chat that asks for nothing else.
-runtime::SamplingParams recommended_sampling(const Model& model);
+// With thinking off, its "direct" object overrides the top level.
+runtime::SamplingParams recommended_sampling(const Model& model, bool thinking);
 
 std::string human_bytes(uint64_t bytes);
 std::string human_seconds(double seconds);

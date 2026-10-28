@@ -186,7 +186,7 @@ class Chat {
     req.prompt = engine_.tokenizer()->encode(rendered, true);
     req.max_tokens = 1 << 20;  // as much as the context allows
     req.thinking = thinking_;
-    req.sampling = cli::recommended_sampling(model_);
+    req.sampling = cli::recommended_sampling(model_, thinking_);
     req.sampling.seed = static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
     Turn turn = run_request(std::move(req));
     last_ = turn;

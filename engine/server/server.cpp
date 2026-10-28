@@ -68,10 +68,24 @@ json bytes_array(const std::string& s) {
 }
 
 // The defaults a model ships with (generation_config.json), used where a request says nothing.
-struct Defaults {
-  double temperature = 1.0, top_p = 1.0;
+// The top level is the thinking sampling; a "direct" object overrides it for requests that
+// turn thinking off, since a direct answer wants a cooler temperature and no penalty.
+struct Sampling {
+  double temperature = 1.0, top_p = 1.0, min_p = 0.0, repetition_penalty = 1.0;
   int top_k = 0;
 };
+struct Defaults {
+  Sampling thinking, direct;
+};
+
+Sampling read_sampling(const json& j, Sampling s) {
+  s.temperature = j.value("temperature", s.temperature);
+  s.top_p = j.value("top_p", s.top_p);
+  s.top_k = j.value("top_k", s.top_k);
+  s.min_p = j.value("min_p", s.min_p);
+  s.repetition_penalty = j.value("repetition_penalty", s.repetition_penalty);
+  return s;
+}
 
 Defaults read_defaults(const std::string& dir) {
   Defaults d;
@@ -79,9 +93,8 @@ Defaults read_defaults(const std::string& dir) {
   if (!in) return d;
   try {
     const json j = json::parse(in);
-    d.temperature = j.value("temperature", d.temperature);
-    d.top_p = j.value("top_p", d.top_p);
-    d.top_k = j.value("top_k", d.top_k);
+    d.thinking = read_sampling(j, d.thinking);
+    d.direct = j.contains("direct") && j["direct"].is_object() ? read_sampling(j["direct"], d.thinking) : d.thinking;
   } catch (const std::exception&) {
   }
   return d;
@@ -122,14 +135,14 @@ int integer_in(const json& body, const char* key, int lo, int hi, int fallback) 
 }
 
 // Sampling, limits and stop conditions shared by both endpoints.
-void read_common(const json& body, Job& job, const Defaults& d) {
+void read_common(const json& body, Job& job, const Sampling& d) {
   if (!body.is_object()) invalid("the request body must be a JSON object");
   runtime::SamplingParams& sp = job.request.sampling;
   sp.temperature = static_cast<float>(number_in(body, "temperature", 0.0, 2.0, d.temperature));
   sp.top_p = static_cast<float>(number_in(body, "top_p", 1e-6, 1.0, d.top_p));
   sp.top_k = integer_in(body, "top_k", 0, 1 << 20, d.top_k);
-  sp.min_p = static_cast<float>(number_in(body, "min_p", 0.0, 1.0, 0.0));
-  sp.repetition_penalty = static_cast<float>(number_in(body, "repetition_penalty", 1e-3, 2.0, 1.0));
+  sp.min_p = static_cast<float>(number_in(body, "min_p", 0.0, 1.0, d.min_p));
+  sp.repetition_penalty = static_cast<float>(number_in(body, "repetition_penalty", 1e-3, 2.0, d.repetition_penalty));
   sp.presence_penalty = static_cast<float>(number_in(body, "presence_penalty", -2.0, 2.0, 0.0));
   sp.frequency_penalty = static_cast<float>(number_in(body, "frequency_penalty", -2.0, 2.0, 0.0));
   if (body.contains("seed") && !body["seed"].is_null()) {
@@ -612,7 +625,10 @@ bool Server::run() {
       Job job;
       job.chat = true;
       job.model = checked_model(body);
-      read_common(body, job, defaults);
+      bool thinking = true;
+      if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object())
+        thinking = body["chat_template_kwargs"].value("enable_thinking", true);
+      read_common(body, job, thinking ? defaults.thinking : defaults.direct);
       read_limit(body, job, body.contains("max_completion_tokens") ? "max_completion_tokens" : "max_tokens");
       job.stream = body.value("stream", false);
       job.include_usage = body.value("stream_options", json::object()).value("include_usage", false);
@@ -624,9 +640,6 @@ bool Server::run() {
 
       bool has_tools = false;
       const std::string tools_text = read_tools(body, has_tools);
-      bool thinking = true;
-      if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object())
-        thinking = body["chat_template_kwargs"].value("enable_thinking", true);
       job.request.thinking = thinking;
 
       lx::text::ChatOptions options;
@@ -658,7 +671,7 @@ bool Server::run() {
       Job job;
       job.chat = false;
       job.model = checked_model(body);
-      read_common(body, job, defaults);
+      read_common(body, job, defaults.thinking);
       read_limit(body, job, "max_tokens");
       job.stream = body.value("stream", false);
       job.include_usage = body.value("stream_options", json::object()).value("include_usage", false);
