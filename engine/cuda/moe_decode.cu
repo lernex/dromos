@@ -43,11 +43,12 @@ constexpr int kMaxTopK = 8;
 template <int F>
 constexpr int kVal = lx::WordFormat<F>::kValues;  // values per lane word
 
-// Steps in flight per warp. A step is one 8-byte word per row the loop reads, per lane. NVFP4 words are
-// wide in values (16 per word), so its rows have few steps and two in flight already cover them; the other
-// formats keep four, which is what the memory pipe needs with a few warps per SM.
+// Steps in flight per warp. A step is one 8-byte word per row the loop reads, per lane. FP8 and INT8 keep four,
+// which their memory pipe needs with a few warps per SM. NVFP4 and BF16 keep one: a ring of two cost NVFP4 8 to
+// 17% at 2 to 8 streams, and a ring of four cost BF16 5% at one stream. Their words are already wide enough, and
+// the ring raised their registers and cut the blocks per SM.
 template <int F>
-constexpr int kDepth = F == LX_W_NVFP4 ? 2 : 4;
+constexpr int kDepth = (F == LX_W_FP8 || F == LX_W_INT8) ? 4 : 1;
 
 // Compile-time static loop: f(integral_constant<int, i>) for i = 0 .. N - 1, so i indexes the ring's slots
 // statically (the slots live in registers).
