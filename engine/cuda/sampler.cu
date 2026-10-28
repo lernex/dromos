@@ -115,6 +115,27 @@ __global__ void __launch_bounds__(kThreads) sample_kernel(const float* __restric
   int32_t* oc = out_counts + static_cast<int64_t>(p.slot) * V;
   const int tid = threadIdx.x;
 
+  // Greedy with neutral penalties and no log-probabilities (the common decode step): the argmax of the raw logits,
+  // read once. The penalties leave w == l here and both paths keep the lowest index among equal maxima, so the token
+  // is the general path's, and the counts take the same update as step 8 below.
+  if (!(p.temperature > 0.0f) && p.repetition_penalty == 1.0f && p.frequency_penalty == 0.0f &&
+      p.presence_penalty == 0.0f && token_logprob == nullptr && top_n == 0) {
+    float best = -INFINITY;
+    int best_i = 0x7fffffff;
+    for (int e = tid; e < V; e += blockDim.x) {
+      if (l[e] > best) best = l[e], best_i = e;
+    }
+    float bv;
+    int bi;
+    block_argmax(best, best_i, sh.red, sh.redi, bv, bi);
+    if (tid == 0) {
+      tokens[i] = bi;
+      atomicAdd(&sc[bi], 1);
+      atomicAdd(&oc[bi], 1);
+    }
+    return;
+  }
+
   // 1. Penalties on the raw logits: repetition over prompt and output, presence and frequency over
   // the output alone.
   for (int e = tid; e < V; e += blockDim.x) {
