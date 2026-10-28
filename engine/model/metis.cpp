@@ -69,7 +69,7 @@ std::vector<float> host_values(const ModelWeights& weights, const std::string& n
 // A projection: one weight [N, K], in the format ModelWeights holds it (BF16, INT8, FP8, NVFP4 or the
 // lossless BF16X), which decode and prefill both read. A BF16 weight may also have a lossless BF16X copy
 // that decode reads instead (ModelFormats::bf16x_decode: the same bf16 values in ~12.2 bits, so the same
-// logits to the bit at ~1.3x fewer bytes).
+// logits to the bit at ~1.3x fewer bytes). In a quantized model that is the projections the recipe keeps wide.
 struct Linear {
   lx_weight w{LX_W_BF16, nullptr, nullptr, 1.0f, nullptr};
   const void* bias = nullptr;  // bf16 [N] or null
@@ -310,8 +310,8 @@ bool bf16x_smaller(int64_t K) {
 }
 
 // A projection [N, K] from the checkpoint (`name` without ".weight", as ModelWeights names it), in the format
-// the weights hold it, which must be `planned` or BF16. With bf16x_decode and a BF16 kind, a BF16 projection
-// also gets the lossless copy decode reads (lossless, so the wide ones too).
+// the weights hold it, which must be `planned` or BF16. With bf16x_decode, a BF16 projection also gets the
+// lossless copy decode reads, whatever the kind's format (lossless, so the wide ones too).
 Linear make_linear(Impl& m, const ModelWeights& weights, const std::string& name, const std::string& bias, int64_t N,
                    int64_t K, lx_wtype planned) {
   const lx_weight* w = weights.projection(name);
@@ -328,8 +328,7 @@ Linear make_linear(Impl& m, const ModelWeights& weights, const std::string& name
   if (!bias.empty()) l.bias = need(weights, bias, LX_BF16, {N});
   l.N = static_cast<int>(N);
   l.K = static_cast<int>(K);
-  if (m.formats.bf16x_decode && planned == LX_W_BF16 && w->type == LX_W_BF16 && bf16x_smaller(K))
-    l.x16 = encode_bf16x(m, w->data, N, K);
+  if (m.formats.bf16x_decode && w->type == LX_W_BF16 && bf16x_smaller(K)) l.x16 = encode_bf16x(m, w->data, N, K);
   if (w->type == LX_W_BF16X)
     m.unpack_bytes = std::max(m.unpack_bytes, static_cast<size_t>(N) * static_cast<size_t>(K) * 2);
   return l;
@@ -674,8 +673,7 @@ MetisModel::MetisModel(const MetisConfig& c, const ModelWeights& weights, const 
       const int64_t gu_rows = static_cast<int64_t>(E) * 2 * m.Iexp, dn_rows = static_cast<int64_t>(E) * Lat;
       layer.gate_up = expert_stack(m, weights, e + "local_experts.gate_up", E, 2 * m.Iexp, Lat, formats.experts);
       layer.down = expert_stack(m, weights, e + "local_experts.down", E, Lat, m.Iexp, formats.experts);
-      if (formats.bf16x_decode && formats.experts == LX_W_BF16 && layer.gate_up.type == LX_W_BF16 &&
-          layer.down.type == LX_W_BF16) {
+      if (formats.bf16x_decode && layer.gate_up.type == LX_W_BF16 && layer.down.type == LX_W_BF16) {
         layer.gate_up_x16 = encode_bf16x(m, layer.gate_up.data, gu_rows, Lat);
         layer.down_x16 = encode_bf16x(m, layer.down.data, dn_rows, m.Iexp);
       }

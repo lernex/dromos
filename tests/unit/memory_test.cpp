@@ -1,6 +1,6 @@
 // The plan's memory against the allocator: load a checkpoint (ModelWeights, in its own format), build the model the
 // plan would give it (4 sequences of 4096 positions, 512 tokens per step), and compare the device memory the load
-// and the model take with the plan's accounting: the weights (and a BF16 model's BF16X decode copies), the state,
+// and the model take with the plan's accounting: the weights (and the BF16X decode copies), the state,
 // the cache and the step's scratch for the format's maths. Needs the GPU and the folders: LX_MODEL_DIR (BF16, with
 // and without the copies, and the lossless BF16X target), LX_CKPT_FP8_DIR and LX_CKPT_NVFP4_DIR; each is skipped
 // without its folder.
@@ -82,6 +82,14 @@ TEST_CASE("the plan's memory matches what the model allocates") {
       check_memory(dir, LX_W_BF16X, false);
     }
   }
-  if (const char* dir = std::getenv("LX_CKPT_FP8_DIR")) check_memory(dir, LX_W_FP8, false);
-  if (const char* dir = std::getenv("LX_CKPT_NVFP4_DIR")) check_memory(dir, LX_W_NVFP4, false);
+  // The quantized folders with and without the BF16X copies of the BF16 tensors they keep wide.
+  const bool copies = lx::runtime::bf16x_available();
+  if (const char* dir = std::getenv("LX_CKPT_FP8_DIR")) {
+    check_memory(dir, LX_W_FP8, false);
+    if (copies) check_memory(dir, LX_W_FP8, true);
+  }
+  if (const char* dir = std::getenv("LX_CKPT_NVFP4_DIR")) {
+    check_memory(dir, LX_W_NVFP4, false);
+    if (copies) check_memory(dir, LX_W_NVFP4, true);
+  }
 }

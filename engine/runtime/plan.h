@@ -67,8 +67,8 @@ struct PlanRequest {
   // An lx_wtype the user named (--weights), or -1 for the format the file stores. Nothing narrower than the
   // file is ever chosen for the user, and nothing wider is planned at all.
   int weights = -1;
-  // A BF16 model decodes from lossless BF16X copies of its weights when they fit (--no-bf16x turns them off,
-  // for measuring plain BF16 decode).
+  // A model decodes from lossless BF16X copies of its BF16 tensors when they fit: every BF16 weight of a BF16 model,
+  // and the wide ones a quantized recipe keeps (--no-bf16x turns them off, for measuring plain BF16 decode).
   bool bf16x = true;
   // --fast-math: the quantized tensor-core maths in place of BF16 (native_math): faster prefill, less accurate.
   bool fast_math = false;
@@ -97,7 +97,8 @@ WeightRecipe recipe_for(lx_wtype target);
 // FP8 on sm_89 and up for FP8, FP4 for NVFP4 experts on the sm_120 family (FP8 for NVFP4's dense products).
 lx_math native_math(lx_wtype format, const DeviceInfo& device, bool fast = false);
 // The model's formats for a target on a device: the recipe's kinds, native_math for the dense kind (prefill) and
-// the experts, and the BF16X decode copies when asked for (BF16 targets only).
+// the experts, and the BF16X decode copies when asked for (every target but the lossless one, which is its own
+// encoding).
 lx::ModelFormats model_formats(lx_wtype target, const DeviceInfo& device, bool bf16x_decode, bool fast = false);
 // Whether a target can be loaded from a folder stored as `stored`: the file's own format; INT8, FP8 or BF16X
 // narrower than or as wide as the file (round-to-nearest, or the lossless encoding); NVFP4 only from a stored
@@ -117,7 +118,7 @@ struct FormatOption {
   std::string load;        // "as stored", "round-to-nearest from BF16", or why it cannot load
   bool fits = false;       // resident, with room for the useful sequences and context
   size_t weight_bytes = 0; // one copy of every weight, resident
-  size_t bf16x_bytes = 0;  // the BF16X decode copies a BF16 model adds when it keeps them
+  size_t bf16x_bytes = 0;  // the BF16X decode copies the model adds when it keeps them
   double decode_ceiling_tps = 0;  // resident, one stream; BF16 with its BF16X copies when this build has them
   std::string maths;       // the maths the format's products multiply in by default
   std::string fast_maths;  // with --fast-math, or "-" when that changes nothing

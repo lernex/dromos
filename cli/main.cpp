@@ -55,7 +55,8 @@ void usage() {
                "                                            load a folder in a weight format and check it\n"
                "  prefill MODEL_DIR PROMPTS_JSON T [RUNS]   time one T-token prefill\n"
                "run, serve, bench, doctor, eval, prefill and the spec commands take --weights bf16|int8|fp8|nvfp4|bf16x\n"
-               "(default: the format the file stores) and --no-bf16x (decode from plain BF16 weights).\n");
+               "(default: the format the file stores) and --no-bf16x (decode reads the plain BF16 tensors,\n"
+               "not their BF16X copies).\n");
 }
 
 }  // namespace

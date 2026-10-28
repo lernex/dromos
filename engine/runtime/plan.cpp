@@ -139,11 +139,6 @@ void each_projection(const MetisConfig& c, Fn&& fn) {
   fn(dm + "metadata_write", Kind::Dense, 1, Mm, R + 4);
 }
 
-// The format ModelFormats plans for a kind under a recipe.
-lx_wtype planned(const WeightRecipe& r, Kind k) {
-  return k == Kind::Experts ? r.experts : k == Kind::LatentUp ? r.latent_up : r.dense;
-}
-
 // Whether the BF16X encoding of rows of K values is smaller than the bf16 rows (metis.cpp, bf16x_smaller).
 bool bf16x_smaller(int64_t K) {
   const int64_t row = lx_bf16x_row_bytes(static_cast<int>(K));
@@ -151,19 +146,19 @@ bool bf16x_smaller(int64_t K) {
 }
 
 // Per projection, what the loader holds and what decode reads: the BF16X copy where the model makes one
-// (metis.cpp: make_linear for a matrix of a BF16 kind whose encoding is smaller; expert_stack for the stacks of a
-// BF16 expert kind), the held weight otherwise.
+// (metis.cpp: make_linear for a matrix held in BF16 whose encoding is smaller; expert_stack for the stacks held in
+// BF16), the held weight otherwise. A quantized target's BF16 tensors (the ones its recipe keeps wide) get their
+// copies too, so the kinds are not consulted: only the format each projection is held in.
 struct Held {
   size_t held = 0, copy = 0;
   size_t decode() const { return copy ? copy : held; }
 };
-Held held_bytes(lx_wtype target, bool bf16x_decode, const WeightRecipe& r, const std::string& key, Kind kind,
-                int64_t E, int64_t N, int64_t K) {
+Held held_bytes(lx_wtype target, bool bf16x_decode, const std::string& key, Kind kind, int64_t E, int64_t N,
+                int64_t K) {
   const lx_wtype format = projection_format(target, key);
   Held h;
   h.held = projection_bytes(format, E * N, K, E > 1 ? E : 0);
-  if (bf16x_decode && format == LX_W_BF16 && planned(r, kind) == LX_W_BF16 &&
-      (kind == Kind::Experts || bf16x_smaller(K)))
+  if (bf16x_decode && format == LX_W_BF16 && (kind == Kind::Experts || bf16x_smaller(K)))
     h.copy = projection_bytes(LX_W_BF16X, E * N, K);
   return h;
 }
@@ -295,7 +290,7 @@ lx::ModelFormats model_formats(lx_wtype target, const DeviceInfo& d, bool bf16x_
   f.latent_up = r.latent_up;
   f.prefill_math = native_math(r.dense, d, fast);
   f.expert_math = native_math(r.experts, d, fast);
-  f.bf16x_decode = bf16x_decode && target == LX_W_BF16;
+  f.bf16x_decode = bf16x_decode && target != LX_W_BF16X;
   return f;
 }
 
@@ -360,40 +355,38 @@ size_t projection_bytes(lx_wtype format, int64_t rows, int64_t cols, int64_t sta
 }
 
 WeightBytes weight_bytes(const MetisConfig& c, lx_wtype target, bool bf16x_decode) {
-  const WeightRecipe r = recipe_for(target);
-  const bool copies = bf16x_decode && target == LX_W_BF16;
+  const bool copies = bf16x_decode && target != LX_W_BF16X;  // the lossless target is the encoding: no second copy
   WeightBytes wb;
   const Plain plain = plain_bytes(c);
   wb.plain = plain.plain;
   wb.derived = plain.derived;
   each_projection(c, [&](const std::string& key, Kind kind, int64_t E, int64_t N, int64_t K) {
-    const Held h = held_bytes(target, copies, r, key, kind, E, N, K);
+    const Held h = held_bytes(target, copies, key, kind, E, N, K);
     (kind == Kind::Experts ? wb.experts : wb.projections) += h.held;
     wb.bf16x += h.copy;
   });
   // The tied head: a BF16 head reads the gather table (and has a BF16X copy of it with the decode copies); any
   // other format is its own copy of the table.
-  const Held head = held_bytes(target, copies, r, "embedding", Kind::Dense, 1, c.vocab_size, c.hidden_size);
+  const Held head = held_bytes(target, copies, "embedding", Kind::Dense, 1, c.vocab_size, c.hidden_size);
   if (projection_format(target, "embedding") != LX_W_BF16) wb.head = head.held;
   wb.bf16x += head.copy;
   return wb;
 }
 
 double decode_bytes_per_token(const MetisConfig& c, lx_wtype target, bool bf16x_decode) {
-  const WeightRecipe r = recipe_for(target);
-  const bool copies = bf16x_decode && target == LX_W_BF16;
+  const bool copies = bf16x_decode && target != LX_W_BF16X;
   const Plain plain = plain_bytes(c);
   // Per pass: every plain tensor but the gather table (one row of it per token is nothing next to the rest), every
   // projection as decode reads it, and the routed experts' share a token's top_k choices read.
   double per_pass = static_cast<double>(plain.plain - plain.gather + plain.derived);
   double experts = 0;
   each_projection(c, [&](const std::string& key, Kind kind, int64_t E, int64_t N, int64_t K) {
-    const double bytes = static_cast<double>(held_bytes(target, copies, r, key, kind, E, N, K).decode());
+    const double bytes = static_cast<double>(held_bytes(target, copies, key, kind, E, N, K).decode());
     (kind == Kind::Experts ? experts : per_pass) += bytes;
   });
   per_pass += experts * c.num_experts_per_tok / c.n_routed_experts;
   // The head once per token: its own copy, or the gather table (or its BF16X copy) when it is BF16.
-  const Held head = held_bytes(target, copies, r, "embedding", Kind::Dense, 1, c.vocab_size, c.hidden_size);
+  const Held head = held_bytes(target, copies, "embedding", Kind::Dense, 1, c.vocab_size, c.hidden_size);
   const double head_read = static_cast<double>(head.decode());
   return per_pass * c.num_passes + head_read + 2.0 * static_cast<double>(state_bytes_per_slot(c));
 }
@@ -630,9 +623,9 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
     o.loadable = can_load(f, stored, c, &o.load);
     if (f == LX_W_BF16X && !o.loadable && stored != LX_W_BF16) continue;  // only a BF16 file has a BF16X form
     o.weight_bytes = weight_bytes(c, f).total();
-    if (f == LX_W_BF16 && bf16x_kernels) o.bf16x_bytes = weight_bytes(c, f, true).bf16x;
+    if (f != LX_W_BF16X && bf16x_kernels) o.bf16x_bytes = weight_bytes(c, f, true).bf16x;
     o.fits = attempt(f, false, useful_slots, kUsefulContext).ok;
-    o.decode_ceiling_tps = decode_ceiling_tps(d, c, f, f == LX_W_BF16 && bf16x_kernels);
+    o.decode_ceiling_tps = decode_ceiling_tps(d, c, f, f != LX_W_BF16X && bf16x_kernels);
     o.maths = maths_text(model_formats(f, d, false));
     const std::string fast = maths_text(model_formats(f, d, false, true));
     o.fast_maths = fast == o.maths ? std::string("-") : fast;
@@ -657,22 +650,25 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
     return "as asked: " + how + " at load";
   };
 
-  // Resident first, with the BF16X decode copies when the format is BF16 and they fit beside the useful sequences.
-  const bool bf16x_wanted = target == LX_W_BF16 && req.bf16x;
+  // Resident first, with the BF16X decode copies of the BF16 tensors the format holds (every BF16 weight of a BF16
+  // model, the ones a quantized recipe keeps wide) when they fit beside the useful sequences.
+  const size_t copies = target == LX_W_BF16X ? 0 : weight_bytes(c, target, true).bf16x;
+  const bool copies_wanted = copies > 0 && req.bf16x && bf16x_kernels;
   std::string bf16x_reason;
   Fit chosen;
   Fit plain_fit;  // the same format without the copies, to say what they cost
-  if (bf16x_wanted && bf16x_kernels) chosen = attempt(target, true, useful_slots, kUsefulContext);
-  if (target == LX_W_BF16) plain_fit = attempt(target, false, useful_slots, kUsefulContext);
-  if (!chosen.ok) chosen = target == LX_W_BF16 ? plain_fit : attempt(target, false, useful_slots, kUsefulContext);
-  if (target == LX_W_BF16) {
-    const size_t copies = weight_bytes(c, LX_W_BF16, true).bf16x;
+  if (copies_wanted) chosen = attempt(target, true, useful_slots, kUsefulContext);
+  if (copies_wanted) plain_fit = attempt(target, false, useful_slots, kUsefulContext);
+  if (!chosen.ok) chosen = attempt(target, false, useful_slots, kUsefulContext);
+  if (copies > 0) {
+    const std::string kept =
+        target == LX_W_BF16 ? "the BF16 weights" : "the BF16 tensors " + format_name(target) + " keeps wide";
     if (!req.bf16x)
       bf16x_reason = "BF16X decode copies off (--no-bf16x): decode reads the BF16 weights.";
     else if (!bf16x_kernels)
       bf16x_reason = "No BF16X decode copies: the loaded backend has no BF16X kernels.";
     else if (chosen.ok && chosen.bf16x)
-      bf16x_reason = "Decode reads lossless BF16X copies of the BF16 weights (" + gb(copies) +
+      bf16x_reason = "Decode reads lossless BF16X copies of " + kept + " (" + gb(copies) +
                      " more): the same logits to the bit from about 1.3x fewer bytes. Prefill reads the BF16 copy.";
     else
       bf16x_reason = "BF16X decode copies dropped: their " + gb(copies) +
@@ -693,7 +689,7 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
         for (const FormatOption& o : options)
           if (o.format == target) self = &o;
         p.reason = describe_load();
-        if (target == LX_W_BF16)
+        if (copies > 0)
           p.bf16x_reason = req.bf16x && bf16x_kernels
                                ? "No BF16X decode copies: offloaded, the VRAM goes to the expert cache."
                                : bf16x_reason;

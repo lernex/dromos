@@ -49,11 +49,11 @@ struct FeatureTap {
 // latent_up are the formats the plan chose: a weight must be held in its kind's format or in BF16 (wider by the
 // recipe), and the model refuses weights loaded in anything else.
 //
-// bf16x_decode: for each kind whose format is BF16, the model encodes a lossless BF16X copy (bf16x.cu) of every
-// BF16 projection and stack of that kind at construction, and decode reads it (the same logits to the bit at
-// ~1.3x fewer bytes) while prefill keeps reading the BF16 copy. The plan budgets the second copy. Weights held
-// as BF16X (loaded with that target) need no flag: decode reads them as they are, and prefill expands each one
-// to a bf16 scratch first.
+// bf16x_decode: the model encodes a lossless BF16X copy (bf16x.cu) of every projection and stack held in BF16 at
+// construction (in a BF16 model all of them; in a quantized one the wide tensors its recipe keeps), and decode reads
+// it (the same logits to the bit at ~1.3x fewer bytes) while prefill keeps reading the BF16 copy. The plan budgets
+// the second copy. Weights held as BF16X (loaded with that target) need no flag: decode reads them as they are, and
+// prefill expands each one to a bf16 scratch first.
 struct ModelFormats {
   lx_wtype dense = LX_W_BF16, experts = LX_W_BF16, latent_up = LX_W_BF16;
   lx_math prefill_math = LX_MATH_BF16, expert_math = LX_MATH_BF16;

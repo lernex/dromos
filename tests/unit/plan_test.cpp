@@ -232,7 +232,7 @@ TEST_CASE("the default math is BF16 for every format on every device") {
   CHECK(f.experts == LX_W_NVFP4);
   CHECK(f.prefill_math == LX_MATH_BF16);
   CHECK(f.expert_math == LX_MATH_BF16);
-  CHECK_FALSE(f.bf16x_decode);  // decode copies are for BF16 models
+  CHECK(f.bf16x_decode);  // the copies of the BF16 tensors NVFP4 keeps wide (latent_up, the Mamba out_proj, LoRA)
 }
 
 TEST_CASE("what each file loads into: never wider, NVFP4 only from the GPTQ folder") {
@@ -364,6 +364,30 @@ TEST_CASE("BF16X decode copies are dropped, and said so, when they do not fit be
   CHECK_FALSE(p.bf16x_decode);
   CHECK(p.bf16x_bytes == 0);
   CHECK(has_note(p, "BF16X decode copies dropped"));
+}
+
+TEST_CASE("quantized targets: the BF16 tensors they keep wide decode from BF16X copies too") {
+  if (!bf16x_available()) return;
+  const DeviceInfo d = simulated("RTX 5070 Ti 16GB", 120, 16, 896, 70);
+  for (const lx_wtype target : {LX_W_FP8, LX_W_NVFP4}) {
+    const CheckpointInfo ck = checkpoint(target);
+    PlanRequest plain = weights(target);
+    plain.bf16x = false;
+    const Plan p = make_plan(d, praxis(), ck, plain);
+    const Plan x = make_plan(d, praxis(), ck, weights(target));
+    CHECK(x.weights == target);
+    CHECK_FALSE(p.bf16x_decode);
+    CHECK(x.bf16x_decode);
+    CHECK(x.bf16x_bytes > 0);
+    CHECK(x.bf16x_bytes == weight_bytes(praxis(), target, true).bf16x);
+    CHECK(x.weight_bytes == p.weight_bytes + x.bf16x_bytes);
+    CHECK(x.decode_ceiling_tps > p.decode_ceiling_tps);
+    CHECK(x.formats().bf16x_decode);
+    CHECK(has_note(x, "lossless BF16X copies of the BF16 tensors"));
+  }
+  // The lossless target is its own encoding: no second copy, whatever the flag says.
+  CHECK(weight_bytes(praxis(), LX_W_BF16X, true).bf16x == 0);
+  CHECK_FALSE(model_formats(LX_W_BF16X, d, true).bf16x_decode);
 }
 
 TEST_CASE("the default is the file's format: offloaded before anything narrower, never narrowed") {

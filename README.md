@@ -20,9 +20,9 @@ a format (`praxis:fp8`), a folder, or `owner/name` on the hub.
 Weights run in the format the file stores: no hidden quantization, so every speed is the speed of a named
 format. `--weights bf16|int8|fp8|nvfp4|bf16x` (run, serve, bench, eval, spec, doctor) names another: INT8 and FP8
 round-to-nearest from a wider file, BF16X the lossless encoding of a BF16 one, NVFP4 only from the GPTQ NVFP4
-folder, nothing wider than the file. A BF16 model decodes from lossless BF16X copies when they fit (`--no-bf16x`
-turns them off), and a model that does not fit the GPU runs with its routed experts offloaded rather than in a
-narrower format. `lernex doctor MODEL` shows every format, what fits, and the decode ceiling of each.
+folder, nothing wider than the file. A model decodes its BF16 tensors (every one of a BF16 model, the wide ones of a
+quantized model) from lossless BF16X copies when they fit (`--no-bf16x` turns them off), and a model
+that does not fit the GPU runs with its routed experts offloaded rather than in a narrower format. `lernex doctor MODEL` shows every format, what fits, and the decode ceiling of each.
 
 `LX_ARCH_OVERRIDE=80|86|89|90` (or `--lx-arch=N` on the kernel tests) makes a newer card run the code paths
 of an older architecture, so the fallbacks are tested on one GPU.

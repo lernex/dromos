@@ -135,7 +135,7 @@ void print_plan(const lx::runtime::Plan& plan) {
   }
   for (const FormatOption& o : plan.options)
     if (o.bf16x_bytes)
-      std::printf("           * decoding from the BF16X copies of the BF16 weights (%.2f GB more)\n",
+      std::printf("           * decoding from the BF16X copies of the BF16 tensors (%.2f GB more)\n",
                   static_cast<double>(o.bf16x_bytes) / 1e9);
   std::printf("           fits: resident with room for %d sequences of %d tokens; decode est.: one stream, the "
               "measured share of the card's bandwidth over the bytes a token reads\n",
@@ -155,7 +155,7 @@ void print_plan(const lx::runtime::Plan& plan) {
   if (!plan.bf16x_reason.empty())
     std::printf("BF16X      %s %s\n", plan.bf16x_decode ? "on:" : "off:", plan.bf16x_reason.c_str());
   else
-    std::printf("BF16X      off: decode copies are for BF16 weights, and these are %s\n",
+    std::printf("BF16X      off: no BF16 tensors to copy in %s\n",
                 format_name(plan.weights).c_str());
   if (plan.decode_ceiling_tps > 0)
     std::printf("decode     about %.0f tokens per second for one stream (the measured share of the card's bandwidth "

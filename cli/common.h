@@ -25,7 +25,7 @@ struct Model {
 Model find_model(const std::string& name, bool download);
 
 // The weight format a command was asked for: --weights bf16|int8|fp8|nvfp4|bf16x (-1, the default, is the format
-// the file stores) and --no-bf16x (a BF16 model decodes from its plain BF16 weights, for measuring).
+// the file stores) and --no-bf16x (decode reads the plain BF16 tensors, for measuring).
 struct FormatFlags {
   int weights = -1;
   bool bf16x = true;
