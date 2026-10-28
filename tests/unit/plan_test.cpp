@@ -355,15 +355,51 @@ TEST_CASE("--weights bf16x: the lossless encoding as the one copy, from a BF16 f
   CHECK_THROWS_AS(make_plan(d, praxis(), fp8_checkpoint(), weights(LX_W_BF16X)), std::runtime_error);
 }
 
-TEST_CASE("BF16X decode copies are dropped, and said so, when they do not fit beside the useful sequences") {
+TEST_CASE("BF16X decode copies never take a sequence; the ones left out are named") {
   if (!bf16x_available()) return;
-  // Praxis BF16 on 8 GB: the weights fit with four sequences, the copies beside them do not
-  const Plan p = make_plan(simulated("RTX 4060 8GB", 89, 8, 272, 24), praxis(), bf16_checkpoint(), PlanRequest{});
-  CHECK(p.weights == LX_W_BF16);
-  CHECK_FALSE(p.offload.enabled);
-  CHECK_FALSE(p.bf16x_decode);
-  CHECK(p.bf16x_bytes == 0);
-  CHECK(has_note(p, "BF16X decode copies dropped"));
+  // Praxis BF16 on 8 GB asked for the useful count: the sequences and the step's scratch first, the copies in what is left
+  const DeviceInfo d = simulated("RTX 4060 8GB", 89, 8, 272, 24);
+  PlanRequest want;
+  want.sequences = kUsefulSlots;
+  PlanRequest want_plain = want;
+  want_plain.bf16x = false;
+  const Plan p = make_plan(d, praxis(), bf16_checkpoint(), want_plain);
+  const Plan x = make_plan(d, praxis(), bf16_checkpoint(), want);
+  CHECK(x.weights == LX_W_BF16);
+  CHECK_FALSE(x.offload.enabled);
+  CHECK(x.max_slots == p.max_slots);  // the copies take no sequence
+  CHECK(x.weight_bytes + x.state_bytes + x.kv_bytes + x.scratch_bytes <= x.budget_bytes);
+  CHECK(x.bf16x_bytes == weight_bytes(praxis(), LX_W_BF16, true, &x.bf16x_dropped).bf16x);
+  if (!x.bf16x_dropped.empty()) CHECK(has_note(x, "Copies left out"));
+}
+
+TEST_CASE("the copies never take a sequence: Logos FP8 on 16 GB holds the 32 asked for") {
+  const DeviceInfo d = simulated("RTX 5070 Ti 16GB", 120, 16, 896, 70);
+  PlanRequest asked;
+  asked.sequences = 32;
+  asked.context = 784;  // the bench's context: the 32 held in full at this length
+  PlanRequest plain = asked;
+  plain.bf16x = false;
+  const Plan p = make_plan(d, logos(), fp8_checkpoint(), plain);
+  const Plan x = make_plan(d, logos(), fp8_checkpoint(), asked);
+  CHECK(x.weights == LX_W_FP8);
+  CHECK(p.max_slots == 32);
+  CHECK(x.max_slots == 32);
+  CHECK(x.weight_bytes + x.state_bytes + x.kv_bytes + x.scratch_bytes <= x.budget_bytes);
+  if (!bf16x_available()) return;
+  const size_t all = weight_bytes(logos(), LX_W_FP8, true).bf16x;
+  CHECK(x.bf16x_bytes == weight_bytes(logos(), LX_W_FP8, true, &x.bf16x_dropped).bf16x);
+  CHECK(x.bf16x_bytes <= all);
+  if (x.bf16x_dropped.empty()) CHECK(x.bf16x_bytes == all);
+  else CHECK(has_note(x, "Copies left out"));
+  // A single stream keeps every copy: they fit beside it.
+  PlanRequest one;
+  one.sequences = 1;
+  const Plan s = make_plan(d, logos(), fp8_checkpoint(), one);
+  CHECK(s.max_slots == 1);
+  CHECK(s.bf16x_decode);
+  CHECK(s.bf16x_dropped.empty());
+  CHECK(s.bf16x_bytes == all);
 }
 
 TEST_CASE("quantized targets: the BF16 tensors they keep wide decode from BF16X copies too") {

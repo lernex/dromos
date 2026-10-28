@@ -9,6 +9,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <map>
 #include <stdexcept>
 
 #include "core/checkpoint.h"
@@ -163,6 +164,61 @@ Held held_bytes(lx_wtype target, bool bf16x_decode, const std::string& key, Kind
   return h;
 }
 
+// A BF16X decode copy, by the unit it belongs to (metis.h, bf16x_copy_made): a projection, a layer's routed experts
+// (both stacks, which the decode kernel reads together), or the LM head. `bytes` is what the copies hold, `saved` the
+// bytes decode stops reading per token: a projection once per pass, the routed experts' share a token's top_k choices
+// read in each pass, the head once.
+struct CopyUnit {
+  std::string unit;
+  size_t bytes = 0;
+  double saved = 0;
+  double density() const { return bytes ? saved / static_cast<double>(bytes) : 0.0; }
+};
+
+std::string copy_unit(const std::string& key, Kind kind) {
+  return kind == Kind::Experts ? key.substr(0, key.rfind('.')) : key;
+}
+
+// Every copy the target makes, the ones with the most bytes saved per byte held first (ties by name).
+std::vector<CopyUnit> copy_units(const MetisConfig& c, lx_wtype target) {
+  std::map<std::string, CopyUnit> by;
+  const double passes = c.num_passes, expert_share = static_cast<double>(c.num_experts_per_tok) / c.n_routed_experts;
+  each_projection(c, [&](const std::string& key, Kind kind, int64_t E, int64_t N, int64_t K) {
+    if (projection_format(target, key) != LX_W_BF16 || (kind != Kind::Experts && !bf16x_smaller(K))) return;
+    const double held = static_cast<double>(projection_bytes(LX_W_BF16, E * N, K, E > 1 ? E : 0));
+    const double copy = static_cast<double>(projection_bytes(LX_W_BF16X, E * N, K));
+    const std::string unit = copy_unit(key, kind);
+    CopyUnit& u = by[unit];
+    u.unit = unit;
+    u.bytes += static_cast<size_t>(copy);
+    u.saved += (held - copy) * (kind == Kind::Experts ? passes * expert_share : passes);
+  });
+  if (projection_format(target, "embedding") == LX_W_BF16 && bf16x_smaller(c.hidden_size)) {
+    const double held = static_cast<double>(projection_bytes(LX_W_BF16, c.vocab_size, c.hidden_size));
+    const double copy = static_cast<double>(projection_bytes(LX_W_BF16X, c.vocab_size, c.hidden_size));
+    by["lm_head"] = CopyUnit{"lm_head", static_cast<size_t>(copy), held - copy};
+  }
+  std::vector<CopyUnit> units;
+  for (const auto& kv : by)
+    if (kv.second.bytes > 0) units.push_back(kv.second);
+  std::sort(units.begin(), units.end(), [](const CopyUnit& a, const CopyUnit& b) {
+    if (a.density() != b.density()) return a.density() > b.density();
+    return a.unit < b.unit;
+  });
+  return units;
+}
+
+// What a copy unit is, for the notes.
+std::string copy_label(const std::string& u) {
+  if (u == "lm_head") return "the LM head";
+  if (u.find("local_experts") != std::string::npos) return "routed experts";
+  if (u.find("shared_expert") != std::string::npos) return "shared experts";
+  if (u.find("latent_") != std::string::npos) return "latent projections";
+  if (u.compare(0, 13, "depth_memory.") == 0) return "depth memory";
+  if (u.find("mixer.impl.") != std::string::npos) return "Mamba projections";
+  return "attention projections";
+}
+
 // The loader's plain tensors (every bf16 or f32 tensor that is not a projection), the bf16 gather table among
 // them, and the hyper-connections' per-pass parameters the model computes from them.
 struct Plain {
@@ -302,6 +358,7 @@ lx::ModelFormats Plan::formats() const {
   f.prefill_math = prefill_math;
   f.expert_math = expert_math;
   f.bf16x_decode = bf16x_decode;
+  f.bf16x_dropped = bf16x_dropped;
   return f;
 }
 
@@ -354,39 +411,42 @@ size_t projection_bytes(lx_wtype format, int64_t rows, int64_t cols, int64_t sta
   return 0;
 }
 
-WeightBytes weight_bytes(const MetisConfig& c, lx_wtype target, bool bf16x_decode) {
+WeightBytes weight_bytes(const MetisConfig& c, lx_wtype target, bool bf16x_decode, const std::set<std::string>* dropped) {
   const bool copies = bf16x_decode && target != LX_W_BF16X;  // the lossless target is the encoding: no second copy
+  // A copy is made unless the plan left its unit out (copy_units).
+  const auto made = [&](const std::string& unit) { return copies && !(dropped && dropped->count(unit)); };
   WeightBytes wb;
   const Plain plain = plain_bytes(c);
   wb.plain = plain.plain;
   wb.derived = plain.derived;
   each_projection(c, [&](const std::string& key, Kind kind, int64_t E, int64_t N, int64_t K) {
-    const Held h = held_bytes(target, copies, key, kind, E, N, K);
+    const Held h = held_bytes(target, made(copy_unit(key, kind)), key, kind, E, N, K);
     (kind == Kind::Experts ? wb.experts : wb.projections) += h.held;
     wb.bf16x += h.copy;
   });
   // The tied head: a BF16 head reads the gather table (and has a BF16X copy of it with the decode copies); any
   // other format is its own copy of the table.
-  const Held head = held_bytes(target, copies, "embedding", Kind::Dense, 1, c.vocab_size, c.hidden_size);
+  const Held head = held_bytes(target, made("lm_head"), "embedding", Kind::Dense, 1, c.vocab_size, c.hidden_size);
   if (projection_format(target, "embedding") != LX_W_BF16) wb.head = head.held;
   wb.bf16x += head.copy;
   return wb;
 }
 
-double decode_bytes_per_token(const MetisConfig& c, lx_wtype target, bool bf16x_decode) {
+double decode_bytes_per_token(const MetisConfig& c, lx_wtype target, bool bf16x_decode, const std::set<std::string>* dropped) {
   const bool copies = bf16x_decode && target != LX_W_BF16X;
+  const auto made = [&](const std::string& unit) { return copies && !(dropped && dropped->count(unit)); };
   const Plain plain = plain_bytes(c);
   // Per pass: every plain tensor but the gather table (one row of it per token is nothing next to the rest), every
   // projection as decode reads it, and the routed experts' share a token's top_k choices read.
   double per_pass = static_cast<double>(plain.plain - plain.gather + plain.derived);
   double experts = 0;
   each_projection(c, [&](const std::string& key, Kind kind, int64_t E, int64_t N, int64_t K) {
-    const double bytes = static_cast<double>(held_bytes(target, copies, key, kind, E, N, K).decode());
+    const double bytes = static_cast<double>(held_bytes(target, made(copy_unit(key, kind)), key, kind, E, N, K).decode());
     (kind == Kind::Experts ? experts : per_pass) += bytes;
   });
   per_pass += experts * c.num_experts_per_tok / c.n_routed_experts;
   // The head once per token: its own copy, or the gather table (or its BF16X copy) when it is BF16.
-  const Held head = held_bytes(target, copies, "embedding", Kind::Dense, 1, c.vocab_size, c.hidden_size);
+  const Held head = held_bytes(target, made("lm_head"), "embedding", Kind::Dense, 1, c.vocab_size, c.hidden_size);
   const double head_read = static_cast<double>(head.decode());
   return per_pass * c.num_passes + head_read + 2.0 * static_cast<double>(state_bytes_per_slot(c));
 }
@@ -406,8 +466,9 @@ double decode_efficiency(lx_wtype target, bool bf16x_decode) {
   }
 }
 
-double decode_ceiling_tps(const DeviceInfo& d, const MetisConfig& c, lx_wtype target, bool bf16x_decode) {
-  const double bytes = decode_bytes_per_token(c, target, bf16x_decode);
+double decode_ceiling_tps(const DeviceInfo& d, const MetisConfig& c, lx_wtype target, bool bf16x_decode,
+                          const std::set<std::string>* dropped) {
+  const double bytes = decode_bytes_per_token(c, target, bf16x_decode, dropped);
   return d.bandwidth_gbs > 0 && bytes > 0 ? d.bandwidth_gbs * 1e9 * decode_efficiency(target, bf16x_decode) / bytes : 0.0;
 }
 
@@ -580,10 +641,10 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
     lx::ModelFormats formats;
     WeightBytes wb;
     size_t need = 0;  // the bytes the format needs for want_slots at floor_ctx
-    int context = 0, slots = 0;
+    int context = 0, slots = 0, step = kMaxStepTokens;
     bool ok = false;
   };
-  auto attempt = [&](lx_wtype format, bool bf16x, int want_slots, int floor_ctx) {
+  auto attempt = [&](lx_wtype format, bool bf16x, int want_slots, int floor_ctx, int cap) {
     Fit f;
     f.format = format;
     f.bf16x = bf16x;
@@ -591,28 +652,29 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
     f.wb = weight_bytes(c, format, bf16x);
     f.need = f.wb.total() + scratch_bytes(c, kMinStepTokens, 0, f.formats) +
              static_cast<size_t>(want_slots) * (per_slot_state + per_position * static_cast<size_t>(floor_ctx));
-    const int need_slots = std::min(want_slots, slot_cap);
+    const int need_slots = std::min(want_slots, cap);
     for (int ctx = context_wanted;; ctx = std::max(floor_ctx, ctx / 2)) {
       const size_t per_slot = per_slot_state + per_position * static_cast<size_t>(ctx);
       // The largest step tier that holds the sequences. An explicit count is held in full when some tier does: the
       // full step first, then the smaller one, so 32 asked for never settle for the 23 a 2048-token step leaves room
       // for. Without a count, the first tier that holds the useful sequences is kept, as before.
-      int got = -1;
+      int got = -1, got_step = kMaxStepTokens;
       for (const int step : {kMaxStepTokens, kMinStepTokens}) {
         const size_t fixed = f.wb.total() + scratch_bytes(c, step, 0, f.formats);
         if (budget <= fixed || per_slot == 0) continue;
-        int slots = static_cast<int>(std::min<size_t>((budget - fixed) / per_slot, static_cast<size_t>(slot_cap)));
+        int slots = static_cast<int>(std::min<size_t>((budget - fixed) / per_slot, static_cast<size_t>(cap)));
         // the scratch grows with the slots' metadata too; take back any slot that no longer fits
         while (slots > 0 && fixed + scratch_bytes(c, step, slots, f.formats) - scratch_bytes(c, step, 0, f.formats) +
                                     static_cast<size_t>(slots) * per_slot > budget)
           --slots;
         if (slots < need_slots) continue;
-        got = std::max(got, slots);
-        if (req.sequences <= 0 || got >= slot_cap) break;
+        if (slots > got) got = slots, got_step = step;
+        if (req.sequences <= 0 || got >= cap) break;
       }
       if (got >= 0) {
         f.context = ctx;
         f.slots = got;
+        f.step = got_step;
         f.ok = true;
         return f;
       }
@@ -631,7 +693,7 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
     if (f == LX_W_BF16X && !o.loadable && stored != LX_W_BF16) continue;  // only a BF16 file has a BF16X form
     o.weight_bytes = weight_bytes(c, f).total();
     if (f != LX_W_BF16X && bf16x_kernels) o.bf16x_bytes = weight_bytes(c, f, true).bf16x;
-    o.fits = attempt(f, false, useful_slots, kUsefulContext).ok;
+    o.fits = attempt(f, false, useful_slots, kUsefulContext, slot_cap).ok;
     o.decode_ceiling_tps = decode_ceiling_tps(d, c, f, f != LX_W_BF16X && bf16x_kernels);
     o.maths = maths_text(model_formats(f, d, false));
     const std::string fast = maths_text(model_formats(f, d, false, true));
@@ -657,29 +719,18 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
     return "as asked: " + how + " at load";
   };
 
-  // Resident first, with the BF16X decode copies of the BF16 tensors the format holds (every BF16 weight of a BF16
-  // model, the ones a quantized recipe keeps wide) when they fit beside the useful sequences.
+  // Resident first, without the BF16X decode copies: at least the useful sequences, as many as fit up to the count asked
+  // for (the useful count, by default), and the step's scratch. The copies come after, from what is left (block C).
+  const int reserve = req.sequences > 0 ? req.sequences : kUsefulSlots;
   const size_t copies = target == LX_W_BF16X ? 0 : weight_bytes(c, target, true).bf16x;
   const bool copies_wanted = copies > 0 && req.bf16x && bf16x_kernels;
-  std::string bf16x_reason;
-  Fit chosen;
-  Fit plain_fit;  // the same format without the copies, to say what they cost
-  if (copies_wanted) chosen = attempt(target, true, useful_slots, kUsefulContext);
-  if (copies_wanted) plain_fit = attempt(target, false, useful_slots, kUsefulContext);
-  if (!chosen.ok) chosen = attempt(target, false, useful_slots, kUsefulContext);
+  // The count asked for is tried first, in full; failing that, the useful count, with as many as fit up to the count asked.
+  Fit chosen = attempt(target, false, reserve, kUsefulContext, reserve);
+  if (!chosen.ok) chosen = attempt(target, false, useful_slots, kUsefulContext, reserve);
+  std::string bf16x_off;  // why the plan makes no copies, for the offloaded plan to say
   if (copies > 0) {
-    const std::string kept =
-        target == LX_W_BF16 ? "the BF16 weights" : "the BF16 tensors " + format_name(target) + " keeps wide";
-    if (!req.bf16x)
-      bf16x_reason = "BF16X decode copies off (--no-bf16x): decode reads the BF16 weights.";
-    else if (!bf16x_kernels)
-      bf16x_reason = "No BF16X decode copies: the loaded backend has no BF16X kernels.";
-    else if (chosen.ok && chosen.bf16x)
-      bf16x_reason = "Decode reads lossless BF16X copies of " + kept + " (" + gb(copies) +
-                     " more): the same logits to the bit from about 1.3x fewer bytes. Prefill reads the BF16 copy.";
-    else
-      bf16x_reason = "BF16X decode copies dropped: their " + gb(copies) +
-                     " does not fit beside the useful sequences; decode reads the BF16 weights.";
+    if (!req.bf16x) bf16x_off = "BF16X decode copies off (--no-bf16x): decode reads the BF16 weights.";
+    else if (!bf16x_kernels) bf16x_off = "No BF16X decode copies: the loaded backend has no BF16X kernels.";
   }
 
   // Not resident usefully: offload the routed experts in the same format before anything narrower is considered.
@@ -699,7 +750,7 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
         if (copies > 0)
           p.bf16x_reason = req.bf16x && bf16x_kernels
                                ? "No BF16X decode copies: offloaded, the VRAM goes to the expert cache."
-                               : bf16x_reason;
+                               : bf16x_off;
         std::vector<std::string> notes;
         notes.push_back("Holding the weights as " + format_name(target) + ", " + p.reason + ".");
         notes.push_back("It does not fit this GPU usefully (" + gb(self ? self->weight_bytes : 0) + " of weights, " +
@@ -727,7 +778,7 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
   // Then the limited tier: one sequence of kLimitedContext positions, said so in the notes.
   bool limited = false;
   if (!chosen.ok) {
-    chosen = attempt(target, false, 1, kLimitedContext);
+    chosen = attempt(target, false, 1, kLimitedContext, slot_cap);
     limited = chosen.ok;
   }
   if (!chosen.ok) {
@@ -741,43 +792,90 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
     throw std::runtime_error("the model does not run on " + std::string(this_device(d)) + " as " + format_name(target) + ":" + why);
   }
 
+  // The BF16X decode copies take the room the reserved sequences and the step's scratch leave, the copy with the most
+  // decode bytes saved per byte held first. One that does not fit is skipped and named in the notes. A copy never takes a
+  // sequence, and a single stream has the room for every copy.
+  std::string bf16x_reason;
+  std::set<std::string> dropped;
+  std::vector<CopyUnit> left_out;
+  size_t copy_bytes = 0, kept_units = 0, dropped_bytes = 0;
+  const size_t reserved = chosen.wb.total() + scratch_bytes(c, chosen.step, chosen.slots, chosen.formats) +
+                          static_cast<size_t>(chosen.slots) * (per_slot_state + per_position * static_cast<size_t>(chosen.context));
+  size_t room = budget > reserved ? budget - reserved : 0;
+  const std::vector<CopyUnit> units = copies_wanted ? copy_units(c, target) : std::vector<CopyUnit>{};
+  for (const CopyUnit& u : units) {
+    if (u.bytes <= room) {
+      room -= u.bytes;
+      copy_bytes += u.bytes;
+      ++kept_units;
+    } else {
+      dropped.insert(u.unit);
+      left_out.push_back(u);
+      dropped_bytes += u.bytes;
+    }
+  }
+  // By default, the sequences past the useful count take what the copies leave.
+  int slots = chosen.slots;
+  if (req.sequences <= 0) {
+    const int64_t per_slot = static_cast<int64_t>(per_slot_state + per_position * static_cast<size_t>(chosen.context));
+    while (slots < slot_cap) {
+      const int64_t grow = per_slot + static_cast<int64_t>(scratch_bytes(c, chosen.step, slots + 1, chosen.formats)) -
+                           static_cast<int64_t>(scratch_bytes(c, chosen.step, slots, chosen.formats));
+      if (grow > static_cast<int64_t>(room)) break;
+      room -= static_cast<size_t>(grow);
+      ++slots;
+    }
+  }
+  if (copies > 0) {
+    const std::string kept =
+        target == LX_W_BF16 ? "the BF16 weights" : "the BF16 tensors " + format_name(target) + " keeps wide";
+    const std::string seqs = std::to_string(slots) + (slots == 1 ? " sequence" : " sequences");
+    if (!bf16x_off.empty()) bf16x_reason = bf16x_off;
+    else if (dropped.empty())
+      bf16x_reason = "Decode reads lossless BF16X copies of " + kept + " (" + gb(copy_bytes) +
+                     " more): the same logits to the bit from about 1.3x fewer bytes. Prefill reads the BF16 copy.";
+    else if (kept_units > 0)
+      bf16x_reason = "Decode reads lossless BF16X copies of " + std::to_string(kept_units) + " of " +
+                     std::to_string(units.size()) + " projections of " + kept + " (" + gb(copy_bytes) +
+                     " more); the rest (" + gb(dropped_bytes) + ") read the BF16 weights, as their copies do not fit beside the " +
+                     seqs + ".";
+    else
+      bf16x_reason = "BF16X decode copies dropped: their " + gb(copies) + " does not fit beside the " + seqs +
+                     "; decode reads the BF16 weights.";
+  }
+
   Plan p;
   p.stored = stored;
   p.weights = target;
   p.recipe = recipe_for(target);
   p.convert_at_load = stored != target;
-  p.bf16x_decode = chosen.bf16x;
+  p.bf16x_decode = copy_bytes > 0;
+  p.bf16x_dropped = dropped;
   p.prefill_math = chosen.formats.prefill_math;
   p.batch_math = p.prefill_math;
   p.expert_math = chosen.formats.expert_math;
-  p.max_slots = chosen.slots;
+  p.max_slots = slots;
   p.kv_capacity = chosen.context;
-  p.weight_bytes = chosen.wb.total();
-  p.bf16x_bytes = chosen.wb.bf16x;
-  p.state_bytes = per_slot_state * static_cast<size_t>(p.max_slots);
-  p.kv_bytes = per_position * static_cast<size_t>(p.kv_capacity) * static_cast<size_t>(p.max_slots);
+  p.weight_bytes = chosen.wb.total() + copy_bytes;
+  p.bf16x_bytes = copy_bytes;
+  p.state_bytes = per_slot_state * static_cast<size_t>(slots);
+  p.kv_bytes = per_position * static_cast<size_t>(chosen.context) * static_cast<size_t>(slots);
   p.options = options;
   p.offload.vram_budget = req.vram_budget;
   p.offload.ram_budget = req.ram_budget;
 
-  // The step: as many tokens as the room left allows, up to kMaxStepTokens; prefill takes the rest
-  // of the step beyond one row per sequence.
-  int tokens = kMaxStepTokens;
-  auto total_with = [&](int t) {
-    return p.weight_bytes + p.state_bytes + p.kv_bytes + scratch_bytes(c, t, p.max_slots, chosen.formats);
-  };
-  while (tokens > kMinStepTokens && total_with(tokens) > budget) tokens /= 2;
-  p.max_step_tokens = tokens;
-  p.scratch_bytes = scratch_bytes(c, tokens, p.max_slots, chosen.formats);
-  p.prefill_chunk = std::max(1, tokens - p.max_slots);
+  // The step the sequences were given, and the scratch for the sequences the plan holds.
+  p.max_step_tokens = chosen.step;
+  p.scratch_bytes = scratch_bytes(c, chosen.step, slots, chosen.formats);
+  p.prefill_chunk = std::max(1, chosen.step - slots);
   p.budget_bytes = budget;
   {
-    const size_t planned_bytes = total_with(tokens);
+    const size_t planned_bytes = p.weight_bytes + p.state_bytes + p.kv_bytes + p.scratch_bytes;
     const size_t spare = budget > planned_bytes + kStartupMarginBytes ? budget - planned_bytes - kStartupMarginBytes : 0;
     p.prefix_device_bytes = std::min(spare, kPrefixDeviceCap);
     p.prefix_host_bytes = kPrefixHostBytes;
   }
-  const double active = decode_bytes_per_token(c, target, p.bf16x_decode);
+  const double active = decode_bytes_per_token(c, target, p.bf16x_decode, &p.bf16x_dropped);
   if (d.bandwidth_gbs > 0 && active > 0)
     p.decode_ceiling_tps = d.bandwidth_gbs * 1e9 * decode_efficiency(target, p.bf16x_decode) / active;
 
@@ -792,10 +890,22 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
                 (offload_why.empty() ? "" : " (offloading the experts does not apply: " + offload_why + ")") + ".");
   n.push_back("Weights " + gb(p.weight_bytes) + ": " + recipe_text(target) + ".");
   if (!p.bf16x_reason.empty()) n.push_back(p.bf16x_reason);
-  if (p.bf16x_decode && plain_fit.ok && (plain_fit.slots > p.max_slots || plain_fit.context > p.kv_capacity))
-    n.push_back("  The copies cost " + std::to_string(plain_fit.slots) + " sequences of " +
-                std::to_string(plain_fit.context) + " tokens down to " + std::to_string(p.max_slots) + " of " +
-                std::to_string(p.kv_capacity) + "; --no-bf16x keeps them.");
+  if (!left_out.empty()) {
+    std::map<std::string, std::pair<size_t, size_t>> by_label;  // label: copy units, bytes
+    for (const CopyUnit& u : left_out) {
+      auto& e = by_label[copy_label(u.unit)];
+      e.first += 1;
+      e.second += u.bytes;
+    }
+    std::string list;
+    for (const auto& kv : by_label) {
+      if (!list.empty()) list += ", ";
+      list += kv.first + (kv.second.first > 1 ? " x" + std::to_string(kv.second.first) : std::string()) + " (" +
+              gb(kv.second.second) + ")";
+    }
+    n.push_back("  Copies left out, for want of room beside the " + std::to_string(p.max_slots) +
+                (p.max_slots == 1 ? " sequence" : " sequences") + ": " + list + ".");
+  }
   n.push_back("Dense products multiply in " + math_name(p.prefill_math, d) + "; routed experts in " +
               math_name(p.expert_math, d) + ".");
   if (req.fast_math && p.prefill_math == LX_MATH_BF16 && p.recipe.dense != LX_W_BF16 && p.recipe.dense != LX_W_BF16X)

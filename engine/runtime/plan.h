@@ -6,6 +6,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <set>
 #include <string>
 #include <vector>
 
@@ -138,7 +139,8 @@ struct Plan {
   int max_step_tokens = 0;    // tokens in one step (decode rows and prefill rows together)
   int prefill_chunk = 0;      // prompt tokens a sequence takes per step while it is being prefilled
   size_t weight_bytes = 0, state_bytes = 0, kv_bytes = 0, scratch_bytes = 0, budget_bytes = 0;
-  size_t bf16x_bytes = 0;          // of weight_bytes, the BF16X decode copies
+  size_t bf16x_bytes = 0;          // of weight_bytes, the BF16X decode copies that are made
+  std::set<std::string> bf16x_dropped;  // copy units the room beside the sequences did not hold (metis.h, bf16x_copy_made)
   size_t prefix_device_bytes = 0;  // prefix snapshots kept in device memory (what the model leaves over)
   size_t prefix_host_bytes = 0;    // and in pinned host memory, when the device share is full
   double decode_ceiling_tps = 0;   // bandwidth / bytes read per token: the most tokens per second one stream can make
@@ -187,15 +189,19 @@ struct WeightBytes {
   size_t loaded() const noexcept { return plain + projections + head + experts; }
   size_t total() const noexcept { return loaded() + derived + bf16x; }
 };
-WeightBytes weight_bytes(const MetisConfig& config, lx_wtype target, bool bf16x_decode = false);
+// With `dropped` (copy units the plan leaves out), only the copies not named there count.
+WeightBytes weight_bytes(const MetisConfig& config, lx_wtype target, bool bf16x_decode = false,
+                         const std::set<std::string>* dropped = nullptr);
 // Bytes of one projection of `rows` x `cols` held in `format` (an expert stack is rows = E * N): its data and
 // scales, and for an NVFP4 stack of `stack_experts` experts their per-expert globals. BF16X is the encoding's
 // fixed rows (lx_bf16x_row_bytes; the rare overflow records are not counted), 0 without a backend that has it.
 size_t projection_bytes(lx_wtype format, int64_t rows, int64_t cols, int64_t stack_experts = 0);
 // What one stream reads per decoded token in a target format, and the most tokens per second bandwidth allows:
 // every layer's dense weights and its routed experts' share once per pass, the head once, and the Mamba state.
-double decode_bytes_per_token(const MetisConfig& config, lx_wtype target, bool bf16x_decode);
-double decode_ceiling_tps(const DeviceInfo& device, const MetisConfig& config, lx_wtype target, bool bf16x_decode);
+double decode_bytes_per_token(const MetisConfig& config, lx_wtype target, bool bf16x_decode,
+                             const std::set<std::string>* dropped = nullptr);
+double decode_ceiling_tps(const DeviceInfo& device, const MetisConfig& config, lx_wtype target, bool bf16x_decode,
+                          const std::set<std::string>* dropped = nullptr);
 // Whether the loaded backend has the BF16X kernels (the CUDA one does).
 bool bf16x_available();
 // Persistent state: the Mamba-2 conv and SSM state of one slot, and the attention KV cache of one slot

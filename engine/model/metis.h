@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -53,12 +54,20 @@ struct FeatureTap {
 // construction (in a BF16 model all of them; in a quantized one the wide tensors its recipe keeps), and decode reads
 // it (the same logits to the bit at ~1.3x fewer bytes) while prefill keeps reading the BF16 copy. The plan budgets
 // the second copy. Weights held as BF16X (loaded with that target) need no flag: decode reads them as they are, and
-// prefill expands each one to a bf16 scratch first.
+// prefill expands each one to a bf16 scratch first. bf16x_dropped names the copy units the plan left out because
+// the room beside its sequences did not hold them (bf16x_copy_made says which are made).
 struct ModelFormats {
   lx_wtype dense = LX_W_BF16, experts = LX_W_BF16, latent_up = LX_W_BF16;
   lx_math prefill_math = LX_MATH_BF16, expert_math = LX_MATH_BF16;
   bool bf16x_decode = false;
+  std::set<std::string> bf16x_dropped;
 };
+
+// The BF16X copy of one unit is made: a projection by its checkpoint name, a layer's routed experts by
+// "layers.N.moe.local_experts" (both stacks, which the decode kernel reads together), the LM head by "lm_head".
+inline bool bf16x_copy_made(const ModelFormats& f, const std::string& unit) {
+  return f.bf16x_decode && !f.bf16x_dropped.count(unit);
+}
 
 class MetisModel {
  public:

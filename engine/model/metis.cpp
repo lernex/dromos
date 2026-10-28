@@ -339,7 +339,7 @@ Linear make_linear(Impl& m, const ModelWeights& weights, const std::string& name
   if (!bias.empty()) l.bias = need(weights, bias, LX_BF16, {N});
   l.N = static_cast<int>(N);
   l.K = static_cast<int>(K);
-  if (m.formats.bf16x_decode && w->type == LX_W_BF16 && bf16x_smaller(K)) l.x16 = encode_bf16x(m, w->data, N, K);
+  if (bf16x_copy_made(m.formats, name) && w->type == LX_W_BF16 && bf16x_smaller(K)) l.x16 = encode_bf16x(m, w->data, N, K);
   if (w->type == LX_W_BF16X)
     m.unpack_bytes = std::max(m.unpack_bytes, static_cast<size_t>(N) * static_cast<size_t>(K) * 2);
   return l;
@@ -696,7 +696,7 @@ MetisModel::MetisModel(const MetisConfig& c, const ModelWeights& weights, const 
       const int64_t gu_rows = static_cast<int64_t>(E) * 2 * m.Iexp, dn_rows = static_cast<int64_t>(E) * Lat;
       layer.gate_up = expert_stack(m, weights, e + "local_experts.gate_up", E, 2 * m.Iexp, Lat, formats.experts);
       layer.down = expert_stack(m, weights, e + "local_experts.down", E, Lat, m.Iexp, formats.experts);
-      if (formats.bf16x_decode && layer.gate_up.type == LX_W_BF16 && layer.down.type == LX_W_BF16) {
+      if (bf16x_copy_made(formats, e + "local_experts") && layer.gate_up.type == LX_W_BF16 && layer.down.type == LX_W_BF16) {
         layer.gate_up_x16 = encode_bf16x(m, layer.gate_up.data, gu_rows, Lat);
         layer.down_x16 = encode_bf16x(m, layer.down.data, dn_rows, m.Iexp);
       }
