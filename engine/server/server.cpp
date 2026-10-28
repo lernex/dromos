@@ -680,6 +680,8 @@ bool Server::run() {
       job.request.sampling.logprobs = job.logprobs;
       job.request.sampling.top_logprobs = job.top_logprobs;
       job.request.thinking = false;
+      // A benchmark client asks for exactly max_tokens, as lernex bench does in process (cli/bench.cpp).
+      job.request.ignore_eos = body.value("ignore_eos", false);
       if (!body.contains("prompt") || body["prompt"].is_null()) invalid("prompt is required", "prompt");
       const json& prompt = body["prompt"];
       if (prompt.is_string()) {
