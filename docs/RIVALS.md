@@ -94,17 +94,30 @@ is where the high p90 TTFT comes from. Per-stream decode at 64 streams is 44 tok
 
 ### 1b. Structured output (JSON schema, 32 in flight, 64 requests, 160 generated)
 
-| Mode | SGLang e2e tok/s | Valid replies | Lernex |
+| Mode | SGLang e2e tok/s | Valid replies | Lernex (commit `c64e94f`, not final main) |
 |---|---|---|---|
-| Free (no `response_format`) | 789 | 49 of 64 | pending final main |
-| `json_schema` (xgrammar) | 957 | 64 of 64 | pending final main |
+| Free (no `response_format`) | 789 | 49 of 64 | 1,215 and 1,483 (two waves), 46 and 48 of 64 valid |
+| `json_schema` (xgrammar) | 957 | 64 of 64 | 1,357 and 1,380 (two waves), 64 of 64 valid, 1.42 to 1.44 times SGLang |
 
-Lernex does not support JSON-schema output. `engine/server/server.cpp` rejects any
-`response_format` whose type is not `text` with HTTP 400, `response_format json_schema is not
-supported yet` (around lines 158 to 160). Lernex's only constrained decoding is the tool-call
-grammar in `engine/runtime/tool_grammar.cpp`, which forces the Metis tool-call format and is not
-JSON. This is a finding: the cell is unsupported on Lernex, not a number. The final run confirms
-the 400 with the same script.
+Lernex now enforces `response_format` `json_object` and `json_schema` on chat and completions:
+a schema compiles to a byte-level pushdown automaton, every decode step masks the logits of the
+constrained rows through `lx_mask_logits`, and the reply stops when its grammar completes. Lernex
+never speculates constrained rows, since the serving engine has no speculative path.
+
+The free and constrained e2e rates above are not a like-for-like step cost: a free reply runs
+longer (54 to 56 tokens) than a constrained one (38 to 42 tokens). The step cost at equal length,
+64 requests with 32 in flight, is the free wave with `ignore_eos` at 42 tokens: constrained
+1,384 tok/s against free 1,443 tok/s (95.9 percent, second round; the first round's free wave was
+cold at 534 tok/s and is not used). Free rates move about 10 percent between runs, so the margin
+over the 95 percent bar is thin.
+
+The mask costs per decode step at 32 in flight: p50 141 microseconds and p99 479 microseconds once
+warm (13 milliseconds at p99 in the first, cold wave). Of the constrained rows, 4.7 percent have
+exactly one allowed token, two per reply; strict jump-forward is not implemented because it would
+only merge adjacent forced tokens and their adjacency was not measured. Grammar compile for this
+schema is 0.015 milliseconds. Logits and KL are unchanged on the unconstrained path: prefill and
+decode logits match the `orch` baseline byte for byte on all three reference prompts, and
+`lernex spec-check` is bit-identical on every row (40 of 40).
 
 ### 1c. Plain batched decode (independent 512-token prompts, 256 generated)
 
@@ -211,10 +224,7 @@ main.
 
 Pending final main. The only losses known before the Lernex run, from the code and the rival side:
 
-1. **Structured output (JSON schema).** Lernex does not have it (HTTP 400). SGLang runs
-   xgrammar-constrained decode at 957 tok/s with 64 of 64 valid replies. This is a missing feature,
-   not a tuning gap.
-2. **Concurrency on 16 GB.** Lernex's default plan holds 37 BF16 sequences at 8,192 context, and
+1. **Concurrency on 16 GB.** Lernex's default plan holds 37 BF16 sequences at 8,192 context, and
    21 Logos FP8 sequences at 2,560 context. SGLang holds 53 Praxis and 8 Logos. The Lernex final
    run must use the tuned settings below, or it under-reports the engine.
 
@@ -258,7 +268,7 @@ scripts/remote.sh rivals x 'PORT=8080 timeout 1500 tools/rivals/serve.sh lernex 
   ~/kronos-scratch/logos/engines/praxis/fp8 --sequences 128 --context 2560'
 scripts/remote.sh rivals x 'PORT=8080 timeout 1500 tools/rivals/serve.sh lernex lernex-logos-fp8 \
   ~/.cache/lernex/models/Lernex/Metis-1.6-Logos-FP8 --sequences 128 --context 2560'
-# structured output: expect HTTP 400 from lernex serve
+# structured output: json_schema on lernex serve, 64 of 64 valid expected
 scripts/remote.sh rivals x 'CELLS=structured PORT=8080 timeout 600 tools/rivals/serve.sh lernex lernex-structured \
   ~/.cache/lernex/models/Lernex/Metis-1.6-Praxis'
 # single stream and CPU
