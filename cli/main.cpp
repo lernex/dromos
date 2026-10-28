@@ -3,6 +3,8 @@
 #include <cstring>
 #include <exception>
 
+#include "lx_version.h"
+
 int cmd_inspect(int argc, char** argv);
 int cmd_eval(int argc, char** argv);
 int cmd_doctor(int argc, char** argv);
@@ -31,6 +33,7 @@ void usage() {
                "                                            the OpenAI API on this machine\n"
                "  pull MODEL                                download a model into the cache\n"
                "  list                                      the models and which are installed\n"
+               "  version                                   the version, the release flavor and the commit\n"
                "  bench MODEL [--streams 1,8,32,64] [--prompt-tokens N] [--gen-tokens N]\n"
                "                                            throughput of the engine on this GPU\n"
                "  doctor [MODEL_DIR] [--context N] [--sequences N]\n"
@@ -60,6 +63,11 @@ int main(int argc, char** argv) {
     return 2;
   }
   const char* cmd = argv[1];
+  // Answered before anything else: no backend is loaded, and no model is looked for.
+  if (!std::strcmp(cmd, "--version") || !std::strcmp(cmd, "version")) {
+    std::printf("lernex %s (%s, %s)\n", LX_VERSION_STRING, LX_FLAVOR_STRING, LX_GIT_SHA_STRING);
+    return 0;
+  }
   try {
     if (!std::strcmp(cmd, "inspect")) return cmd_inspect(argc - 1, argv + 1);
     if (!std::strcmp(cmd, "eval")) return cmd_eval(argc - 1, argv + 1);
