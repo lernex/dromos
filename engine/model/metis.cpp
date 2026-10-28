@@ -155,6 +155,11 @@ struct MetisModel::Impl {
   void* moe_workspace = nullptr;
   offload::ExpertOffload* offload = nullptr;  // the routed experts, when they run offloaded
   FILE* route_trace = nullptr;                // LX_ROUTE_TRACE: every layer's routing, for the placement stats
+  FILE* linear_trace = nullptr;               // LX_LINEAR_TRACE: every decode-sized product's shape, in issue order
+  // LX_SERIAL_DECODE: a decode step runs on the one stream in issue order, its side streams joined into it, so the
+  // kernels of a profile come out in the order the products were issued (the same kernels, without the overlap).
+  bool serial_decode = false;
+  bool side_streams(int T) const { return T <= kGemvRows && !serial_decode; }
   // With the trace: the next layer's routing predicted from the streams as they leave this layer
   // (the next layer's MoE read, latent_down and router applied early, with this layer's features).
   float *pred_mixed = nullptr, *pred_router_in = nullptr, *pred_logits = nullptr,
@@ -229,6 +234,7 @@ struct MetisModel::Impl {
   ~Impl() {
     for (auto& [key, prog] : programs) lx_program_destroy(prog);
     if (route_trace) std::fclose(route_trace);
+    if (linear_trace) std::fclose(linear_trace);
     for (void* e : fork_events) lx_rt_event_destroy(e);
     for (void* e : join_events) lx_rt_event_destroy(e);
     if (side) lx_rt_stream_destroy(side);
@@ -545,6 +551,11 @@ MetisModel::MetisModel(const MetisConfig& c, const ModelWeights& weights, const 
     m.route_trace = std::fopen(trace, "wb");
     if (!m.route_trace) throw std::runtime_error(std::string("cannot open ") + trace);
   }
+  if (const char* trace = std::getenv("LX_LINEAR_TRACE")) {
+    m.linear_trace = std::fopen(trace, "w");
+    if (!m.linear_trace) throw std::runtime_error(std::string("cannot open ") + trace);
+  }
+  m.serial_decode = std::getenv("LX_SERIAL_DECODE") != nullptr;
   m.S = c.n_streams;
   m.D = c.hidden_size;
   m.L_layers = c.num_hidden_layers;
@@ -1001,6 +1012,9 @@ void linear(Impl& m, const Linear& l, const void* x, lx_dtype x_dtype, int ld_x,
             int M, void* s, float alpha = 1.0f, float beta = 0.0f, int rows_per_token = 1) {
   const bool decode_step = M / rows_per_token <= Impl::kGemvRows;
   if (M <= Impl::kGemvRows || decode_step) {
+    if (m.linear_trace)
+      std::fprintf(m.linear_trace, "gemv %d %d %s %d %s %s %d\n", l.N, l.K, l.x16 ? "BF16X" : format_name(l.w.type), M,
+                   x_dtype == LX_F32 ? "f32" : "bf16", y_dtype == LX_F32 ? "f32" : "bf16", beta != 0.0f ? 1 : 0);
     const size_t xs = x_dtype == LX_F32 ? 4 : 2, ys = y_dtype == LX_F32 ? 4 : 2;
     for (int r0 = 0; r0 < M; r0 += Impl::kGemvRows) {
       const int rows = std::min(Impl::kGemvRows, M - r0);
@@ -1140,7 +1154,7 @@ void memory_write(Impl& m, const MetisConfig& c, int T, int pass, int anchor, in
   const int ld_bank = m.Emax * Mm;
   // The key and the value read the same entry and write their own banks. On a decode-sized step the value runs
   // on value_side beside the key, and the key joins it before the function returns.
-  if (T <= Impl::kGemvRows) {
+  if (m.side_streams(T)) {
     check(lx_rt_event_record(m.value_fork, s), "event record");
     check(lx_rt_stream_wait(m.value_side, m.value_fork), "stream wait");
     linear(m, m.m_value, m.entry, LX_F32, Mm, m.bank_v + n_entries * Mm, LX_F32, ld_bank, T, m.value_side);
@@ -1725,6 +1739,7 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
   const MetisConfig& c = cfg_;
   const int S = m.S, D = m.D, R = m.R, Lat = m.Lat, E = m.E;
 
+  if (m.linear_trace) std::fprintf(m.linear_trace, "step %d\n", T);
   LX_CHECK(lx_embed_streams(m.embedding, m.d_tokens, m.stream_emb, m.streams, T, S, D, s));
   LX_CHECK(lx_stream_mean(m.streams, m.previous, T, S, D, s));
   lx_rt_memset(m.history, 0, static_cast<int64_t>(sizeof(float) * T * R), s);
@@ -1744,7 +1759,7 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
       // left them and write nothing the mixer touches, so on a decode-sized step they run on route_side and
       // join before the MoE reads them. A larger step keeps its order: its GEMMs share one workspace.
       memory_retrieve(m, T, n_entries, s);
-      const bool beside = T <= Impl::kGemvRows;
+      const bool beside = m.side_streams(T);
       void* rs = beside ? m.route_side : s;
       if (beside) {
         check(lx_rt_event_record(m.route_fork, s), "event record");
@@ -1824,7 +1839,7 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
       }
       // The shared expert's gate-up and activation read only latent_bf, so on a decode-sized step they run on
       // shared_side while the routed experts run, and join before shared_down adds into routed.
-      const bool shared_beside = T <= Impl::kGemvRows;
+      const bool shared_beside = m.side_streams(T);
       if (shared_beside) {
         check(lx_rt_event_record(m.shared_fork, s), "event record");
         check(lx_rt_stream_wait(m.shared_side, m.shared_fork), "stream wait");
@@ -1852,7 +1867,7 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
       linear(m, layer.shared_down, m.shared_bf, LX_BF16, m.Ishared, m.routed, LX_F32, Lat, T, s, 1.0f, 1.0f);
       // moe_summary reads the routing and the expert embeddings, not routed, so on a decode-sized step it runs
       // on moe_side beside latent_up, and joins before the history update reads summary
-      const bool moe_beside = T <= Impl::kGemvRows;
+      const bool moe_beside = m.side_streams(T);
       if (moe_beside) {
         check(lx_rt_event_record(m.moe_fork, s), "event record");
         check(lx_rt_stream_wait(m.moe_side, m.moe_fork), "stream wait");
