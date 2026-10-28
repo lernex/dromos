@@ -211,6 +211,11 @@ struct MetisModel::Impl {
   int next_parts_cap = 0;
   std::map<lx_program*, std::vector<std::pair<int, std::string>>> program_names;
   int traced_steps = 0;
+  // The Mamba decode step as one kernel (lx_mamba_decode_step), where the backend has it: one token per sequence,
+  // not speculative. mamba_sync holds its group arrival counters (kept zero by the kernel). LX_MAMBA_SPLIT (any value
+  // but 0) keeps the three kernels, for A/B.
+  bool fused_mamba = false;
+  int32_t* mamba_sync = nullptr;
 
   template <typename T>
   T* alloc(size_t count, size_t elem = sizeof(T)) {
@@ -637,6 +642,13 @@ MetisModel::MetisModel(const MetisConfig& c, const ModelWeights& weights, const 
     m.route_in = route_without_difference(m, m.m_route, D, R);
     build_bank_projection(m, weights, dm);
   }
+  // The fused Mamba decode step: a probe with no sequences (every backend answers 0 to that, and one without the
+  // entry answers LX_ERR_NOT_SUPPORTED).
+  const char* split = std::getenv("LX_MAMBA_SPLIT");
+  m.fused_mamba = !(split && std::strcmp(split, "0") != 0) &&
+                  lx_mamba_decode_step(nullptr, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                       nullptr, nullptr, 0.0f, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0, nullptr) == 0;
+  if (m.fused_mamba) m.mamba_sync = m.alloc<int32_t>(static_cast<size_t>(max_tokens) * m.G);
 
   size_t unpack_experts = 0;  // the bf16 bytes of an expert layer's BF16X stacks, expanded for prefill
   for (int i = 0; i < m.L_layers; ++i) {
@@ -1757,25 +1769,35 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
       } else {
         const int gn = m.G * m.N;
         linear(m, layer.in_proj, m.h_bf, LX_BF16, D, m.zxbcdt, LX_F32, m.proj, T, s);
-        if (spec) {
-          // the step's tokens become pending positions (kernels.h, "Speculative decoding")
-          LX_CHECK(lx_spec_conv1d(m.zxbcdt + m.I, m.proj, layer.conv_w, layer.conv_b, m.conv_state[slot_index],
-                                  m.conv_hist[slot_index], m.d_slots, m.d_has_state, m.d_fold, m.d_keep, m.d_cu, n_seq,
-                                  m.xbc, m.conv_dim, m.W, s));
-          LX_CHECK(lx_spec_ssm_scan(m.xbc, m.conv_dim, m.zxbcdt + m.I + m.conv_dim, m.proj, m.xbc + m.I,
-                                    m.xbc + m.I + gn, m.conv_dim, layer.A_log, layer.D, layer.dt_bias,
-                                    m.ssm_state[slot_index], m.ssm_hist[slot_index], m.d_slots, m.d_has_state,
-                                    m.d_fold, m.d_keep, m.d_cu, n_seq, m.ssm_y, m.H, m.Pd, m.G, m.N, s));
+        // A decode step (one token per sequence, not speculative) is one kernel, lx_mamba_decode_step: the conv, the
+        // scan and the gated norm with the same bits as the three below, which serve everything else (prefill, verify
+        // steps, LX_MAMBA_SPLIT, and backends without the entry).
+        if (!spec && T == n_seq && m.fused_mamba) {
+          LX_CHECK(lx_mamba_decode_step(m.zxbcdt, m.proj, layer.conv_w, layer.conv_b, m.conv_state[slot_index],
+                                        m.ssm_state[slot_index], layer.A_log, layer.D, layer.dt_bias, m.d_slots,
+                                        m.d_has_state, layer.norm_w, c.mamba_norm_eps, m.ssm_y, m.normed_bf,
+                                        m.mamba_sync, n_seq, m.H, m.Pd, m.G, m.N, m.W, s));
         } else {
-          LX_CHECK(lx_conv1d_varlen(m.zxbcdt + m.I, m.proj, layer.conv_w, layer.conv_b, m.conv_state[slot_index],
-                                    m.d_slots, m.d_has_state, m.d_cu, n_seq, m.xbc, m.conv_dim, m.W, s));
-          LX_CHECK(lx_ssm_scan_varlen(m.xbc, m.conv_dim, m.zxbcdt + m.I + m.conv_dim, m.proj, m.xbc + m.I,
+          if (spec) {
+            // the step's tokens become pending positions (kernels.h, "Speculative decoding")
+            LX_CHECK(lx_spec_conv1d(m.zxbcdt + m.I, m.proj, layer.conv_w, layer.conv_b, m.conv_state[slot_index],
+                                    m.conv_hist[slot_index], m.d_slots, m.d_has_state, m.d_fold, m.d_keep, m.d_cu, n_seq,
+                                    m.xbc, m.conv_dim, m.W, s));
+            LX_CHECK(lx_spec_ssm_scan(m.xbc, m.conv_dim, m.zxbcdt + m.I + m.conv_dim, m.proj, m.xbc + m.I,
                                       m.xbc + m.I + gn, m.conv_dim, layer.A_log, layer.D, layer.dt_bias,
-                                      m.ssm_state[slot_index], m.d_slots, m.d_has_state, m.d_cu, n_seq, m.ssm_y, m.H,
-                                      m.Pd, m.G, m.N, s));
+                                      m.ssm_state[slot_index], m.ssm_hist[slot_index], m.d_slots, m.d_has_state,
+                                      m.d_fold, m.d_keep, m.d_cu, n_seq, m.ssm_y, m.H, m.Pd, m.G, m.N, s));
+          } else {
+            LX_CHECK(lx_conv1d_varlen(m.zxbcdt + m.I, m.proj, layer.conv_w, layer.conv_b, m.conv_state[slot_index],
+                                      m.d_slots, m.d_has_state, m.d_cu, n_seq, m.xbc, m.conv_dim, m.W, s));
+            LX_CHECK(lx_ssm_scan_varlen(m.xbc, m.conv_dim, m.zxbcdt + m.I + m.conv_dim, m.proj, m.xbc + m.I,
+                                        m.xbc + m.I + gn, m.conv_dim, layer.A_log, layer.D, layer.dt_bias,
+                                        m.ssm_state[slot_index], m.d_slots, m.d_has_state, m.d_cu, n_seq, m.ssm_y, m.H,
+                                        m.Pd, m.G, m.N, s));
+          }
+          LX_CHECK(lx_gated_rmsnorm(m.ssm_y, m.zxbcdt, m.proj, layer.norm_w, m.normed_bf, T, m.I, m.G,
+                                    c.mamba_norm_eps, s));
         }
-        LX_CHECK(lx_gated_rmsnorm(m.ssm_y, m.zxbcdt, m.proj, layer.norm_w, m.normed_bf, T, m.I, m.G,
-                                  c.mamba_norm_eps, s));
         linear(m, layer.out_proj, m.normed_bf, LX_BF16, m.I, m.update, LX_F32, D, T, s);
       }
       LX_CHECK(lx_mhc_write(m.mixed, mc + S * S + S, m.update, m.streams, T, S, D, s));
