@@ -217,3 +217,29 @@ def test_qkv_column_slice_of_wider_buffer(lx):
     # The 20-token sequence takes the tensor-core kernel, whose q rows are then not 8-byte aligned.
     check_step(lx, H=8, KVH=2, Dh=64, capacity=32, n_slots=2, seqs=[(1, 3, 5), (0, 0, 20)], seed=11,
                col=7, pad=21)
+
+
+@pytest.mark.parametrize("ctx", [1, 97, 784, 1500])
+def test_decode_token_is_bit_identical_alone_and_in_a_batch(lx, ctx):
+    """Every sequence's decode output is the same bits alone and in batches of 2, 8, 32 and 64 sequences. The cluster
+    split is fixed by the architecture (attention.cu), so the step's size cannot change a token's reduction. The
+    rewritten cache rows are identical, so the runs share one cache."""
+    H, KVH, Dh, n = 32, 8, 64, 64
+    cap = ctx + 8
+    width = (H + 2 * KVH) * Dh
+    torch.manual_seed(ctx)
+    qkv = torch.randn(n, width, device=DEVICE)
+    k, v = caches(n, cap, KVH, Dh, [(s, ctx, 1) for s in range(n)])
+    slots = torch.arange(n, dtype=torch.int32, device=DEVICE)
+    starts = torch.full((n,), ctx, dtype=torch.int32, device=DEVICE)
+    one = torch.tensor([0, 1], dtype=torch.int32, device=DEVICE)
+    alone = torch.stack([
+        run(lx, qkv[s:s + 1], 0, k, v, slots[s:s + 1], starts[s:s + 1], one, H, KVH, Dh)[0] for s in range(n)
+    ])
+    for bs in (2, 8, 32, 64):
+        cu = torch.arange(bs + 1, dtype=torch.int32, device=DEVICE)
+        out = run(lx, qkv[:bs], 0, k, v, slots[:bs], starts[:bs], cu, H, KVH, Dh)
+        differing = int((out != alone[:bs]).sum().item())
+        assert differing == 0, (
+            f"context {ctx}: {differing} of {bs * H * Dh} values differ between a batch of {bs} and alone"
+        )

@@ -8,13 +8,13 @@
 // dims (one 16-byte load), so a dot product is a 3-step shuffle. Every group keeps its own
 // online-softmax state, merged in registers within a warp and through shared memory across warps.
 //
-// Few (token, kv head) items, as in decode: the 8 blocks of a cluster share each item. Block r
-// takes cache tiles r, r + 8, ... and the 8 partial softmax states are merged through distributed
-// shared memory, so a single decode token runs on 8 SMs per kv head instead of one. Many items, as
-// in prefill: each block takes whole items and the cluster never synchronizes. The choice depends
-// on T, which is device data, so every block of a cluster makes the same one. Below sm_90 there are
-// no clusters: the host passes clusters = 0 and every block takes whole items, which is the same
-// result (the split only changes which SM does which tile).
+// On sm_90 and up, the 8 blocks of a cluster share each (token, kv head) item: block r takes cache
+// tiles r, r + 8, ... and the 8 partial softmax states are merged through distributed shared memory,
+// so a decode token runs on 8 SMs per kv head. The rule is the architecture's alone, never the
+// step's: a sequence's reduction order must not change with what else runs beside it, so a token's
+// bits are the same alone and in any batch (test_attention.py checks this). Below sm_90 there are no
+// clusters (the host passes clusters = 0) and each block takes whole items, tiles 0, 1, ... That is a
+// different reduction order from the cluster split, so bits are per architecture, not across them.
 //
 // The C ABI has no token count, so both kernels read T = cu_seqlens[n_seq] on the device and
 // grid-stride over the work. Launch sizes are constants; the grid is a multiple of the cluster size.
@@ -33,7 +33,6 @@ constexpr int kWarps = kThreads / 32;
 constexpr int kLanesPerKey = 8;                            // lanes sharing one key, 8 dims each
 constexpr int kKeysPerTileStep = kThreads / kLanesPerKey;  // keys handled per step of a tile
 constexpr int kSplit = 8;                                  // blocks per item in split mode; the cluster size
-constexpr int kSplitBelow = 64;                            // fewer items than this: split each item
 constexpr int kTile = 4;                                   // query heads per pass over the cache
 constexpr int kBlockN = 64;                                // cache positions per shared-memory tile
 constexpr int kStages = 3;                                 // cp.async pipeline depth
@@ -126,8 +125,9 @@ __global__ void LX_CLUSTER_DIMS(kSplit) __launch_bounds__(kThreads) attention_ke
   const int T = cu_seqlens[n_seq];
 
   // Split mode: the cluster's blocks share each item; block `rank` takes tiles rank, rank + S, ...
-  // Otherwise each block takes whole items and tiles 0, 1, ... Uniform across the cluster.
-  const bool split = clusters && T * KVH < kSplitBelow;
+  // Otherwise each block takes whole items and tiles 0, 1, ... Uniform across the cluster, and fixed
+  // by the architecture: it must not depend on T, or a token's reduction would change with its batch.
+  const bool split = clusters != 0;
   const int S = split ? kSplit : 1;
   const int r0 = split ? rank : 0;
   const int first = split ? blockIdx.x / kSplit : blockIdx.x;
