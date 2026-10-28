@@ -21,6 +21,10 @@ constexpr int kMaxStreams = 8;
 // same constants for its own decode kernels.
 constexpr int kDecodeTokens = 8;
 
+// The mhc kernels spread a row over blocks up to this many tokens. Eight stopped at the 8-stream decode, so a 32-stream
+// step ran one block per token (the serial row walk the spread kernels exist to avoid): 14 us per write, 9 us per read.
+constexpr int kMhcSpreadTokens = 64;
+
 // A decode token's row is split over a cluster of this many blocks, one column slice each. Eight is
 // the largest portable cluster size.
 constexpr int kCluster = 8;
@@ -222,7 +226,7 @@ namespace {
 // Whether the decode token's cluster path can run: a short decode step, a slice that fits the block,
 // and a device with clusters.
 bool mhc_cluster_ok(int T, int D) {
-  return T <= kDecodeTokens && slice_width(D) <= kClusterThreads && lx_arch() >= lx::kClusterArch;
+  return T <= kMhcSpreadTokens && slice_width(D) <= kClusterThreads && lx_arch() >= lx::kClusterArch;
 }
 
 int launch_mhc_read(bool cluster, const float* streams, const float* matrix, const float* read, const void* norm_w,
@@ -317,7 +321,7 @@ const lx::TunableRegistration reg_mhc_read("mhc_read", {"block", "cluster8"}, &t
 extern "C" int lx_mhc_write(const float* mixed, const float* write, const float* update, float* streams, int T,
                             int S, int D, void* stream) {
   if (T <= 0 || S <= 0 || D <= 0) return 0;
-  if (T <= kDecodeTokens) {
+  if (T <= kMhcSpreadTokens) {
     const dim3 grid(static_cast<unsigned>((D + 255) / 256), static_cast<unsigned>(T));
     mhc_write_columns_kernel<<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(
         mixed, write, update, streams, S, D);
