@@ -659,7 +659,7 @@ void Engine::Impl::end(const std::shared_ptr<Sequence>& s, FinishReason reason, 
   if (s->ended) return;
   s->ended = true;
   if (s->parser && reason != FinishReason::Cancelled && reason != FinishReason::Error) {
-    std::string tail = show_held ? s->held + s->detok->flush() : std::string();
+    std::string tail = show_held ? s->held + s->detok->finish() : std::string();
     s->held.clear();
     TokenDelta d;
     d.token = -1;

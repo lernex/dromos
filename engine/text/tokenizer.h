@@ -29,6 +29,9 @@ class Tokenizer {
     virtual ~Stream() = default;
     virtual std::string push(int32_t id) = 0;
     virtual std::string flush() = 0;
+    // flush() at the end of a reply. A character the reply stopped inside (max_tokens, the context, a
+    // stop) is dropped rather than shown as U+FFFD; the rest is what flush() returns.
+    virtual std::string finish() = 0;
   };
   virtual std::unique_ptr<Stream> stream(bool skip_special = false) const = 0;
 

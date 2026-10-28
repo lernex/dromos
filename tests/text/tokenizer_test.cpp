@@ -163,3 +163,37 @@ TEST_CASE("encode speed, single thread") {
               total_ids);
   CHECK(best > 0.0);
 }
+
+TEST_CASE("a reply that stops inside a character ends without U+FFFD") {
+  // The model folder alone is enough: no golden needed. Some vocabulary entries are one byte of a multi-byte
+  // character; alone they decode to U+FFFD, and a reply cut right after one must not show it.
+  if (model_dir().empty()) {
+    std::printf("reply-end test skipped: set LX_TEXT_MODEL\n");
+    return;
+  }
+  auto tok = Tokenizer::load(model_dir());
+  const std::string replacement = "\xEF\xBF\xBD";
+  int32_t partial = -1;
+  for (int32_t id = 0; id < tok->vocab_size() && partial < 0; ++id) {
+    if (tok->is_special(id) || tok->decode({id}, false).find(replacement) == std::string::npos) continue;
+    auto probe = tok->stream(false);
+    // A lead byte: push() holds it back and finish() drops it, so nothing is shown at all. (A complete character
+    // is shown by push(), and a stray continuation byte by push() as U+FFFD.)
+    if (probe->push(id).empty() && probe->finish().empty()) partial = id;
+  }
+  REQUIRE(partial >= 0);
+  auto cut = tok->stream(false);
+  CHECK(cut->push(partial).empty());
+  CHECK(cut->finish().find(replacement) == std::string::npos);
+  auto flushed = tok->stream(false);
+  flushed->push(partial);
+  CHECK(flushed->flush() == replacement);  // flush keeps the transformers decode: the replacement is still there
+
+  // A finished reply is unchanged: the text before the cut is what the stream showed, and finish adds nothing.
+  const auto ids = tok->encode("a\xE4\xBD\xA0" "b", false);
+  auto whole = tok->stream(false);
+  std::string acc;
+  for (int32_t id : ids) acc += whole->push(id);
+  acc += whole->finish();
+  CHECK(acc == "a\xE4\xBD\xA0" "b");
+}

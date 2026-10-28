@@ -129,6 +129,10 @@ std::string utf8_lossy(std::string_view s) {
   return out;
 }
 
+std::string utf8_lossy_final(std::string_view s) {
+  return utf8_lossy(s.substr(0, s.size() - utf8_incomplete_tail(s)));
+}
+
 size_t utf8_incomplete_tail(std::string_view s) {
   const size_t n = s.size();
   for (size_t back = 1; back <= 3 && back <= n; ++back) {

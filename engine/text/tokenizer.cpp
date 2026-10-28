@@ -167,6 +167,12 @@ class BpeTokenizer final : public Tokenizer {
       return out;
     }
 
+    std::string finish() override {
+      std::string out = utf8_lossy_final(pending_);
+      pending_.clear();
+      return out;
+    }
+
    private:
     const BpeTokenizer& tok_;
     bool skip_special_;
