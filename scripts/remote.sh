@@ -24,7 +24,9 @@ host=${LX_HOST:-lernex}
 here=$(cd "$(dirname "$0")/.." && pwd)
 remote="lernex-engine-dev/$slot"
 ssh "$host" "mkdir -p $remote"
-rsync -az --delete --exclude 'build*/' --exclude out/ --exclude .git/ --exclude __pycache__/ --exclude .pytest_cache/ "$here/" "$host:$remote/"
+# Changed files are found by checksum and land with the server's current time, not the Mac's: a copied mtime can
+# be older than the object built from the previous version, and ninja then links the stale object.
+rsync -rlpzc --no-times --delete --exclude 'build*/' --exclude out/ --exclude .git/ --exclude __pycache__/ --exclude .pytest_cache/ "$here/" "$host:$remote/"
 bdir=${LX_BUILD_DIR:-build}
 cfg=""
 if [ -n "${LX_ARCHS:-}" ]; then
