@@ -150,7 +150,7 @@ struct Config {
   // epilogue then overlaps the other's mainloop. The output write is first order here: at K = 2048 an f32
   // result carries 1024 FLOPs per byte, so at the FP4 peak the stores alone need most of DRAM's bandwidth.
   static constexpr int kMinBlocks = 2 * (kSmem + 1024) <= 102400 && kThreads <= 128 ? 2 : 1;
-  static_assert(RB == 128 || (RB == 64 && T::kLdm), "64-byte rows: homogeneous kinds only");
+  static_assert(RB == 128 || RB == 256 || (RB == 64 && T::kLdm), "row bytes: 128 or 256 (or 64 for homogeneous kinds)");
 };
 
 __device__ __forceinline__ float bf16_lo(uint32_t w) { return __uint_as_float(w << 16); }
@@ -346,8 +346,8 @@ __device__ __forceinline__ void gemm_body(const typename Prob::Params& pp, const
     } else if constexpr (T::kABits == 16) {
 #pragma unroll
       for (int mt = 0; mt < kMT; ++mt) {
-        const uint4 v = mma::lds128(sA + swz<128, 1>(row0 + mt * 16 + fr, 4 * ks + fq));
-        const uint4 u = mma::lds128(sA + swz<128, 1>(row0 + mt * 16 + fr + 8, 4 * ks + fq));
+        const uint4 v = mma::lds128(sA + swz<C::kARow, 1>(row0 + mt * 16 + fr, 4 * ks + fq));
+        const uint4 u = mma::lds128(sA + swz<C::kARow, 1>(row0 + mt * 16 + fr + 8, 4 * ks + fq));
         f.a[mt][0][0] = v.x; f.a[mt][0][1] = u.x; f.a[mt][0][2] = v.y; f.a[mt][0][3] = u.y;
         f.a[mt][1][0] = v.z; f.a[mt][1][1] = u.z; f.a[mt][1][2] = v.w; f.a[mt][1][3] = u.w;
       }
@@ -364,8 +364,8 @@ __device__ __forceinline__ void gemm_body(const typename Prob::Params& pp, const
     } else {  // W4A8
 #pragma unroll
       for (int mt = 0; mt < kMT; ++mt) {
-        const uint2 v = mma::lds64(sA + swz<128, 2>(row0 + mt * 16 + fr, 2 * ks + (fq >> 1)) + 8 * (fq & 1));
-        const uint2 u = mma::lds64(sA + swz<128, 2>(row0 + mt * 16 + fr + 8, 2 * ks + (fq >> 1)) + 8 * (fq & 1));
+        const uint2 v = mma::lds64(sA + swz<C::kARow, 2>(row0 + mt * 16 + fr, 2 * ks + (fq >> 1)) + 8 * (fq & 1));
+        const uint2 u = mma::lds64(sA + swz<C::kARow, 2>(row0 + mt * 16 + fr + 8, 2 * ks + (fq >> 1)) + 8 * (fq & 1));
         f.a[mt][0][0] = v.x; f.a[mt][0][1] = u.x; f.a[mt][0][2] = v.y; f.a[mt][0][3] = u.y;
       }
 #pragma unroll

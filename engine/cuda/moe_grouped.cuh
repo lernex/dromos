@@ -230,6 +230,7 @@ struct Variant {
   int bm;
   GateUpFn gate_up;
   DownFn down;
+  int min_pairs = 0, max_pairs = 0;  // a variant picked for [min_pairs, max_pairs] (token, slot) pairs, see pick()
 };
 
 template <int kKind, int kArch>
@@ -256,12 +257,13 @@ LX_MOEG_FAMILY(kW4A8, 120)
 #undef LX_MOEG_FAMILY
 
 // A variant: BMxBN (BM one of the table heights), warps, stages, A bytes per row per k-tile; both stages.
-#define LX_MV(K, A, BM, BN, WM, WN, ST, RB)                                                          \
+#define LX_MVP(K, A, BM, BN, WM, WN, ST, RB, MINP, MAXP)                                             \
   Variant {                                                                                          \
     #BM "x" #BN "_w" #WM "x" #WN "_s" #ST "_k" #RB, BM,                                              \
         launch_grouped<lx::tc::K, A, BM, BN, WM, WN, ST, RB, GateUpProb, GateUpEpi>,                 \
-        launch_grouped<lx::tc::K, A, BM, BN, WM, WN, ST, RB, DownProb, DownEpi>                      \
+        launch_grouped<lx::tc::K, A, BM, BN, WM, WN, ST, RB, DownProb, DownEpi>, MINP, MAXP          \
   }
+#define LX_MV(K, A, BM, BN, WM, WN, ST, RB) LX_MVP(K, A, BM, BN, WM, WN, ST, RB, 0, 0)
 #define LX_MOEG(K, A, NAME, ...)                                    \
   template <>                                                       \
   const char* Family<lx::tc::K, A>::name() {                        \

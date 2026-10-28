@@ -310,8 +310,14 @@ const Variant& pick(int P, int E, int N, int K) {
   if (i < 0 || i >= n) {
     const int rows = std::max(1, P / E);
     i = 0;
-    for (int j = 0; j < n; ++j)
-      if (v[j].bm <= rows) i = j;
+    for (int j = 0; j < n; ++j) {
+      if (v[j].max_pairs > 0) {
+        // A variant measured for a band of batch sizes (bit-identical to the others, see its registration).
+        if (P >= v[j].min_pairs && P <= v[j].max_pairs) i = j;
+      } else if (v[j].bm <= rows) {
+        i = j;
+      }
+    }
   }
   return v[i];
 }
