@@ -204,3 +204,42 @@ def test_moe_summary_small_odd(lx, T, E, R, top_k):
     lx("moe_summary", ids, weights, emb, summary, T, R, top_k)
     want = (weights.double()[:, :, None] * emb[ids.long()].double()).sum(1)
     close(summary, want, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("E", METIS_E)
+@pytest.mark.parametrize("T", [1, 7, 300])
+def test_moe_summary_history_is_summary_then_axpby(lx, E, T):
+    """The fused launch writes the same summary and the same history, bit for bit, as moe_summary then axpby."""
+    torch.manual_seed(E * 1000 + T + 7)
+    R = 256
+    emb = torch.randn(E, R, device=DEVICE).to(torch.bfloat16).contiguous()
+    ids = torch.rand(T, E, device=DEVICE).argsort(-1)[:, :TOP_K].to(torch.int32).contiguous()
+    weights = torch.softmax(torch.randn(T, TOP_K, device=DEVICE), -1).contiguous()
+    history0 = torch.randn(T, R, device=DEVICE).contiguous()
+    summary_ref = torch.empty(T, R, device=DEVICE)
+    lx("moe_summary", ids, weights, emb, summary_ref, T, R, TOP_K)
+    history_ref = history0.clone()
+    lx("axpby_f32", history_ref, summary_ref, 0.5, 0.5, T * R)
+    summary = torch.empty(T, R, device=DEVICE)
+    history = history0.clone()
+    lx("moe_summary_history", ids, weights, emb, summary, history, 0.5, 0.5, T, R, TOP_K)
+    assert torch.equal(summary, summary_ref)
+    assert torch.equal(history, history_ref)
+
+
+@pytest.mark.parametrize("T,E,R,top_k", [(3, 5, 7, 2), (2, 9, 13, 9)])
+def test_moe_summary_history_small_odd(lx, T, E, R, top_k):
+    torch.manual_seed(T * 100 + E + 7)
+    emb = torch.randn(E, R, device=DEVICE).to(torch.bfloat16).contiguous()
+    ids = torch.rand(T, E, device=DEVICE).argsort(-1)[:, :top_k].to(torch.int32).contiguous()
+    weights = torch.softmax(torch.randn(T, top_k, device=DEVICE), -1).contiguous()
+    history0 = torch.randn(T, R, device=DEVICE).contiguous()
+    summary_ref = torch.empty(T, R, device=DEVICE)
+    lx("moe_summary", ids, weights, emb, summary_ref, T, R, top_k)
+    history_ref = history0.clone()
+    lx("axpby_f32", history_ref, summary_ref, 0.5, 0.5, T * R)
+    summary = torch.empty(T, R, device=DEVICE)
+    history = history0.clone()
+    lx("moe_summary_history", ids, weights, emb, summary, history, 0.5, 0.5, T, R, top_k)
+    assert torch.equal(summary, summary_ref)
+    assert torch.equal(history, history_ref)

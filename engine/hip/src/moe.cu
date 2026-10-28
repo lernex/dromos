@@ -186,6 +186,24 @@ __global__ void moe_summary_kernel(const int32_t* __restrict__ ids, const float*
   summary[idx] = acc;
 }
 
+// moe_summary_kernel, then history = a * history + b * summary on the same element: the CUDA kernel's twin.
+__global__ void moe_summary_history_kernel(const int32_t* __restrict__ ids, const float* __restrict__ weights,
+                                          const bf16* __restrict__ emb, float* __restrict__ summary,
+                                          float* __restrict__ history, float a, float b, int64_t n, int R,
+                                          int top_k) {
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= n) return;
+  const int64_t t = idx / R;
+  const int r = static_cast<int>(idx % R);
+  float acc = 0.0f;
+  for (int k = 0; k < top_k; ++k) {
+    const int64_t p = t * top_k + k;
+    acc += weights[p] * lx::to_f32(emb[static_cast<int64_t>(ids[p]) * R + r]);
+  }
+  summary[idx] = acc;
+  history[idx] = a * history[idx] + b * acc;
+}
+
 }  // namespace
 
 extern "C" int lx_moe_route(const float* logits, const float* selection_bias, int32_t* ids, float* weights,
@@ -221,6 +239,16 @@ extern "C" int lx_moe_experts(const void* latent, const int32_t* ids, const floa
       inter, ids, weights, static_cast<const bf16*>(down), out, L, I, top_k, row_blocks_b);
 
   hipFreeAsync(inter, s);
+  return lx::launch_status();
+}
+
+extern "C" int lx_moe_summary_history(const int32_t* ids, const float* weights, const void* expert_emb, float* summary,
+                                      float* history, float a, float b, int T, int R, int top_k, void* stream) {
+  if (T <= 0 || R <= 0) return 0;
+  const int64_t n = static_cast<int64_t>(T) * R;
+  auto s = static_cast<hipStream_t>(stream);
+  moe_summary_history_kernel<<<static_cast<unsigned int>((n + kThreads - 1) / kThreads), kThreads, 0, s>>>(
+      ids, weights, static_cast<const bf16*>(expert_emb), summary, history, a, b, n, R, top_k);
   return lx::launch_status();
 }
 

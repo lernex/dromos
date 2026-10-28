@@ -182,6 +182,15 @@ int lx_moe_summary(const int32_t* ids, const float* weights, const void* expert_
   return k.launch(stream, a, size2(ceil_div(R, 64), T), size2(64, 1));
 }
 
+int lx_axpby_f32(float* y, const float* x, float alpha, float beta, int64_t n, void* stream);
+
+int lx_moe_summary_history(const int32_t* ids, const float* weights, const void* expert_emb, float* summary,
+                           float* history, float a, float b, int T, int R, int top_k, void* stream) {
+  const int status = lx_moe_summary(ids, weights, expert_emb, summary, T, R, top_k, stream);
+  if (status != kOk) return status;
+  return lx_axpby_f32(history, summary, a, b, int64_t(T) * R, stream);
+}
+
 int64_t lx_moe_decode_workspace_bytes(int T, int I, int top_k) {
   if (T <= 0 || I <= 0 || top_k <= 0) return 0;
   const int64_t P = int64_t(T) * top_k;

@@ -193,6 +193,10 @@ LX_API int lx_moe_experts(const void* latent, const int32_t* ids, const float* w
 // summary[t, :] = sum_k weights[t, k] * expert_emb[ids[t, k], :]. expert_emb bf16 [E, R]; summary f32 [T, R].
 LX_API int lx_moe_summary(const int32_t* ids, const float* weights, const void* expert_emb, float* summary,
                           int T, int R, int top_k, void* stream);
+// lx_moe_summary, and history = a * history + b * summary on the same elements (one launch: the layer's history
+// update, glue::axpby, with the summary it reads). history f32 [T, R], updated in place.
+LX_API int lx_moe_summary_history(const int32_t* ids, const float* weights, const void* expert_emb, float* summary,
+                                  float* history, float a, float b, int T, int R, int top_k, void* stream);
 
 // ---- Decode GEMV (gemv.cu) ------------------------------------------------------------------
 // Matrix-vector products for decode steps (M <= 8 rows), memory-bound by design: one pass over

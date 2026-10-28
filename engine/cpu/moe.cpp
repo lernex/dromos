@@ -417,6 +417,30 @@ int lx_moe_summary(const int32_t* ids, const float* weights, const void* expert_
   return kOk;
 }
 
+int lx_moe_summary_history(const int32_t* ids, const float* weights, const void* expert_emb, float* summary,
+                           float* history, float a, float b, int T, int R, int top_k, void* stream) {
+  LX_PROFILE("moe_summary_history");
+  (void)stream;
+  if (T <= 0 || R <= 0) return kOk;
+  if (!ids || !weights || !expert_emb || !summary || !history || top_k < 1) return fail(kInvalid);
+  const uint16_t* emb = static_cast<const uint16_t*>(expert_emb);
+  parallel_for(T, grain_for(T, std::max(1, 16384 / R)), [&](int64_t t0, int64_t t1) {
+    for (int64_t t = t0; t < t1; ++t) {
+      float* s = summary + t * R;
+      float* h = history + t * R;
+      for (int r = 0; r < R; ++r) s[r] = 0.0f;
+      for (int k = 0; k < top_k; ++k) {
+        const float w = weights[t * top_k + k];
+        const uint16_t* row = emb + static_cast<int64_t>(ids[t * top_k + k]) * R;
+        for (int r = 0; r < R; ++r) s[r] += w * bf16_to_f32(row[r]);
+      }
+      // The history update on the same elements: history = a * history + b * summary, lx_axpby_f32's expression.
+      for (int r = 0; r < R; ++r) h[r] = a * h[r] + b * s[r];
+    }
+  });
+  return kOk;
+}
+
 int lx_moe_experts(const void* latent, const int32_t* ids, const float* weights, const void* gate_up, const void* down,
                    float* out, int T, int L, int I, int top_k, void* stream) {
   LX_PROFILE("moe_experts");

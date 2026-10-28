@@ -2101,17 +2101,21 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
         LX_CHECK(lx_silu_mul(m.shared_gu, 2 * m.Ishared, m.shared_bf, LX_BF16, T, m.Ishared, s));
       }
       linear(m, layer.shared_down, m.shared_bf, LX_BF16, m.Ishared, m.routed, LX_F32, Lat, T, s, 1.0f, 1.0f);
-      // moe_summary reads the routing and the expert embeddings, not routed, so on a decode-sized step it runs
-      // on moe_side beside latent_up, and joins before the history update reads summary
+      // The expert summary reads the routing and the expert embeddings, not routed, so on a decode-sized step it runs
+      // on moe_side beside latent_up, and joins before the memory write reads summary. The same launch folds in the
+      // history update, history = 0.5 * history + 0.5 * summary (the axpby that used to follow the join).
       const bool moe_beside = m.side_streams(T);
       if (moe_beside) {
         check(lx_rt_event_record(m.moe_fork, s), "event record");
         check(lx_rt_stream_wait(m.moe_side, m.moe_fork), "stream wait");
-        LX_CHECK(lx_moe_summary(m.route_ids, m.route_w, layer.expert_emb, m.summary, T, R, m.K, m.moe_side));
+        LX_CHECK(lx_moe_summary_history(m.route_ids, m.route_w, layer.expert_emb, m.summary, m.history, 0.5f, 0.5f, T, R,
+                                        m.K, m.moe_side));
         check(lx_rt_event_record(m.moe_join, m.moe_side), "event record");
       }
       linear(m, layer.latent_up, m.routed, LX_F32, Lat, m.update, LX_F32, D, T, s);
-      if (!moe_beside) LX_CHECK(lx_moe_summary(m.route_ids, m.route_w, layer.expert_emb, m.summary, T, R, m.K, s));
+      if (!moe_beside)
+        LX_CHECK(lx_moe_summary_history(m.route_ids, m.route_w, layer.expert_emb, m.summary, m.history, 0.5f, 0.5f, T, R,
+                                        m.K, s));
       LX_CHECK(lx_mhc_write(m.mixed, ec + S * S + S, m.update, m.streams, T, S, D, s));
 
       if (prefetching && i + 1 < m.L_layers) {
@@ -2156,7 +2160,6 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
       }
 
       if (moe_beside) check(lx_rt_stream_wait(s, m.moe_join), "stream wait");
-      LX_CHECK(glue::axpby(m.history, m.summary, 0.5f, 0.5f, static_cast<int64_t>(T) * R, s));
       if (layer.attention) memory_write(m, c, T, pass, anchor++, n_entries, s);
       write_tap(m, pass, i, T, s);
     }
