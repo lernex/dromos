@@ -183,7 +183,11 @@ std::string alias_repo(const Alias& alias, const std::string& format) {
   return alias.bf16;
 }
 
-fs::path cache_root() { return fs::path(home()) / ".cache" / "lernex" / "models"; }
+fs::path cache_root() {
+  // LERNEX_MODELS moves the cache (docs/RELEASE.md); by default it is ~/.cache/lernex/models.
+  if (const char* env = std::getenv("LERNEX_MODELS"); env && *env) return fs::path(env);
+  return fs::path(home()) / ".cache" / "lernex" / "models";
+}
 
 fs::path install_dir(const std::string& repo) {
   const size_t slash = repo.find('/');

@@ -31,7 +31,7 @@ const std::vector<Alias>& aliases();
 // The repository an alias names in a format ("bf16", "fp8", "nvfp4").
 std::string alias_repo(const Alias& alias, const std::string& format);
 
-std::filesystem::path cache_root();                  // ~/.cache/lernex/models
+std::filesystem::path cache_root();                  // LERNEX_MODELS, else ~/.cache/lernex/models
 std::filesystem::path install_dir(const std::string& repo);
 std::string hf_token();                              // HF_TOKEN, else the huggingface-cli token, else empty
 bool installed(const std::filesystem::path& dir);    // every file of its manifest has verified

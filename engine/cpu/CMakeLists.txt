@@ -69,6 +69,12 @@ target_link_libraries(lernex_cpu PRIVATE Threads::Threads)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   target_link_options(lernex_cpu PRIVATE -Wl,--no-undefined)
 endif()
+if(LX_STATIC_RUNTIME)
+  target_link_options(lernex_cpu PRIVATE ${LX_STATIC_RUNTIME})
+endif()
+if(LX_HIDE_LINK_SYMBOLS)
+  target_link_options(lernex_cpu PRIVATE "${LX_HIDE_LINK_SYMBOLS}")
+endif()
 
 # A native check of every level the machine can run against the generic level, without PyTorch
 # (the Mac has no PyTorch): tests/cpu/isa_check.cpp.

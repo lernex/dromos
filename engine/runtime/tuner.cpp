@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "core/install.h"
 #include "nlohmann/json.hpp"
 
 #ifndef LX_TUNING_DIR
@@ -292,7 +293,11 @@ std::string tune_cache_path(const DeviceInfo& device) {
 }
 
 std::string shipped_table_path(const DeviceInfo& device) {
-  return std::string(LX_TUNING_DIR) + "/" + device.slug() + "_" + kEngineVersion + ".json";
+  const std::string name = device.slug() + "_" + kEngineVersion + ".json";
+  // The install's own tables (<executable>/../share/lernex/tuning) first, then the source tree the build came from.
+  const std::string share = lx::install::share_dir();
+  if (!share.empty() && std::filesystem::exists(share + "/tuning/" + name)) return share + "/tuning/" + name;
+  return std::string(LX_TUNING_DIR) + "/" + name;
 }
 
 void save_table(const TuneReport& report, const DeviceInfo& device, const std::string& path) {

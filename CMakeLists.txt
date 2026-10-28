@@ -17,6 +17,11 @@ endif()
 option(LX_BACKEND_CUDA "Build the CUDA backend" ${NOT_APPLE_DEFAULT})
 option(LX_BACKEND_CPU "Build the CPU backend (liblernex_cpu.so)" ${NOT_APPLE_DEFAULT})
 option(LX_BACKEND_METAL "Build the Metal backend (liblernex_metal.dylib)" ${APPLE_DEFAULT})
+# The release flavors (docs/RELEASE.md, scripts/release/build.sh): LX_BUNDLE_CUDA copies the toolkit's cudart and
+# cuBLASLt into lib/ beside the CUDA backend, under their SONAMEs, so the tarball needs only the driver. LX_STATIC_
+# LIBSTDCXX links libstdc++ and libgcc statically, so the binaries run on distributions older than the build's.
+option(LX_BUNDLE_CUDA "Copy libcudart and libcublasLt into lib/ beside the CUDA backend" OFF)
+option(LX_STATIC_LIBSTDCXX "Link libstdc++ and libgcc statically (Linux release builds)" OFF)
 
 # The CUDA architectures this build compiles for, chosen with -DLX_ARCHS:
 #   120a-real  the development default (RTX 50), so an edit-compile loop stays fast
@@ -36,6 +41,7 @@ endif()
 if(LX_BACKEND_CUDA)
   set(CMAKE_CUDA_ARCHITECTURES ${LX_ARCH_LIST})
 endif()
+
 # The version and the release flavor, baked into `lernex --version` and into `lernex update` (docs/RELEASE.md).
 #   -DLX_VERSION=X.Y.Z  the version. Without it, git describe --tags --match 'v*': vX.Y.Z is X.Y.Z, commits after a
 #                       tag are X.Y.Z-dev.N+gSHA, and an untagged checkout is 0.0.0-dev+SHA.
@@ -109,6 +115,19 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# The static runtime for the Linux release builds: libstdc++ and libgcc are part of the binaries, so the release runs
+# on any distribution from the build base's glibc up. The backends hide what they link (their interface is C).
+# The C++ targets take the flags as the driver's; nvcc (the CUDA backend's link) takes them through its host compiler.
+if(LX_STATIC_LIBSTDCXX AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set(LX_STATIC_RUNTIME -static-libstdc++ -static-libgcc)
+  set(LX_STATIC_RUNTIME_CUDA "SHELL:-Xcompiler -static-libstdc++,-static-libgcc")
+  set(LX_HIDE_LINK_SYMBOLS "LINKER:--exclude-libs,ALL")
+else()
+  set(LX_STATIC_RUNTIME "")
+  set(LX_STATIC_RUNTIME_CUDA "")
+  set(LX_HIDE_LINK_SYMBOLS "")
+endif()
+
 if(LX_BACKEND_CPU)
   add_subdirectory(engine/cpu)
 endif()
@@ -124,10 +143,9 @@ if(NOT Python3_Interpreter_FOUND)
   message(FATAL_ERROR "python3 is needed to generate the backend dispatch table (tools/gen_dispatch.py)")
 endif()
 include(GNUInstallDirs)
-set(LX_INSTALL_LIBDIR "${CMAKE_INSTALL_LIBDIR}")
-if(NOT LX_INSTALL_LIBDIR)
-  set(LX_INSTALL_LIBDIR "lib")
-endif()
+# The install tree is bin/ and lib/ on every platform (docs/RELEASE.md), whatever the distribution's default
+# (lib64 on the RPM bases): the CLI looks for its backends in ../lib.
+set(LX_INSTALL_LIBDIR "lib")
 file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/generated")
 set(LX_DISPATCH_GEN "${CMAKE_BINARY_DIR}/generated/lx_dispatch_gen.cpp")
 add_custom_command(
@@ -156,6 +174,33 @@ if(LX_BACKEND_CUDA)
   add_library(lernex_kernels SHARED ${LX_CUDA_SOURCES})
   target_include_directories(lernex_kernels PUBLIC engine)
   target_link_libraries(lernex_kernels PUBLIC CUDA::cudart CUDA::cublasLt)
+  if(LX_STATIC_RUNTIME_CUDA)
+    target_link_options(lernex_kernels PRIVATE "${LX_STATIC_RUNTIME_CUDA}")
+  endif()
+  if(LX_HIDE_LINK_SYMBOLS)
+    target_link_options(lernex_kernels PRIVATE "${LX_HIDE_LINK_SYMBOLS}")
+  endif()
+
+  # The release flavors carry the toolkit's runtime libraries in lib/, under the SONAMEs the backend asks for
+  # (libcudart.so.13 from libcudart.so.13.2.75): the tarball then needs only the NVIDIA driver.
+  if(LX_BUNDLE_CUDA)
+    foreach(target IN ITEMS CUDA::cudart CUDA::cublasLt)
+      get_target_property(lib_path ${target} IMPORTED_LOCATION)
+      if(NOT lib_path)
+        get_target_property(lib_path ${target} IMPORTED_LOCATION_RELEASE)
+      endif()
+      if(NOT lib_path)
+        message(FATAL_ERROR "LX_BUNDLE_CUDA: no file for ${target}")
+      endif()
+      file(REAL_PATH "${lib_path}" lib_real)
+      get_filename_component(lib_name "${lib_real}" NAME)
+      string(REGEX REPLACE "^(lib[A-Za-z]+\\.so\\.[0-9]+)\\..*$" "\\1" lib_soname "${lib_name}")
+      if(lib_soname STREQUAL lib_name)
+        message(FATAL_ERROR "LX_BUNDLE_CUDA: ${lib_name} is not a versioned shared library")
+      endif()
+      install(FILES "${lib_real}" DESTINATION "${LX_INSTALL_LIBDIR}" RENAME "${lib_soname}")
+    endforeach()
+  endif()
 endif()
 
 # The prefix cache snapshots the model's slot state. That needs MetisModel::save_slot and restore_slot,
@@ -186,6 +231,9 @@ if(LX_CLI_SOURCES AND TARGET lernex_core)
   add_executable(lernex ${LX_CLI_SOURCES})
   target_include_directories(lernex PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(lernex PRIVATE lernex_core)
+  if(LX_STATIC_RUNTIME)
+    target_link_options(lernex PRIVATE ${LX_STATIC_RUNTIME})
+  endif()
   # The backend libraries are opened at run time from next to the executable, so the CLI builds them too.
   foreach(backend lernex_kernels lernex_cpu lernex_metal)
     if(TARGET ${backend})
@@ -228,4 +276,30 @@ endif()
 if(LX_SLOT_STATE AND TARGET lernex_core)
   add_executable(lernex_prefix_check tests/gpu/prefix/prefix_check.cpp)
   target_link_libraries(lernex_prefix_check PRIVATE lernex_core)
+endif()
+
+# The install tree (docs/RELEASE.md, `cmake --install BUILD --prefix DIR`): bin/lernex, lib/ with the backends (and the
+# toolkit's libraries, LX_BUNDLE_CUDA), share/lernex/tuning, and LICENSE. The packager writes share/lernex/channel.
+# Relocatable: the CLI finds its backends in ../lib, and each backend finds the libraries beside it ($ORIGIN). The
+# build tree keeps CMake's own rpath.
+if(APPLE)
+  set(LX_RPATH_CLI "@loader_path/../lib")
+  set(LX_RPATH_LIB "@loader_path")
+else()
+  set(LX_RPATH_CLI "$ORIGIN/../lib")
+  set(LX_RPATH_LIB "$ORIGIN")
+endif()
+if(TARGET lernex)
+  set_target_properties(lernex PROPERTIES INSTALL_RPATH "${LX_RPATH_CLI}")
+  install(TARGETS lernex RUNTIME DESTINATION bin)
+endif()
+foreach(backend lernex_kernels lernex_cpu lernex_metal)
+  if(TARGET ${backend})
+    set_target_properties(${backend} PROPERTIES INSTALL_RPATH "${LX_RPATH_LIB}")
+    install(TARGETS ${backend} LIBRARY DESTINATION "${LX_INSTALL_LIBDIR}" RUNTIME DESTINATION "${LX_INSTALL_LIBDIR}")
+  endif()
+endforeach()
+install(DIRECTORY tuning/ DESTINATION share/lernex/tuning FILES_MATCHING PATTERN "*.json")
+if(EXISTS "${CMAKE_SOURCE_DIR}/LICENSE")
+  install(FILES "${CMAKE_SOURCE_DIR}/LICENSE" DESTINATION .)
 endif()
