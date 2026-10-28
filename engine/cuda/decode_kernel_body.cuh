@@ -86,11 +86,10 @@ template <>
 struct Word<LX_W_INT8> {
   using F = WordI8;
 };
-// BF16X's quad, the copy's own. bf16x::patched() loops over a row's patch slots (and an overflow record); inlined at every
-// quad of every reader step it made the copy's compile superlinear, so the copies with BF16X took about twelve times as long
-// to compile as the same copies without. Out of line, the patch fix-up is one call per quad, and a row without patches takes
-// the same first compare. The bits are the same as bf16x::quad's.
-__device__ __noinline__ uint32_t bf16x_patched(const uint8_t* row, int K, uint32_t k, uint32_t e) {
+// BF16X's quad, the copy's own. bf16x::patched() loops over a row's patch slots (and an overflow record); a row without
+// patches takes the same first compare. Inline: the four family copies compile about five times faster than with this
+// out of line (633 s against 3446 s at -j2), for 1 to 2% of decode. The bits are the same as bf16x::quad's.
+__device__ __forceinline__ uint32_t bf16x_patched(const uint8_t* row, int K, uint32_t k, uint32_t e) {
   return bf16x::patched(row, K, k, e);
 }
 __device__ __forceinline__ uint2 bf16x_quad(const uint8_t* row, int K, int k) {
@@ -1160,10 +1159,10 @@ __device__ __forceinline__ void gemv_mma(const Gemv& g, int b0, int nb, int sh, 
 
 // The tensor-core reader for the product's format (kPlanes 2: f32 x in two 16-bit planes).
 // One format's products for a batch of a run's rows: the tensor-core reader when the product has mma, else the FMA reader.
-// Out of line per format: gemv_run dispatches to these, so the readers of one format are not inlined beside another's
-// (with every format's readers in gemv_run, the copies compiled superlinearly in the number of formats).
+// Inline, like bf16x_patched: gemv_run dispatches to one format's products per copy, and out of line they cost the
+// copies about five times the compile.
 template <int kType>
-__device__ __noinline__ void gemv_products(const Gemv& g, int b0, int nb, int sh, float* red) {
+__device__ __forceinline__ void gemv_products(const Gemv& g, int b0, int nb, int sh, float* red) {
   if constexpr (kType != kF32) {
     if (g.mma) {
       if (g.mma <= 2) gemv_mma<kType, 1>(g, b0, nb, sh, red);
