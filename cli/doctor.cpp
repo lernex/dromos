@@ -176,10 +176,24 @@ void print_plan(const lx::runtime::Plan& plan) {
                 o.fits ? "yes" : "no", static_cast<double>(o.weight_bytes) / 1e9, ceiling, o.maths.c_str(),
                 o.fast_maths.c_str(), o.loadable ? "" : "no: ", o.load.c_str());
   }
-  for (const FormatOption& o : plan.options)
-    if (o.bf16x_bytes)
-      std::printf("           * decoding from the BF16X copies of the BF16 tensors (%.2f GB more)\n",
-                  static_cast<double>(o.bf16x_bytes) / 1e9);
+  // One footnote for every starred format: the size once when the copies weigh the same in each, else per format.
+  std::string copies;
+  bool same = true;
+  std::size_t first = 0;
+  for (const FormatOption& o : plan.options) {
+    if (!o.bf16x_bytes) continue;
+    if (first && o.bf16x_bytes != first) same = false;
+    if (!first) first = o.bf16x_bytes;
+    char part[48];
+    std::snprintf(part, sizeof part, "%s%.2f GB to %s", copies.empty() ? "" : ", ",
+                  static_cast<double>(o.bf16x_bytes) / 1e9, format_name(o.format).c_str());
+    copies += part;
+  }
+  if (first && same)
+    std::printf("           * decoding from the BF16X copies of the BF16 tensors (%.2f GB more)\n",
+                static_cast<double>(first) / 1e9);
+  else if (first)
+    std::printf("           * decoding from the BF16X copies of the BF16 tensors, which add %s\n", copies.c_str());
   std::printf("           fits: resident with room for %d sequences of %d tokens; decode est.: one stream, the "
               "measured share of the card's bandwidth over the bytes a token reads\n",
               kUsefulSlots, kUsefulContext);
