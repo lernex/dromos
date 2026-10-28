@@ -36,7 +36,14 @@
 #include "cli/roofline.h"
 #include "core/install.h"
 #include "model/traffic.h"
-#include "census_text.h"
+#include <fstream>
+#include <sstream>
+
+#include "text/tokenizer.h"
+
+#ifndef LX_CORPUS_PATH
+#define LX_CORPUS_PATH "tools/rivals/corpus.txt"
+#endif
 #include "runtime/engine.h"
 
 namespace lx::cli {
@@ -52,6 +59,7 @@ struct BenchArgs {
   bool one_count = false;    // a child run: one stream count, the plan and its row (no header); see cmd_bench
   bool components = false;   // print the step's bytes by component at each stream count (the profile's byte floor)
   bool speculate = false;    // --spec: prompt-lookup drafts for a lone stream, as serving does
+  bool random_prompts = false;  // --random-prompts: the bench's own random ids, as before the corpus was the default
   FormatFlags format;
 };
 
@@ -82,6 +90,26 @@ struct StreamTiming {
   std::vector<double> token_times;  // engine clock, one per generated token
   runtime::RequestResult result;
 };
+
+// The corpus the prompts are cut from: tools/rivals/corpus.txt, tokenized with the model's own tokenizer, the same ids the
+// rival client sends. FNV-1a of the ids is printed so the two can be checked against each other.
+std::vector<int32_t> corpus_tokens(const lx::text::Tokenizer& tok) {
+  std::ifstream in(LX_CORPUS_PATH, std::ios::binary);
+  if (!in) throw std::runtime_error(std::string("bench: cannot read the corpus at ") + LX_CORPUS_PATH);
+  std::stringstream text;
+  text << in.rdbuf();
+  return tok.encode(text.str());
+}
+
+uint32_t fnv1a(const std::vector<int32_t>& ids) {
+  uint32_t h = 2166136261u;
+  for (int32_t id : ids)
+    for (int b = 0; b < 4; ++b) {
+      h ^= (static_cast<uint32_t>(id) >> (8 * b)) & 0xffu;
+      h *= 16777619u;
+    }
+  return h;
+}
 
 // Runs `streams` requests at once and returns each one's timings, when all have finished. The prompts are the bench's
 // random ids, or with `text` real text: stream i reads its own window of the passage, the windows spread across it.
@@ -200,6 +228,7 @@ int cmd_bench(int argc, char** argv) {
     else if (a == "--no-prefix-cache") args.prefix_cache = false;
     else if (a == "--one-count") args.one_count = true;
     else if (a == "--components") args.components = true;
+    else if (a == "--random-prompts") args.random_prompts = true;
     else if (args.model.empty() && a[0] != '-') args.model = a;
     else throw std::runtime_error("unknown option " + a);
   }
@@ -213,7 +242,7 @@ int cmd_bench(int argc, char** argv) {
 
   const Model model = find_model(args.model, false);
   EngineOptions options;
-  options.load_tokenizer = false;
+  options.load_tokenizer = true;  // the corpus is tokenized with the model's own tokenizer
   options.prefix_cache = args.prefix_cache;
   // A child run that refuses its count exits with this status: the plan holds fewer sequences than the count.
   constexpr int kRefusedExit = 3;
@@ -225,6 +254,8 @@ int cmd_bench(int argc, char** argv) {
     std::printf("%s  (%s)\n", args.model.c_str(), model.dir.c_str());
     std::printf("  %d prompt tokens, %d generated tokens per stream, %s\n", args.prompt_tokens, args.gen_tokens,
                 args.sample ? "sampled (temperature 0.6, top-p 0.95, top-k 20)" : "greedy");
+    std::printf("  prompts: %s\n", args.random_prompts ? "random ids (--random-prompts)"
+                                                       : "real text, windows of tools/rivals/corpus.txt spread across it");
     std::printf("  each stream count loads its own engine, so it runs on the plan a standalone run at that count gets\n");
     std::printf("%8s %12s %12s %10s %10s %13s %15s %9s %9s %15s\n", "streams", "decode tok/s", "per stream", "TTFT p50",
                 "TTFT p90", "prefill tok/s", "roofline tok/s", "% of spec", "% of peak", "per-token tok/s");
@@ -283,31 +314,31 @@ int cmd_bench(int argc, char** argv) {
   for (const std::string& note : plan.notes) std::printf("  %s\n", note.c_str());
   if (!engine.placement().empty()) std::printf("%s", engine.placement().c_str());
 
-  // The routing the run touches, measured twice: a census of this stream count's decode steps, eager (graphs off, so it
-  // is not timed). The headline is real text: each stream reads its own window of a prose passage. The bench's random
-  // ids are measured beside it, since routing on random ids can concentrate differently.
-  const int census_prompt = std::min(args.prompt_tokens, 64), census_gen = std::min(args.gen_tokens, 64);
+  // The prompts are the corpus's real text by default (the same windows the rival client cuts), or the bench's random ids.
+  const std::vector<int32_t> corpus = args.random_prompts ? std::vector<int32_t>{} : corpus_tokens(*engine.tokenizer());
+  const std::vector<int32_t>* text = args.random_prompts ? nullptr : &corpus;
+  if (text) std::printf("  corpus: %zu tokens, fnv1a %08x\n", corpus.size(), fnv1a(corpus));
+
+  run_batch(engine, streams, std::min(args.prompt_tokens, 64), 8, engine.config().vocab_size, args.sample);  // warm up, on random ids
+  const double submitted = engine.now();
+  const auto timings = run_batch(engine, streams, args.prompt_tokens, args.gen_tokens, engine.config().vocab_size, args.sample, text);
+  const Row row = measure(timings, args.prompt_tokens, submitted);
+  // The routing the run touches: a census of this stream count's decode steps on the same prompts as the timed run,
+  // run eagerly (graphs off, so it is not timed). The roofline reads it.
+  const int census_gen = std::min(args.gen_tokens, 64);
   engine.set_expert_census(true);
-  run_batch(engine, streams, census_prompt, census_gen, engine.config().vocab_size, args.sample, &lx::cli::census_prose());
+  run_batch(engine, streams, args.prompt_tokens, census_gen, engine.config().vocab_size, args.sample, text);
   engine.set_expert_census(false);
   lx::DecodeTraffic traffic = engine.decode_traffic(context);
-  traffic.measured_on = "real text (prose passage, a window per stream)";
-  engine.set_expert_census(true);
-  run_batch(engine, streams, census_prompt, census_gen, engine.config().vocab_size, args.sample);
-  engine.set_expert_census(false);
-  lx::DecodeTraffic random_traffic = engine.decode_traffic(context);
-  random_traffic.measured_on = "random ids (the bench's synthetic prompts)";
-  const auto mean_union = [streams](const lx::DecodeTraffic& t) -> double {
-    const auto it = t.measured.find(streams);
-    if (it == t.measured.end() || it->second.empty()) return -1;
+  traffic.measured_on = text ? "real text (tools/rivals/corpus.txt)" : "random ids (--random-prompts)";
+  const auto found = traffic.measured.find(streams);
+  if (found != traffic.measured.end() && !found->second.empty()) {
     double sum = 0;
-    for (double v : it->second) sum += v;
-    return sum / static_cast<double>(it->second.size());
-  };
-  const double union_prose = mean_union(traffic), union_random = mean_union(random_traffic);
-  std::printf("  routing census at %d streams (%d-token prompts, %d generated): %.1f experts per layer-pass on real text"
-              " (the roofline's), %.1f on random ids, %.1f uniform\n",
-              streams, census_prompt, census_gen, union_prose, union_random, traffic.expected_experts(streams));
+    for (double v : found->second) sum += v;
+    std::printf("  routing census at %d streams (%d-token prompts, %d generated, %s): %.1f experts per layer-pass, %.1f uniform\n",
+                streams, args.prompt_tokens, census_gen, text ? "real text" : "random ids",
+                sum / static_cast<double>(found->second.size()), traffic.expected_experts(streams));
+  }
 
   // The traffic the engine counts, against the config's count for the same format: they must agree (traffic.h).
   const lx::DecodeTraffic from_config = lx::config_decode_traffic(engine.config(), plan.weights, plan.bf16x_decode, context, &plan.bf16x_dropped);
@@ -330,10 +361,6 @@ int cmd_bench(int argc, char** argv) {
   }
 
   if (args.components) print_components(traffic, ("components at " + std::to_string(streams) + " streams, context " + std::to_string(context) + ":").c_str(), streams);
-  run_batch(engine, streams, std::min(args.prompt_tokens, 64), 8, engine.config().vocab_size, args.sample);  // warm up
-  const double submitted = engine.now();
-  const auto timings = run_batch(engine, streams, args.prompt_tokens, args.gen_tokens, engine.config().vocab_size, args.sample);
-  const Row row = measure(timings, args.prompt_tokens, submitted);
   // The ceilings for this many streams: at the spec, and at the measured read rate (the tighter one in practice).
   const double spec_ceiling = roofline_ok && bw.spec_gbs > 0 ? lx::cli::ceiling_tps(traffic, streams, bw.spec_gbs, tflops) : 0;
   const double peak_ceiling = roofline_ok ? lx::cli::ceiling_tps(traffic, streams, bw.measured_gbs, tflops) : 0;

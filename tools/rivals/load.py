@@ -76,7 +76,11 @@ def build_prompts(ids: list[int], n: int, args: argparse.Namespace, seed: int) -
     width = args.prompt_tokens
     if len(ids) <= width:
         raise SystemExit(f"corpus has {len(ids)} tokens; need more than {width}")
-    starts = [rng.randrange(0, len(ids) - width) for _ in range(n)]
+    if args.random_windows:
+        starts = [rng.randrange(0, len(ids) - width) for _ in range(n)]
+    else:  # the bench's rule: window i starts at (N - width) * i // (n - 1), so both read the same tokens
+        span = len(ids) - width
+        starts = [0] if n == 1 else [span * i // (n - 1) for i in range(n)]
     return [ids[s : s + width] for s in starts]
 
 
@@ -205,6 +209,8 @@ def main() -> int:
     p.add_argument("--shared-prefix", type=int, default=2048, help="shared prefix tokens (0: unique prompts)")
     p.add_argument("--suffix", type=int, default=64, help="unique suffix tokens after the shared prefix")
     p.add_argument("--prompt-tokens", type=int, default=512, help="prompt tokens in unique mode")
+    p.add_argument("--random-windows", action="store_true",
+                   help="unique mode: random window starts (the old behaviour); default is the bench's spread rule")
     p.add_argument("--gen", type=int, default=256, help="generated tokens per request")
     p.add_argument("--concurrency", type=lambda s: [int(x) for x in s.split(",")], default=[64, 128])
     p.add_argument("--waves", type=int, default=2, help="measured waves per concurrency level")
