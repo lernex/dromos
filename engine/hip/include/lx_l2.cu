@@ -5,10 +5,11 @@
 
 extern "C" {
 
-int lx_rt_l2_persist(const void* base, int64_t bytes, float hit_ratio) {
+int lx_rt_l2_persist(const void* base, int64_t bytes, float hit_ratio, int64_t* granted_bytes) {
   (void)base;
   (void)bytes;
   (void)hit_ratio;
+  if (granted_bytes) *granted_bytes = 0;
   return LX_ERR_NOT_SUPPORTED;
 }
 

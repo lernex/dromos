@@ -26,6 +26,17 @@ double min_reads_from_env() {
   return v && *v ? std::atof(v) : 0.0;
 }
 
+// LX_L2_PIN_MAX_TOKENS=n: steps of at most n tokens run with the window. The default is 1, the one-stream decode: on
+// the measured formats it is faster by 1.4 to 2.6 percent there, while at 8 streams NVFP4 loses 0.2 to 1.6 percent
+// (BF16 gains 1.1) and at 32 the window is a wash or a cost.
+int max_tokens_from_env() {
+  static const int n = [] {
+    const char* v = std::getenv("LX_L2_PIN_MAX_TOKENS");
+    return v && *v ? std::atoi(v) : 1;
+  }();
+  return n;
+}
+
 }  // namespace
 
 Hold hold_from_env() {
@@ -51,8 +62,23 @@ int64_t budget_bytes() {
 Arena::Arena() : hold_(hold_from_env()) {}
 
 Arena::~Arena() {
-  if (window_ > 0) lx_rt_l2_persist(nullptr, 0, 0);
+  if (window_ > 0) lx_rt_l2_persist(nullptr, 0, 0, nullptr);
   if (base_) lx_rt_free(base_);
+}
+
+bool step_pinned(int tokens) { return tokens > 0 && tokens <= max_tokens_from_env(); }
+
+void Arena::set_on(bool on) {
+  if (window_ <= 0 || on == on_) return;
+  if (on) {
+    int64_t applied = 0;
+    if (lx_rt_l2_persist(base_, window_, 1.0f, &applied) != 0) return;  // the window stays off
+    on_ = true;
+  } else {
+    lx_rt_l2_persist(nullptr, 0, 0, nullptr);
+    on_ = false;
+  }
+  if (logging()) std::fprintf(stderr, "L2 carve-out %s\n", on_ ? "on" : "off");
 }
 
 void Arena::weight(std::vector<Part> parts, double reads) {
@@ -86,13 +112,17 @@ void* Arena::state_buffer(int index) const {
 
 bool Arena::open(int64_t budget) {
   if (hold_ == Hold::Off || budget <= 0 || items_.empty()) return false;
+  // What the device grants for the budget, clamped to its persisting carve-out and window limit. The arena is packed
+  // to that, so it holds no bytes the window cannot keep. Asking allocates nothing and changes no state.
+  int64_t granted = 0;
+  if (lx_rt_l2_persist(nullptr, budget, 1.0f, &granted) != 0 || granted <= 0) return false;
   // Highest reads per token first; ties keep their registration order (weights before states).
   std::vector<size_t> order(items_.size());
   std::iota(order.begin(), order.end(), size_t{0});
   std::stable_sort(order.begin(), order.end(),
                    [this](size_t a, size_t b) { return items_[a].reads > items_[b].reads; });
   std::vector<size_t> chosen;
-  int64_t room = budget;
+  int64_t room = granted;
   const double min_reads = min_reads_from_env();
   for (size_t i : order) {
     if (room <= 0) break;
@@ -111,10 +141,11 @@ bool Arena::open(int64_t budget) {
     offset += items_[i].bytes;
   }
   const int64_t bytes = offset;
-  const int64_t window = std::min(budget, bytes);
+  const int64_t window = std::min(granted, bytes);
   void* base = nullptr;
   if (lx_rt_alloc(&base, bytes) != 0 || !base) throw std::runtime_error("L2 arena: device allocation failed");
-  const int status = lx_rt_l2_persist(base, window, 1.0f);
+  int64_t applied = 0;
+  const int status = lx_rt_l2_persist(base, window, 1.0f, &applied);
   if (status != 0) {
     lx_rt_free(base);
     if (status != LX_ERR_NOT_SUPPORTED)
@@ -124,7 +155,8 @@ bool Arena::open(int64_t budget) {
   }
   base_ = base;
   arena_bytes_ = bytes;
-  window_ = window;
+  window_ = applied;
+  on_ = true;
   auto* at = static_cast<char*>(base);
   for (size_t i : chosen) {
     Item& it = items_[i];
@@ -145,8 +177,9 @@ bool Arena::open(int64_t budget) {
   if (logging()) {
     size_t weights = 0, states = 0;
     for (size_t i : chosen) (items_[i].state ? states : weights) += 1;
-    std::fprintf(stderr, "L2 window: %lld bytes (budget %lld), arena %lld bytes, %zu weight regions, %zu states\n",
-                 static_cast<long long>(window), static_cast<long long>(budget), static_cast<long long>(bytes),
+    std::fprintf(stderr,
+                 "L2 window: %lld bytes granted for %lld asked, arena %lld bytes, %zu weight regions, %zu states\n",
+                 static_cast<long long>(applied), static_cast<long long>(budget), static_cast<long long>(bytes),
                  weights, states);
     for (size_t i : chosen)
       std::fprintf(stderr, "  %s %10lld bytes at %10lld, %g reads a token\n", items_[i].state ? "state " : "weight",

@@ -22,8 +22,9 @@ Window g_window;  // one window per process: the model that set it owns the regi
 
 extern "C" {
 
-int lx_rt_l2_persist(const void* base, int64_t bytes, float hit_ratio) {
-  if (!base || bytes <= 0) {
+int lx_rt_l2_persist(const void* base, int64_t bytes, float hit_ratio, int64_t* granted_bytes) {
+  if (granted_bytes) *granted_bytes = 0;
+  if (bytes <= 0) {
     g_window = Window{};
     if (cudaError_t e = cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, 0); e != cudaSuccess)
       return static_cast<int>(e);
@@ -36,6 +37,8 @@ int lx_rt_l2_persist(const void* base, int64_t bytes, float hit_ratio) {
   if (persist <= 0 || window <= 0) return LX_ERR_NOT_SUPPORTED;
   // The carve-out and the window hold the same bytes: a window larger than the carve-out would evict its own lines.
   const int64_t size = std::min<int64_t>(bytes, std::min<int64_t>(persist, window));
+  if (granted_bytes) *granted_bytes = size;
+  if (!base) return 0;  // only asked
   if (cudaError_t e = cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, static_cast<size_t>(size)); e != cudaSuccess)
     return static_cast<int>(e);
   g_window.base = base;

@@ -1768,6 +1768,9 @@ void MetisModel::stage(const StepBatch& b, bool spec, void* s) {
 // graph for decode and verify shapes.
 void MetisModel::launch(int T, int n_seq, bool all_rows, float* logits, bool spec, void* s) {
   Impl& m = *impl_;
+  // The L2 carve-out is process-wide: it is on for a decode-sized step and off for the rest (pin.h). Set before the
+  // capture, so a graph captures with the window it runs under.
+  m.pins.set_on(pin::step_pinned(T));
   if (decode_program_covers(m, T, n_seq, spec)) {
     run_program(m, cfg_, T, logits, s);
     return;

@@ -1252,10 +1252,11 @@ int lx_rt_stream_wait(void* stream, void* event) {
 }
 
 // Apple GPUs have no persisting L2 window (kernels.h, lx_rt_l2_persist): the model runs unpinned.
-int lx_rt_l2_persist(const void* base, int64_t bytes, float hit_ratio) {
+int lx_rt_l2_persist(const void* base, int64_t bytes, float hit_ratio, int64_t* granted_bytes) {
   (void)base;
   (void)bytes;
   (void)hit_ratio;
+  if (granted_bytes) *granted_bytes = 0;
   return kNotSupported;
 }
 
