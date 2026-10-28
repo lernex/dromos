@@ -139,4 +139,12 @@ int lx_attention_varlen(const float* qkv, int ld_qkv, void* k_cache, void* v_cac
   return kOk;
 }
 
+// The fused Mamba decode step is CUDA's (and the CPU's): here the model runs the three kernels above.
+int lx_mamba_decode_step(const float*, int, const void*, const void*, float*, float*, const float*, const float*,
+                         const float*, const int32_t*, const int32_t*, const void*, float, float*, void*, int32_t*, int,
+                         int, int, int, int, int, void*) {
+  return LX_ERR_NOT_SUPPORTED;
+}
+
 }  // extern "C"
+
