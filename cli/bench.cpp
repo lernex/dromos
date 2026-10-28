@@ -370,7 +370,9 @@ int cmd_bench(int argc, char** argv) {
     agree = agree && std::fabs(a - b) <= 1e-9 * std::max(a, b);
   }
   agree = agree && std::fabs(traffic.macs_per_token() - from_config.macs_per_token()) <= 1e-9 * traffic.macs_per_token();
-  if (roofline_ok) {
+  if (args.speculate) {
+    std::printf("  roofline  not shown with --spec: prompt lookup beats the plain-decode ceiling, so a fraction of it means nothing\n");
+  } else if (roofline_ok) {
     std::printf("  roofline  %.0f GB/s spec, %.0f GB/s measured%s, %s, context %d (mean over the run)\n", bw.spec_gbs,
                 bw.measured_gbs, peak.known ? "" : ", no tensor peak for this device",
                 peak.known ? (std::to_string(static_cast<int>(tflops)) + " TFLOPS BF16 tensor").c_str() : "no compute bound",
@@ -386,15 +388,16 @@ int cmd_bench(int argc, char** argv) {
   // The ceilings for this many streams: at the spec, and at the measured read rate (the tighter one in practice).
   const double spec_ceiling = roofline_ok && bw.spec_gbs > 0 ? lx::cli::ceiling_tps(traffic, streams, bw.spec_gbs, tflops) : 0;
   const double peak_ceiling = roofline_ok ? lx::cli::ceiling_tps(traffic, streams, bw.measured_gbs, tflops) : 0;
-  std::string roof = "-", of_spec = "-", of_peak = "-";
-  if (peak_ceiling > 0) {
+  // A speculative row leaves the roofline columns blank: the ceilings are plain decode's, and prompt lookup is not bound by them.
+  std::string roof = args.speculate ? "" : "-", of_spec = roof, of_peak = roof;
+  if (peak_ceiling > 0 && !args.speculate) {
     char buf[32];
     std::snprintf(buf, sizeof buf, "%.0f", peak_ceiling);
     roof = buf;
     std::snprintf(buf, sizeof buf, "%.1f%%", 100.0 * row.decode_tps / peak_ceiling);
     of_peak = buf;
   }
-  if (spec_ceiling > 0) {
+  if (spec_ceiling > 0 && !args.speculate) {
     char buf[32];
     std::snprintf(buf, sizeof buf, "%.1f%%", 100.0 * row.decode_tps / spec_ceiling);
     of_spec = buf;
@@ -402,6 +405,22 @@ int cmd_bench(int argc, char** argv) {
   std::printf("%8d %12.1f %12.1f %10s %10s %13.0f %15s %9s %9s %15.1f\n", row.streams, row.decode_tps, row.per_stream_tps,
               human_seconds(row.ttft_p50).c_str(), human_seconds(row.ttft_p90).c_str(), row.prefill_tps, roof.c_str(),
               of_spec.c_str(), of_peak.c_str(), row.per_token_tps);
+  if (args.speculate) {
+    // Prompt lookup's own numbers: how often its drafts were right, and what each verify step bought.
+    long long steps = 0, drafted = 0, accepted = 0;
+    for (const StreamTiming& t : timings) {
+      steps += t.result.spec_steps;
+      drafted += t.result.spec_drafted;
+      accepted += t.result.spec_accepted;
+    }
+    if (steps > 0 && drafted > 0)
+      std::printf("  speculation  %.1f%% of %lld drafts accepted, %.2f drafts accepted per verify step, %.2f tokens per verify step over %lld steps\n",
+                  100.0 * accepted / drafted, drafted, static_cast<double>(accepted) / steps,
+                  static_cast<double>(accepted + steps) / steps, steps);
+    else
+      std::printf("  speculation  no verify steps ran: prompt lookup runs on a lone stream\n");
+    std::printf("  note: greedy continuation of a corpus repeats, so prompt lookup matches it every step and inflates this row; the speedup to quote is the chat mix (tools/spec_mix.py)\n");
+  }
   std::fflush(stdout);
   return 0;
 }

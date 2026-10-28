@@ -111,6 +111,7 @@ struct Sequence {
   int prompt_fed = 0;
   int cached = 0;                       // prompt tokens restored from the cache, not fed
   int generated = 0;
+  int spec_steps = 0, spec_drafted = 0, spec_accepted = 0;  // prompt-lookup verify steps, drafts, accepted drafts
   bool has_pending = false;  // a sampled token waits to be fed
   int32_t pending = 0;
   std::vector<int32_t> history;                   // the prompt, then every token shown: the drafter's context
@@ -788,6 +789,9 @@ bool Engine::Impl::spec_step(const std::shared_ptr<Sequence>& s) {
   int32_t next = 0;
   spec->verify(q.slot, config, step, draft.q, r.position, accepted, next, stream);
   q.drafter->observe(accepted, next, stream);
+  s->spec_steps += 1;
+  s->spec_drafted += static_cast<int>(draft.tokens.size());
+  s->spec_accepted += accepted;
   {
     std::lock_guard<std::mutex> lock(mu);
     stats.steps += 1;
@@ -845,6 +849,9 @@ void Engine::Impl::end(const std::shared_ptr<Sequence>& s, FinishReason reason, 
   result.finished_at = now();
   result.seconds = result.finished_at - s->submitted_at;
   result.time_to_first_token = s->generated > 0 ? s->first_token_at - s->submitted_at : 0.0;
+  result.spec_steps = s->spec_steps;
+  result.spec_drafted = s->spec_drafted;
+  result.spec_accepted = s->spec_accepted;
   if (s->callbacks.on_finish) {
     try {
       s->callbacks.on_finish(result);

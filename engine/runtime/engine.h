@@ -85,6 +85,11 @@ struct RequestResult {
   double seconds = 0.0;              // seconds from submit to the finish
   double first_token_at = 0.0;       // engine clock, seconds, for throughput over a set of requests
   double finished_at = 0.0;
+  // Prompt-lookup speculation on this request (zero when it never ran a verify step): the verify steps, the draft
+  // tokens proposed to them, and the draft tokens the target accepted.
+  int spec_steps = 0;
+  int spec_drafted = 0;
+  int spec_accepted = 0;
 };
 
 struct RequestCallbacks {
