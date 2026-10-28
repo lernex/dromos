@@ -537,27 +537,80 @@ gemv_vec_kernel(const TX* __restrict__ x, const __grid_constant__ Offsets off, c
 
 // One warp per block. The warp covers 32 / lpr rows: lane c of a row's group of lpr lanes reads the
 // e consecutive inputs starting at c * e. Scalar loads, so any stride or alignment works.
-template <int F, typename TX>
+//
+// kVec: e == 8 (K a power of two, or any K that is 8 * lpr), K % 8 == 0, aligned rows. Then a lane's 8 weights are
+// one 8- or 16-byte load, fetched before the dependency wait (weights never depend on the previous kernel), and each
+// x row is one vector load (16 bytes of bf16, or two float4 of f32). The products and their fma order are exactly
+// the scalar path's (k ascending within the lane, then the same xor tree over the lpr lanes), so the bits are the same.
+template <int F>
+__device__ __forceinline__ Slice<F> load_row8(const lx_weight& w, int64_t n, int K, int c) {
+  Slice<F> s;
+  if constexpr (F == LX_W_BF16) {
+    s.w = __ldcs(reinterpret_cast<const uint4*>(static_cast<const uint16_t*>(w.data) + n * K + c * 8));
+  } else {
+    s.w = __ldcs(reinterpret_cast<const uint2*>(static_cast<const uint8_t*>(w.data) + n * K + c * 8));
+  }
+  return s;
+}
+
+// The 8 x values at p as f32, in k order.
+template <typename TX>
+__device__ __forceinline__ void load_x8(const TX* p, float (&f)[8]);
+template <>
+__device__ __forceinline__ void load_x8<bf16>(const bf16* p, float (&f)[8]) {
+  const uint4 v = __ldg(reinterpret_cast<const uint4*>(p));
+  const uint32_t words[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+  for (int q = 0; q < 4; ++q) {
+    f[2 * q] = __uint_as_float(words[q] << 16);
+    f[2 * q + 1] = __uint_as_float(words[q] & 0xffff0000u);
+  }
+}
+template <>
+__device__ __forceinline__ void load_x8<float>(const float* p, float (&f)[8]) {
+  const float4 a = __ldg(reinterpret_cast<const float4*>(p));
+  const float4 b = __ldg(reinterpret_cast<const float4*>(p) + 1);
+  f[0] = a.x, f[1] = a.y, f[2] = a.z, f[3] = a.w;
+  f[4] = b.x, f[5] = b.y, f[6] = b.z, f[7] = b.w;
+}
+
+template <int F, typename TX, bool kVec>
 __global__ void gemv_small_kernel(const TX* __restrict__ x, int ld_x, const lx_weight w,
                                   const void* __restrict__ bias, bool bias_bf16, void* __restrict__ y, bool y_bf16,
                                   int ld_y, int M, int N, int K, int lpr, int e, float alpha, float beta) {
-  lx::pdl_trigger();
-  lx::pdl_wait();  // x and w may both be written by the previous kernel
   const int lane = threadIdx.x;
   const int slot = lane / lpr, c = lane % lpr;
   const int64_t n = static_cast<int64_t>(blockIdx.x) * (32 / lpr) + slot;
+
+  Slice<F> row{};
+  if constexpr (kVec) {
+    if (n < N) row = load_row8<F>(w, n, K, c);  // before the wait: weights do not depend on the previous kernel
+  }
+  lx::pdl_trigger();
+  lx::pdl_wait();  // x may be written by the previous kernel
 
   float acc[kMaxM];
 #pragma unroll
   for (int m = 0; m < kMaxM; ++m) acc[m] = 0.0f;
   if (n < N) {
-    for (int i = 0; i < e; ++i) {
-      const int k = c * e + i;
-      if (k >= K) break;
-      const float wv = lx::element<F>(w, n, k, K);
+    if constexpr (kVec) {
+      float wf[8];
+      slice_f32<F>(row, wf);
+      for (int m = 0; m < M; ++m) {
+        float xf[8];
+        load_x8<TX>(x + static_cast<int64_t>(m) * ld_x + c * 8, xf);
 #pragma unroll
-      for (int m = 0; m < kMaxM; ++m)
-        if (m < M) acc[m] = fmaf(wv, lx::to_f32(x[static_cast<int64_t>(m) * ld_x + k]), acc[m]);
+        for (int i = 0; i < 8; ++i) acc[m] = fmaf(wf[i], xf[i], acc[m]);
+      }
+    } else {
+      for (int i = 0; i < e; ++i) {
+        const int k = c * e + i;
+        if (k >= K) break;
+        const float wv = lx::element<F>(w, n, k, K);
+#pragma unroll
+        for (int m = 0; m < kMaxM; ++m)
+          if (m < M) acc[m] = fmaf(wv, lx::to_f32(x[static_cast<int64_t>(m) * ld_x + k]), acc[m]);
+      }
     }
   }
 
@@ -641,8 +694,18 @@ cudaError_t launch_small(const Args& a) {
   const unsigned blocks = static_cast<unsigned>((a.N + rows_per_warp - 1) / rows_per_warp);
   cudaLaunchAttribute attr{};
   const cudaLaunchConfig_t cfg = pdl_config(blocks, 32, a.stream, attr);
-  cudaLaunchKernelEx(&cfg, gemv_small_kernel<F, TX>, static_cast<const TX*>(a.x), a.ld_x, a.w, a.bias, a.bias_bf16,
-                     a.y, a.y_bf16, a.ld_y, a.M, a.N, a.K, lpr, e, a.alpha, a.beta);
+  // The vector path (gemv_small_kernel's kVec): 8 values a lane, a row whose x and weights are aligned for vector loads.
+  const bool aligned = reinterpret_cast<uintptr_t>(a.w.data) % 16 == 0 &&
+                       ((reinterpret_cast<uintptr_t>(a.x) | (static_cast<uint64_t>(a.ld_x) * sizeof(TX))) % 16 == 0);
+  if constexpr (F != LX_W_NVFP4) {  // NVFP4 keeps its scalar path (its 8 values share two scale bytes)
+    if (aligned && e == kLaneK && a.K % kLaneK == 0) {
+      cudaLaunchKernelEx(&cfg, gemv_small_kernel<F, TX, true>, static_cast<const TX*>(a.x), a.ld_x, a.w, a.bias,
+                         a.bias_bf16, a.y, a.y_bf16, a.ld_y, a.M, a.N, a.K, lpr, e, a.alpha, a.beta);
+      return cudaGetLastError();
+    }
+  }
+  cudaLaunchKernelEx(&cfg, gemv_small_kernel<F, TX, false>, static_cast<const TX*>(a.x), a.ld_x, a.w, a.bias,
+                     a.bias_bf16, a.y, a.y_bf16, a.ld_y, a.M, a.N, a.K, lpr, e, a.alpha, a.beta);
   return cudaGetLastError();
 }
 
