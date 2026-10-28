@@ -30,6 +30,23 @@ Resident weights include the BF16X lossless copies that decode reads for the wid
 
 Where each row's weights come from: Praxis BF16 is the BF16 file as stored. Praxis INT8 is round-to-nearest from the BF16 file, at load. Praxis FP8 and NVFP4 load the checkpoints stored under `kronos-scratch/logos/engines/praxis/` (`fp8`, `nvfp4`); NVFP4 is refused from a plain BF16 checkpoint. Logos FP8 is `Metis-1.6-Logos-FP8` as stored.
 
+## Routing census: the text the union was measured on
+
+The ceiling reads how many distinct routed experts a layer-pass touches. `lernex bench` measures that on its own decode steps (eager, so it is not timed) and prints the text it was measured on. It measures twice:
+
+- **Real text** (the headline): a 300-token prose passage from the logosrefs prompt set, each stream reading its own 64-token window, the windows spread across the passage (`cli/census_text.h`).
+- **Random ids**: the bench's synthetic prompts, the same ones the timed runs use.
+
+Logos FP8 at 32 streams (512 prompt tokens, 256 generated, context 640):
+
+| Routing measured on | Experts per layer-pass | Roofline at 32 streams, measured bandwidth (tok/s) |
+|---|---|---|
+| Real text (prose passage) | 49.1 | 1946 |
+| Random ids (the timed runs' prompts) | 65.4 to 66.0 | 1745 |
+| Uniform, from the config (no run) | 94.1 | 1512 (the table below) |
+
+The timed decode rates in this file were measured on random-id prompts. Against the random-id roofline, the 32-stream run of 1193.7 tok/s is 68.4%. The bench's roofline column now reads the real-text census, so its 61.3% share mixes two texts until the timed run is on real text too. The uniform figures in the roofline table below are the modelled union and are superseded by the census rows here.
+
 ## Measured decode: `lernex bench`
 
 One run per format and stream count on commit 4b25613:

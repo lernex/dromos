@@ -68,6 +68,7 @@ struct DecodeTraffic {
   // over the layer's passes and steps of the distinct experts its streams chose. A count with no measurement reads the
   // uniform-routing expectation below.
   std::map<int, std::vector<double>> measured;
+  std::string measured_on;  // what the census ran on, for the output: real text, or the bench's random ids
 
   // Bytes one step of `streams` decoding tokens moves: shared items once, stream items per stream, and each expert item
   // over the union of the streams' choices: the measured union where a run measured this stream count, else the

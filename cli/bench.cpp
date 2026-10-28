@@ -36,6 +36,7 @@
 #include "cli/roofline.h"
 #include "core/install.h"
 #include "model/traffic.h"
+#include "census_text.h"
 #include "runtime/engine.h"
 
 namespace lx::cli {
@@ -82,9 +83,10 @@ struct StreamTiming {
   runtime::RequestResult result;
 };
 
-// Runs `streams` requests at once and returns each one's timings, when all have finished.
+// Runs `streams` requests at once and returns each one's timings, when all have finished. The prompts are the bench's
+// random ids, or with `text` real text: stream i reads its own window of the passage, the windows spread across it.
 std::vector<StreamTiming> run_batch(runtime::Engine& engine, int streams, int prompt_tokens, int gen_tokens,
-                                    int vocab, bool sample) {
+                                    int vocab, bool sample, const std::vector<int32_t>* text = nullptr) {
   std::vector<StreamTiming> timings(streams);
   std::mutex mu;
   std::condition_variable cv;
@@ -92,10 +94,17 @@ std::vector<StreamTiming> run_batch(runtime::Engine& engine, int streams, int pr
   for (int i = 0; i < streams; ++i) {
     runtime::GenerateRequest req;
     req.prompt.resize(prompt_tokens);
-    uint64_t x = 0x9E3779B97F4A7C15ull * static_cast<uint64_t>(i + 1);
-    for (int& id : req.prompt) {
-      x ^= x << 13, x ^= x >> 7, x ^= x << 17;
-      id = 1000 + static_cast<int>(x % static_cast<uint64_t>(vocab - 2000));
+    if (text) {
+      const int n = static_cast<int>(text->size());
+      const int span = std::max(0, n - prompt_tokens);
+      const int offset = streams > 1 ? static_cast<int>(static_cast<int64_t>(i) * span / (streams - 1)) : 0;
+      for (int k = 0; k < prompt_tokens; ++k) req.prompt[k] = (*text)[(offset + k) % n];
+    } else {
+      uint64_t x = 0x9E3779B97F4A7C15ull * static_cast<uint64_t>(i + 1);
+      for (int& id : req.prompt) {
+        x ^= x << 13, x ^= x >> 7, x ^= x << 17;
+        id = 1000 + static_cast<int>(x % static_cast<uint64_t>(vocab - 2000));
+      }
     }
     req.max_tokens = gen_tokens;
     req.ignore_eos = true;
@@ -274,13 +283,31 @@ int cmd_bench(int argc, char** argv) {
   for (const std::string& note : plan.notes) std::printf("  %s\n", note.c_str());
   if (!engine.placement().empty()) std::printf("%s", engine.placement().c_str());
 
-  // The routing the run touches: a census of this stream count's decode steps, run eagerly (graphs off) so it is not
-  // timed. The roofline reads the experts the router chose, not the uniform expectation.
+  // The routing the run touches, measured twice: a census of this stream count's decode steps, eager (graphs off, so it
+  // is not timed). The headline is real text: each stream reads its own window of a prose passage. The bench's random
+  // ids are measured beside it, since routing on random ids can concentrate differently.
+  const int census_prompt = std::min(args.prompt_tokens, 64), census_gen = std::min(args.gen_tokens, 64);
   engine.set_expert_census(true);
-  run_batch(engine, streams, std::min(args.prompt_tokens, 64), std::min(args.gen_tokens, 64), engine.config().vocab_size,
-            args.sample);
+  run_batch(engine, streams, census_prompt, census_gen, engine.config().vocab_size, args.sample, &lx::cli::census_prose());
   engine.set_expert_census(false);
-  const lx::DecodeTraffic traffic = engine.decode_traffic(context);
+  lx::DecodeTraffic traffic = engine.decode_traffic(context);
+  traffic.measured_on = "real text (prose passage, a window per stream)";
+  engine.set_expert_census(true);
+  run_batch(engine, streams, census_prompt, census_gen, engine.config().vocab_size, args.sample);
+  engine.set_expert_census(false);
+  lx::DecodeTraffic random_traffic = engine.decode_traffic(context);
+  random_traffic.measured_on = "random ids (the bench's synthetic prompts)";
+  const auto mean_union = [streams](const lx::DecodeTraffic& t) -> double {
+    const auto it = t.measured.find(streams);
+    if (it == t.measured.end() || it->second.empty()) return -1;
+    double sum = 0;
+    for (double v : it->second) sum += v;
+    return sum / static_cast<double>(it->second.size());
+  };
+  const double union_prose = mean_union(traffic), union_random = mean_union(random_traffic);
+  std::printf("  routing census at %d streams (%d-token prompts, %d generated): %.1f experts per layer-pass on real text"
+              " (the roofline's), %.1f on random ids, %.1f uniform\n",
+              streams, census_prompt, census_gen, union_prose, union_random, traffic.expected_experts(streams));
 
   // The traffic the engine counts, against the config's count for the same format: they must agree (traffic.h).
   const lx::DecodeTraffic from_config = lx::config_decode_traffic(engine.config(), plan.weights, plan.bf16x_decode, context, &plan.bf16x_dropped);

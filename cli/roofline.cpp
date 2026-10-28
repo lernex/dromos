@@ -125,8 +125,9 @@ void print_components(const DecodeTraffic& traffic, const char* title, int strea
     double mean = 0;
     for (double v : found->second) mean += v;
     mean /= static_cast<double>(found->second.size());
-    std::printf("  routed experts per layer-pass: %.1f measured over the run's decode steps, %.1f uniform (the model)\n",
-                mean, traffic.expected_experts(streams));
+    std::printf("  routed experts per layer-pass: %.1f measured on %s, %.1f uniform (the model)\n", mean,
+                traffic.measured_on.empty() ? "the run's decode steps" : traffic.measured_on.c_str(),
+                traffic.expected_experts(streams));
     std::printf("  step bytes: %.1f MB measured, %.1f MB modelled\n", total / 1e6,
                 traffic.step_bytes(streams, true) / 1e6);
   } else {
