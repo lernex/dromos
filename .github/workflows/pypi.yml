@@ -96,6 +96,7 @@ jobs:
           python -m pip install --quiet twine
           python -m twine check --strict dist/*.whl
           python -m zipfile -l dist/*.whl | grep -q "lernex/_bin/bin/lernex"
+          python -m zipfile -l dist/*.whl | grep -q "lernex-.*\.dist-info/licenses/LICENSE"
       - name: Smoke-test in a fresh venv
         shell: bash
         run: |

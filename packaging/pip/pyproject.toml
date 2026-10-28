@@ -1,7 +1,7 @@
 # The lernex wheel. Built by build_wheel.py, which stages this directory with the release tree under
 # lernex/_bin and writes wheel.json (the version and the dependencies); setup.py reads that file.
 [build-system]
-requires = ["setuptools>=70.1", "wheel>=0.43"]
+requires = ["setuptools>=77.0.3", "wheel>=0.43"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -17,6 +17,10 @@ readme = { text = """Lernex's inference engine for the Metis models, run on your
 The engine picks its backend when it starts: CUDA on an NVIDIA GPU (Linux x86_64; the CUDA runtime comes from
 NVIDIA's own wheels, which this package installs), Metal on Apple silicon (macOS 14 or later), and the CPU otherwise.
 """, content-type = "text/plain" }
+license = "Apache-2.0"
+# The engine's LICENSE and NOTICE, and the third-party licenses beside them (scripts/release/build.sh): build_wheel.py
+# stages them next to this file, so setuptools writes them into the wheel's dist-info.
+license-files = ["LICENSE", "NOTICE", "licenses/*"]
 requires-python = ">=3.9"
 classifiers = [
   "Environment :: GPU :: NVIDIA CUDA",

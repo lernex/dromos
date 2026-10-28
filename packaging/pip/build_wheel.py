@@ -125,6 +125,11 @@ def check_tree(tree, cuda):
         fail("the tree has the CUDA backend (liblernex_kernels.so): pass --cuda MAJOR")
     if cuda is not None and not has_kernels:
         fail("--cuda given, but the tree has no liblernex_kernels.so")
+    for name in ("LICENSE", "NOTICE"):
+        if not os.path.isfile(os.path.join(tree, name)):
+            fail("the tree has no %s (build it with scripts/release/build.sh)" % name)
+    if not os.path.isdir(os.path.join(tree, "share", "lernex", "licenses")):
+        fail("the tree has no share/lernex/licenses (build it with scripts/release/build.sh)")
     if not os.path.isfile(os.path.join(lib, "liblernex_cpu.so")) and not os.path.isfile(
             os.path.join(lib, "liblernex_metal.dylib")):
         fail("the tree has no CPU or Metal backend library")
@@ -141,9 +146,27 @@ def stage_tree(tree, dest):
     os.makedirs(channel, exist_ok=True)
     with open(os.path.join(channel, "channel"), "w", encoding="utf-8") as f:
         f.write("pip\n")
+    # The wheel bundles no NVIDIA library, so the NVIDIA license that came with the toolkit's libraries is not its
+    # to carry: the NVIDIA wheels ship their own.
+    licenses = os.path.join(dest, "share", "lernex", "licenses")
+    for name in sorted(os.listdir(licenses)) if os.path.isdir(licenses) else []:
+        if name.startswith("NVIDIA"):
+            os.remove(os.path.join(licenses, name))
+            print("build_wheel: left out of the wheel (the NVIDIA wheels carry their own license): " + name)
     # The launcher's own mode bits come from the tree; make sure the engine is executable after staging.
     engine = os.path.join(dest, "bin", "lernex")
     os.chmod(engine, os.stat(engine).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def stage_licenses(dest, stage):
+    """The license files the wheel's metadata names (pyproject.toml license-files): LICENSE and NOTICE at the
+    top of the package directory, and the third-party licenses beside them, copied from the tree's own copies."""
+    shutil.copy2(os.path.join(dest, "LICENSE"), os.path.join(stage, "LICENSE"))
+    shutil.copy2(os.path.join(dest, "NOTICE"), os.path.join(stage, "NOTICE"))
+    os.makedirs(os.path.join(stage, "licenses"), exist_ok=True)
+    source = os.path.join(dest, "share", "lernex", "licenses")
+    for name in sorted(os.listdir(source)):
+        shutil.copy2(os.path.join(source, name), os.path.join(stage, "licenses", name))
 
 
 def build(args):
@@ -156,6 +179,7 @@ def build(args):
         stage = os.path.join(work, "pip")
         shutil.copytree(HERE, stage, ignore=shutil.ignore_patterns("build_wheel.py", "__pycache__"))
         stage_tree(tree, os.path.join(stage, "lernex", "_bin"))
+        stage_licenses(os.path.join(stage, "lernex", "_bin"), stage)
         with open(os.path.join(stage, "wheel.json"), "w", encoding="utf-8") as f:
             json.dump({"version": args.version, "requires": requirements(args.cuda)}, f, indent=1)
         # The platform tag goes in setup.cfg, so pip builds the wheel with it (no setup.py command line).
@@ -177,7 +201,7 @@ def main():
     parser.add_argument("--out", required=True, help="the directory the wheel is written to")
     parser.add_argument("--version", required=True, help="the PEP 440 version, e.g. 0.1.0")
     parser.add_argument("--plat", required=True, help="the wheel's platform tag, e.g. manylinux_2_28_x86_64")
-    parser.add_argument("--cuda", default=None, help="the CUDA toolkit major of the CUDA backend: 13")
+    parser.add_argument("--cuda", default=None, help="the CUDA toolkit major of the CUDA backend: 12")
     build(parser.parse_args())
 
 
