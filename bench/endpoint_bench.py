@@ -238,6 +238,11 @@ async def prefill_once(session, url, name, tokens: list[int]) -> float:
     return result["events"][0] - submitted
 
 
+def save_partial(path: str, out: dict) -> None:
+    with open(path, "w") as f:
+        json.dump(out, f, indent=1)
+
+
 async def main_async(args) -> dict:
     base = args.url.rstrip("/")
     url = base + "/v1/completions"
@@ -266,12 +271,14 @@ async def main_async(args) -> dict:
                 # Warm-up, as cli/bench.cpp does: min(prompt, 64) prompt tokens, 8 generated tokens.
                 await run_streams(session, url, args.model, n, min(args.prompt_tokens, 64), 8, args.vocab)
                 rows = []
+                out["decode"][str(n)] = rows  # saved as each repeat finishes, so a later failure keeps them
                 for r in range(args.repeats):
                     row = await run_streams(
                         session, url, args.model, n, args.prompt_tokens, args.gen_tokens, args.vocab, samples
                     )
                     row["repeat"] = r
                     rows.append(row)
+                    save_partial(args.out, out)
                     print(
                         f"{args.label} streams={n:>3} rep={r} decode={row['decode_tps']:8.1f} tok/s "
                         f"per-stream={row['per_stream_tps']:7.1f} TTFT p50={row['ttft_p50']:.3f}s "
@@ -282,7 +289,6 @@ async def main_async(args) -> dict:
                         f"short={row['streams_not_at_gen_tokens']}",
                         flush=True,
                     )
-                out["decode"][str(n)] = rows
             for T in prefill_list:
                 tokens = prefill_tokens(args.prompts, T)
                 await prefill_once(session, url, args.model, tokens)  # warm-up
