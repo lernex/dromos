@@ -16,6 +16,7 @@
 #include "core/checkpoint.h"
 #include "cuda/kernels.h"
 #include "model/glue.h"
+#include "model/pin.h"
 #include "runtime/offload.h"
 
 namespace lx {
@@ -221,6 +222,10 @@ struct MetisModel::Impl {
   // but 0) keeps the three kernels, for A/B.
   bool fused_mamba = false;
   int32_t* mamba_sync = nullptr;
+
+  // The persisting L2 window of the decode (pin.h): its arena holds the hottest decode weights and, when asked,
+  // the Mamba states. Declared last: its destructor clears the window after the graphs that read it are gone.
+  pin::Arena pins;
 
   template <typename T>
   T* alloc(size_t count, size_t elem = sizeof(T)) {
@@ -530,6 +535,91 @@ void build_bank_projection(Impl& m, const ModelWeights& weights, const std::stri
 
 }  // namespace
 
+namespace {
+
+// ---- The L2 window (pin.h) ---------------------------------------------------------------------
+
+// The decode's copy of a projection for the window: its BF16X copy when decode reads one, else the weight and its
+// scales as they are (a BF16X folder's own encoding is not registered: its size is only known once encoded).
+void pin_linear(pin::Arena& arena, Linear& l, double reads) {
+  if (l.x16) {
+    const int64_t bytes = lx_bf16x_bytes(l.w.data, l.N, l.K, nullptr);
+    if (bytes > 0) arena.weight({pin::Part{l.x16, bytes, [&l](const void* p) { l.x16 = p; }}}, reads);
+    return;
+  }
+  const int64_t N = l.N, K = l.K;
+  int64_t data = 0, scale = 0;
+  switch (l.w.type) {
+    case LX_W_BF16: data = N * K * 2; break;
+    case LX_W_INT8:
+    case LX_W_FP8: data = N * K; scale = N * 4; break;
+    case LX_W_NVFP4: data = N * K / 2; scale = N * K / 16; break;
+    default: return;  // BF16X folders and anything else: left in place
+  }
+  std::vector<pin::Part> parts{pin::Part{l.w.data, data, [&l](const void* p) { l.w.data = p; }}};
+  if (scale > 0 && l.w.scale) parts.push_back(pin::Part{l.w.scale, scale, [&l](const void* p) { l.w.scale = p; }});
+  arena.weight(std::move(parts), reads);
+}
+
+// Registers the decode's weights with the window, by the reads per token the step makes of each (run, in its order):
+// the depth memory's routing features once per layer and at each pass's end, its retrieval (query and output) once an
+// entry exists, its writes (state, metadata, key, value) at each attention layer and each pass's end; every other
+// projection, the router and the expert embeddings once per pass. Only the reads matter for the choice: a region
+// read n times a token saves n times its bytes from DRAM when it stays in L2.
+void pin_weights(Impl& m) {
+  const int P = m.P_passes, E = m.E;
+  int entries = 0;
+  double route = 0, query = 0, writes = 0;
+  for (int pass = 0; pass < P; ++pass) {
+    for (int i = 0; i < m.L_layers; ++i) {
+      if (entries > 0) query += 1;
+      route += 1;
+      if (m.layers[i].attention) {
+        writes += 1;
+        entries += 1;
+      }
+    }
+    if (entries > 0) query += 1;
+    route += 1;
+    writes += 1;
+    entries += 1;
+  }
+  pin_linear(m.pins, m.m_route, route);
+  pin_linear(m.pins, m.m_query, query);
+  pin_linear(m.pins, m.m_out, query);
+  pin_linear(m.pins, m.m_state, writes);
+  pin_linear(m.pins, m.m_meta, writes);
+  pin_linear(m.pins, m.m_key, writes);
+  pin_linear(m.pins, m.m_value, writes);
+  for (Impl::Layer& layer : m.layers) {
+    if (layer.attention) {
+      pin_linear(m.pins, layer.qkv, P);
+      pin_linear(m.pins, layer.out, P);
+      pin_linear(m.pins, layer.lora_down, P);
+      pin_linear(m.pins, layer.lora_up, P);
+    } else {
+      pin_linear(m.pins, layer.in_proj, P);
+      pin_linear(m.pins, layer.out_proj, P);
+    }
+    pin_linear(m.pins, layer.latent_down, P);
+    pin_linear(m.pins, layer.latent_up, P);
+    pin_linear(m.pins, layer.shared_gate_up, P);
+    pin_linear(m.pins, layer.shared_down, P);
+    const int64_t router = static_cast<int64_t>(E) * (m.Lat + m.R) * 4;
+    m.pins.weight({pin::Part{layer.router_w, router, [&layer](const void* p) {
+                               layer.router_w = static_cast<const float*>(p);
+                             }}},
+                  P);
+    const int64_t experts = static_cast<int64_t>(E) * m.R * 2;
+    m.pins.weight({pin::Part{layer.expert_emb, experts, [&layer](const void* p) { layer.expert_emb = p; }}}, P);
+  }
+  const int64_t c_hidden = static_cast<int64_t>(m.R) * (3 * m.D + m.R) * 4;
+  m.pins.weight({pin::Part{m.c_hidden_w, c_hidden, [&m](const void* p) { m.c_hidden_w = static_cast<const float*>(p); }}},
+                P);
+}
+
+}  // namespace
+
 MetisModel::MetisModel(const MetisConfig& c, const ModelWeights& weights, const ModelFormats& formats, int max_slots,
                        int kv_capacity, int max_tokens, offload::ExpertOffload* experts, bool speculative)
     : cfg_(c), slot_len_(max_slots, 0), folded_(max_slots, 0), pending_(max_slots, 0), impl_(new Impl) {
@@ -717,9 +807,22 @@ MetisModel::MetisModel(const MetisConfig& c, const ModelWeights& weights, const 
   m.unpack_bytes = std::max(m.unpack_bytes, unpack_experts);
   if (m.unpack_bytes) m.unpack = m.alloc<char>(m.unpack_bytes);
 
+  // The L2 window (pin.h): registered before the states are allocated, since the arena may hold them. A Mamba state
+  // is read and written once per pass a token, so it counts twice.
+  // The weights first: with equal reads per token, the window takes a weight before a state.
+  if (m.pins.holds_weights()) pin_weights(m);
+  std::vector<int> conv_pin(static_cast<size_t>(m.P_passes) * m.L_layers, -1), ssm_pin(conv_pin);
+  for (int idx = 0; idx < m.P_passes * m.L_layers; ++idx) {
+    if (m.layers[idx % m.L_layers].attention) continue;
+    conv_pin[idx] = m.pins.state(static_cast<int64_t>(max_slots) * (m.W - 1) * m.conv_dim * 4, 2.0);
+    ssm_pin[idx] = m.pins.state(static_cast<int64_t>(max_slots) * m.H * m.Pd * m.N * 4, 2.0);
+  }
+  m.pins.open(pin::budget_bytes());
+
   // persistent state, one per (pass, layer)
   for (int pass = 0; pass < m.P_passes; ++pass) {
     for (int i = 0; i < m.L_layers; ++i) {
+      const size_t idx = static_cast<size_t>(pass) * m.L_layers + i;
       if (m.layers[i].attention) {
         const size_t n = static_cast<size_t>(max_slots) * kv_capacity * m.KVH * m.Dh;
         m.k_cache.push_back(m.alloc<uint16_t>(n));
@@ -727,8 +830,13 @@ MetisModel::MetisModel(const MetisConfig& c, const ModelWeights& weights, const 
         m.conv_state.push_back(nullptr);
         m.ssm_state.push_back(nullptr);
       } else {
-        m.conv_state.push_back(m.alloc<float>(static_cast<size_t>(max_slots) * (m.W - 1) * m.conv_dim));
-        m.ssm_state.push_back(m.alloc<float>(static_cast<size_t>(max_slots) * m.H * m.Pd * m.N));
+        // a state the window holds lives in the arena (zeroed there, as the allocations below are)
+        const size_t conv_n = static_cast<size_t>(max_slots) * (m.W - 1) * m.conv_dim;
+        const size_t ssm_n = static_cast<size_t>(max_slots) * m.H * m.Pd * m.N;
+        auto* conv = static_cast<float*>(m.pins.state_buffer(conv_pin[idx]));
+        auto* ssm = static_cast<float*>(m.pins.state_buffer(ssm_pin[idx]));
+        m.conv_state.push_back(conv ? conv : m.alloc<float>(conv_n));
+        m.ssm_state.push_back(ssm ? ssm : m.alloc<float>(ssm_n));
         m.k_cache.push_back(nullptr);
         m.v_cache.push_back(nullptr);
       }
