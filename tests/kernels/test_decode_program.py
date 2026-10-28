@@ -17,6 +17,16 @@ import torch.nn.functional as F
 import formats as fm
 from conftest import BF16, F32, close
 
+
+@pytest.fixture(autouse=True)
+def _needs_program(lx):
+    """Skip before a test allocates anything when the backend has no decode program (Metal, CPU, or a CUDA build
+    with -DLX_DECODE_PROGRAM=OFF): a skip raised after the weights exist keeps them alive, and the file runs out of
+    card memory."""
+    if not hasattr(lx.lib, "lx_program_create"):
+        pytest.skip("this backend has no decode program")
+
+
 W_BF16, W_INT8, W_F32 = 0, 1, 16
 FX_PLAIN, FX_RMS, FX_GATED, FX_CONCAT = 0, 1, 2, 3
 FY_STORE, FY_WRITE = 0, 1
