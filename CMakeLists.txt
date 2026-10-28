@@ -176,6 +176,14 @@ if(LX_BACKEND_CUDA)
 
   # Every kernel, behind a C ABI (engine/cuda/kernels.h) so the tests can call them through ctypes.
   file(GLOB LX_CUDA_SOURCES CONFIGURE_DEPENDS engine/cuda/*.cu)
+  # The persistent decode program (decode_program.cu and the decode_kernel*.cu that run it) is opt-in at run time
+  # (LX_PROGRAM) and its kernel is the slowest file to compile by far, about 30 minutes for one architecture. The
+  # release flavors leave it out (scripts/release/build.sh); a build without it decodes kernel by kernel, and says
+  # so when LX_PROGRAM asks for the program.
+  option(LX_DECODE_PROGRAM "Build the persistent decode program (opt-in at run time with LX_PROGRAM)" ON)
+  if(NOT LX_DECODE_PROGRAM)
+    list(FILTER LX_CUDA_SOURCES EXCLUDE REGEX "/decode_(program|kernel[^/]*)\\.cu$")
+  endif()
   add_library(lernex_kernels SHARED ${LX_CUDA_SOURCES})
   target_include_directories(lernex_kernels PUBLIC engine)
   target_link_libraries(lernex_kernels PUBLIC CUDA::cudart CUDA::cublasLt)

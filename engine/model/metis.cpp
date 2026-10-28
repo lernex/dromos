@@ -15,6 +15,7 @@
 
 #include "core/checkpoint.h"
 #include "cuda/kernels.h"
+#include "dispatch/dispatch.h"
 #include "model/glue.h"
 #include "model/pin.h"
 #include "runtime/offload.h"
@@ -767,6 +768,16 @@ MetisModel::MetisModel(const MetisConfig& c, const ModelWeights& weights, const 
   };
   m.use_program = program && std::strcmp(program, "0") != 0 && !speculative && !experts && plain(formats.dense) &&
                   plain(formats.experts) && plain(formats.latent_up);
+  if (m.use_program) {
+    // A backend built without the program (-DLX_DECODE_PROGRAM=OFF, as the release flavors are, or one that has
+    // none) says so once, plainly, and decodes kernel by kernel.
+    const auto& missing = lx::dispatch::info().missing;
+    if (std::find(missing.begin(), missing.end(), "lx_program_create") != missing.end()) {
+      std::fprintf(stderr, "lernex: LX_PROGRAM is set, but this build's %s backend has no decode program; "
+                   "decoding kernel by kernel\n", lx::dispatch::info().backend.c_str());
+      m.use_program = false;
+    }
+  }
   if (m.use_program) {
     lx_program* probe = lx_program_create(1, nullptr, nullptr, nullptr, nullptr);
     m.use_program = probe != nullptr;

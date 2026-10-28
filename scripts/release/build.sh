@@ -35,9 +35,10 @@ targets=(lernex)
 case "$flavor" in
   linux-x86_64-cuda12 | linux-x86_64-cuda13)
     # -DLX_LINEINFO=OFF drops the device code's line tables: they were most of the fatbin (430 MB to 150 MB for
-    # LX_ARCHS=all, 46 MB gzipped), and the PyPI wheel has a 100 MB limit.
+    # LX_ARCHS=all, 46 MB gzipped), and the PyPI wheel has a 100 MB limit. -DLX_DECODE_PROGRAM=OFF leaves out the
+    # opt-in decode program, whose kernel alone takes about 30 minutes per architecture to compile.
     cmake_args+=(-DLX_BACKEND_CUDA=ON -DLX_BACKEND_CPU=ON -DLX_BUNDLE_CUDA=ON -DLX_ARCHS=all -DLX_STATIC_LIBSTDCXX=ON
-                 -DLX_LINEINFO=OFF -DCUDAToolkit_ROOT="$cuda" -DCMAKE_CUDA_COMPILER="$cuda/bin/nvcc")
+                 -DLX_LINEINFO=OFF -DLX_DECODE_PROGRAM=OFF -DCUDAToolkit_ROOT="$cuda" -DCMAKE_CUDA_COMPILER="$cuda/bin/nvcc")
     targets+=(lernex_kernels lernex_cpu)
     ;;
   linux-x86_64-cpu | linux-aarch64-cpu)
