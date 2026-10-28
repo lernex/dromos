@@ -1,4 +1,4 @@
-// lernex doctor [MODEL_DIR] [--weights bf16|int8|fp8|nvfp4|bf16x] [--no-bf16x] [--context N] [--sequences N]
+// lernex doctor [MODEL] [--weights bf16|int8|fp8|nvfp4|bf16x] [--no-bf16x] [--context N] [--sequences N]
 //
 // Prints what this GPU or CPU can do, which kernels this build has, which tuning table is in use, and, with a
 // model folder, the plan the engine would run it under, in plain language: the format the file stores,
@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <exception>
 #include <stdexcept>
 #include <string>
@@ -203,6 +204,8 @@ int cmd_doctor(int argc, char** argv) {
                                                 : table.c_str());
 
     if (!dir.empty()) {
+      // MODEL is a folder, or an alias or repository installed in the cache (praxis, logos:fp8), as for bench.
+      if (!std::filesystem::is_directory(dir)) dir = lx::cli::find_model(dir, false).dir.string();
       const lx::MetisConfig config = lx::load_config(dir);
       const CheckpointInfo checkpoint = inspect_checkpoint(dir);
       std::printf("\nmodel      %s: %d layers (%zu attention), hidden %d, %d routed experts, %d passes\n",

@@ -39,7 +39,7 @@ void usage() {
                "  version                                   the version, the release flavor and the commit\n"
                "  bench MODEL [--streams 1,8,32,64] [--prompt-tokens N] [--gen-tokens N]\n"
                "                                            throughput of the engine on this GPU\n"
-               "  doctor [MODEL_DIR] [--context N] [--sequences N]\n"
+               "  doctor [MODEL] [--context N] [--sequences N]\n"
                "                                            the GPU, what it can run, and the plan for a model\n"
                "  tune MODEL_DIR [--out PATH] [--log]       time the kernel variants on this GPU, keep the winners\n"
                "  inspect MODEL_DIR                         load a model and describe it\n"
