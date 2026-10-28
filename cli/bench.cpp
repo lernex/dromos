@@ -260,7 +260,6 @@ int cmd_bench(int argc, char** argv) {
   }
 
   const int context = args.prompt_tokens + args.gen_tokens / 2;  // the mean context a stream reads over the run
-  const lx::DecodeTraffic traffic = engine.decode_traffic(context);
   // The roofline needs the whole model on the device: an offloaded plan's experts come over PCIe, which is another bound.
   const bool roofline_ok = !plan.offload.enabled && bw.measured_gbs > 0;
 
@@ -269,11 +268,19 @@ int cmd_bench(int argc, char** argv) {
   for (const std::string& note : plan.notes) std::printf("  %s\n", note.c_str());
   if (!engine.placement().empty()) std::printf("%s", engine.placement().c_str());
 
+  // The routing the run touches: a census of this stream count's decode steps, run eagerly (graphs off) so it is not
+  // timed. The roofline reads the experts the router chose, not the uniform expectation.
+  engine.set_expert_census(true);
+  run_batch(engine, streams, std::min(args.prompt_tokens, 64), std::min(args.gen_tokens, 64), engine.config().vocab_size,
+            args.sample);
+  engine.set_expert_census(false);
+  const lx::DecodeTraffic traffic = engine.decode_traffic(context);
+
   // The traffic the engine counts, against the config's count for the same format: they must agree (traffic.h).
   const lx::DecodeTraffic from_config = lx::config_decode_traffic(engine.config(), plan.weights, plan.bf16x_decode, context, &plan.bf16x_dropped);
   bool agree = true;
   for (int n : {1, 8, 32}) {
-    const double a = traffic.step_bytes(n), b = from_config.step_bytes(n);
+    const double a = traffic.step_bytes(n, true), b = from_config.step_bytes(n);
     agree = agree && std::fabs(a - b) <= 1e-9 * std::max(a, b);
   }
   agree = agree && std::fabs(traffic.macs_per_token() - from_config.macs_per_token()) <= 1e-9 * traffic.macs_per_token();

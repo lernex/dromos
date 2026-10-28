@@ -158,6 +158,14 @@ struct MetisModel::Impl {
   void* moe_workspace = nullptr;
   offload::ExpertOffload* offload = nullptr;  // the routed experts, when they run offloaded
   FILE* route_trace = nullptr;                // LX_ROUTE_TRACE: every layer's routing, for the placement stats
+  // set_expert_census: the distinct experts each decode step's streams chose, per checkpoint layer, summed over its
+  // passes (n counts them), kept per stream count (the step's T)
+  struct Census {
+    std::vector<double> sum;
+    std::vector<int> n;
+  };
+  bool census = false;
+  std::map<int, Census> census_by_streams;
   FILE* linear_trace = nullptr;               // LX_LINEAR_TRACE: every decode-sized product's shape, in issue order
   // LX_SERIAL_DECODE: a decode step runs on the one stream in issue order, its side streams joined into it, so the
   // kernels of a profile come out in the order the products were issued (the same kernels, without the overlap).
@@ -1047,9 +1055,17 @@ void MetisModel::set_feature_taps(const std::vector<FeatureTap>& taps) {
 int MetisModel::feature_dim() const { return impl_->tap_dim; }
 const float* MetisModel::features() const { return impl_->tap_out; }
 
+void MetisModel::set_expert_census(bool on) {
+  Impl& m = *impl_;
+  m.census = on;
+  if (on) m.census_by_streams.clear();  // turning it on starts a fresh census; turning it off keeps what it counted
+  // a captured graph does not read the routing back to the host, so a census runs its steps eagerly
+  m.use_graphs = std::getenv("LX_NO_GRAPHS") == nullptr && !m.route_trace && !on;
+}
+
 DecodeTraffic MetisModel::decode_traffic(int context) const {
   const Impl& m = *impl_;
-  return count_decode_traffic(
+  DecodeTraffic t = count_decode_traffic(
       cfg_,
       [&m](const std::string& name, int64_t E, int64_t N, int64_t K) {
         const auto it = m.decode_mats.find(name);
@@ -1059,6 +1075,15 @@ DecodeTraffic MetisModel::decode_traffic(int context) const {
         return it->second;
       },
       context);
+  for (const auto& [streams, cen] : m.census_by_streams) {
+    bool whole = !cen.n.empty();
+    for (int n : cen.n) whole = whole && n > 0;
+    if (!whole) continue;
+    std::vector<double> mean;
+    for (size_t i = 0; i < cen.n.size(); ++i) mean.push_back(cen.sum[i] / cen.n[i]);
+    t.measured[streams] = std::move(mean);
+  }
+  return t;
 }
 
 MetisModel::HeadWeights MetisModel::head_weights() const {
@@ -1666,7 +1691,7 @@ lx_program* build_program(Impl& m, const MetisConfig& c, int T, float* logits) {
 // models, so a verify step and the steps around it share one path, offloaded experts, projections
 // in host memory, BF16X copies), with no route trace or feature taps to write.
 bool decode_program_covers(const Impl& m, int T, int n_seq, bool spec) {
-  if (!m.use_program || spec || T != n_seq || T > 8 || m.route_trace) return false;
+  if (!m.use_program || spec || T != n_seq || T > 8 || m.route_trace || m.census) return false;
   for (int col : m.tap_col)
     if (col >= 0) return false;
   return true;
@@ -1972,14 +1997,33 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
       gemm_f32(m.router_in, Lat + R, layer.router_w, layer.router_b, m.router_logits, E, T, E, Lat + R, s);
       LX_CHECK(lx_moe_route(m.router_logits, layer.selection_bias, m.route_ids, m.route_w, m.entropy, m.confidence, T,
                             E, m.K, s));
-      if (m.route_trace) {  // pass, layer, T, then T * K expert ids (int32)
+      const bool census_step = m.census && T == n_seq;  // a decode step: one token per stream
+      if (m.route_trace || census_step) {
         std::vector<int32_t> ids(static_cast<size_t>(T) * m.K);
         check(lx_rt_copy(ids.data(), m.route_ids, static_cast<int64_t>(ids.size() * 4), LX_COPY_D2H, s),
               "route trace copy");
         check(lx_rt_stream_sync(s), "stream sync");
-        const int32_t head[3] = {pass, i, T};
-        std::fwrite(head, 4, 3, m.route_trace);
-        std::fwrite(ids.data(), 4, ids.size(), m.route_trace);
+        if (m.route_trace) {  // pass, layer, T, then T * K expert ids (int32)
+          const int32_t head[3] = {pass, i, T};
+          std::fwrite(head, 4, 3, m.route_trace);
+          std::fwrite(ids.data(), 4, ids.size(), m.route_trace);
+        }
+        if (census_step) {  // the distinct experts the step's streams chose in this layer-pass
+          std::vector<char> hit(static_cast<size_t>(E), 0);
+          int distinct = 0;
+          for (int32_t e : ids)
+            if (e >= 0 && e < E && !hit[e]) {
+              hit[e] = 1;
+              ++distinct;
+            }
+          auto& cen = m.census_by_streams[T];
+          if (cen.sum.empty()) {
+            cen.sum.assign(m.L_layers, 0.0);
+            cen.n.assign(m.L_layers, 0);
+          }
+          cen.sum[i] += distinct;
+          cen.n[i] += 1;
+        }
       }
       // The shared expert's gate-up and activation read only latent_bf, so on a decode-sized step they run on
       // shared_side while the routed experts run, and join before shared_down adds into routed.

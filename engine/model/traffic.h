@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -63,14 +64,22 @@ struct DecodeTraffic {
   int top_k = 0;    // routed experts per token per layer-pass
   int experts = 0;  // routed experts per layer
   std::vector<TrafficItem> items;
+  // The routing a decode run measured (MetisModel::set_expert_census): per stream count, per checkpoint layer, the mean
+  // over the layer's passes and steps of the distinct experts its streams chose. A count with no measurement reads the
+  // uniform-routing expectation below.
+  std::map<int, std::vector<double>> measured;
 
   // Bytes one step of `streams` decoding tokens moves: shared items once, stream items per stream, and each expert item
-  // over the expected union of the streams' choices, E * (1 - (1 - k / E)^n) experts per layer-pass.
-  double step_bytes(int streams) const;
+  // over the union of the streams' choices: the measured union where a run measured this stream count, else the
+  // uniform-routing expectation E * (1 - (1 - k / E)^n) per layer-pass. `modelled` takes the expectation always: the
+  // number the model counts from the config.
+  double step_bytes(int streams, bool modelled = false) const;
   // The expected distinct experts a layer-pass reads for `streams` streams, uniform routing (k when streams is 1).
   double expected_experts(int streams) const;
+  // The experts an expert item's layer-pass reads at `streams` streams: measured or expected, as step_bytes.
+  double experts_read(const TrafficItem& item, int streams, bool modelled = false) const;
   // What one item adds to a step of `streams` streams (its scope's rule above).
-  double item_bytes(const TrafficItem& item, int streams) const;
+  double item_bytes(const TrafficItem& item, int streams, bool modelled = false) const;
   // The step's bytes per token, at one stream: step_bytes(1).
   double bytes_per_token() const { return step_bytes(1); }
   // Multiply-accumulates one token takes (every product it multiplies: an expert counts its top_k picks, the depth

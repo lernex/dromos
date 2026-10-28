@@ -133,6 +133,8 @@ class Engine {
   // What one decode step moves through memory at `context` cache positions per stream, in this engine's formats
   // (model/traffic.h). The roofline's numerator; an offloaded plan's experts are counted where they are not resident.
   lx::DecodeTraffic decode_traffic(int context) const;
+  // The routing census behind the measured experts (metis.h): decode steps count their routed experts while it is on.
+  void set_expert_census(bool on);
 
   // Queues a request. Throws std::invalid_argument for a request the engine cannot run (empty
   // prompt, a prompt longer than the context, out-of-range sampling values) and std::runtime_error

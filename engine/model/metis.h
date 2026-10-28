@@ -148,6 +148,9 @@ class MetisModel {
   // What one decode step moves through memory with `context` cache positions per stream (traffic.h): the matrices this
   // model loaded, in the formats and with the BF16X decode copies it reads, counted over the same events as decode.
   DecodeTraffic decode_traffic(int context) const;
+  // The routing census behind decode_traffic's measured experts. While on, decode steps (one token per stream) run
+  // eagerly and their routing is read back and counted; turning it on starts a fresh census.
+  void set_expert_census(bool on);
   const MetisConfig& config() const { return cfg_; }
 
   // The weights, state and scratch; defined in metis.cpp.

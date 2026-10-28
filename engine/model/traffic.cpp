@@ -57,7 +57,16 @@ double DecodeTraffic::expected_experts(int streams) const {
   return E * (1.0 - std::pow(1.0 - k / E, streams));
 }
 
-double DecodeTraffic::item_bytes(const TrafficItem& it, int streams) const {
+double DecodeTraffic::experts_read(const TrafficItem& it, int streams, bool modelled) const {
+  if (!modelled) {
+    const auto found = measured.find(streams);
+    if (found != measured.end() && it.layer >= 0 && static_cast<size_t>(it.layer) < found->second.size())
+      return found->second[it.layer];
+  }
+  return expected_experts(streams);
+}
+
+double DecodeTraffic::item_bytes(const TrafficItem& it, int streams, bool modelled) const {
   const double per = it.data + it.scales;
   switch (it.scope) {
     case Scope::Shared:
@@ -65,14 +74,14 @@ double DecodeTraffic::item_bytes(const TrafficItem& it, int streams) const {
     case Scope::PerStream:
       return streams * it.count * (per + it.per_position * context);
     case Scope::Expert:
-      return it.count * expected_experts(streams) * per;
+      return it.count * experts_read(it, streams, modelled) * per;
   }
   return 0;
 }
 
-double DecodeTraffic::step_bytes(int streams) const {
+double DecodeTraffic::step_bytes(int streams, bool modelled) const {
   double total = 0;
-  for (const TrafficItem& it : items) total += item_bytes(it, streams);
+  for (const TrafficItem& it : items) total += item_bytes(it, streams, modelled);
   return total;
 }
 

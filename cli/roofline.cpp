@@ -119,6 +119,20 @@ double expert_bytes(const DecodeTraffic& traffic, int streams) {
 void print_components(const DecodeTraffic& traffic, const char* title, int streams) {
   const double total = traffic.step_bytes(streams);
   std::printf("%s\n", title);
+  // Both routing counts: the measured union the rows are over, and the uniform expectation the model counts from the config.
+  const auto found = traffic.measured.find(streams);
+  if (found != traffic.measured.end() && !found->second.empty()) {
+    double mean = 0;
+    for (double v : found->second) mean += v;
+    mean /= static_cast<double>(found->second.size());
+    std::printf("  routed experts per layer-pass: %.1f measured over the run's decode steps, %.1f uniform (the model)\n",
+                mean, traffic.expected_experts(streams));
+    std::printf("  step bytes: %.1f MB measured, %.1f MB modelled\n", total / 1e6,
+                traffic.step_bytes(streams, true) / 1e6);
+  } else {
+    std::printf("  routed experts per layer-pass: %.1f uniform (the model; no run measured the routing)\n",
+                traffic.expected_experts(streams));
+  }
 
   // The groups, in the order their first component appears, then every component under its group.
   struct Row {

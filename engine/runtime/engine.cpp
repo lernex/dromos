@@ -280,6 +280,7 @@ double Engine::now() const { return impl_->now(); }
 const std::string& Engine::placement() const { return impl_->placement; }
 
 lx::DecodeTraffic Engine::decode_traffic(int context) const { return impl_->model->decode_traffic(context); }
+void Engine::set_expert_census(bool on) { impl_->model->set_expert_census(on); }
 
 uint64_t Engine::submit(GenerateRequest request, RequestCallbacks callbacks) {
   Impl& m = *impl_;
