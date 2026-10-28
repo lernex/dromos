@@ -30,22 +30,23 @@ Resident weights include the BF16X lossless copies that decode reads for the wid
 
 Where each row's weights come from: Praxis BF16 is the BF16 file as stored. Praxis INT8 is round-to-nearest from the BF16 file, at load. Praxis FP8 and NVFP4 load the checkpoints stored under `kronos-scratch/logos/engines/praxis/` (`fp8`, `nvfp4`); NVFP4 is refused from a plain BF16 checkpoint. Logos FP8 is `Metis-1.6-Logos-FP8` as stored.
 
-## Routing census: the text the union was measured on
+## Bench prompts and the routing census
 
-The ceiling reads how many distinct routed experts a layer-pass touches. `lernex bench` measures that on its own decode steps (eager, so it is not timed) and prints the text it was measured on. It measures twice:
+**The basis changed at commit 07db7ad.** From that commit `lernex bench` cuts its prompts from `tools/rivals/corpus.txt`, tokenized with the model's own tokenizer: 10,298 tokens, FNV-1a `df6a8031` (the same ids the rival client sends, checked against the HF tokenizer). Stream i of n reads the 512-token window that starts at `(N - 512) * i / (n - 1)`, so the windows spread across the corpus. The rival client's unique-prompt mode uses the same rule by default now (`--random-windows` restores its old random starts), so a rival run at n streams and a bench run at n streams read the same tokens. `--random-prompts` restores the bench's synthetic ids, which every row before 07db7ad was measured on.
 
-- **Real text** (the headline): a 300-token prose passage from the logosrefs prompt set, each stream reading its own 64-token window, the windows spread across the passage (`cli/census_text.h`).
-- **Random ids**: the bench's synthetic prompts, the same ones the timed runs use.
+The routing census runs on the same prompts as the timed run, eagerly (graphs off, so it is not timed). It runs after the timed run, so its prefix-cache hits do not turn the timed prefill into a cache read. The warm-up runs on random ids for the same reason.
 
 Logos FP8 at 32 streams (512 prompt tokens, 256 generated, context 640):
 
-| Routing measured on | Experts per layer-pass | Roofline at 32 streams, measured bandwidth (tok/s) |
-|---|---|---|
-| Real text (prose passage) | 49.1 | 1946 |
-| Random ids (the timed runs' prompts) | 65.4 to 66.0 | 1745 |
-| Uniform, from the config (no run) | 94.1 | 1512 (the table below) |
+| Prompts (commit) | Experts per layer-pass | Decode tok/s | Roofline at measured bandwidth | Share of roofline |
+|---|---|---|---|---|
+| Real text, corpus windows (07db7ad) | 67.8 | 1132.4 | 1711 | 66.2% |
+| Random ids (f6e0eb3, `--random-prompts`) | 66.0 | 1200.6 | 1745 | 68.8% |
+| Uniform, from the config (no run) | 94.1 | not timed | 1512 (table below) | not timed |
 
-The timed decode rates in this file were measured on random-id prompts. Against the random-id roofline, the 32-stream run of 1193.7 tok/s is 68.4%. The bench's roofline column now reads the real-text census, so its 61.3% share mixes two texts until the timed run is on real text too. The uniform figures in the roofline table below are the modelled union and are superseded by the census rows here.
+The real-text decode rate is 5.7% below the random-id rate, and the two censuses read almost the same union (67.8 and 66.0), so the union does not explain the gap. Run-to-run noise is about 3.5%; this is not yet explained beyond that.
+
+An earlier real-text census (e8b7997) used a 300-token prose passage in 64-token windows and read 49.1 experts per layer-pass, with a roofline of 1946. That passage was too short and too short-windowed to be the bench's basis, so its figures are superseded by the corpus rows above.
 
 ## Measured decode: `lernex bench`
 
