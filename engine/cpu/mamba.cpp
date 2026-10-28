@@ -360,4 +360,35 @@ int lx_gated_rmsnorm(const float* y, const float* z, int ld_z, const void* w, vo
   return kOk;
 }
 
+// The decode step (kernels.h, lx_mamba_decode_step) is the three kernels above run in turn, one token per
+// sequence, so its bits are theirs by construction. The conv's output and the identity cu_seqlens share one
+// scratch block (slot 7, which no kernel above uses), so a warm step allocates nothing.
+int lx_mamba_decode_step(const float* zxbcdt, int ld, const void* conv_w, const void* conv_b, float* conv_state,
+                         float* ssm_state, const float* A_log, const float* D, const float* dt_bias,
+                         const int32_t* slot_ids, const int32_t* has_state, const void* norm_w, float eps, float* y,
+                         void* out, int32_t* sync, int n_seq, int H, int P, int G, int N, int W, void* stream) {
+  LX_PROFILE("mamba_decode_step");
+  (void)stream;
+  (void)sync;  // the CUDA kernel's group counters: the three kernels need none
+  if (n_seq <= 0) return kOk;
+  if (H <= 0 || G <= 0 || H % G != 0 || P < 1 || N < 1 || W < 1 || W > 8) return fail(kInvalid);
+  const int I = H * P, GN = G * N, conv_dim = I + 2 * GN;
+  if (ld < 2 * I + 2 * GN + H) return fail(kInvalid);
+  if (!zxbcdt || !conv_w || !conv_b || !conv_state || !ssm_state || !A_log || !D || !dt_bias || !slot_ids ||
+      !has_state || !norm_w || !y || !out)
+    return fail(kInvalid);
+  const size_t xbc_bytes = sizeof(float) * static_cast<size_t>(n_seq) * conv_dim;
+  char* block = static_cast<char*>(scratch(xbc_bytes + 64 + sizeof(int32_t) * (n_seq + 1), 7));
+  float* xbc = reinterpret_cast<float*>(block);
+  int32_t* cu = reinterpret_cast<int32_t*>(block + ((xbc_bytes + 63) & ~static_cast<size_t>(63)));
+  for (int s = 0; s <= n_seq; ++s) cu[s] = s;
+  int status = lx_conv1d_varlen(zxbcdt + I, ld, conv_w, conv_b, conv_state, slot_ids, has_state, cu, n_seq, xbc,
+                                conv_dim, W, nullptr);
+  if (status) return status;
+  status = lx_ssm_scan_varlen(xbc, conv_dim, zxbcdt + I + conv_dim, ld, xbc + I, xbc + I + GN, conv_dim, A_log, D,
+                              dt_bias, ssm_state, slot_ids, has_state, cu, n_seq, y, H, P, G, N, nullptr);
+  if (status) return status;
+  return lx_gated_rmsnorm(y, zxbcdt, ld, norm_w, out, n_seq, I, G, eps, nullptr);
+}
+
 }  // extern "C"

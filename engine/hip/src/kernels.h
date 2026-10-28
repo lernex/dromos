@@ -140,6 +140,25 @@ LX_API int lx_ssm_scan_varlen(const float* x, int ld_x, const float* dt_raw, int
 LX_API int lx_gated_rmsnorm(const float* y, const float* z, int ld_z, const void* w, void* out, int T,
                             int I, int groups, float eps, void* stream);
 
+// The Mamba-2 step of a decode step (one token per sequence, row s is sequence s), as one kernel: the
+// causal conv, the selective scan and the gated RMSNorm of lx_conv1d_varlen, lx_ssm_scan_varlen and
+// lx_gated_rmsnorm, with the same bits. zxbcdt f32 [n_seq, ld] is in_proj's output in Mamba-2's order
+// z | xBC | dt: z is columns [0, I), xBC [I, I + conv_dim) with conv_dim = I + 2 G N, dt columns
+// [I + conv_dim, I + conv_dim + H), where I = H P (ld >= 2 I + 2 G N + H). Sequence s's conv state (slot
+// slot_ids[s], as lx_conv1d_varlen keeps it; zeros when has_state[s] == 0) and SSM state
+// ([slots, H, P, N] f32) are each read once and written once. y f32 [n_seq, I] receives the scan's output
+// before the gate, and out bf16 [n_seq, I] the gated norm of y with z and norm_w (bf16 [I]), as
+// lx_gated_rmsnorm with groups = G. sync: int32 [n_seq * G] arrival counters for the groups, zero on the
+// first call; the kernel leaves them zero after every call. A row's bits do not depend on the other rows.
+// The bits are those of the three kernels run in turn when the gated norm's K = I / G is at least 256 (the
+// sums run over the same 256 threads), which holds for every Metis model. Returns LX_ERR_NOT_SUPPORTED on a
+// backend without it (the model then runs the three kernels).
+LX_API int lx_mamba_decode_step(const float* zxbcdt, int ld, const void* conv_w, const void* conv_b, float* conv_state,
+                                float* ssm_state, const float* A_log, const float* D, const float* dt_bias,
+                                const int32_t* slot_ids, const int32_t* has_state, const void* norm_w, float eps,
+                                float* y, void* out, int32_t* sync, int n_seq, int H, int P, int G, int N, int W,
+                                void* stream);
+
 // ---- Attention (attention.cu) ---------------------------------------------------------------
 
 // Causal GQA with no positional encoding, appending this step's keys and values to the cache:

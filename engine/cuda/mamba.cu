@@ -264,6 +264,211 @@ __global__ void gated_rmsnorm_kernel(const float* __restrict__ y, const float* _
   }
 }
 
+// ---- Fused decode step ----------------------------------------------------------------------
+
+// One token per sequence, the conv, the scan and the gated norm in one kernel. Block (h, s) is head h of
+// sequence s: it convolves its x channels and its group's B and C channels (every head of a group reads
+// the same B and C, and each head's taps are the same arithmetic as lx_conv1d_varlen's), scans its own
+// [P, N] state (the same lanes and summation order as ssm_scan_kernel, so the bits are the same), and
+// writes its y. Only a group's last block to arrive finishes it: that block has every head's y, so it
+// computes the group's gated norm (the same reduction as gated_rmsnorm_kernel, over the same 256
+// threads), and it moves the group's B and C conv state on, since every head has read the old one by
+// then. The arrival counter is the only cross-block ordering; the sums run in a fixed order, so a row's
+// bits never depend on which block arrives last or on the other rows.
+constexpr int kDecodeThreads = 256;  // four lanes per state row, a row per channel of the head (P <= 64)
+constexpr int kDecodeMaxP = 64;
+constexpr int kDecodeMaxN = 256;
+
+struct DecodeArgs {
+  const float* zxbcdt;
+  int ld;
+  const __nv_bfloat16* conv_w;
+  const __nv_bfloat16* conv_b;
+  float* conv_state;
+  float* ssm_state;
+  const float* A_log;
+  const float* D;
+  const float* dt_bias;
+  const int32_t* slot_ids;
+  const int32_t* has_state;
+  const __nv_bfloat16* norm_w;
+  float eps;
+  float* y;
+  __nv_bfloat16* out;
+  int32_t* sync;
+  int H, P, G, N, W;
+};
+
+template <int NI>
+__global__ void __launch_bounds__(kDecodeThreads) mamba_decode_kernel(const DecodeArgs a) {
+  __shared__ float xs[kDecodeMaxP];                  // the head's x conv outputs
+  __shared__ __align__(16) float Bs[kDecodeMaxN];    // the group's B conv outputs, zero past N
+  __shared__ __align__(16) float Cs[kDecodeMaxN];    // the group's C conv outputs, zero past N
+  __shared__ float nst[7][kDecodeMaxP];             // the head's x channels' new conv state rows
+  __shared__ float red[32];
+  __shared__ int last;
+
+  const int tid = threadIdx.x, q = tid & 3, p = tid >> 2;
+  const int h = blockIdx.x, s = blockIdx.y;
+  const int H = a.H, P = a.P, G = a.G, N = a.N, W = a.W;
+  const int I = H * P, GN = G * N, conv_dim = I + 2 * GN;
+  const int g = h / (H / G);
+  const int slot = a.slot_ids[s];
+  const bool has = a.has_state[s] != 0;
+  const bool valid = p < P;
+  const bool vec = (N & 3) == 0;  // whole float4 chunks: a chunk past N is wholly past N
+  const float* zrow = a.zxbcdt + static_cast<int64_t>(s) * a.ld;
+  float* cst = a.conv_state + static_cast<int64_t>(slot) * (W - 1) * conv_dim;
+  float* st = a.ssm_state + ((static_cast<int64_t>(slot) * H + h) * P + (valid ? p : 0)) * N;
+  // The head's scalars come first too, with the state, so none of their loads waits behind the conv.
+  const float dt_raw = zrow[I + conv_dim + h];
+  const float dt_bias = a.dt_bias[h];
+  const float A_log = a.A_log[h];
+  const float Dh = a.D[h];
+
+  // The state comes first, so its loads are in flight behind the conv. Lane q holds the chunks of four
+  // columns at 4 * (q + 4 i) for i < NI, as in ssm_scan_kernel.
+  float S[NI][4];
+  const bool load = valid && has;
+#pragma unroll
+  for (int i = 0; i < NI; ++i) {
+    const int n0 = 4 * (q + 4 * i);
+    if (vec) {
+      const float4 v = (load && n0 < N) ? __ldcg(reinterpret_cast<const float4*>(st + n0)) : make_float4(0, 0, 0, 0);
+      S[i][0] = v.x;
+      S[i][1] = v.y;
+      S[i][2] = v.z;
+      S[i][3] = v.w;
+    } else {
+#pragma unroll
+      for (int e = 0; e < 4; ++e) S[i][e] = (load && n0 + e < N) ? __ldcg(st + n0 + e) : 0.0f;
+    }
+  }
+
+  // The conv of the head's x channels [h P, h P + P), then the group's B and C channels, in conv order
+  // (x | B | C). Each channel's taps are read once. The loop only loads and writes shared memory, so the
+  // loads of its next iterations can go out early; the x channels' new state rows wait in shared memory
+  // for the barrier, and B and C wait for the last block of the group.
+#pragma unroll 3
+  for (int j = tid; j < P + 2 * N; j += kDecodeThreads) {
+    const int c = j < P ? h * P + j : (j < P + N ? I + g * N + (j - P) : I + GN + g * N + (j - P - N));
+    const float xn = zrow[I + c];
+    float old[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) old[k] = (k < W - 1 && has) ? __ldcg(cst + static_cast<int64_t>(k) * conv_dim + c) : 0.0f;
+    float acc = __bfloat162float(a.conv_b[c]);
+#pragma unroll
+    for (int k = 0; k < 8; ++k)
+      if (k < W) acc = fmaf(__bfloat162float(a.conv_w[c * W + k]), k < W - 1 ? old[k] : xn, acc);
+    const float out = lx::silu(acc);
+    if (j < P) {
+      xs[j] = out;
+      if (W >= 2) {
+#pragma unroll
+        for (int k = 0; k < 7; ++k)
+          if (k < W - 1) nst[k][j] = k < W - 2 ? old[k + 1] : xn;
+      }
+    } else if (j < P + N) {
+      Bs[j - P] = out;
+    } else {
+      Cs[j - P - N] = out;
+    }
+  }
+  // Padding past N is zero, as in the scan: a chunk's lanes read whole float4s.
+  for (int i = N + tid; i < 16 * NI; i += kDecodeThreads) {
+    Bs[i] = 0.0f;
+    Cs[i] = 0.0f;
+  }
+  __syncthreads();
+  // The x channels' new state, each row written by one thread (nothing else touches these channels).
+  if (W >= 2)
+    for (int i = tid; i < (W - 1) * P; i += kDecodeThreads)
+      cst[static_cast<int64_t>(i / P) * conv_dim + h * P + i % P] = nst[i / P][i % P];
+
+  const float dt = lx::softplus(dt_raw + dt_bias);
+  const float negA = -expf(A_log);
+  const float decay = expf(dt * negA);
+  const float xp = valid ? xs[p] : 0.0f;
+  const float dtx = dt * xp;
+  float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+  for (int i = 0; i < NI; ++i) {
+    const int c0 = 4 * (q + 4 * i);
+    const float4 bb = *reinterpret_cast<const float4*>(Bs + c0);
+    const float4 cc = *reinterpret_cast<const float4*>(Cs + c0);
+    const float bv[4] = {bb.x, bb.y, bb.z, bb.w};
+    const float cv[4] = {cc.x, cc.y, cc.z, cc.w};
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+      S[i][e] = fmaf(decay, S[i][e], dtx * bv[e]);
+      acc[e] = fmaf(S[i][e], cv[e], acc[e]);
+    }
+  }
+  float y = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+#pragma unroll
+  for (int o = 1; o < 4; o <<= 1) y += __shfl_xor_sync(0xffffffffu, y, o);
+  if (valid && q == 0) a.y[static_cast<int64_t>(s) * I + h * P + p] = y + Dh * xp;
+  if (valid) {
+#pragma unroll
+    for (int i = 0; i < NI; ++i) {
+      const int n0 = 4 * (q + 4 * i);
+      if (vec) {
+        if (n0 < N) __stcg(reinterpret_cast<float4*>(st + n0), make_float4(S[i][0], S[i][1], S[i][2], S[i][3]));
+      } else {
+#pragma unroll
+        for (int e = 0; e < 4; ++e)
+          if (n0 + e < N) __stcg(st + n0 + e, S[i][e]);
+      }
+    }
+  }
+
+  // Arrival: the group's last block to finish takes over. Every thread's writes are fenced before the count.
+  __threadfence();
+  __syncthreads();
+  if (tid == 0) last = atomicAdd(a.sync + static_cast<int64_t>(s) * G + g, 1) == H / G - 1;
+  __syncthreads();
+  if (!last) return;
+  __threadfence();
+
+  // The group's B and C conv state moves on: every head of the group has read the old state.
+  for (int j = tid; j < 2 * N; j += kDecodeThreads) {
+    const int c = I + (j < N ? g * N + j : GN + g * N + (j - N));
+    const float xn = zrow[I + c];
+    float old[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) old[k] = (k < W - 1 && has) ? __ldcg(cst + static_cast<int64_t>(k) * conv_dim + c) : 0.0f;
+    if (W >= 2) {
+#pragma unroll
+      for (int k = 0; k < 6; ++k)
+        if (k < W - 2) cst[static_cast<int64_t>(k) * conv_dim + c] = old[k + 1];
+      cst[static_cast<int64_t>(W - 2) * conv_dim + c] = xn;
+    }
+  }
+
+  // The group's gated norm over its K channels (the head blocks' y, read from L2 past their writes).
+  const int K = I / G, base = g * K;
+  const float* yr = a.y + static_cast<int64_t>(s) * I + base;
+  const float* zr = zrow + base;
+  float sum = 0.0f;
+  for (int i = tid; i < K; i += kDecodeThreads) {
+    const float v = __ldcg(yr + i) * lx::silu(zr[i]);
+    sum += v * v;
+  }
+  const float scale = rsqrtf(lx::block_sum(sum, red) / K + a.eps);
+  for (int i = tid; i < K; i += kDecodeThreads) {
+    const float v = __ldcg(yr + i) * lx::silu(zr[i]);
+    a.out[static_cast<int64_t>(s) * I + base + i] =
+        lx::from_f32<__nv_bfloat16>(v * scale * __bfloat162float(a.norm_w[base + i]));
+  }
+  if (tid == 0) a.sync[static_cast<int64_t>(s) * G + g] = 0;  // the next step starts from zero counters
+}
+
+template <int NI>
+int launch_decode(const DecodeArgs& args, int n_seq, int H, cudaStream_t s) {
+  mamba_decode_kernel<NI><<<dim3(H, n_seq), kDecodeThreads, 0, s>>>(args);
+  return lx::launch_status();
+}
+
 }  // namespace
 
 extern "C" int lx_conv1d_varlen(const float* x, int ld_x, const void* w, const void* bias, float* conv_state,
@@ -312,4 +517,46 @@ extern "C" int lx_gated_rmsnorm(const float* y, const float* z, int ld_z, const 
   gated_rmsnorm_kernel<<<T * groups, threads, 0, s>>>(y, z, ld_z, static_cast<const __nv_bfloat16*>(w),
                                                       static_cast<__nv_bfloat16*>(out), I, groups, eps);
   return lx::launch_status();
+}
+
+extern "C" int lx_mamba_decode_step(const float* zxbcdt, int ld, const void* conv_w, const void* conv_b, float* conv_state,
+                                    float* ssm_state, const float* A_log, const float* D, const float* dt_bias,
+                                    const int32_t* slot_ids, const int32_t* has_state, const void* norm_w, float eps,
+                                    float* y, void* out, int32_t* sync, int n_seq, int H, int P, int G, int N, int W,
+                                    void* stream) {
+  if (n_seq <= 0) return 0;
+  if (H <= 0 || G <= 0 || H % G != 0 || P < 1 || P > kDecodeMaxP || N < 1 || N > kDecodeMaxN || W < 1 || W > 8 ||
+      n_seq > 65535)
+    return static_cast<int>(cudaErrorInvalidValue);
+  const int I = H * P;
+  if (ld < 2 * I + 2 * G * N + H) return static_cast<int>(cudaErrorInvalidValue);
+  const DecodeArgs args{zxbcdt,
+                        ld,
+                        static_cast<const __nv_bfloat16*>(conv_w),
+                        static_cast<const __nv_bfloat16*>(conv_b),
+                        conv_state,
+                        ssm_state,
+                        A_log,
+                        D,
+                        dt_bias,
+                        slot_ids,
+                        has_state,
+                        static_cast<const __nv_bfloat16*>(norm_w),
+                        eps,
+                        y,
+                        static_cast<__nv_bfloat16*>(out),
+                        sync,
+                        H,
+                        P,
+                        G,
+                        N,
+                        W};
+  auto s = static_cast<cudaStream_t>(stream);
+  // The same chunk counts as lx_ssm_scan_varlen, so every shape runs the scan's lanes.
+  const int ni = ((N + 3) / 4 + 3) / 4;
+  if (ni <= 1) return launch_decode<1>(args, n_seq, H, s);
+  if (ni <= 2) return launch_decode<2>(args, n_seq, H, s);
+  if (ni <= 4) return launch_decode<4>(args, n_seq, H, s);
+  if (ni <= 8) return launch_decode<8>(args, n_seq, H, s);
+  return launch_decode<16>(args, n_seq, H, s);
 }
