@@ -1,0 +1,495 @@
+# Lernex engine
+
+The inference engine for Lernex's Metis models, written from scratch for them.
+Private until launch. Architecture: `docs/ARCHITECTURE.md`. Kernel ABI: `engine/cuda/kernels.h`.
+
+```bash
+scripts/remote.sh <slot> test        # build on the GPU server; the kernel tests and the C++ unit tests
+scripts/remote.sh <slot> run ./build/lernex_tests   # the C++ tests (scheduler, digests, hub)
+LX_ARCHS=all scripts/remote.sh <slot> build   # every architecture: RTX 30 / A100 up to RTX 50, H100, B200
+scripts/remote.sh <slot> x 'LX_BIN=build/lernex LX_MODEL=DIR $PY -m pytest -q tests/server'   # the server, end to end
+scripts/remote.sh <slot> x 'build/lernex doctor MODEL_DIR'   # the GPU, and the plan for a model
+scripts/remote.sh <slot> x 'build/lernex tune MODEL_DIR --out PATH'   # time the kernel variants on this GPU
+```
+
+Commands: `lernex run MODEL` (chat), `lernex serve MODEL` (OpenAI API), `lernex pull MODEL`,
+`lernex list`, `lernex bench MODEL --streams 1,8,32,64`, `lernex update` (the latest release, for installs made from a
+release tarball), `lernex version`. MODEL is `praxis`, `logos`, an alias with
+a format (`praxis:fp8`), a folder, or `owner/name` on the hub.
+
+Weights run in the format the file stores: no hidden quantization, so every speed is the speed of a named
+format. `--weights bf16|int8|fp8|nvfp4|bf16x` (run, serve, bench, eval, spec, doctor) names another: INT8 and FP8
+round-to-nearest from a wider file, BF16X the lossless encoding of a BF16 one, NVFP4 only from the GPTQ NVFP4
+folder, nothing wider than the file. A model decodes its BF16 tensors (every one of a BF16 model, the wide ones of a
+quantized model) from lossless BF16X copies when they fit (`--no-bf16x` turns them off), and a model
+that does not fit the GPU runs with its routed experts offloaded rather than in a narrower format. `lernex doctor MODEL` shows every format, what fits, and the decode ceiling of each.
+
+`LX_ARCH_OVERRIDE=80|86|89|90` (or `--lx-arch=N` on the kernel tests) makes a newer card run the code paths
+of an older architecture, so the fallbacks are tested on one GPU.
+# Lernex engine: architecture
+
+An inference engine written for the Metis models (Metis-1.6 Logos 10.2B, Praxis 3.0B) and
+nothing else. General engines run Metis through layers built for other models; this one is
+shaped around what Metis actually is, which is where its speed has to come from.
+
+## The model, as the engine sees it
+
+Per token: embed, broadcast to S = 4 residual streams, then the stack of L blocks runs twice
+(pass 0 and 1) with the same weights. Each block:
+
+1. depth-memory read: attend over the token's own memory bank, gate the result into the streams,
+   and compute routing features `tanh(route_projection([state, retrieved, difference, history]))`
+2. hyper-connection read (4x4 Sinkhorn mix + weighted read + RMSNorm) -> mixer -> write
+   (mixer = Mamba-2, or GQA attention with no positional encoding and a per-pass LoRA on QKV)
+3. hyper-connection read -> latent MoE (route on [latent, routing features], top-4 of E plus a
+   shared expert) -> write
+4. after an attention block, and at the end of each pass, a new memory entry is written
+
+Then mean over streams, RMSNorm, tied LM head. The reference implementation is
+`engines-mac/mlx-metis/metis16.py` (exact port of the native model, verified to its BF16 noise
+floor); `docs/KERNELS` is `engine/cuda/kernels.h`.
+
+Only the mixers look across positions, so a sequence's state is: per (pass, Mamba layer) a conv
+state and an SSM state (fixed size, f32), per (pass, attention layer) a KV cache (small: few
+attention layers, GQA). Everything else (memory bank, routing history) is per token and dies
+with the step.
+
+## Numerics
+
+The correctness bar is the FP32 native runtime: KL to its logits, top-20, on the three
+reference prompts, must stay inside the BF16 noise floor of the native model itself
+(Praxis 7.3e-3 / 1.4e-2 / 2.2e-3; Logos 2.5e-3 / 1.3e-2 / 3.7e-3).
+
+- Residual streams, norms, routing, memory, SSM and conv state: f32.
+- GEMM inputs bf16 (tensor cores), f32 accumulation. Routers and the depth head are f32 weights
+  and run as exact f32 GEMMs.
+- The 4x4 mixes depend only on (layer, pass): computed once at load on the host.
+
+## Layout
+
+- `engine/cuda/` kernels behind a C ABI (`kernels.h`). Each is tested on its own against a
+  PyTorch reference (`tests/kernels`, through ctypes).
+- `engine/core/` config, safetensors loading, device memory.
+- `engine/model/` the Metis forward pass, built from the kernels.
+- `engine/runtime/` state slots, scheduler, batching (after the first milestone).
+- `cli/` the `lernex` binary.
+- `tools/compare.py` end-to-end check against the reference logits.
+
+## Milestones
+
+1. Praxis BF16 on CUDA, one sequence, prefill + decode, inside the noise floor.
+2. One-sequence speed: quantized weights, fused kernels, CUDA graphs. Target: beat 250 tok/s
+   (llama.cpp Q4_K_M on the 5070 Ti).
+3. Continuous batching and the server. Target: beat vLLM's 2,386 tok/s (Praxis FP8, 32 streams).
+4. Logos (117 / 770 tok/s to beat), Metal, then the CLI and installers.
+# The push from one fast stream to a product
+
+Started 2026-10-24, after milestone 2 (295 tok/s single-stream Praxis, int8 decode).
+
+## What it has to become
+
+`lernex run praxis` and `lernex serve logos`: one program that picks the weight format and the
+math for whatever NVIDIA GPU it lands on, batches many users, and is the fastest way to run
+Metis in every format, compared format for format with vLLM, SGLang and llama.cpp.
+
+The speed claim is about the engine, never the quantization. Every benchmark names its format
+and is compared against other engines running the same format.
+
+## Where decode time goes (from milestone 2)
+
+Per token, single stream: weight bytes / 896 GB/s (BF16 2.38 ms, 8-bit 1.37 ms) plus about
+2.0 ms of everything else, the same in every format (vLLM: about 2.6 ms). That 2 ms is about 900
+kernel launches from Metis's small parts, run twice. The math itself is ~1% of a decode step.
+Prefill and large batches are the opposite: math-bound, which is where FP8 and FP4 tensor cores pay.
+
+## Workstreams
+
+Each runs in its own clone of this repo with its own `scripts/remote.sh` slot. Anything that
+loads a whole model or measures speed goes through `remote.sh SLOT x '...'` (one GPU lock, so
+runs never share the card). `engine/model/metis.cpp` is integrated by the lead only: workstreams
+deliver kernels and modules behind the interfaces below, with tests, and may hand back a
+proposed metis.cpp diff for their part.
+
+| | Owns | Interface |
+|---|---|---|
+| Formats | decode GEMV and expert kernels for FP8 / NVFP4 / INT8, load-time quantizers, the checkpoint loader (BF16, compressed-tensors FP8 and NVFP4), an NVFP4 checkpoint of post-trained Praxis | `kernels.h` lx_gemv_w, lx_moe_experts_decode, lx_quantize_weight; `core/checkpoint.h` |
+| Native math | tensor-core GEMM and grouped expert GEMM in every format and math mode, activation quantization, the per-arch kernel families, autotunable variants | `kernels.h` lx_gemm_w, lx_moe_experts_grouped |
+| Decode overhead | fused decode kernels that take the ~900 launches per token down, the decode Mamba step, and the restructured decode path | new `kernels.h` entries it specifies |
+| Hardware | multi-architecture build, device query and arch override, fallbacks for every sm_90+-only kernel, the autotuner and its cache, the plan (format, math, slots, context from VRAM) | `runtime/plan.h`, `runtime/tuner.h` |
+| Text | tokenizer, chat template, reasoning and tool-call parsing, streaming detokenization | `text/tokenizer.h` |
+| Serving | scheduler (continuous batching, chunked prefill), GPU sampling, the OpenAI-compatible server, `lernex run / serve / pull / bench`, model download | `runtime/engine.h`, `server/` |
+
+## Correctness
+
+Every format is judged by top-20 KL against the FP32 native logits (`tools/compare.py`,
+`work/praxisrefs`; Logos refs in `hfport/dev`). BF16 must sit inside the native BF16 noise
+floor (Praxis 7.3e-3 / 1.4e-2 / 2.2e-3). Quantized formats are reported next to the same file
+run in vLLM (Praxis FP8 checkpoint: 0.0077 / 0.040 / 0.0066), and must not be worse.
+
+## Targets (RTX 5070 Ti)
+
+| | Format | To beat |
+|---|---|---|
+| Praxis, 1 stream | BF16 / FP8 | vLLM 201 / 231 tok/s |
+| Praxis, 32 streams | BF16 / FP8 | vLLM 1,836 / 2,386 tok/s |
+| Logos, 1 / 32 streams | FP8 | vLLM 117 / 770 tok/s |
+| Praxis, 1 stream | 4-bit | llama.cpp Q4_K_M 250 tok/s |
+| Prefill | every format | vLLM and llama.cpp, same file |
+
+## Backends: one model, every machine
+
+The owner's bar: Metis runs at its best wherever it is, on anything, as fast as that thing can
+run it, at the highest quality it can. So the engine has four backends sharing one model
+implementation, one set of weight formats, one server and one CLI:
+
+| Backend | Hardware | Notes |
+|---|---|---|
+| CUDA | NVIDIA, sm_80+ | `engine/cuda`, the reference backend |
+| HIP | AMD (RDNA 3/4, CDNA 3) | `engine/hip`, ported from the CUDA kernels; wave32 and wave64, WMMA / MFMA for native math |
+| Metal | Apple silicon | `engine/metal`, unified memory: weights mapped straight from the file, no copies |
+| CPU | x86 (AVX2, AVX-VNNI, AVX-512) and ARM (NEON, SVE where present) | `engine/cpu`, also the offload tier's CPU expert path |
+
+The backend interface is the kernels.h ABI, including its "Runtime" section (memory, copies,
+streams, events, graph capture), plus tunable.h (each backend reports its own `lx_arch`). Each
+backend is one shared library exporting every `lx_*` function, and the model code calls nothing
+else. The `lernex` binary loads the best backend present at startup (CUDA or HIP when a GPU and
+driver are found, Metal on a Mac, the CPU otherwise). Every backend runs the same kernel test
+suite (tests/kernels, with a backend option) and the same end-to-end KL check.
+
+Offloading (VRAM + pinned RAM over PCIe + CPU compute + NVMe at once) is a core capability, not a
+fallback: Logos is ~90% routed experts and a token touches 2% of them.
+# Releases and installs
+
+How a tagged commit becomes something people install, and the contract every installer shares.
+Every install path ends in the same tree, so `lernex` behaves the same however it arrived.
+
+## Versions
+
+A release is a git tag `vX.Y.Z` on `main` (`vX.Y.Z-rcN` for a pre-release). The build bakes the
+version in: CMake takes `-DLX_VERSION=X.Y.Z`, and without it reads `git describe --tags --match 'v*'`
+(an untagged build is `0.0.0-dev+<sha>`). `lernex --version` prints one line and loads no backend:
+
+    lernex 0.1.0 (linux-x86_64-cuda12, 777d965)
+
+## Release assets
+
+Names carry no version, so `https://github.com/lernex/lernex-engine/releases/latest/download/NAME`
+is a stable link:
+
+| Asset | Contents |
+|---|---|
+| `lernex-linux-x86_64-cuda12.tar.gz` | CUDA backend, every architecture (`-DLX_ARCHS=all`), plus the CPU backend |
+| `lernex-linux-x86_64-cpu.tar.gz` | CPU backend only |
+| `lernex-linux-aarch64-cpu.tar.gz` | CPU backend only |
+| `lernex-darwin-arm64.tar.gz` | Metal backend (macOS 14+) |
+| `install.sh` | the installer |
+| `SHA256SUMS` | `sha256sum` format, one line per asset above |
+
+One CUDA flavor ships, built with CUDA 12.8. Measured 2026-10-28 on an RTX 5070 Ti (driver 595), Praxis:
+the 12.8 build decodes 293.9 / 1,140 tok/s at 1 / 8 streams against 295.2 / 1,165 for a 13.4 build, with
+the same KL to the reference, and 12.8 runs on older drivers. The driver it needs: 570.26 or newer for the
+12.8 toolkit (and for any RTX 50 card), 525.60.13 or newer for older cards through NVIDIA's minor-version
+compatibility (the build carries real code for every architecture, no PTX to JIT; drivers below 595 are
+untested). An older driver, or no GPU, gets the CPU flavor. `scripts/release/build.sh` still builds a
+`cuda13` flavor, and install.sh prefers it when a release lists one.
+
+## The tree
+
+Every tarball unpacks, with no top directory, to:
+
+    bin/lernex
+    lib/liblernex_kernels.so  liblernex_cpu.so      (linux; liblernex_metal.dylib on macOS)
+    lib/libcudart.so.N  lib/libcublasLt.so.N      (CUDA flavor only, the toolkit's own)
+    share/lernex/tuning/*.json
+    share/lernex/channel                           tarball | homebrew | pip | docker
+    share/lernex/licenses/                         third-party licenses (and NVIDIA's EULA, CUDA flavor)
+    LICENSE  NOTICE                                Apache-2.0, and what else ships under which terms
+
+`bin/lernex` finds its backends in `../lib` (already done by engine/dispatch), and the backends find
+the bundled CUDA libraries through an `$ORIGIN` rpath. Tuning tables are read from `../share/lernex/tuning`
+next to the real executable, then the source tree they were built from. Nothing reads a path baked in at
+build time unless it exists.
+
+`share/lernex/channel` says who installed it, so `lernex update` and the daily notice name the right
+command: `lernex update` for `tarball`, `brew upgrade lernex`, `pip install -U lernex`,
+`docker pull ghcr.io/lernex/lernex`. A tree without the file is a source build.
+
+## Where things live
+
+| Path | What |
+|---|---|
+| `~/.lernex/versions/X.Y.Z/` | an installed tree (install.sh and `lernex update`) |
+| `~/.lernex/current` | symlink to the active version; switched atomically |
+| `~/.local/bin/lernex` | symlink to `~/.lernex/current/bin/lernex` (install.sh adds it to PATH if needed) |
+| `~/.cache/lernex/models/` | models (`LERNEX_MODELS` overrides) |
+| `~/.cache/lernex/update-check` | the daily check's cache |
+
+Environment: `LERNEX_NO_UPDATE_CHECK=1` turns the daily check off. `LERNEX_RELEASES` (default
+`https://github.com/lernex/lernex-engine/releases`) points install.sh and `lernex update` at another
+release host, for tests.
+
+## Updates
+
+- `lernex update` finds the latest release, downloads this install's flavor, checks it against
+  `SHA256SUMS`, unpacks it to `~/.lernex/versions/NEW`, flips `current`, and keeps the previous
+  version for one rollback. `lernex update --check` only reports.
+- `run` and `serve` print one quiet line when a newer release is known: at most one network check a
+  day, in the background with a short timeout, cached, so startup never waits on it.
+
+## Install paths
+
+    curl -fsSL https://github.com/lernex/lernex-engine/releases/latest/download/install.sh | sh
+    brew install lernex/tap/lernex
+    pip install lernex
+    docker run --gpus all -p 8080:8080 -v lernex:/root/.cache/lernex ghcr.io/lernex/lernex praxis
+
+install.sh picks the flavor from the OS, the architecture and the NVIDIA driver; re-running it upgrades.
+
+## Build bases
+
+Linux builds run on an old base so the binaries run on any current distribution: manylinux_2_28
+(glibc 2.28) where the CUDA toolkit allows it, else ubuntu 22.04. The CPU backend compiles every ISA
+level and picks at run time (engine/cpu); nothing is built with `-march=native`. macOS builds target 14.0.
+TLS comes from the system libcurl, opened at run time (engine/core/http.cpp), so no OpenSSL is linked.
+# Install tests
+
+What `scripts/install.sh`, the Docker image and the install paths were run on, with the result of each run. Every row
+names the machine, the release build it installed and what happened. A row marked "not run" has not been run in this
+round; the Open items say what it needs.
+
+## Method
+
+- Release host: a directory laid out like GitHub's (`latest/download/` and `download/vX.Y.Z/`, each holding the
+  tarballs, `SHA256SUMS` and `install.sh`), reached through `LERNEX_RELEASES`. `SHA256SUMS` is written by
+  `scripts/release/sums.sh`, as the release workflow does.
+- The tarballs are the release agent's `scripts/release/build.sh` outputs, not hand-assembled trees. The release ships
+  one CUDA build, cuda12 (CUDA 12.8). The x86_64 CPU tarballs are the `out/v010` and `out/v011` builds on the GPU server;
+  the cuda12 tarball is `out12/lernex-linux-x86_64-cuda12.tar.gz` (713,243,380 bytes, sha256 `572ee1be5e6aa531…`,
+  `--version` `lernex 0.1.0 (linux-x86_64-cuda12, 0609dd3)`, built before the line-info cut). The local builds have no
+  `LX_GIT_SHA` in the CPU runs (`wip`); the release workflow sets it from the commit.
+- `install.sh` is the one on main at `9f13f51` (sha256 `e0fd2436…`).
+- Each run starts from a fresh `HOME` or a fresh container, so the install is the first install on the machine.
+- The Praxis weights come from the GPU server's cache. Containers mount that folder, so no 6 GB download happens in a
+  test.
+- Flags that were needed to get a run through, and why, are in the Notes.
+
+## Results
+
+| # | What | Where | Build | Result |
+|---|------|-------|-------|--------|
+| 1 | Fresh install 0.1.0, `--version`, `doctor`, `pull` without libcurl, one prompt, upgrade to 0.1.1 | ubuntu:22.04 x86_64, udocker on the GPU server, wget only | cpu, `build.sh` (out/v010, out/v011) | pass (1a) |
+| 2 | Same as 1 | ubuntu:24.04 x86_64, udocker on the GPU server, curl | cpu, `build.sh` | pass (2a) |
+| 3 | Generation, one prompt, thinking off | rows 1 and 2 | cpu | pass: "17 times 3" answered `51`, 30 and 32 tok/s |
+| 4 | Darwin install, `--version`, `doctor`, Metal backend loads, temp HOME | this Mac, arm64 | metal, `build.sh` | not run in this round |
+| 5 | Install refusals: Intel Mac, Rosetta shell, macOS 13 | this Mac, shimmed `uname`, `sysctl`, `sw_vers` | n/a | pass, each prints its reason and installs nothing (run before the link change; the refusals come before it) |
+| 6 | Driver and GPU selection, cases A to L | GPU server, shimmed `nvidia-smi` and `uname` | fake tarballs | pass, rerun on the current `install.sh`, same outcomes as 6a |
+| 7 | Upgrade, re-install with and without `.install`, previous link, piped install | this Mac, temp HOME | fake darwin tarballs | pass (7a) |
+| 8 | Piped install, tty progress bar, idempotent PATH line, fish config | this Mac | darwin | pass (earlier run, before the link change) |
+| 9 | Checksum mismatch, bad version, bad `LERNEX_FLAVOR`, a non-Lernex file at `~/.local/bin/lernex` | this Mac and GPU server | fake | pass: nothing installed in each, rerun on the current `install.sh` |
+| 10 | GPU install through `install.sh` (cuda12 chosen by itself), `--version`, `doctor`, one prompt with `lernex run`, `serve` and one curl | GPU server, native, temp HOME, local release host | cuda12, `build.sh` (out12) | pass for install, run, serve and curl; `doctor praxis` fails in this build, see 10a |
+| 11 | arm64 Ubuntu 22.04 and 24.04: install, `doctor`, upgrade | Docker Desktop, linux/arm64 | cpu, `build.sh` (aarch64) | not run in this round |
+| 12 | amd64 Ubuntu 22.04 and 24.04 under emulation: install, `doctor`, upgrade | Docker Desktop, linux/amd64 | cpu, `build.sh` (x86_64) | not run in this round |
+| 13 | Image build `linux/amd64` from `docker/Dockerfile` on main (cuda12 default), `--version` in the image, saved to the server | this Mac, Docker Desktop, one heavy.sh session | cuda12, `build.sh` (out12) | pass (13a) |
+| 14 | The image on the GPU server: serve praxis and one curl on the GPU | GPU server, udocker 1.3.17 (P1, `setup --nvidia`) | the image from row 13, flattened | pass with workarounds (14a) |
+
+### 1a. ubuntu:22.04, wget only (udocker on the GPU server)
+
+```
+== os: Ubuntu 22.04.5 LTS
+== tools: /usr/bin/wget          libcurl.so.4 in the loader cache: 0
+== install pinned 0.1.0
+lernex: Linux x86_64: cpu build, the NVIDIA driver 595.91.07 is here, but nvidia-smi is not on PATH to check the GPU
+lernex: downloading lernex-linux-x86_64-cpu.tar.gz
+lernex: installed lernex 0.1.0 in ~/.lernex/versions/0.1.0
+lernex: linked ~/.local/bin/lernex
+lernex: libcurl is missing, so lernex cannot download models yet. Install it: sudo apt-get install -y curl ...
+lernex: done. Try: lernex doctor
+== version: lernex 0.1.0 (linux-x86_64-cpu, wip)
+== doctor: CPU Intel Core i5-14500, 14 threads, AVX2 and AVX-VNNI; backend CPU, liblernex_cpu.so
+== pull praxis (no libcurl)
+lernex: libcurl is not installed, so models cannot be downloaded
+== run praxis --think off, "What is 17 times 3?"
+51    1 tokens, 30 tok/s
+== upgrade (latest)
+lernex: installed lernex 0.1.1 in ~/.lernex/versions/0.1.1 (was 0.1.0)
+== version: lernex 0.1.1 (linux-x86_64-cpu, wip)   versions: 0.1.0 0.1.1   current -> versions/0.1.1
+```
+
+### 2a. ubuntu:24.04, curl installed (udocker on the GPU server)
+
+The same sequence, with libcurl present (no warning). `lernex run praxis --think off` answered `51` at 32 tok/s, and
+the re-run upgraded 0.1.0 to 0.1.1 (`versions: 0.1.0 0.1.1`, `current` at 0.1.1).
+
+Notes for 1a and 2a:
+- udocker's proot and fakechroot modes resolve `/proc/self/exe` to the dynamic loader, so the engine cannot find its
+  backend next to the executable (`dispatch.cpp` derives the directory from that link). The phases set `LX_KERNELS`
+  to the installed `liblernex_cpu.so`. That bypasses the probe, not the install: the tree, `bin/lernex --version`,
+  the link and the CPU backend's own exports were used as installed.
+- `doctor` lists the 15 `lx_program_*` symbols as missing on the CPU backend (see Findings).
+
+### 10a. GPU server, native, install.sh from a local release host (05:00 UTC, 2026-10-28)
+
+Run under `scripts/remote.sh installer x`, with `unset LX_KERNELS LX_BACKEND` in the command, so the installed tree
+resolved its own backend. GPU: NVIDIA GeForce RTX 5070 Ti (sm_120), driver 595.91.07.
+
+```
+lernex: Linux x86_64: cuda12 build, NVIDIA GeForce RTX 5070 Ti, driver 595.91.07
+lernex: downloading lernex-linux-x86_64-cuda12.tar.gz
+lernex: installed lernex 0.1.0 in ~/.lernex/versions/0.1.0
+lernex: linked ~/.local/bin/lernex
+lernex: done. Try: lernex doctor
+== version: lernex 0.1.0 (linux-x86_64-cuda12, 0609dd3)
+== tree: ~/.lernex/versions/0.1.0, channel tarball
+== doctor praxis: rc 1, "error: cannot open praxis/config.json" (the alias is not in this build, see Findings)
+   the rest of doctor: GPU RTX 5070 Ti (device 0), sm_120, 16.61 GB; CUDA driver 13.2, runtime 12.8
+   backend CUDA, liblernex_kernels.so in the installed tree; tuning from the installed tree
+== run praxis --think off, "What is 17 times 3?"  rc 0:  51   1 tokens, 12 tok/s
+== serve praxis --host 127.0.0.1 --port 18093: up in about 2 s
+   GPU while serving: the engine's pid, 14,510 MiB (planned 14.77 GB of 14.78 GB)
+== POST /v1/chat/completions (enable_thinking false): "51", finish_reason stop
+== serve stopped
+```
+
+Logs: `~/installer-gpu/logs/row10/` on the GPU server (`install.txt`, `doctor.txt`, `run.txt`, `serve.log`,
+`chat.json`); the row script is `~/installer-gpu/logs/row10.sh`.
+
+### 13a. Image on this Mac (one heavy.sh session)
+
+```
+docker build --platform linux/amd64 -t lernex/engine:0.1.0-test \
+  --build-arg LERNEX_VERSION=0.1.0 \
+  --build-arg LERNEX_RELEASES=http://host.docker.internal:18243 \
+  -f docker/Dockerfile docker
+```
+
+- Docker Desktop 29.4.0 started for the session (it was not running) with 8.3 GB and 10 CPUs. The base images were
+  already in its cache, so the build did not pull them. The fetch stage downloaded the cuda12 tarball and its
+  `SHA256SUMS` from the local release host and checked the tarball (`sha256sum -c`), then unpacked it to `/opt/lernex`.
+- Build rc 0 in about 1 minute of build time (the x86_64 steps run under emulation).
+- Image size (`docker image inspect`): 822,010,399 bytes.
+- `docker run --rm --platform linux/amd64 --entrypoint lernex lernex/engine:0.1.0-test --version`:
+  `lernex 0.1.0 (linux-x86_64-cuda12, 0609dd3)`.
+- `docker save | gzip -3` to the GPU server: `~/installer-gpu/image/lernex-engine-0.1.0-amd64.tar.gz`, 818,419,493
+  bytes, `gzip -t` ok.
+- Docker Desktop was quit as soon as the save was verified. Quitting the GUI did not stop `com.docker.backend` within
+  90 seconds, so the session stopped the backend at 05:04:01 and Docker was down at 05:04:06 (about 97 seconds after the
+  quit started). The session log is `~/installer-gpu/logs/session.log`.
+
+What this row does not show: `docker run` of the container with the GPU and its own `ENTRYPOINT` (serve on port 8080).
+There is no Docker on the GPU server, so the same image was run under udocker in row 14 instead.
+
+### 14a. The image on the GPU server (udocker 1.3.17)
+
+The saved image was not loadable as it is, so the run used these steps:
+1. `udocker load` fails on Docker 29's save format: with `index.json` present it reads the OCI index and raises
+   `KeyError: 'index'`; with `index.json` removed it raises `KeyError: 'json'` on the layer metadata and `create` says
+   "imagerepo is invalid".
+2. The layers were flattened into one rootfs in the order of `manifest.json`, honouring whiteouts (8 layers, 1.5 GB,
+   `flatten.py` in `~/installer-gpu/image/`), and imported with `udocker import`. The image's environment, entrypoint
+   and command were not carried over; they were passed on the command line.
+3. `udocker setup --execmode=P1` and `udocker setup --nvidia` added the host's NVIDIA libraries (libcuda 595.91.07,
+   libnvidia-ml, and the rest) to the container.
+
+Run with `udocker run` (P1), `-e LX_KERNELS=/opt/lernex/lib/liblernex_kernels.so`, and the models folder mounted at
+`/root/.cache/lernex/models`:
+
+```
+doctor (model folder): rc 0; GPU RTX 5070 Ti; CUDA driver 13.2, runtime 12.8; backend CUDA, liblernex_kernels.so (/opt/lernex/lib)
+run praxis --think off: rc 0, 51 at 12 tok/s
+serve praxis --host 127.0.0.1 --port 8094: up; GPU compute app: /usr/local/bin/lernex, 14,510 MiB
+POST /v1/chat/completions: "51"
+serve stopped; the GPU is free afterwards (0%, 10 MiB)
+```
+
+Why R1 (the rootless runc mode) was not used: `udocker run` in R1 fails with
+`nsexec: failed to unshare remaining namespaces (except cgroupns): Operation not permitted`. The server runs Ubuntu 26.04
+with `kernel.apparmor_restrict_unprivileged_userns = 1`, which blocks the namespace setup for an unprivileged user. That
+is a host setting for the owner to decide; it was not changed here.
+
+Notes for 14a:
+- `LX_KERNELS` is set because udocker's proot mode resolves `/proc/self/exe` to the loader, so the backend probe cannot
+  find `lib/` next to the executable. The backend that ran is the image's own `liblernex_kernels.so` (the CUDA build).
+- Logs: `~/installer-gpu/udocker-run/` (`doctor.txt`, `run.txt`, `serve.log`, `chat.json`, `log.txt`). The script is
+  `~/installer-gpu/udocker-serve.sh`, run under `remote.sh x`.
+
+### 6a. Driver and GPU selection (GPU server, shimmed `nvidia-smi` and `uname`)
+
+| Case | Machine | Build chosen | Line printed |
+|------|---------|--------------|--------------|
+| A | no `nvidia-smi` on PATH, `/proc/driver/nvidia/version` says 595.91.07 | cpu | `the NVIDIA driver 595.91.07 is here, but nvidia-smi is not on PATH to check the GPU` |
+| B | driver 470.182.03, sm_86 | cpu | `driver 470.182.03 is older than 525, the oldest CUDA build needs` |
+| C | driver 535.183.01, sm_86 | cuda12 | `cuda12 build, NVIDIA GeForce RTX 3090, driver 535.183.01` |
+| D | driver 595.91.07, sm_75 | cpu | `NVIDIA GeForce RTX 2080 is sm_75, and the CUDA builds need sm_80 or newer` |
+| E | driver 595.91.07, sm_120 | cuda13 | `cuda13 build, NVIDIA GeForce RTX 5070 Ti, driver 595.91.07` |
+| F | as E, release lists only cuda12 | cuda12 | `cuda12 build, NVIDIA GeForce RTX 5070 Ti, driver 595.91.07` |
+| G | driver 595.91.07, compute capability query fails | cpu | `nvidia-smi cannot read the GPU's compute capability` |
+| H | `LERNEX_FLAVOR=cuda13`, driver 535 | cuda13 | warning: `cuda13 needs an NVIDIA driver of 580 or newer ... the engine may not start` |
+| I | `LERNEX_FLAVOR=cuda12`, release lists no cuda12 | refused | `this release has no lernex-linux-x86_64-cuda12.tar.gz, so there is no cuda12 build for this machine` |
+| J | aarch64 (shimmed `uname -m`) | cpu | `Linux aarch64: cpu build` |
+| K | `LERNEX_FLAVOR=cuda13` on aarch64 | refused | `LERNEX_FLAVOR does not apply on aarch64 Linux: the only build is cpu` |
+| L | `LERNEX_FLAVOR=cuda99` | refused | `LERNEX_FLAVOR must be cpu, cuda12 or cuda13, not cuda99` |
+
+Case A reads the real `/proc/driver/nvidia/version` on the GPU server, because no `nvidia-smi` was on that PATH. That
+`/proc` parse was broken until this run caught it: the first number after "Kernel Module" is the `86` of `x86_64`.
+The releases in these cases are fake; they exercise the choice, not the engine. The cuda13 branches stay in `install.sh`
+(a release that ships cuda13 would use them); the release ships cuda12 only, so cases E and H need a release that has
+cuda13 to mean anything.
+
+### 7a. Install-link behaviour (this Mac, fake darwin tarballs 0.1.0, 0.1.1, 0.1.2, temp HOME)
+
+- Fresh install 0.1.0: `current` is absolute and points at `versions/0.1.0`; no `previous`.
+- Upgrade to 0.1.1: `previous` is absolute and points at `versions/0.1.0`; `versions` holds 0.1.0 and 0.1.1.
+- Upgrade to 0.1.2: `versions` holds 0.1.1 and 0.1.2 (0.1.0 pruned); `previous` points at 0.1.1.
+- Re-run of 0.1.2 with the `.install` marker: "already installed and current", nothing changes.
+- Re-run of 0.1.2 with the marker removed (the state after `lernex update`): downloads, re-installs, writes the marker,
+  and keeps `previous` at 0.1.1 instead of dropping the rollback target.
+- Checksum mismatch: "does not match SHA256SUMS ... Nothing was installed"; no `versions` entry, no link moved.
+- No `LERNEX_VERSION`: installs the latest, 0.1.2.
+
+Before this change install.sh pointed `current` at a relative path and never wrote `previous`, so
+`lernex update --rollback` (which reads `~/.lernex/previous` and checks the target as a directory from wherever it
+runs) reported no previous version after an install.sh upgrade.
+
+## Findings
+
+- The CPU and Metal backends do not export the 15 `lx_program_*` symbols that `kernels.h` declares; `doctor` lists
+  them missing on both. Pre-existing, not an installer problem.
+- The cuda12 tarball (`0609dd3`) predates the `doctor` alias commit on main (`2ac61ea`): `doctor praxis` fails with
+  "cannot open praxis/config.json" in row 10. A release rebuilt from main would fix it; the same tarball does accept a
+  model folder path.
+- `lernex update` does not write install.sh's `.install` marker. A re-run of install.sh after a `lernex update` to the
+  same version downloads the release again and reinstalls it (harmless, slower). The release side could write the
+  marker in `install_release`, or install.sh could compare `--version` output.
+- Local `build.sh` runs without `LX_GIT_SHA` print `wip` in `--version`.
+- udocker 1.3.17 cannot load a `docker save` archive from Docker 29 (see 14a). Flattening the layers works.
+- On the GPU server, udocker's rootless runc mode is blocked by `kernel.apparmor_restrict_unprivileged_userns = 1`.
+- In udocker's proot mode the backend probe needs `LX_KERNELS` (see 1a, 14a).
+- Quitting Docker Desktop from the command line (`osascript quit`) left `com.docker.backend` running for 90 seconds; the
+  session had to stop it. Docker should be quit from the GUI, or the session should wait longer before stopping it.
+- A glibc below 2.34 needs `-pthread` on the link lines for the engine (CMake did not add it); `build.sh` runs in
+  manylinux_2_28, which has the newer glibc, so the release is unaffected.
+
+## Docker
+
+- `docker/Dockerfile` (on main): multi-stage. A plain Ubuntu 24.04 stage fetches the flavor's tarball, checks it against
+  `SHA256SUMS` and unpacks it to `/opt/lernex`; the final stage is NVIDIA's CUDA base. The default is cuda12 on
+  `nvidia/cuda:12.8.1-base-ubuntu24.04`, the CUDA 12.8 the release ships; the base tag exists on Docker Hub. The tarball
+  bundles the CUDA runtime, so the base needs no toolkit.
+- Entrypoint: `lernex serve --host 0.0.0.0 --port 8080`, default command `praxis`. A deviation from the brief's
+  `ENTRYPOINT ["lernex","serve"]` plus `CMD` flags: `docker run image praxis` serves on port 8080 without repeating the
+  flags, and `--entrypoint lernex` still reaches the other commands.
+- `.github/workflows/docker.yml`: runs when a GitHub release is published (the owner publishes the draft from
+  `release.yml`), not on the tag push. A tag push starts before the draft is published, so the image would wait on
+  assets that do not exist yet. A manual run (`workflow_dispatch` with a version) builds the image and pushes nothing.
+  `packages: write` is set on the job for the GHCR push. `:latest` is not set for a prerelease. The flavor is cuda12.
+- Not verified: `docker run` of the image itself (with the GPU, or its own entrypoint). Row 13 covers the build and the
+  `--version` check; row 14 covers the same tree under udocker.
+
+## Open items
+
+- Rows 4, 11 and 12 are not run in this round. Row 4 (darwin native install) is a light test on this Mac once a darwin
+  build is ready. Rows 11 and 12 need Docker Desktop on the Mac for a second session; they were left out so the image
+  session stayed alone on the machine.
+- Row 14 with Docker's own GPU path needs Docker with the NVIDIA Container Toolkit on a Linux GPU host (owner). udocker
+  R1 needs `kernel.apparmor_restrict_unprivileged_userns` relaxed on the server (owner).
+- The release tarball behind rows 10 and 13 needs a rebuild from main for the `doctor` alias.

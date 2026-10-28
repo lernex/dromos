@@ -252,9 +252,16 @@ Same bench shape as above (512 prompt tokens, 256 generated, greedy), same card,
 | Engine | Version | Model and format | 1 stream (tok/s) | 8 streams (tok/s) | 32 streams (tok/s) | Share of roofline at 1 stream | Status |
 |---|---|---|---|---|---|---|---|
 | vLLM | pending | Praxis BF16 | pending | pending | pending | pending | not measured |
-| SGLang | pending | Praxis BF16 | pending | pending | pending | pending | not measured |
-| llama.cpp | pending | Praxis, GGUF | pending | pending | pending | pending | not measured |
+| SGLang 0.5.22 + sglang-metis 0.1.0 | 0.5.22 | Praxis BF16 | 141.8 (decode) | 674 (e2e) | 980 (e2e) | 30% of 467 (Praxis BF16 measured ceiling) | measured, rivals; `docs/RIVALS.md` |
+| SGLang 0.5.22 + sglang-metis 0.1.0 | 0.5.22 | Praxis FP8 checkpoint | 141.9 (decode) | 740 (e2e) | 1596 (e2e) | 25% of 564 (Praxis FP8 measured ceiling) | measured, rivals; `docs/RIVALS.md` |
+| llama.cpp metis16 | 07cacf7fa | Praxis BF16 GGUF | 185.2 (tg256) | not run | not run | 40% of 467 (Praxis BF16 measured ceiling) | measured, rivals; `docs/RIVALS.md` |
+| llama.cpp metis16 | 07cacf7fa | Praxis Q4_K_M GGUF (5.5 bits) | 253.3 (tg256) | not run | not run | not comparable (a different format; 38% of the 658 tok/s NVFP4 ceiling, for reference) | measured, rivals; `docs/RIVALS.md` |
 | MLX | pending | Praxis, MLX | pending | pending | pending | pending | not measured |
+
+The SGLang rows at 8 and 32 streams are end-to-end output tok/s from `tools/rivals/load.py` (the
+prefill ramp is included), not the decode column above, so compare them with the Lernex e2e
+number from the same client. The 1-stream SGLang rows are the per-stream decode rate. Lernex's
+column is filled from the final-main run of that same client (see `docs/RIVALS.md`).
 
 ## How to read the numbers
 

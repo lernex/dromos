@@ -1,0 +1,271 @@
+# Rivals: Lernex against each engine on its home turf
+
+Same RTX 5070 Ti (16 GB), same Metis-1.6 weights, same client, same prompts. Each table cell reads
+`Lernex X vs Rival Y (ratio)`. The rival side of every cell was measured here, pinned as listed
+below. **The Lernex column is pending final main**: Lernex is measured once, at the end, on final
+main, with the commands in the last section. Nothing in a Lernex column below was measured on this
+doc's commit.
+
+Status: rival numbers measured 2026-10-27/28 on `ssh lernex` (Intel i5-14500, 14 physical cores,
+30 GB RAM, RTX 5070 Ti 16 GB, Ubuntu). Raw results are in `tools/rivals/results/` and the server
+logs stay in `~/lernex-engine-dev/rivals/out/rivals/` on the GPU server.
+
+## Engines and versions
+
+| Engine | Version and commit | Where it ran | Launch |
+|---|---|---|---|
+| SGLang | 0.5.22, with `sglang-metis` 0.1.0 (`sglang.srt.plugins`), xgrammar 0.2.7, torch 2.14.1, transformers 5.19.0, flashinfer 0.7.1 | `~/venvs/sglang` | `python -m sglang.launch_server --reasoning-parser metis --tool-call-parser metis` plus the flags in each table |
+| llama.cpp | `metis16` branch at `07cacf7fa` (model: Add support for Metis-1.6 models), CUDA 13.4, sm_120, `GGML_CUDA_FA=ON` | `~/lernex-engine-dev/rivals-llama` (a `git archive` of that commit, built with `cmake -S . -B build-rivals -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=OFF`, target `llama-bench`) | `llama-bench -p 512 -n 128,256 -r 3` (`-r 2` for the BF16 expert cells) |
+| Lernex | main at `6b8731f` for the preliminary runs (not in the tables); final main is measured at the end | `~/lernex-engine-dev/rivals`, built with `scripts/remote.sh rivals build` | `build/lernex serve` |
+
+A note on the llama.cpp build: the `build-cuda` directory already on the server was built from an
+older commit (`065905776`), so the numbers here come from a fresh build at the pinned commit.
+
+## Models and bits per weight
+
+Bits per weight are the file size over every element in the file, so keep-wide tensors count. The
+GGUF element counts come from the file headers.
+
+| Model | File | Bytes | Bits per weight |
+|---|---|---|---|
+| Praxis (2.94 B weights) | GGUF Q4_K_M | 2.02 GB | 5.49 |
+| Praxis | GGUF Q8_0 | 3.22 GB | 8.76 |
+| Praxis | GGUF BF16 | 5.90 GB | 16.03 |
+| Praxis | Lernex NVFP4 (`praxis/nvfp4`) | 2.01 GB | about 5.46 (same tensor set as the GGUF) |
+| Praxis | FP8 checkpoint (`praxis/fp8`, both engines) | 3.53 GB | 9.6 (several tensors are kept BF16) |
+| Logos (10.23 B weights) | GGUF Q4_K_M | 6.74 GB | 5.28 |
+| Logos | GGUF Q8_0 | 11.11 GB | 8.69 |
+| Logos | GGUF BF16 | 20.47 GB | 16.02 (does not fit the card) |
+| Logos | FP8 checkpoint (`hfport/fp8`, both engines) | 11.66 GB | about 9.1 |
+
+Lernex has no 4-bit Logos format: the closest Lernex format to Logos Q4_K_M is FP8, so the Logos
+row compares FP8 with Q8_0 (8.7 bits) and says so. Lernex NVFP4 Praxis and llama.cpp Q4_K_M are
+both about 5.5 bits per weight in the file, which is the fair pairing for 4-bit.
+
+## Method
+
+- `tools/rivals/load.py`: asyncio streaming client on `/v1/completions` with token-id prompts cut
+  from `tools/rivals/corpus.txt` by each model's own `tokenizer.json`, so both engines see identical
+  token ids. Greedy (temperature 0, repetition penalty 1, no penalties), `ignore_eos` set. A
+  warm-up request fills the prefix cache first. Each wave sends all requests at once.
+  - **e2e tok/s**: completion tokens of the wave over the time from sending the first request to the
+    last finishing. Prefill and ramp are included: this is what a client waits for.
+  - **TTFT p50 / p90**: send to first streamed chunk.
+  - **stream tok/s**: per-request decode rate after the first token, median across the wave.
+  - Two measured waves per level; the tables show both where they differ.
+- Shared-prefix cells: 2,048-token prefix plus a 64-token unique suffix, 256 generated, 64 and 128
+  requests in flight. Unique cells: independent 512-token prompts, 256 generated, 1, 8 and 32 in
+  flight.
+- `tools/rivals/structured.py`: chat requests with thinking off, 160 generated, 64 requests with 32
+  in flight. Constrained replies use `response_format` `json_schema`, free replies do not. A reply is
+  valid when it parses and matches the schema (title string, year integer, up to five tags).
+- `tools/rivals/serve.sh`: starts one server, waits for `/v1/models`, runs the cells, stops the
+  whole process group. Each GPU window holds the lock for one engine's cells, back to back.
+- `tools/rivals/single.sh`: llama-bench and `lernex bench` single-stream and CPU cells.
+- `tools/rivals/summarize.py`: prints the waves of any result file.
+
+Lernex ignores `ignore_eos`, so a Lernex request can stop at an end token. The client records
+`tokens_min` and `tokens_max` per wave. The final Lernex run must show 256 for every request or
+say which waves did not, because a short request lowers Lernex's e2e number.
+
+## 1. SGLang home turf
+
+### 1a. Shared prefix (2,048 tokens shared, 64 unique, 256 generated)
+
+SGLang flags, from the tuning below: Praxis (BF16 and FP8) `--max-mamba-cache-size 160
+--max-total-tokens 131072 --cuda-graph-max-bs-decode 64 --mem-fraction-static 0.8` (53 running
+requests, a 16,838-token KV pool); Logos FP8 `--max-mamba-cache-size 24 --max-total-tokens 16384
+--cuda-graph-max-bs-decode 8 --mem-fraction-static 0.85` with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+(8 running requests).
+
+| Model and format | Streams | Lernex | SGLang e2e tok/s (waves) | SGLang TTFT p50 / p90 (ms, wave 0) | Ratio |
+|---|---|---|---|---|---|
+| Praxis BF16 | 64 | pending final main | 1607, 1609 | 258 / 6136 | pending |
+| Praxis BF16 | 128 | pending final main | 1896, 1900 | 6122 / 12068 | pending |
+| Praxis FP8 | 64 | pending final main | 1734, 1839 | 379 / 6258 | pending |
+| Praxis FP8 | 128 | pending final main | 2134, 2161 | 5903 / 11481 | pending |
+| Logos FP8 | 64 | pending final main | 434, 436 | 16717 / 33141 | pending |
+| Logos FP8 | 128 | pending final main | 436, 436 | 35286 / 65837 | pending |
+
+SGLang's radix cache is on in all of these. Its log shows `#cached-token: 2048` on the shared
+requests, so the prefix is reused. Praxis BF16 held 53 running requests and the rest queued, which
+is where the high p90 TTFT comes from. Per-stream decode at 64 streams is 44 tok/s for Praxis and
+55 tok/s for Logos FP8.
+
+### 1b. Structured output (JSON schema, 32 in flight, 64 requests, 160 generated)
+
+| Mode | SGLang e2e tok/s | Valid replies | Lernex |
+|---|---|---|---|
+| Free (no `response_format`) | 789 | 49 of 64 | pending final main |
+| `json_schema` (xgrammar) | 957 | 64 of 64 | pending final main |
+
+Lernex does not support JSON-schema output. `engine/server/server.cpp` rejects any
+`response_format` whose type is not `text` with HTTP 400, `response_format json_schema is not
+supported yet` (around lines 158 to 160). Lernex's only constrained decoding is the tool-call
+grammar in `engine/runtime/tool_grammar.cpp`, which forces the Metis tool-call format and is not
+JSON. This is a finding: the cell is unsupported on Lernex, not a number. The final run confirms
+the 400 with the same script.
+
+### 1c. Plain batched decode (independent 512-token prompts, 256 generated)
+
+| Model and format | Streams | Lernex | SGLang e2e tok/s (waves) | SGLang stream tok/s | Ratio |
+|---|---|---|---|---|---|
+| Praxis BF16 | 1 | pending final main | 139 | 142 | pending |
+| Praxis BF16 | 8 | pending final main | 674 (669, 679) | 88 to 89 | pending |
+| Praxis BF16 | 32 | pending final main | 980 (979, 981) | 58 | pending |
+| Praxis FP8 | 1 | pending final main | 140 | 142 | pending |
+| Praxis FP8 | 8 | pending final main | 740 | 97 | pending |
+| Praxis FP8 | 32 | pending final main | 1596 (1583, 1608) | 54 | pending |
+| Logos FP8 | 1 | pending final main | 80 | 82 | pending |
+| Logos FP8 | 8 | pending final main | 401 | 53 | pending |
+| Logos FP8 | 32 | pending final main | 403 | 54 | pending |
+
+At 32 streams, Praxis BF16 can only run about 21 requests at a time in the 16,838-token KV pool
+(each request holds 768 tokens), so the 32-stream cell is memory-limited for SGLang.
+
+### SGLang configuration on this card (what had to change, and why)
+
+These are the runs that failed before the table flags were reached, so the next person does not
+repeat them.
+
+| Model | Attempt | Result |
+|---|---|---|
+| Praxis BF16 | `--mem-fraction-static` left at auto (0.748) | refused at start: weights leave no room for the KV pool |
+| Praxis BF16 | mem 0.9, mamba 160, graph 32 | shared-prefix cell dies with CUDA out of memory in `copy_mamba_state` (1.25 GiB temporary) |
+| Praxis BF16 | mem 0.85, same flags | same out-of-memory in the copy |
+| Praxis BF16 | mem 0.8, graph 32 | runs, but 35 running requests exceed the graph cap, so decode runs without CUDA graphs: 813 to 896 tok/s at 64 streams, 17 tok/s per stream |
+| Praxis BF16 | mem 0.8, graph 64 | **final**: 1608 and 1898 tok/s at 64 and 128 streams |
+| Logos FP8 | flags from `sglang-metis/README.md` (mem 0.92, KV 32768) | out of memory in the Mamba copy (596 MiB) after the first shared-prefix requests |
+| Logos FP8 | mem 0.85, KV 32768 | same out-of-memory (the pool is capped by `--max-total-tokens`, so the fraction changes nothing here) |
+| Logos FP8 | mem 0.85, KV 16384, expandable segments | **final**: runs with 8 running requests |
+
+The Mamba copy-on-write that the shared-prefix cells trigger needs roughly 0.6 to 1.3 GiB of free
+memory at the moment of the copy. On a 16 GB card the defaults in the sglang-metis README leave less
+than that, so the copy fails under shared-prefix load. These numbers are SGLang's best this
+session found on this card, not its ceiling on a bigger one.
+
+## 2. llama.cpp home turf
+
+### 2a. Single stream on the GPU (full offload)
+
+llama-bench, `-p 512 -n 128,256`, 3 repetitions, tok/s.
+
+| Format (bits per weight) | pp512 | tg128 | tg256 | Lernex, same weight class | Ratio |
+|---|---|---|---|---|---|
+| Praxis Q4_K_M (5.49) | 3945 (+/- 197) | 252.4 | 253.3 | pending final main: Praxis NVFP4 (about 5.5) | pending |
+| Praxis Q8_0 (8.76) | 4104 | 235.1 | 235.8 | pending final main: Praxis FP8 (9.6) | pending |
+| Praxis BF16 (16.03) | 3471 | 184.5 | 185.2 | pending final main: Praxis BF16 | pending |
+| Logos Q4_K_M (5.28) | 1868 | 124.4 | 124.9 | pending final main: no Lernex 4-bit Logos; FP8 is the nearest | pending |
+| Logos Q8_0 (8.69) | 1897 | 115.0 | 115.5 | pending final main: Logos FP8 (about 9.1) | pending |
+
+The Lernex side is `lernex bench` at one stream, 512 prompt and 256 generated tokens, through the
+same card. Its earlier numbers (at 6b8731f) are in `tools/rivals/results/lernex-6b8731f-preliminary/`
+and are not in these tables.
+
+### 2b. CPU only (14 threads, no GPU)
+
+llama-bench with `CUDA_VISIBLE_DEVICES=` and `-ngl 0 -t 14`, tok/s. Lernex's CPU backend is
+selected with `LX_BACKEND=cpu` and `LX_THREADS=14`. The CPU backend implements BF16, INT8, FP8 and
+NVFP4 (`engine/cpu/gemm.cpp`).
+
+| Model | Format (bits per weight) | pp512 | tg128 | tg256 | Lernex CPU, same class | Ratio |
+|---|---|---|---|---|---|---|
+| Praxis | Q4_K_M (5.49) | 170.1 | 27.4 | 25.8 | pending final main: NVFP4 (about 5.5) | pending |
+| Praxis | Q8_0 (8.76) | 127.3 | 22.4 | 23.6 | pending final main: INT8 (`--weights int8`, 8 bits plus a scale per row) | pending |
+| Logos | Q4_K_M (5.28) | 75.4 | 12.8 | 12.6 | pending final main: no Logos NVFP4 file | pending |
+| Logos | Q8_0 (8.69) | 45.6 | 12.3 | 12.6 | pending final main: Logos FP8 (about 9.1) | pending |
+
+Caveat: these CPU cells ran through the no-lock `run` verb while other agents' jobs were starting.
+The load average went from 2.9 to 10.6 during the window, and the Logos Q8_0 prefill spread is
+large (45.6 +/- 23). A quiet-machine rerun belongs in the final pass.
+
+### 2c. Logos BF16 partial offload (20.5 GB does not fit 16 GB)
+
+No llama.cpp result. Every configuration tried failed while creating the context. The device
+allocation that fails is the CUDA weight buffer, which the log reports at the start of each load:
+
+| `-ngl` | Device buffer requested (MiB) | Result |
+|---|---|---|
+| 16 | 19318 | fails (`cudaMalloc`, then the compute reservation) |
+| 20 | 19318 | fails |
+| 22 | 18386 | fails |
+| 24 | 16462 | fails |
+| 28 | 12640 | fails |
+| 30 | 10706 | fails |
+| 32 | 8812 | fails |
+| 34 | 6879 | fails |
+| 36 | 5010 | fails (`failed to allocate compute pp buffers`, 5.25 GB) |
+
+The requested device buffer shrinks as `-ngl` grows, which is the opposite of partial offload: in
+this build the layer-to-device mapping for `metis16` looks inverted, so a larger `-ngl` puts fewer
+layers on the card. The prompt compute reservation is 5 to 20 GB across the same range. Routing the
+routed experts to the host (`-ngl 99 -ot "ffn_.*_exps=CPU"`, 18.1 GB of the 20.5 GB file) still
+asks for a 17.3 GB device buffer at micro-batch 512, 128 and 64, so the micro-batch does not help.
+Values from 37 to 40 and a host-side layer split were not tried; the upstream check comes first.
+
+The logs are in `tools/rivals/results/single-logos-bf16-*.log`. This is a llama.cpp limit in this
+build, not a Lernex loss. The Lernex side (routed experts offloaded automatically) is pending final
+main.
+
+## Cells we lose
+
+Pending final main. The only losses known before the Lernex run, from the code and the rival side:
+
+1. **Structured output (JSON schema).** Lernex does not have it (HTTP 400). SGLang runs
+   xgrammar-constrained decode at 957 tok/s with 64 of 64 valid replies. This is a missing feature,
+   not a tuning gap.
+2. **Concurrency on 16 GB.** Lernex's default plan holds 37 BF16 sequences at 8,192 context, and
+   21 Logos FP8 sequences at 2,560 context. SGLang holds 53 Praxis and 8 Logos. The Lernex final
+   run must use the tuned settings below, or it under-reports the engine.
+
+## Commands and reproduction
+
+Lock windows, one engine each. Every GPU window has a `timeout`. The rivals slot is
+`~/lernex-engine-dev/rivals`.
+
+```bash
+# rival side (already run; repeat only if the rival or the card changes)
+scripts/remote.sh rivals x 'PORT=30000 timeout 1500 tools/rivals/serve.sh sglang sglang-praxis-bf16 \
+  ~/.cache/lernex/models/Lernex/Metis-1.6-Praxis \
+  --max-mamba-cache-size 160 --max-total-tokens 131072 --cuda-graph-max-bs-decode 64 --mem-fraction-static 0.8'
+scripts/remote.sh rivals x 'PORT=30000 timeout 1500 tools/rivals/serve.sh sglang sglang-praxis-fp8 \
+  ~/kronos-scratch/logos/engines/praxis/fp8 --max-mamba-cache-size 160 --max-total-tokens 131072 \
+  --cuda-graph-max-bs-decode 64 --mem-fraction-static 0.8'
+scripts/remote.sh rivals x 'PORT=30000 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True timeout 1500 \
+  tools/rivals/serve.sh sglang sglang-logos-fp8 ~/.cache/lernex/models/Lernex/Metis-1.6-Logos-FP8 \
+  --max-mamba-cache-size 24 --max-total-tokens 16384 --cuda-graph-max-bs-decode 8 --mem-fraction-static 0.85'
+scripts/remote.sh rivals x 'CELLS=structured PORT=30000 timeout 1500 tools/rivals/serve.sh sglang \
+  sglang-praxis-bf16-structured ~/.cache/lernex/models/Lernex/Metis-1.6-Praxis \
+  --max-mamba-cache-size 160 --max-total-tokens 131072 --cuda-graph-max-bs-decode 64 --mem-fraction-static 0.8'
+scripts/remote.sh rivals x 'timeout 900 tools/rivals/single.sh llama-gpu'
+scripts/remote.sh rivals x 'timeout 900 tools/rivals/single.sh llama-gpu-bf16'
+scripts/remote.sh rivals run 'timeout 2700 tools/rivals/single.sh llama-cpu'   # no GPU, no lock
+scripts/remote.sh rivals x 'NGL="24 22 20 16" timeout 1800 tools/rivals/single.sh llama-offload'
+scripts/remote.sh rivals x 'timeout 1800 tools/rivals/single.sh llama-experts'
+```
+
+Lernex, final main (to run once, on the lead's final commit; each window is one model and one
+format, with the same client):
+
+```bash
+# BF16, the default plan and the tuned plans (the tuned ones lift the slot count for 64 and 128 streams)
+scripts/remote.sh rivals x 'PORT=8080 timeout 1500 tools/rivals/serve.sh lernex lernex-praxis-bf16 \
+  ~/.cache/lernex/models/Lernex/Metis-1.6-Praxis'
+scripts/remote.sh rivals x 'PORT=8080 timeout 1500 tools/rivals/serve.sh lernex lernex-praxis-bf16-nobf16x \
+  ~/.cache/lernex/models/Lernex/Metis-1.6-Praxis --sequences 128 --context 2560 --no-bf16x'
+# FP8 and Logos FP8 (same client, tuned context)
+scripts/remote.sh rivals x 'PORT=8080 timeout 1500 tools/rivals/serve.sh lernex lernex-praxis-fp8 \
+  ~/kronos-scratch/logos/engines/praxis/fp8 --sequences 128 --context 2560'
+scripts/remote.sh rivals x 'PORT=8080 timeout 1500 tools/rivals/serve.sh lernex lernex-logos-fp8 \
+  ~/.cache/lernex/models/Lernex/Metis-1.6-Logos-FP8 --sequences 128 --context 2560'
+# structured output: expect HTTP 400 from lernex serve
+scripts/remote.sh rivals x 'CELLS=structured PORT=8080 timeout 600 tools/rivals/serve.sh lernex lernex-structured \
+  ~/.cache/lernex/models/Lernex/Metis-1.6-Praxis'
+# single stream and CPU
+scripts/remote.sh rivals x 'timeout 1200 tools/rivals/single.sh lernex-gpu'
+scripts/remote.sh rivals run 'timeout 2700 tools/rivals/single.sh lernex-cpu'
+scripts/remote.sh rivals x 'timeout 1200 tools/rivals/single.sh lernex-offload'
+```
+
+Each Lernex window also records the plan lines (`Up to N sequences`) in
+`out/rivals/<name>.server.log`, so the final table can say how many sequences each run held.
