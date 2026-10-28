@@ -1,10 +1,183 @@
 # Install tests
 
-What `scripts/install.sh`, the Docker image and the install paths were run on, with the result of each run. Every row
-names the machine, the release build it installed and what happened. A row marked "not run" has not been run in this
-round; the Open items say what it needs.
+What `scripts/install.sh`, the Docker image, `lernex update` and the install paths were run on, with the result of
+each run. Every row names the machine, the release build it installed and what happened. There have been two rounds:
+the release candidate v0.1.0-rc1 (round 2, first below) and the 0.1.0 test builds before it (round 1). A row marked
+"not run" was not run in its round; the Open items say what is left.
 
-## Method
+## Round 2: v0.1.0-rc1 (2026-10-28)
+
+The tag `v0.1.0-rc1` is on `7608083`. Every row in this round installed the release candidate's own tarballs, built
+from the tag, through the tag's own `install.sh` and `docker/Dockerfile`.
+
+### How the release candidate was built
+
+The tag's release workflow (run 40783732071) did not start: GitHub refuses Actions jobs on the private repository
+until the account's included minutes reset on November 1 (they ran out on October 19, and the spending limit is $0).
+Public repositories run free, so the v0.1.0 tag, pushed once the repository is public, runs `release.yml` as written.
+
+So the four tarballs were built the way `release.yml` builds them, from `git archive v0.1.0-rc1`, with the workflow's
+own scripts and base images, on our machines:
+
+| Tarball | Where | How | Bytes | sha256 |
+|---------|-------|-----|------:|--------|
+| `lernex-linux-x86_64-cpu.tar.gz` | GPU server, Docker | `quay.io/pypa/manylinux_2_28_x86_64`, `scripts/release/build.sh`, 2 min at `LX_JOBS=4` | 3,583,197 | `3b5885e4…` |
+| `lernex-linux-x86_64-cuda12.tar.gz` | GPU server, Docker | the same base, `scripts/release/cuda-toolkit.sh 12.8`, then `build.sh`, 17 min at `LX_JOBS=4` | 563,814,407 | `36bdfee3…` |
+| `lernex-linux-aarch64-cpu.tar.gz` | this Mac, Docker Desktop, linux/arm64 | `quay.io/pypa/manylinux_2_28_aarch64`, `build.sh` (GCC 14.2.1) | 3,007,222 | `852ed9f5…` |
+| `lernex-darwin-arm64.tar.gz` | this Mac, native, under `heavy.sh` | `build.sh` (AppleClang 21) | 1,248,377 | `6db3f583…` |
+
+- Every build had `LX_VERSION=0.1.0-rc1` and `LX_GIT_SHA=7608083`, as the workflow sets them from the tag, so
+  `--version` prints `lernex 0.1.0-rc1 (FLAVOR, 7608083)` in every row.
+- `SHA256SUMS` was written by `scripts/release/sums.sh`. `install.sh` is the tag's, sha256 `e0fd2436…`, the same file
+  round 1 tested.
+- The CUDA build leaves the decode program out (`LX_DECODE_PROGRAM` is off in the release flavors, `80658f7`). The
+  tarball is 564 MB against round 1's 713 MB. Unpacked it is 886 MB, of which `libcublasLt.so.12` is 752 MB and
+  `liblernex_kernels.so` 129 MB.
+- The release host is round 1's: a folder shaped like GitHub's releases, served on 127.0.0.1 (port 18240 on the GPU
+  server, 18250 on this Mac, reached from Docker Desktop containers as `host.docker.internal`). Row 15 adds GitHub's
+  `/latest` redirect (see 15a).
+- The scripts are `~/installer-rc/` on the GPU server (`build-rc.sh`, `rc-tests.sh`, `update-test.sh`, `relhost.py`,
+  logs in `out-0.1.0-rc1/` and `out-update/`). The Mac rows ran from a session scratch folder with the same layout.
+
+### Results
+
+| # | What | Where | Result |
+|---|------|-------|--------|
+| 4 | `install.sh` (latest), native: `--version`, `doctor`, signature, quarantine, re-run | this Mac, macOS 27.0, Apple M5, temp HOME | pass (4b) |
+| 10 | `install.sh` (latest), native, cuda12 chosen by itself: `--version`, `doctor praxis`, one prompt, `serve` and one curl | GPU server, RTX 5070 Ti, driver 595.91.07, temp HOME | pass (10b) |
+| 11 | arm64 Ubuntu 22.04 and 24.04: install, `--version`, `doctor`, re-run | this Mac, Docker Desktop 29.4.0, linux/arm64 | pass (11b) |
+| 12 | x86_64 Ubuntu 22.04 (wget only) and 24.04 (curl): install, `--version`, `doctor`, one prompt on the CPU, re-run | GPU server, Docker 29.1.3, native x86_64 (round 1 planned emulation on the Mac) | pass (12b) |
+| 13 | Image build from the tag's `docker/Dockerfile` against the release candidate's host | GPU server, Docker 29.1.3 | pass (13b) |
+| 14 | The image through Docker's GPU path: `docker run --gpus all`, its own ENTRYPOINT and CMD, one curl, `doctor` | GPU server, NVIDIA Container Toolkit | pass (14c) |
+| 15 | `lernex update` end to end: 0.1.0-rc1 installed pinned, `update --check`, `update` to 0.1.0, check again, `--rollback`; the daily notice in `lernex run` | GPU server, ubuntu:24.04 container, a test host with GitHub's `/latest` redirect | pass (15a) |
+
+Rows 5 to 9 test `install.sh`'s choices and refusals with shims and fake tarballs. `install.sh` is byte for byte the
+file they passed on, so they were not rerun.
+
+### 4b. This Mac, native (macOS 27.0, Apple M5, temp HOME)
+
+```
+lernex: done. Try: lernex doctor                        install rc 0
+version    lernex 0.1.0-rc1 (darwin-arm64, 7608083)
+doctor     rc 0; Metal driver 27.0, runtime 4.0; backend Metal, liblernex_metal.dylib in the installed tree; missing none
+signature  Signature=adhoc, TeamIdentifier not set
+quarantine no com.apple.quarantine on ~/.lernex/current/bin/lernex
+re-run     "lernex 0.1.0-rc1 is already installed and current", rc 0
+```
+
+`doctor` on this build still printed CUDA's fields for the Apple GPU (`arch sm_1010`, `L2 0 MB`, `clusters yes`). Main
+fixed that after the tag (see Findings).
+
+### 10b. GPU server, native (RTX 5070 Ti, driver 595.91.07, temp HOME)
+
+```
+lernex: Linux x86_64: cuda12 build, NVIDIA GeForce RTX 5070 Ti, driver 595.91.07
+lernex: installed lernex 0.1.0-rc1 in ~/.lernex/versions/0.1.0-rc1
+version       lernex 0.1.0-rc1 (linux-x86_64-cuda12, 7608083)
+doctor praxis rc 0: sm_120; CUDA driver 13.2, runtime 12.8; kernels for sm_80 sm_86 sm_89 sm_90 sm_100 sm_120;
+              backend CUDA, liblernex_kernels.so in the installed tree; missing none; tuning from the installed tree;
+              the plan for praxis (BF16 stored and chosen, BF16X on, speculation on for one stream)
+run praxis --think off, "What is 17 times 3?": 51
+serve praxis on 127.0.0.1:18241: up to 30 sequences of 8192 tokens, 14.68 GB planned of 14.78 GB
+POST /v1/chat/completions: "51", finish_reason stop
+```
+
+`doctor praxis` failing on the model alias was round 1's finding; it passes here. The run and serve held the GPU lock
+and waited about five minutes for the engine work ahead of them.
+
+### 11b. arm64 Ubuntu (Docker Desktop on this Mac)
+
+Both containers: install rc 0, `lernex 0.1.0-rc1 (linux-aarch64-cpu, 7608083)`, `doctor` rc 0 (Advanced SIMD, dot
+product, I8MM, BF16; 116 GB/s measured on 10 threads; backend `liblernex_cpu.so`; missing none), and a re-run that
+printed "already installed and current". Docker Desktop was started for the row and quit after it.
+
+### 12b. x86_64 Ubuntu (Docker on the GPU server)
+
+```
+22.04, wget only: install rc 0, with the libcurl warning; lernex 0.1.0-rc1 (linux-x86_64-cpu, 7608083)
+                  doctor: i5-14500, AVX2, FMA, F16C, AVX-VNNI; 74 GB/s measured on 14 threads; missing none
+                  run praxis --think off on the CPU: 51, 19 tok/s
+24.04, curl:      install rc 0; lernex 0.1.0-rc1 (linux-x86_64-cpu, 7608083); doctor as 22.04
+                  run praxis --think off on the CPU: 51, 26 tok/s
+                  re-run, both: "lernex 0.1.0-rc1 is already installed and current"
+```
+
+The rate is one generated token over its own time, so it says little, and this run shared the CPU with row 15's
+notice container.
+
+### 13b and 14c. The image, on the GPU server
+
+Built from the tag's `docker/Dockerfile` with Docker 29.1.3, on the host network so that the fetch stage reached the
+release candidate's host:
+
+    docker build --network host -t lernex/engine:0.1.0-rc1 \
+      --build-arg LERNEX_VERSION=0.1.0-rc1 --build-arg LERNEX_RELEASES=http://127.0.0.1:18240 .
+
+```
+fetch stage   lernex-linux-x86_64-cuda12.tar.gz: OK (sha256sum -c against the release's SHA256SUMS)
+build         rc 0 in 3.6 minutes, nvidia/cuda:12.8.1-base-ubuntu24.04 pulled fresh
+image         670,718,068 bytes (round 1's 0609dd3 image: 822,010,399)
+config        ENTRYPOINT lernex serve --host 0.0.0.0 --port 8080, CMD praxis
+--version     lernex 0.1.0-rc1 (linux-x86_64-cuda12, 7608083)
+```
+
+Then the image's own ENTRYPOINT and CMD, the GPU through `--gpus all`, the models folder mounted, under the GPU lock:
+
+    docker run -d --rm --gpus all -p 127.0.0.1:18242:8080 -v ~/.cache/lernex/models:/root/.cache/lernex/models lernex/engine:0.1.0-rc1
+
+```
+serve         Serving praxis on http://0.0.0.0:8080/v1: up to 30 sequences of 8192 tokens, 14.68 GB planned of 14.78 GB
+POST /v1/chat/completions ("What is 17 times 3?", thinking off): "51", finish_reason stop
+doctor        (docker exec, while serving) sm_120; CUDA driver 13.2, runtime 12.8; kernels for sm_80 sm_86 sm_89 sm_90 sm_100 sm_120;
+              backend CUDA, /opt/lernex/lib/liblernex_kernels.so; missing none; tuning from the image
+stopped       docker stop; no compute apps on the GPU afterwards
+```
+
+The image was built on the GPU server, not saved and copied from this Mac as in round 1, now that the server has
+Docker. It stays there as `lernex/engine:0.1.0-rc1` and is not pushed anywhere.
+
+### 15a. `lernex update` end to end
+
+`lernex update` asks the release host for `/latest` and reads the version from where it redirects
+(`/releases/tag/vX.Y.Z` on GitHub). A plain file server has no such redirect, and the release candidate is a
+prerelease, which `update` never offers (GitHub's `/releases/latest` never names one). So this row adds what the real
+host has:
+
+- `relhost.py` serves the folder and answers `/latest` with a 302 to `/tag/v0.1.0`, as GitHub does.
+- A test-only 0.1.0 x86_64 CPU tarball, built from the same `v0.1.0-rc1` source with `LX_VERSION=0.1.0` in the same
+  manylinux base, plays the newer release. It was never published and exists only on the GPU server.
+
+In a fresh ubuntu:24.04 container on the GPU server, with `LERNEX_RELEASES` pointing at that host:
+
+```
+install 0.1.0-rc1 pinned        lernex: done. Try: lernex doctor
+version                         lernex 0.1.0-rc1 (linux-x86_64-cpu, 7608083)
+update --check                  lernex 0.1.0 is available (you have 0.1.0-rc1). Run `lernex update` to install it.
+run praxis --think off          51
+update                          downloading lernex 0.1.0 (linux-x86_64-cpu)
+                                lernex 0.1.0 is installed and current. lernex 0.1.0-rc1 is kept: `lernex update --rollback` returns to it.
+version after update            lernex 0.1.0 (linux-x86_64-cpu, 7608083)
+~/.lernex/versions              0.1.0 0.1.0-rc1, current -> versions/0.1.0
+update --check again            lernex 0.1.0 is the latest release.
+update --rollback               lernex switched back to 0.1.0-rc1. The next run uses it.
+version after rollback          lernex 0.1.0-rc1 (linux-x86_64-cpu, 7608083)
+```
+
+The daily notice, in a second fresh container against the same host. `lernex run` prints it from
+`~/.cache/lernex/update-check`, which the previous run's background check writes, so it takes two runs to appear:
+
+```
+run 1 (no cache yet)     51, no notice; afterwards the cache reads latest=0.1.0
+run 2                    51, and on stderr: lernex 0.1.0 is out (you have 0.1.0-rc1). Run `lernex update` to install it.
+update                   to 0.1.0
+run 3                    51, no notice
+```
+
+Against the plain hosts of rows 4 and 10 to 12, which have no `/latest` redirect, `update --check` printed "the
+release host names no latest release", as it should. On 22.04 without libcurl it printed "libcurl is not available
+on this system", matching the installer's warning.
+
+## Round 1 method: the 0.1.0 test builds
 
 - Release host: a directory laid out like GitHub's (`latest/download/` and `download/vX.Y.Z/`, each holding the
   tarballs, `SHA256SUMS` and `install.sh`), reached through `LERNEX_RELEASES`. `SHA256SUMS` is written by
@@ -20,7 +193,7 @@ round; the Open items say what it needs.
   test.
 - Flags that were needed to get a run through, and why, are in the Notes.
 
-## Results
+## Round 1 results
 
 | # | What | Where | Build | Result |
 |---|------|-------|-------|--------|
@@ -224,15 +397,26 @@ gets the same run once it is built from the RC tarball.
 
 ## Findings
 
-- The CPU and Metal backends do not export the 15 `lx_program_*` symbols that `kernels.h` declares; `doctor` lists
-  them missing on both. Pre-existing, not an installer problem.
-- The cuda12 tarball (`0609dd3`) predates the `doctor` alias commit on main (`2ac61ea`): `doctor praxis` fails with
-  "cannot open praxis/config.json" in row 10. A release rebuilt from main would fix it; the same tarball does accept a
-  model folder path.
+- Resolved in rc1: `doctor` listed the 15 `lx_program_*` symbols as missing on the CPU and Metal backends. The decode
+  program is CUDA's alone and opt-in, so `doctor` leaves those names out, and rc1 prints `missing none` on all three
+  backends (rows 4, 10 to 12).
+- Resolved in rc1: round 1's cuda12 tarball (`0609dd3`) predated the `doctor` alias, so `doctor praxis` failed with
+  "cannot open praxis/config.json". rc1's `doctor praxis` passes (10b).
+- Fixed on main after rc1 (`80bfefd`): on a Mac, `doctor` printed CUDA's fields for the Apple GPU (`arch sm_1010`,
+  `SMs 10, L2 0 MB`, `tensor cores`, `clusters yes (sm_90 and up)`). It is the first command `install.sh` suggests.
+  It now prints the Apple family, the GPU cores, the unified memory the GPU can use, whether the GEMMs and attention run
+  on the neural accelerators (Apple family 10 and later, `LX_METAL_NAX=0` turns them off), and the macOS and Metal
+  versions. Checked on this Mac with a darwin build of main, with and without `LX_METAL_NAX=0` and
+  `LX_ARCH_OVERRIDE=1009`. v0.1.0 carries it; rc1's darwin tarball does not.
+- The darwin binary is ad-hoc signed (no Developer ID, not notarized). `install.sh` downloads with curl, which sets no
+  quarantine, so the install runs (4b); Homebrew's formula downloads with curl too. A tarball downloaded in a browser
+  is quarantined, and Gatekeeper refuses an ad-hoc binary from it. Signing and notarizing in `release.yml` needs a
+  Developer ID Application certificate and a notary credential as repository secrets.
 - `lernex update` does not write install.sh's `.install` marker. A re-run of install.sh after a `lernex update` to the
   same version downloads the release again and reinstalls it (harmless, slower). The release side could write the
   marker in `install_release`, or install.sh could compare `--version` output.
-- Local `build.sh` runs without `LX_GIT_SHA` print `wip` in `--version`.
+- Local `build.sh` runs without `LX_GIT_SHA` print `wip` in `--version`. The release workflow sets it, and the rc1
+  builds set it the same way.
 - udocker 1.3.17 cannot load a `docker save` archive from Docker 29 (see 14a). Flattening the layers works.
 - On the GPU server, udocker's rootless runc mode is blocked by `kernel.apparmor_restrict_unprivileged_userns = 1`.
 - In udocker's proot mode the backend probe needs `LX_KERNELS` (see 1a, 14a).
@@ -255,14 +439,19 @@ gets the same run once it is built from the RC tarball.
   assets that do not exist yet. A manual run (`workflow_dispatch` with a version) builds the image and pushes nothing.
   `packages: write` is set on the job for the GHCR push. `:latest` is not set for a prerelease. The flavor is cuda12.
 - Verified: `docker run --gpus all` of the image with its own entrypoint and default command, serve and one chat
-  request on the GPU (row 14b). Row 13 covers the build and the `--version` check.
+  request on the GPU (round 1's 14b, and round 2's 14c on the release candidate's image). Rows 13a and 13b cover the
+  build and the `--version` check.
 
 ## Open items
 
-- Rows 4, 11 and 12 are not run in this round. Row 4 (darwin native install) is a light test on this Mac once a darwin
-  build is ready. Rows 11 and 12 need Docker Desktop on the Mac for a second session; they were left out so the image
-  session stayed alone on the machine.
-- Row 14 with Docker's own GPU path passed as 14b. udocker R1 is not pursued: the server keeps
-  `kernel.apparmor_restrict_unprivileged_userns = 1` on purpose, and Docker with the NVIDIA runtime replaces udocker there.
-- Rows 13 and 14b ran the image built at 0609dd3. The release candidate's image needs both runs again.
-- The release tarball behind rows 10 and 13 needs a rebuild from main for the `doctor` alias.
+- `release.yml`, `pypi.yml` and `docker.yml` have not run on GitHub yet: Actions is held on the private repository by
+  billing until November 1 (round 2, How the release candidate was built). Their first run is the v0.1.0 tag once the
+  repository is public. Round 2 followed `release.yml`'s steps by hand on the same base images and scripts, and
+  `actionlint` 1.7.7 passes on all three workflows apart from one intentional SC2086 in `pypi.yml` (`$CUDA_FLAG` is
+  left unquoted so that an empty flag adds no argument).
+- Signing and notarizing the darwin tarball needs a Developer ID Application certificate and a notary credential as
+  repository secrets (Findings). Until then `install.sh` works on a Mac and a browser-downloaded tarball does not.
+- Rows 5 to 9 were not rerun in round 2, because `install.sh` has not changed since they passed. Rerun them whenever it
+  does.
+- udocker's R1 mode is not pursued: the GPU server keeps `kernel.apparmor_restrict_unprivileged_userns = 1` on
+  purpose, and Docker with the NVIDIA runtime replaces udocker there (14b, and round 2's row 14).
