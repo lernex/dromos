@@ -85,7 +85,38 @@ void print_cpu(const lx::runtime::DeviceInfo& d) {
   std::printf("           FP8 and FP4 products are exact, summed in double\n");
 }
 
+// An Apple GPU: its family (the Metal backend's arch is 1000 + the family), its cores, the unified memory macOS lets
+// it hold, and whether the GEMMs and attention run on its neural accelerators. None of CUDA's terms apply here.
+void print_apple_gpu(const lx::runtime::DeviceInfo& d) {
+  const int family = d.cc() - 1000, real_family = d.real_cc() - 1000;
+  std::printf("GPU        %s (device %d)\n", d.name.c_str(), d.ordinal);
+  if (family != real_family)
+    std::printf("family     Apple %d as the kernels see it (the GPU is Apple %d; LX_ARCH_OVERRIDE lowers it)\n", family,
+                real_family);
+  else
+    std::printf("family     Apple %d: Metal compiles the kernels for this GPU at run time\n", family);
+  std::printf("cores      %d GPU cores\n", d.sms);
+  std::printf("memory     %.2f GB of unified memory the GPU can use, %.2f GB free now\n",
+              static_cast<double>(d.total_bytes) / 1e9, static_cast<double>(d.free_bytes) / 1e9);
+  if (d.bandwidth_gbs > 0)
+    std::printf("bandwidth  %.0f GB/s (memory transfer rate x bus width)\n", d.bandwidth_gbs);
+  else
+    std::printf("bandwidth  not known for this chip\n");
+  // The neural accelerators are Apple family 10 (the M5) and later; Device::nax() in the Metal backend decides.
+  const char* nax = std::getenv("LX_METAL_NAX");
+  if (real_family < 10)
+    std::printf("math       simdgroup matrices (this GPU has no neural accelerators)\n");
+  else if (nax && nax[0] == '0')
+    std::printf("math       simdgroup matrices (LX_METAL_NAX=0 keeps the GEMMs off the neural accelerators)\n");
+  else
+    std::printf("math       neural accelerators for the GEMMs and attention (LX_METAL_NAX=0 turns them off)\n");
+  std::string metal = d.runtime_text;  // "4.0" is Metal 4, "3.2" stays
+  if (metal.size() > 2 && metal.compare(metal.size() - 2, 2, ".0") == 0) metal.resize(metal.size() - 2);
+  std::printf("Metal      macOS %s, Metal %s\n", d.driver_text.c_str(), metal.c_str());
+}
+
 void print_gpu(const lx::runtime::DeviceInfo& d) {
+  if (lx_rt_backend() == LX_BACKEND_METAL) return print_apple_gpu(d);
   const lx::dispatch::Info& backend = lx::dispatch::info();
   std::printf("GPU        %s (device %d)\n", d.name.c_str(), d.ordinal);
   if (d.cc() != d.real_cc())
