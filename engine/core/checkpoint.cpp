@@ -15,7 +15,7 @@
 // Recipes (recipe() below), each checked against the folder it describes:
 //   - FP8: the published FP8 folders (Praxis, Logos) quantize the Mamba in_proj, the attention qkv and out,
 //     and the routed experts; everything else is BF16, the tied head included.
-//   - NVFP4: the GPTQ NVFP4 folder (Praxis) quantizes the routed experts to NVFP4, the dense projections
+//   - NVFP4: the GPTQ NVFP4 folder (Praxis, Logos) quantizes the routed experts to NVFP4, the dense projections
 //     and the tied head to FP8, and keeps the MoE latent_up BF16.
 //   - INT8: the engine's int8 decode policy (metis.cpp: every projection made with quantize = true is int8
 //     unless LX_W8_KEEP names it, default out_proj). The projections the engine makes with quantize = false
@@ -173,6 +173,7 @@ struct GptqCheckpoint {
 };
 constexpr GptqCheckpoint kGptqNvfp4[] = {
     {"praxis", "/home/aiadmin/kronos-scratch/logos/engines/praxis/nvfp4"},
+    {"logos", "/home/aiadmin/kronos-scratch/logos/engines/logos-nvfp4"},
 };
 
 // The refusal of a conversion to NVFP4 from a folder that is not NVFP4 (ModelWeights::load).
