@@ -156,10 +156,11 @@ int64_t lx_spec_ssm_hist_floats(int H, int P, int N) {
 // positions it keeps (hist rows after those), then its new tokens (x rows). Each new token's taps point at
 // the right rows of that list, so its output is conv_token's on the same rows a plain call over the
 // accepted tokens would read. Then the base state takes the fold (the last W - 1 rows up to the folded
-// positions, as the plain conv's state update leaves them) and hist becomes [kept rows, new rows].
+// positions, as the plain conv's state update leaves them) and hist becomes [kept rows, new rows]. The state
+// is indexed by slot; the history by hist_ids[s] (null: history 0 for every sequence).
 int lx_spec_conv1d(const float* x, int ld_x, const void* w, const void* bias, float* conv_state, float* conv_hist,
-                   const int32_t* slot_ids, const int32_t* has_state, const int32_t* fold, const int32_t* keep,
-                   const int32_t* cu_seqlens, int n_seq, float* out, int C, int W, void* stream) {
+                   const int32_t* slot_ids, const int32_t* hist_ids, const int32_t* has_state, const int32_t* fold,
+                   const int32_t* keep, const int32_t* cu_seqlens, int n_seq, float* out, int C, int W, void* stream) {
   LX_PROFILE("spec_conv1d");
   (void)stream;
   if (n_seq <= 0) return kOk;
@@ -168,7 +169,8 @@ int lx_spec_conv1d(const float* x, int ld_x, const void* w, const void* bias, fl
     return fail(kInvalid);
   for (int s = 0; s < n_seq; ++s) {
     const int len = cu_seqlens[s + 1] - cu_seqlens[s];
-    if (fold[s] < 0 || keep[s] < 0 || len < 0 || fold[s] + keep[s] > kMaxPending || keep[s] + len > kMaxPending)
+    if (fold[s] < 0 || keep[s] < 0 || len < 0 || fold[s] + keep[s] > kMaxPending || keep[s] + len > kMaxPending ||
+        (hist_ids && hist_ids[s] < 0))
       return fail(kInvalid);
   }
   const uint16_t* wb = static_cast<const uint16_t*>(w);
@@ -187,8 +189,9 @@ int lx_spec_conv1d(const float* x, int ld_x, const void* w, const void* bias, fl
       const int start = cu_seqlens[s], len = cu_seqlens[s + 1] - start;
       const int f = fold[s], kp = keep[s];
       const bool has = has_state[s] != 0;
+      const int64_t hist_index = hist_ids ? hist_ids[s] : 0;
       float* st = conv_state + static_cast<int64_t>(slot_ids[s]) * (W - 1) * C;
-      float* hist = conv_hist + static_cast<int64_t>(slot_ids[s]) * kMaxPending * C;
+      float* hist = conv_hist + hist_index * kMaxPending * C;
       // Input i of the list after the base state (i < 0 reaches into it), for channels from c0.
       auto input = [&](int i) -> const float* {
         if (i >= f + kp) return x + static_cast<int64_t>(start + i - f - kp) * ld_x + c0;
@@ -228,9 +231,9 @@ int lx_spec_conv1d(const float* x, int ld_x, const void* w, const void* bias, fl
 // every y equal a plain scan over the accepted tokens bit for bit.
 int lx_spec_ssm_scan(const float* x, int ld_x, const float* dt_raw, int ld_dt, const float* B, const float* C,
                      int ld_bc, const float* A_log, const float* D, const float* dt_bias, float* ssm_state,
-                     float* ssm_hist, const int32_t* slot_ids, const int32_t* has_state, const int32_t* fold,
-                     const int32_t* keep, const int32_t* cu_seqlens, int n_seq, float* y, int H, int P, int G, int N,
-                     void* stream) {
+                     float* ssm_hist, const int32_t* slot_ids, const int32_t* hist_ids, const int32_t* has_state,
+                     const int32_t* fold, const int32_t* keep, const int32_t* cu_seqlens, int n_seq, float* y, int H,
+                     int P, int G, int N, void* stream) {
   LX_PROFILE("spec_ssm_scan");
   (void)stream;
   if (n_seq <= 0) return kOk;
@@ -241,7 +244,8 @@ int lx_spec_ssm_scan(const float* x, int ld_x, const float* dt_raw, int ld_dt, c
     return fail(kInvalid);
   for (int s = 0; s < n_seq; ++s) {
     const int len = cu_seqlens[s + 1] - cu_seqlens[s];
-    if (fold[s] < 0 || keep[s] < 0 || len < 0 || fold[s] + keep[s] > kMaxPending || keep[s] + len > kMaxPending)
+    if (fold[s] < 0 || keep[s] < 0 || len < 0 || fold[s] + keep[s] > kMaxPending || keep[s] + len > kMaxPending ||
+        (hist_ids && hist_ids[s] < 0))
       return fail(kInvalid);
   }
   const Kern& k = kern();
@@ -255,7 +259,8 @@ int lx_spec_ssm_scan(const float* x, int ld_x, const float* dt_raw, int ld_dt, c
       const int start = cu_seqlens[s], len = cu_seqlens[s + 1] - start;
       const int f = fold[s], kp = keep[s];
       float* base = ssm_state + (static_cast<int64_t>(slot_ids[s]) * H + h) * PN;
-      float* hist = ssm_hist + static_cast<int64_t>(slot_ids[s]) * kMaxPending * row;
+      const int64_t hist_index = hist_ids ? hist_ids[s] : 0;
+      float* hist = ssm_hist + hist_index * kMaxPending * row;
       ScanItem a;
       a.P = P;
       a.N = N;

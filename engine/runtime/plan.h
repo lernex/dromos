@@ -73,8 +73,8 @@ struct PlanRequest {
   bool bf16x = true;
   // --fast-math: the quantized tensor-core maths in place of BF16 (native_math): faster prefill, less accurate.
   bool fast_math = false;
-  // The engine builds its model speculative (EngineOptions::speculate): each slot then keeps a speculative history,
-  // which the plan reserves. Off (--no-spec), the plan gives that memory back to the KV cache.
+  // The engine builds its model speculative (EngineOptions::speculate): the plan reserves one speculative history, shared by
+  // the stream that verifies. Off (--no-spec), the plan gives that memory back to the KV cache.
   bool speculative = true;
   int context = 0;    // context each sequence is sized for, 0 for automatic
   int sequences = 0;  // concurrent sequences wanted, 0 for automatic

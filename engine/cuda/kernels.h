@@ -706,8 +706,11 @@ LX_API int lx_mask_logits(float* logits, int V, const int32_t* rows, const uint3
 //   the base state (conv_state and ssm_state, as lx_conv1d_varlen and lx_ssm_scan_varlen keep
 //   them), covering every position up to the slot's folded length, and
 //   up to LX_SPEC_MAX_PENDING pending positions after it, as the inputs their state update needs:
-//   conv_hist f32 [slots, LX_SPEC_MAX_PENDING, C] (the conv inputs) and ssm_hist f32
-//   [slots, lx_spec_ssm_hist_floats(H, P, N)] (each head's x, B and dt_raw).
+//   conv_hist f32 [histories, LX_SPEC_MAX_PENDING, C] (the conv inputs) and ssm_hist f32
+//   [histories, lx_spec_ssm_hist_floats(H, P, N)] (each head's x, B and dt_raw).
+// A history is shared, not per slot: hist_ids[s] names the history sequence s uses (null: history 0 for every
+// sequence). The engine keeps one history for the one stream that verifies at a time, and folds its pending positions
+// before another stream takes it over (MetisModel::forward_spec).
 // Each step a sequence names fold[s] (its first pending positions, folded into the base state for
 // good) and keep[s] (the pending positions after those, which stay pending); pending positions past
 // fold + keep are dropped (rejected drafts). The step's new tokens run from the state after all
@@ -725,17 +728,17 @@ LX_API int64_t lx_spec_ssm_hist_floats(int H, int P, int N);
 // lx_conv1d_varlen with pending positions (contract above): out for the new tokens; conv_state
 // changes only when fold > 0; conv_hist ends as [kept rows, new rows].
 LX_API int lx_spec_conv1d(const float* x, int ld_x, const void* w, const void* bias, float* conv_state,
-                          float* conv_hist, const int32_t* slot_ids, const int32_t* has_state, const int32_t* fold,
-                          const int32_t* keep, const int32_t* cu_seqlens, int n_seq, float* out, int C, int W,
-                          void* stream);
+                          float* conv_hist, const int32_t* slot_ids, const int32_t* hist_ids,
+                          const int32_t* has_state, const int32_t* fold, const int32_t* keep,
+                          const int32_t* cu_seqlens, int n_seq, float* out, int C, int W, void* stream);
 
 // lx_ssm_scan_varlen with pending positions (contract above): y for the new tokens; ssm_state
 // changes only when fold > 0; ssm_hist ends as [kept rows, new rows] for every head.
 LX_API int lx_spec_ssm_scan(const float* x, int ld_x, const float* dt_raw, int ld_dt, const float* B, const float* C,
                             int ld_bc, const float* A_log, const float* D, const float* dt_bias, float* ssm_state,
-                            float* ssm_hist, const int32_t* slot_ids, const int32_t* has_state, const int32_t* fold,
-                            const int32_t* keep, const int32_t* cu_seqlens, int n_seq, float* y, int H, int P, int G,
-                            int N, void* stream);
+                            float* ssm_hist, const int32_t* slot_ids, const int32_t* hist_ids,
+                            const int32_t* has_state, const int32_t* fold, const int32_t* keep,
+                            const int32_t* cu_seqlens, int n_seq, float* y, int H, int P, int G, int N, void* stream);
 
 // lx_gemm_f32 for decode-sized steps (M <= 8): y[M, N] = x[M, K] @ w[N, K]^T + bias[N], every row
 // summed in an order that does not depend on M, so a row's bits never depend on the other rows.

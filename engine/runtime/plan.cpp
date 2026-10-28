@@ -474,10 +474,10 @@ size_t state_bytes_per_slot(const MetisConfig& c) {
   return static_cast<size_t>(c.num_passes) * static_cast<size_t>(mamba_layers(c)) * per_layer;
 }
 
-// The speculative history of one slot (kernels.h, Speculative decoding): per Mamba layer and pass, the conv inputs of up to
-// LX_SPEC_MAX_PENDING positions and each head's SSM inputs for them. The engine builds its model speculative, so a lone
-// stream can verify drafts in any slot: the history is reserved for every slot.
-size_t spec_history_bytes_per_slot(const MetisConfig& c) {
+// The speculative history (kernels.h, Speculative decoding): per Mamba layer and pass, the conv inputs of up to
+// LX_SPEC_MAX_PENDING positions and each head's SSM inputs for them. One history serves the one stream that verifies at
+// a time (MetisModel::claim_history), so it is a fixed cost, not a per-slot one.
+size_t spec_history_bytes(const MetisConfig& c) {
   const int64_t I = c.mamba_intermediate(), H = c.mamba_heads(), Pd = c.mamba_head_dim, N = c.mamba_d_state;
   const int64_t G = c.mamba_n_groups, conv_dim = I + 2 * G * N;
   const int64_t row = (Pd + 3) / 4 * 4 + (N + 3) / 4 * 4 + 4;  // lx_spec_ssm_hist_floats: H * LX_SPEC_MAX_PENDING rows
@@ -628,7 +628,8 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
   if (!can_load(target, stored, c, &how)) throw std::runtime_error(format_name(target) + " cannot be planned: " + how);
 
   const size_t budget = resident_budget(d, req);
-  const size_t per_slot_state = state_bytes_per_slot(c) + (req.speculative ? spec_history_bytes_per_slot(c) : 0);
+  const size_t per_slot_state = state_bytes_per_slot(c);
+  const size_t history = req.speculative ? spec_history_bytes(c) : 0;  // one buffer, whatever the slot count
   const size_t per_position = kv_bytes_per_position(c);
   const int context_cap = c.max_position_embeddings > 0 ? c.max_position_embeddings : kDefaultContext;
   const int slot_cap = req.sequences > 0 ? req.sequences : kMaxSlots;
@@ -656,7 +657,7 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
     f.bf16x = bf16x;
     f.formats = model_formats(format, d, bf16x, req.fast_math);
     f.wb = weight_bytes(c, format, bf16x);
-    f.need = f.wb.total() + scratch_bytes(c, kMinStepTokens, 0, f.formats) +
+    f.need = f.wb.total() + scratch_bytes(c, kMinStepTokens, 0, f.formats) + history +
              static_cast<size_t>(want_slots) * (per_slot_state + per_position * static_cast<size_t>(floor_ctx));
     const int need_slots = std::min(want_slots, cap);
     for (int ctx = context_wanted;; ctx = std::max(floor_ctx, ctx / 2)) {
@@ -666,7 +667,7 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
       // for. Without a count, the first tier that holds the useful sequences is kept, as before.
       int got = -1, got_step = kMaxStepTokens;
       for (const int step : {kMaxStepTokens, kMinStepTokens}) {
-        const size_t fixed = f.wb.total() + scratch_bytes(c, step, 0, f.formats);
+        const size_t fixed = f.wb.total() + scratch_bytes(c, step, 0, f.formats) + history;
         if (budget <= fixed || per_slot == 0) continue;
         int slots = static_cast<int>(std::min<size_t>((budget - fixed) / per_slot, static_cast<size_t>(cap)));
         // the scratch grows with the slots' metadata too; take back any slot that no longer fits
@@ -806,7 +807,7 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
   std::set<std::string> dropped;
   std::vector<CopyUnit> left_out;
   size_t copy_bytes = 0, kept_units = 0, dropped_bytes = 0;
-  const size_t reserved = chosen.wb.total() + scratch_bytes(c, chosen.step, chosen.slots, chosen.formats) +
+  const size_t reserved = chosen.wb.total() + scratch_bytes(c, chosen.step, chosen.slots, chosen.formats) + history +
                           static_cast<size_t>(chosen.slots) * (per_slot_state + per_position * static_cast<size_t>(chosen.context));
   size_t room = budget > reserved ? budget - reserved : 0;
   const std::vector<CopyUnit> units = copies_wanted ? copy_units(c, target, chosen.slots) : std::vector<CopyUnit>{};
@@ -873,7 +874,7 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
 
   // The step the sequences were given, and the scratch for the sequences the plan holds.
   p.max_step_tokens = chosen.step;
-  p.scratch_bytes = scratch_bytes(c, chosen.step, slots, chosen.formats);
+  p.scratch_bytes = scratch_bytes(c, chosen.step, slots, chosen.formats) + history;
   p.prefill_chunk = std::max(1, chosen.step - slots);
   p.budget_bytes = budget;
   {

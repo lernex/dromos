@@ -389,6 +389,7 @@ struct SpecConvArgs {
   LX_PTR(float) state;
   LX_PTR(float) hist;
   LX_CPTR(int) slot_ids;
+  LX_CPTR(int) hist_ids;
   LX_CPTR(int) has_state;
   LX_CPTR(int) fold;
   LX_CPTR(int) keep;
@@ -407,6 +408,7 @@ struct SpecScanArgs {
   LX_PTR(float) state;
   LX_PTR(float) hist;
   LX_CPTR(int) slot_ids;
+  LX_CPTR(int) hist_ids;
   LX_CPTR(int) has_state;
   LX_CPTR(int) fold;
   LX_CPTR(int) keep;

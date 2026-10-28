@@ -43,8 +43,9 @@ kernel void spec_conv_out(constant SpecConvArgs& a [[buffer(0)]], uint2 tg [[thr
   const int start = a.cu[s], len = a.cu[s + 1] - start;
   const bool has = a.has_state[s] != 0;
   const long slot = a.slot_ids[s];
+  const long hidx = a.hist_ids ? a.hist_ids[s] : 0;  // the history is indexed by history, not slot
   const device float* st = a.state + slot * (W - 1) * C;
-  const device float* hs = a.hist + slot * kSpecMaxPending * C;
+  const device float* hs = a.hist + hidx * kSpecMaxPending * C;
   const int pending = a.fold[s] + a.keep[s];
   float wk[8];
   for (int k = 0; k < 8; ++k) wk[k] = k < W ? bf(a.w[c * W + k]) : 0.0f;
@@ -77,8 +78,9 @@ kernel void spec_conv_state(constant SpecConvArgs& a [[buffer(0)]], uint2 gid [[
   const int start = a.cu[s], len = a.cu[s + 1] - start;
   const bool has = a.has_state[s] != 0;
   const long slot = a.slot_ids[s];
+  const long hidx = a.hist_ids ? a.hist_ids[s] : 0;  // the history is indexed by history, not slot
   device float* st = a.state + slot * (W - 1) * C;
-  device float* hs = a.hist + slot * kSpecMaxPending * C;
+  device float* hs = a.hist + hidx * kSpecMaxPending * C;
   const int f = a.fold[s], kp = a.keep[s];
   if (f > 0) {
     float nv[7];
@@ -126,8 +128,9 @@ kernel void spec_ssm_scan(constant SpecScanArgs& a [[buffer(0)]], threadgroup fl
   const int g = h / (a.H / a.G);
   const int start = a.cu[s], len = a.cu[s + 1] - start;
   const long slot = a.slot_ids[s];
+  const long hidx = a.hist_ids ? a.hist_ids[s] : 0;  // the history is indexed by history, not slot
   device float* st = a.state + (slot * a.H + h) * P * N;
-  device float* hs = a.hist + (slot * a.H + h) * kSpecMaxPending * HS;
+  device float* hs = a.hist + (hidx * a.H + h) * kSpecMaxPending * HS;
   const bool has = a.has_state[s] != 0;
   const int fold = a.fold[s], keep = a.keep[s];
   const float negA = -exp(a.A_log[h]);

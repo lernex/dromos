@@ -1,7 +1,66 @@
 --- a/spec.cu
 +++ b/spec.cu
-@@ -138,12 +138,11 @@
- // (slot, head).
+@@ -45,17 +45,18 @@
+ __global__ void spec_conv_out_kernel(const float* __restrict__ x, int ld_x, const __hip_bfloat16* __restrict__ w,
+                                      const __hip_bfloat16* __restrict__ bias, const float* __restrict__ state,
+                                      const float* __restrict__ hist, const int32_t* __restrict__ slot_ids,
+-                                     const int32_t* __restrict__ has_state, const int32_t* __restrict__ fold,
+-                                     const int32_t* __restrict__ keep, const int32_t* __restrict__ cu,
+-                                     float* __restrict__ out, int C, int W) {
++                                     const int32_t* __restrict__ hist_ids, const int32_t* __restrict__ has_state,
++                                     const int32_t* __restrict__ fold, const int32_t* __restrict__ keep,
++                                     const int32_t* __restrict__ cu, float* __restrict__ out, int C, int W) {
+   const int s = blockIdx.y;
+   const int c = blockIdx.x * blockDim.x + threadIdx.x;
+   if (c >= C) return;
+   const int start = cu[s], len = cu[s + 1] - start;
+   const bool has = has_state[s] != 0;
+   const int64_t slot = slot_ids[s];
++  const int64_t hidx = hist_ids ? hist_ids[s] : 0;
+   const float* st = state + slot * (W - 1) * C;
+-  const float* hs = hist + slot * kMaxPending * C;
++  const float* hs = hist + hidx * kMaxPending * C;
+   const int pending = fold[s] + keep[s];
+ 
+   float wk[8];
+@@ -86,17 +87,18 @@
+ // are appended after the kept ones. Every value is read into registers before its row is written.
+ __global__ void spec_conv_state_kernel(const float* __restrict__ x, int ld_x, float* __restrict__ state,
+                                        float* __restrict__ hist, const int32_t* __restrict__ slot_ids,
+-                                       const int32_t* __restrict__ has_state, const int32_t* __restrict__ fold,
+-                                       const int32_t* __restrict__ keep, const int32_t* __restrict__ cu, int C,
+-                                       int W) {
++                                       const int32_t* __restrict__ hist_ids, const int32_t* __restrict__ has_state,
++                                       const int32_t* __restrict__ fold, const int32_t* __restrict__ keep,
++                                       const int32_t* __restrict__ cu, int C, int W) {
+   const int s = blockIdx.y;
+   const int c = blockIdx.x * blockDim.x + threadIdx.x;
+   if (c >= C) return;
+   const int start = cu[s], len = cu[s + 1] - start;
+   const bool has = has_state[s] != 0;
+   const int64_t slot = slot_ids[s];
++  const int64_t hidx = hist_ids ? hist_ids[s] : 0;
+   float* st = state + slot * (W - 1) * C;
+-  float* hs = hist + slot * kMaxPending * C;
++  float* hs = hist + hidx * kMaxPending * C;
+   const int f = fold[s], kp = keep[s];
+   if (f > 0) {
+     float nv[7];
+@@ -124,7 +126,7 @@
+ // ---- Selective scan with pending positions --------------------------------------------------
+ // The same block layout, staging and per-token math as ssm_scan_kernel in mamba.cu (read that one
+ // first): one block per (head, sequence), four lanes per state row, tokens staged through shared
+-// memory. Before the new tokens, the block replays the pending positions from the slot's history
++// memory. Before the new tokens, the block replays the pending positions from the sequence's history
+ // (the fold positions, then the base state write, then the kept ones), and as each chunk of new
+ // tokens arrives it copies their x, B and dt_raw into the history after the kept rows.
+ 
+@@ -135,15 +137,14 @@
+ __host__ __device__ constexpr int round4(int v) { return (v + 3) & ~3; }
+ 
+ // A history row of one head: x [round4(P)] | B [round4(N)] | dt_raw | pad, kMaxPending rows per
+-// (slot, head).
++// (history index, head).
  __host__ __device__ constexpr int hist_row_floats(int P, int N) { return round4(P) + round4(N) + 4; }
  
 -__device__ __forceinline__ void cp_async_f32(float* smem, const float* gmem) {
@@ -18,3 +77,69 @@
  
  struct SpecScanArgs {
    const float* x;
+@@ -159,6 +160,7 @@
+   float* state;
+   float* hist;
+   const int32_t* slot_ids;
++  const int32_t* hist_ids;
+   const int32_t* has_state;
+   const int32_t* fold;
+   const int32_t* keep;
+@@ -188,8 +190,9 @@
+   const int start = a.cu[s], len = a.cu[s + 1] - start;
+   const int nchunks = (len + kChunk - 1) / kChunk;
+   const int64_t slot = a.slot_ids[s];
++  const int64_t hidx = a.hist_ids ? a.hist_ids[s] : 0;
+   float* st = a.state + (slot * a.H + h) * P * N;
+-  float* hs = a.hist + (slot * a.H + h) * kMaxPending * HS;
++  float* hs = a.hist + (hidx * a.H + h) * kMaxPending * HS;
+   const bool has = a.has_state[s] != 0;
+   const int fold = a.fold[s], keep = a.keep[s];
+   const float negA = -expf(a.A_log[h]);
+@@ -857,33 +860,36 @@
+ }
+ 
+ extern "C" int lx_spec_conv1d(const float* x, int ld_x, const void* w, const void* bias, float* conv_state,
+-                              float* conv_hist, const int32_t* slot_ids, const int32_t* has_state, const int32_t* fold,
+-                              const int32_t* keep, const int32_t* cu_seqlens, int n_seq, float* out, int C, int W,
+-                              void* stream) {
++                              float* conv_hist, const int32_t* slot_ids, const int32_t* hist_ids,
++                              const int32_t* has_state, const int32_t* fold, const int32_t* keep,
++                              const int32_t* cu_seqlens, int n_seq, float* out, int C, int W, void* stream) {
+   if (n_seq <= 0) return 0;
+   if (C <= 0 || W < 1 || W > 8 || ld_x < C || n_seq > 65535) return static_cast<int>(hipErrorInvalidValue);
+   auto s = static_cast<hipStream_t>(stream);
+   spec_conv_out_kernel<<<dim3((C + 31) / 32, n_seq), dim3(32, 8), 0, s>>>(
+       x, ld_x, static_cast<const __hip_bfloat16*>(w), static_cast<const __hip_bfloat16*>(bias), conv_state, conv_hist,
+-      slot_ids, has_state, fold, keep, cu_seqlens, out, C, W);
++      slot_ids, hist_ids, has_state, fold, keep, cu_seqlens, out, C, W);
+   spec_conv_state_kernel<<<dim3((C + 127) / 128, n_seq), 128, 0, s>>>(x, ld_x, conv_state, conv_hist, slot_ids,
+-                                                                      has_state, fold, keep, cu_seqlens, C, W);
++                                                                      hist_ids, has_state, fold, keep, cu_seqlens,
++                                                                      C, W);
+   return lx::launch_status();
+ }
+ 
+ extern "C" int lx_spec_ssm_scan(const float* x, int ld_x, const float* dt_raw, int ld_dt, const float* B,
+                                 const float* C, int ld_bc, const float* A_log, const float* D, const float* dt_bias,
+-                                float* ssm_state, float* ssm_hist, const int32_t* slot_ids, const int32_t* has_state,
+-                                const int32_t* fold, const int32_t* keep, const int32_t* cu_seqlens, int n_seq,
+-                                float* y, int H, int P, int G, int N, void* stream) {
++                                float* ssm_state, float* ssm_hist, const int32_t* slot_ids, const int32_t* hist_ids,
++                                const int32_t* has_state, const int32_t* fold, const int32_t* keep,
++                                const int32_t* cu_seqlens, int n_seq, float* y, int H, int P, int G, int N,
++                                void* stream) {
+   if (n_seq <= 0) return 0;
+   if (H <= 0 || G <= 0 || H % G != 0 || P < 1 || P > 64 || N < 1 || N > 256 || n_seq > 65535)
+     return static_cast<int>(hipErrorInvalidValue);
+   if (ld_x < H * P || ld_dt < H || ld_bc < G * N) return static_cast<int>(hipErrorInvalidValue);
+   const int threads = (4 * P + 31) / 32 * 32;
+   const int ni = ((N + 3) / 4 + 3) / 4;
+-  const SpecScanArgs args{x,        ld_x,     dt_raw,   ld_dt,     B,    C,    ld_bc,      A_log, D, dt_bias,
+-                          ssm_state, ssm_hist, slot_ids, has_state, fold, keep, cu_seqlens, y,     H, P, G, N};
++  const SpecScanArgs args{x,         ld_x,     dt_raw,   ld_dt,     B,        C,    ld_bc,  A_log,
++                          D,         dt_bias,  ssm_state, ssm_hist, slot_ids, hist_ids, has_state, fold,
++                          keep,      cu_seqlens, y,     H,        P,        G,    N};
+   auto s = static_cast<hipStream_t>(stream);
+   if (ni <= 1) return launch_spec_scan<1>(args, n_seq, threads, s);
+   if (ni <= 2) return launch_spec_scan<2>(args, n_seq, threads, s);

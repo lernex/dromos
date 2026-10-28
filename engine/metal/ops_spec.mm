@@ -28,15 +28,17 @@ extern "C" {
 int64_t lx_spec_ssm_hist_floats(int H, int P, int N) { return int64_t(H) * kMaxPending * hist_row_floats(P, N); }
 
 int lx_spec_conv1d(const float* x, int ld_x, const void* w, const void* bias, float* conv_state, float* conv_hist,
-                   const int32_t* slot_ids, const int32_t* has_state, const int32_t* fold, const int32_t* keep,
-                   const int32_t* cu_seqlens, int n_seq, float* out, int C, int W, void* stream) {
+                   const int32_t* slot_ids, const int32_t* hist_ids, const int32_t* has_state, const int32_t* fold,
+                   const int32_t* keep, const int32_t* cu_seqlens, int n_seq, float* out, int C, int W, void* stream) {
   static Kernel out_k("spec_conv_out"), state_k("spec_conv_state");
   if (n_seq <= 0) return kOk;
   if (C <= 0 || W < 1 || W > 8 || ld_x < C || n_seq > 65535) return kInvalidValue;
-  // Token counts and slots are device data: unknown extents for x, out, the state and the history.
+  // Token counts and slots are device data: unknown extents for x, out, the state and the history. hist_ids
+  // is null for history 0 everywhere (addr maps null to 0, which the kernels read as "no array").
   SpecConvArgs a{addr(stream, x, kUnknownExtent), addr(stream, w, size_t(C) * W * 2), addr(stream, bias, size_t(C) * 2),
                  addr_w(stream, conv_state, kUnknownExtent), addr_w(stream, conv_hist, kUnknownExtent),
-                 addr(stream, slot_ids, size_t(n_seq) * 4), addr(stream, has_state, size_t(n_seq) * 4),
+                 addr(stream, slot_ids, size_t(n_seq) * 4), addr(stream, hist_ids, size_t(n_seq) * 4),
+                 addr(stream, has_state, size_t(n_seq) * 4),
                  addr(stream, fold, size_t(n_seq) * 4), addr(stream, keep, size_t(n_seq) * 4),
                  addr(stream, cu_seqlens, size_t(n_seq + 1) * 4), addr_w(stream, out, kUnknownExtent), ld_x, C, W};
   // The outputs read the old state and history, so they go first, and the state kernel waits for them.
@@ -47,8 +49,9 @@ int lx_spec_conv1d(const float* x, int ld_x, const void* w, const void* bias, fl
 
 int lx_spec_ssm_scan(const float* x, int ld_x, const float* dt_raw, int ld_dt, const float* B, const float* C, int ld_bc,
                      const float* A_log, const float* D, const float* dt_bias, float* ssm_state, float* ssm_hist,
-                     const int32_t* slot_ids, const int32_t* has_state, const int32_t* fold, const int32_t* keep,
-                     const int32_t* cu_seqlens, int n_seq, float* y, int H, int P, int G, int N, void* stream) {
+                     const int32_t* slot_ids, const int32_t* hist_ids, const int32_t* has_state, const int32_t* fold,
+                     const int32_t* keep, const int32_t* cu_seqlens, int n_seq, float* y, int H, int P, int G, int N,
+                     void* stream) {
   static Kernel k1("spec_ssm_scan_1"), k2("spec_ssm_scan_2"), k4("spec_ssm_scan_4"), k8("spec_ssm_scan_8"),
       k16("spec_ssm_scan_16");
   if (n_seq <= 0) return kOk;
@@ -59,7 +62,8 @@ int lx_spec_ssm_scan(const float* x, int ld_x, const float* dt_raw, int ld_dt, c
                  addr(stream, A_log, size_t(H) * 4),     addr(stream, D, size_t(H) * 4),
                  addr(stream, dt_bias, size_t(H) * 4),   addr_w(stream, ssm_state, kUnknownExtent),
                  addr_w(stream, ssm_hist, kUnknownExtent), addr(stream, slot_ids, size_t(n_seq) * 4),
-                 addr(stream, has_state, size_t(n_seq) * 4), addr(stream, fold, size_t(n_seq) * 4),
+                 addr(stream, hist_ids, size_t(n_seq) * 4), addr(stream, has_state, size_t(n_seq) * 4),
+                 addr(stream, fold, size_t(n_seq) * 4),
                  addr(stream, keep, size_t(n_seq) * 4),  addr(stream, cu_seqlens, size_t(n_seq + 1) * 4),
                  addr_w(stream, y, kUnknownExtent),      ld_x, ld_dt, ld_bc, H, P, G, N};
   // lx_ssm_scan_varlen's launch, plus room for the replayed history rows.

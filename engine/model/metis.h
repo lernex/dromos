@@ -161,11 +161,13 @@ class MetisModel {
   void stage(const StepBatch& b, bool spec, void* stream);
   void launch(int T, int n_seq, bool all_rows, float* logits, bool spec, void* stream);
   void fold_pending(const StepBatch& b, void* stream);
+  void claim_history(int slot, void* stream);
 
   MetisConfig cfg_;
   std::vector<int> slot_len_;
   std::vector<int> folded_;   // positions in the base state
   std::vector<int> pending_;  // positions after it, held as inputs (speculative mode)
+  int hist_owner_ = -1;       // the slot whose pending positions the shared speculative history holds, or -1
   Impl* impl_;
 };
 

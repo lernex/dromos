@@ -110,7 +110,7 @@ def test_spec_conv1d_matches_plain(lx, C, W, steps, seed):
         if flat:
             x[:T, :C] = pool[flat]
         out = torch.full((max(T, 1), C), NAN, device="cuda")
-        lx("spec_conv1d", x, ld, w, bias, state, hist, i32([tr.slot for tr in tracks]), i32(has),
+        lx("spec_conv1d", x, ld, w, bias, state, hist, i32([tr.slot for tr in tracks]), i32([tr.slot for tr in tracks]), i32(has),
            i32([p[0] for p in plan]), i32([p[1] for p in plan]), cumulative(lengths), len(tracks), out, C, W)
         start = 0
         for tr, ids, n in zip(tracks, news, lengths):
@@ -187,7 +187,7 @@ def test_spec_ssm_scan_matches_plain(lx, H, P, G, N, steps, seed):
             bufs[key] = b
         y = torch.full((T, H, P), NAN, device="cuda")
         lx("spec_ssm_scan", bufs["x"], ld_x, bufs["dt"], ld_dt, bufs["B"], bufs["C"], ld_bc, consts["A_log"],
-           consts["D"], consts["dt_bias"], state, hist, i32([tr.slot for tr in tracks]), i32(has),
+           consts["D"], consts["dt_bias"], state, hist, i32([tr.slot for tr in tracks]), i32([tr.slot for tr in tracks]), i32(has),
            i32([p[0] for p in plan]), i32([p[1] for p in plan]), cumulative(lengths), len(tracks), y, H, P, G, N)
         start = 0
         for tr, n in zip(tracks, lengths):
@@ -228,11 +228,11 @@ def test_spec_ssm_verify_then_commit(lx):
         x, dt, B, Cm = (pool[k][ids].contiguous() for k in ("x", "dt", "B", "C"))
         y = torch.empty(K, H, P, device="cuda")
         lx("spec_ssm_scan", x, H * P, dt, H, B, Cm, G * N, consts["A_log"], consts["D"], consts["dt_bias"], state,
-           hist, i32([0]), i32([1]), i32([0]), i32([0]), cumulative([K]), 1, y, H, P, G, N)
+           hist, i32([0]), i32([0]), i32([1]), i32([0]), i32([0]), cumulative([K]), 1, y, H, P, G, N)
         assert torch.equal(state[0], prefilled), "a verify step must not touch the base state"
         empty = torch.empty(1, H * P + G * N * 2 + H, device="cuda")
         lx("spec_ssm_scan", empty, H * P, empty, H, empty, empty, G * N, consts["A_log"], consts["D"],
-           consts["dt_bias"], state, hist, i32([0]), i32([1]), i32([j]), i32([0]), cumulative([0]), 1, empty, H, P,
+           consts["dt_bias"], state, hist, i32([0]), i32([0]), i32([1]), i32([j]), i32([0]), cumulative([0]), 1, empty, H, P,
            G, N)
         _, want = plain_scan(lx, pool, list(range(L + j)), zero, False, H, P, G, N, consts)
         assert torch.equal(state[0], want), f"commit {j}: state differs"

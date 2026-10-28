@@ -880,11 +880,10 @@ MetisModel::MetisModel(const MetisConfig& c, const ModelWeights& weights, const 
         m.k_cache.push_back(nullptr);
         m.v_cache.push_back(nullptr);
       }
+      // one speculative history per layer and pass, shared by the stream that verifies (claim_history)
       const bool hist = speculative && !m.layers[i].attention;
-      m.conv_hist.push_back(hist ? m.alloc<float>(static_cast<size_t>(max_slots) * LX_SPEC_MAX_PENDING * m.conv_dim)
-                                 : nullptr);
-      m.ssm_hist.push_back(
-          hist ? m.alloc<float>(static_cast<size_t>(max_slots) * lx_spec_ssm_hist_floats(m.H, m.Pd, m.N)) : nullptr);
+      m.conv_hist.push_back(hist ? m.alloc<float>(static_cast<size_t>(LX_SPEC_MAX_PENDING) * m.conv_dim) : nullptr);
+      m.ssm_hist.push_back(hist ? m.alloc<float>(static_cast<size_t>(lx_spec_ssm_hist_floats(m.H, m.Pd, m.N))) : nullptr);
     }
   }
   m.speculative = speculative;
@@ -1029,6 +1028,20 @@ void MetisModel::reset_slot(int slot) {
   slot_len_.at(slot) = 0;
   folded_.at(slot) = 0;
   pending_.at(slot) = 0;
+  if (hist_owner_ == slot) hist_owner_ = -1;
+}
+
+// The speculative history is one buffer (kernels.h, Speculative decoding), for the one stream that verifies. A stream that
+// takes it over first folds the previous owner's pending positions into its base state, so nothing in the buffer is still
+// needed; the owner's pending positions were the only ones it held.
+void MetisModel::claim_history(int slot, void* s) {
+  if (hist_owner_ == slot) return;
+  if (hist_owner_ >= 0 && pending_[hist_owner_] > 0) {
+    StepBatch fold;
+    fold.slots = {hist_owner_};
+    fold_pending(fold, s);
+  }
+  hist_owner_ = slot;
 }
 
 int MetisModel::max_verify_tokens() const {
@@ -1775,6 +1788,8 @@ void MetisModel::forward_spec(const StepBatch& b, float* logits, void* s) {
   const int T = static_cast<int>(b.tokens.size());
   const int n_seq = static_cast<int>(b.slots.size());
   if (T == 0) return;
+  if (n_seq != 1) throw std::runtime_error("a verify step takes one sequence: the speculative history is one buffer");
+  claim_history(b.slots[0], s);
   if (T > m.max_tokens) throw std::runtime_error("step has more tokens than max_tokens");
   if (n_seq > m.max_slots || static_cast<int>(b.cu_seqlens.size()) != n_seq + 1)
     throw std::runtime_error("bad step batch");
@@ -1910,10 +1925,10 @@ void MetisModel::fold_pending(const StepBatch& b, void* s) {
   for (size_t li = 0; li < m.conv_hist.size(); ++li) {
     if (!m.conv_hist[li]) continue;
     const Impl::Layer& layer = m.layers[li % m.L_layers];
-    LX_CHECK(lx_spec_conv1d(m.xbc, m.proj, layer.conv_w, layer.conv_b, m.conv_state[li], m.conv_hist[li], d, d + n,
+    LX_CHECK(lx_spec_conv1d(m.xbc, m.proj, layer.conv_w, layer.conv_b, m.conv_state[li], m.conv_hist[li], d, nullptr, d + n,
                             d + 2 * n, d + 3 * n, d + 4 * n, n, m.xbc, m.conv_dim, m.W, s));
     LX_CHECK(lx_spec_ssm_scan(m.xbc, m.conv_dim, m.xbc, m.proj, m.xbc, m.xbc, m.conv_dim, layer.A_log, layer.D,
-                              layer.dt_bias, m.ssm_state[li], m.ssm_hist[li], d, d + n, d + 2 * n, d + 3 * n, d + 4 * n,
+                              layer.dt_bias, m.ssm_state[li], m.ssm_hist[li], d, nullptr, d + n, d + 2 * n, d + 3 * n, d + 4 * n,
                               n, m.ssm_y, m.H, m.Pd, m.G, m.N, s));
   }
   for (int slot : slots) {
@@ -1986,12 +2001,13 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
           if (spec) {
             // the step's tokens become pending positions (kernels.h, "Speculative decoding")
             LX_CHECK(lx_spec_conv1d(m.zxbcdt + m.I, m.proj, layer.conv_w, layer.conv_b, m.conv_state[slot_index],
-                                    m.conv_hist[slot_index], m.d_slots, m.d_has_state, m.d_fold, m.d_keep, m.d_cu, n_seq,
+                                    m.conv_hist[slot_index], m.d_slots, nullptr, m.d_has_state, m.d_fold, m.d_keep,
+                                    m.d_cu, n_seq,
                                     m.xbc, m.conv_dim, m.W, s));
             LX_CHECK(lx_spec_ssm_scan(m.xbc, m.conv_dim, m.zxbcdt + m.I + m.conv_dim, m.proj, m.xbc + m.I,
                                       m.xbc + m.I + gn, m.conv_dim, layer.A_log, layer.D, layer.dt_bias,
-                                      m.ssm_state[slot_index], m.ssm_hist[slot_index], m.d_slots, m.d_has_state,
-                                      m.d_fold, m.d_keep, m.d_cu, n_seq, m.ssm_y, m.H, m.Pd, m.G, m.N, s));
+                                      m.ssm_state[slot_index], m.ssm_hist[slot_index], m.d_slots, nullptr,
+                                      m.d_has_state, m.d_fold, m.d_keep, m.d_cu, n_seq, m.ssm_y, m.H, m.Pd, m.G, m.N, s));
           } else {
             LX_CHECK(lx_conv1d_varlen(m.zxbcdt + m.I, m.proj, layer.conv_w, layer.conv_b, m.conv_state[slot_index],
                                       m.d_slots, m.d_has_state, m.d_cu, n_seq, m.xbc, m.conv_dim, m.W, s));
