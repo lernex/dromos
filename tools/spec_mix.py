@@ -41,8 +41,12 @@ def main():
     ap.add_argument("--tokens", type=int, default=512, help="tokens per prompt (512, the scoreboard's)")
     ap.add_argument("--repeat", type=int, default=2, help="runs per prompt, median reported (2)")
     ap.add_argument("--temp", type=float, help="sample at this temperature (greedy by default)")
+    ap.add_argument("--only", help="comma list: aggregate only these mix prompts (the scoreboard's think row is think_chat)")
     ap.add_argument("--json", help="keep lernex spec's per-prompt numbers in this file")
     args = ap.parse_args()
+    mix = MIX if not args.only else set(args.only.split(","))
+    if not mix <= MIX:
+        sys.exit(f"--only names outside the chat mix: {sorted(mix - MIX)}")
 
     out = args.json or tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
     cmd = [args.lernex, "spec", args.model, args.prompts, "--drafters", "plain,ngram", "--tokens", str(args.tokens),
@@ -54,7 +58,7 @@ def main():
     subprocess.run(cmd, check=True)
 
     with open(out) as f:
-        rows = [r for r in json.load(f) if r["prompt"] in MIX]
+        rows = [r for r in json.load(f) if r["prompt"] in mix]
     if not rows:
         sys.exit(f"no chat-mix prompts in {args.prompts}: the mix is {sorted(MIX)}")
 
@@ -65,7 +69,8 @@ def main():
             sys.exit(f"no {drafter} rows for the mix")
         rates[drafter] = sum(r["emitted"] for r in rs) / sum(r["decode_s"] for r in rs)
     label = f"{args.weights or 'folder format'}, {'temp ' + str(args.temp) if args.temp is not None else 'greedy'}"
-    print(f"chat mix ({label}, {len(rows) // 2} prompts): plain {rates['plain']:.1f} tok/s, "
+    what = "chat mix" if mix == MIX else "+".join(sorted(mix))
+    print(f"{what} ({label}, {len(rows) // 2} prompts): plain {rates['plain']:.1f} tok/s, "
           f"prompt lookup {rates['ngram']:.1f} tok/s, ratio {rates['ngram'] / rates['plain']:.2f}x")
 
 
