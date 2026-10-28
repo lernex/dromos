@@ -128,6 +128,9 @@ struct EngineStats {
   double mask_us_p50 = 0.0;           // CPU time to build a step's constrained masks: median and 99th percentile
   double mask_us_p99 = 0.0;
   double grammar_compile_ms = 0.0;    // the last schema compiled (cache misses only)
+  uint64_t spec_steps = 0;            // verify steps of a lone stream (prompt-lookup drafts checked in one step)
+  uint64_t spec_drafted = 0;          // draft tokens those verify steps checked
+  uint64_t spec_accepted = 0;         // draft tokens the target accepted
 };
 
 class Engine {

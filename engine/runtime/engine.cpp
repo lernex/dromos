@@ -737,12 +737,15 @@ bool Engine::Impl::accept(const std::shared_ptr<Sequence>& s, int32_t token, flo
 
 // A decoding sequence may verify drafts: it has its first token, and nothing it asks for needs the sampler's penalties,
 // logprobs or a grammar (the verify step's sampling is the plain sampler's filter, without the penalties).
+// A constrained row never speculates: a verify step has no grammar mask, so a draft the schema forbids would be
+// accepted or rejected by the target alone. Constrained rows (q.json for response_format, q.grammar for tool calls)
+// always take the plain step, where the mask is applied before every sample.
 bool Engine::Impl::spec_eligible(const std::shared_ptr<Sequence>& s) const {
   if (!spec) return false;
   const Sequence& q = *s;
   const SamplingParams& sp = q.request.sampling;
-  return q.has_pending && !q.ended && !q.cancelled && !q.grammar && !sp.logprobs && sp.repetition_penalty == 1.0f &&
-         sp.presence_penalty == 0.0f && sp.frequency_penalty == 0.0f &&
+  return q.has_pending && !q.ended && !q.cancelled && !q.grammar && !q.json && !sp.logprobs &&
+         sp.repetition_penalty == 1.0f && sp.presence_penalty == 0.0f && sp.frequency_penalty == 0.0f &&
          q.prompt_fed == static_cast<int>(q.request.prompt.size());
 }
 
@@ -788,6 +791,9 @@ bool Engine::Impl::spec_step(const std::shared_ptr<Sequence>& s) {
     std::lock_guard<std::mutex> lock(mu);
     stats.steps += 1;
     stats.decode_steps += 1;
+    stats.spec_steps += 1;
+    stats.spec_drafted += draft.tokens.size();
+    stats.spec_accepted += static_cast<uint64_t>(accepted);
   }
   for (int j = 1; j <= accepted; ++j)
     if (accept(s, step[static_cast<size_t>(j)], 0.0f, nullptr, nullptr, 0, /*feed=*/false)) {

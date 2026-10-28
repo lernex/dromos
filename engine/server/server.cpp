@@ -637,6 +637,10 @@ bool Server::run() {
                              {"mask_us_p50", st.mask_us_p50},
                              {"mask_us_p99", st.mask_us_p99},
                              {"compile_ms", st.grammar_compile_ms}};
+    // Prompt-lookup speculation for a lone stream: verify steps, and the drafts they checked and kept.
+    health["speculation"] = {{"verify_steps", st.spec_steps},
+                             {"drafted", st.spec_drafted},
+                             {"accepted", st.spec_accepted}};
     res.set_content(health.dump(), "application/json");
   });
 

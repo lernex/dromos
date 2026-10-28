@@ -422,6 +422,40 @@ def test_json_schema_reply_parses_and_matches(client):
     assert isinstance(obj["tags"], list) and len(obj["tags"]) <= 5 and all(isinstance(t, str) for t in obj["tags"])
 
 
+def test_json_schema_lone_stream_stays_valid_and_never_speculates(server):
+    base, _ = server
+
+    def spec():
+        return requests.get(base + "/health", timeout=10).json()["speculation"]
+
+    # A repeated phrase gives prompt lookup drafts to propose. The same request without response_format is the control:
+    # alone in flight it verifies drafts. The json_schema request, also alone in flight, must verify none.
+    body = {
+        "model": "praxis",
+        "messages": [{"role": "user", "content": "Describe this as JSON: " + "the Rosetta Stone, " * 12}],
+        "max_tokens": 160,
+        "temperature": 0,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    before = spec()
+    requests.post(base + "/v1/chat/completions", json=body).raise_for_status()
+    control = spec()
+    assert control["verify_steps"] > before["verify_steps"], "the free control should speculate on this prompt"
+
+    body["response_format"] = {"type": "json_schema", "json_schema": {"name": "excerpt", "schema": SCHEMA}}
+    r = requests.post(base + "/v1/chat/completions", json=body)
+    r.raise_for_status()
+    after = spec()
+    assert after["verify_steps"] == control["verify_steps"], "a constrained lone stream must not speculate"
+    assert after["drafted"] == control["drafted"] and after["accepted"] == control["accepted"], after
+    choice = r.json()["choices"][0]
+    assert choice["finish_reason"] == "stop", choice
+    obj = json.loads(choice["message"]["content"])
+    assert list(obj) == ["title", "year", "tags"]
+    assert isinstance(obj["title"], str) and isinstance(obj["year"], int)
+    assert isinstance(obj["tags"], list) and len(obj["tags"]) <= 5 and all(isinstance(t, str) for t in obj["tags"])
+
+
 def test_ignore_eos_on_chat_runs_to_max_tokens(server):
     base, _ = server
     body = {
