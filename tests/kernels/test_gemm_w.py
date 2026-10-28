@@ -284,9 +284,15 @@ def test_gemm_w_rows_do_not_depend_on_the_batch(lx, name, wtype, math, oldest):
     names = (ctypes.c_char_p * 256)()
     count = lx.lib.lx_tune_kernels(names, 256)
     fams = [names[i].decode() for i in range(min(count, 256)) if names[i].decode().startswith(f"gemm_w.{kind}.sm")]
-    fam = max((f for f in fams if int(f.split(".sm")[1]) <= have), key=lambda f: int(f.split(".sm")[1])).encode()
-    lx.lib.lx_tune_variant_name.restype = ctypes.c_char_p
+    cands = [f for f in fams if int(f.split(".sm")[1]) <= have]
     head = x[:64].contiguous()
+    if not cands:
+        # No tuner family for this kind on this backend (Metal registers none): its one kernel, unforced.
+        small = plain_gemm(lx, head, w, math, bias, N)
+        assert torch.equal(small, big[:64]), f"{name}: rows differ from the same rows at M = 512"
+        return
+    fam = max(cands, key=lambda f: int(f.split(".sm")[1])).encode()
+    lx.lib.lx_tune_variant_name.restype = ctypes.c_char_p
     for v in range(lx.lib.lx_tune_variants(fam)):
         vname = lx.lib.lx_tune_variant_name(fam, v).decode()
         if "_x" in vname:

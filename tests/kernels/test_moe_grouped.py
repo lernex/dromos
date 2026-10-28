@@ -308,7 +308,10 @@ def native_family(lx, name):
     count = lx.lib.lx_tune_kernels(names, 256)
     fams = [names[i].decode() for i in range(min(count, 256)) if names[i].decode().startswith(f"moe_grouped.{kind}.sm")]
     have = native_arch(lx)
-    return max((f for f in fams if int(f.split(".sm")[1]) <= have), key=lambda f: int(f.split(".sm")[1])).encode()
+    cands = [f for f in fams if int(f.split(".sm")[1]) <= have]
+    if not cands:
+        return None  # a backend with no tuner families for this kind (Metal) runs its one kernel, unforced
+    return max(cands, key=lambda f: int(f.split(".sm")[1])).encode()
 
 
 @pytest.mark.parametrize("skew", [False, True])
@@ -342,6 +345,11 @@ def test_moe_grouped_rows_do_not_depend_on_a_prefill_batch(lx, name, wtype, math
     assert status == 0, f"lx_moe_experts_grouped returned CUDA error {status}"
     small = tuple(x[:64].contiguous() for x in case[:3]) + case[3:]
     fam = native_family(lx, name)
+    if fam is None:
+        status, out = run(lx, small, math, 64, L, I, E, top_k)
+        assert status == 0, f"{name} returned CUDA error {status}"
+        assert torch.equal(out, big[:64]), f"{name}: the first 64 tokens differ from their rows in a batch of 512"
+        return
     lx.lib.lx_tune_variant_name.restype = ctypes.c_char_p
     for v in range(lx.lib.lx_tune_variants(fam)):
         lx.lib.lx_tune_force(fam, 64 * top_k, 2 * I, L, v)

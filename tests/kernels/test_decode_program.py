@@ -89,6 +89,9 @@ class Program:
 
     def __init__(self, lx, M, tokens=None, slots=None, has_state=None, start_pos=None):
         self.lib = lx.lib
+        if not hasattr(self.lib, "lx_program_create"):
+            # Metal (and CPU) export no decode program: a caller falls back to the per-kernel path (kernels.h).
+            pytest.skip("this backend has no decode program")
         self.lib.lx_program_create.restype = c_void_p
         self.lib.lx_program_create.argtypes = [c_int, c_void_p, c_void_p, c_void_p, c_void_p]
         for name in ["gemv", "embed", "memory_read", "ssm", "select", "experts", "attention", "memory_entry",
