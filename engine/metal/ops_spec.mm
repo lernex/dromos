@@ -86,6 +86,17 @@ int lx_spec_gemv_f32(const float* x, int ld_x, const float* w, const float* bias
   return k.launch(stream, a, size1(ceil_div(N, 4)), size1(128));
 }
 
+int lx_spec_penalize(float* logits, int V, lx_spec_penalty pen, const int32_t* tokens, int rows, const int32_t* seen,
+                     const int32_t* out_counts, void* stream) {
+  static Kernel k("spec_penalize");
+  if (rows <= 0) return kOk;
+  if (V <= 0 || !logits || !tokens || !seen || !out_counts) return kInvalidValue;
+  SpecPenalizeArgs a{addr_w(stream, logits, size_t(rows) * V * 4), addr(stream, tokens, size_t(rows) * 4),
+                     addr(stream, seen, size_t(V) * 4), addr(stream, out_counts, size_t(V) * 4),
+                     pen.repetition_penalty, pen.presence_penalty, pen.frequency_penalty, V};
+  return k.launch(stream, a, size1(NSUInteger(rows)), size1(kThreads));
+}
+
 int lx_spec_probs(const float* logits, int V, const lx_spec_filter* filters, int rows, float* probs, void* stream) {
   static Kernel k("spec_probs");
   if (rows <= 0) return kOk;

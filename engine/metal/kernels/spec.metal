@@ -248,6 +248,25 @@ template [[host_name("spec_ssm_scan_16")]] kernel void spec_ssm_scan<16>(constan
 constant constexpr uint kDomainAccept = 0x53504131u;    // "SPA1": the acceptance uniforms
 constant constexpr uint kDomainResidual = 0x53505231u;  // "SPR1": residual and bonus draws
 
+// One threadgroup per row of a verify step: sampler.metal's penalties (step 1) on the row, with the counts the step's
+// drafts before the row add (tokens[1 .. r]). The expressions are sampler.metal's, as penalize_kernel's are
+// sample_kernel's.
+kernel void spec_penalize(constant SpecPenalizeArgs& a [[buffer(0)]], uint r [[threadgroup_position_in_grid]],
+                          uint tid [[thread_index_in_threadgroup]], uint threads [[threads_per_threadgroup]]) {
+  const int V = a.V;
+  device float* l = a.logits + long(r) * V;
+  for (int e = tid; e < V; e += threads) {
+    int extra = 0;
+    for (uint t = 1; t <= r; ++t) extra += a.tokens[t] == e;
+    const int sc = a.seen[e] + extra;
+    const int co = a.out_counts[e] + extra;
+    float x = l[e];
+    if (a.repetition_penalty != 1.0f && sc > 0) x = x > 0.0f ? x / a.repetition_penalty : x * a.repetition_penalty;
+    if (co > 0) x -= a.frequency_penalty * float(co) + a.presence_penalty;
+    l[e] = x;
+  }
+}
+
 // One threadgroup per row: the row's filtered distribution, in place of its scaled logits.
 kernel void spec_probs(constant SpecProbsArgs& a [[buffer(0)]], uint r [[threadgroup_position_in_grid]],
                        uint tid [[thread_index_in_threadgroup]], uint threads [[threads_per_threadgroup]]) {

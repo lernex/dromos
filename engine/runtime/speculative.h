@@ -142,7 +142,26 @@ struct SpecConfig {
   int max_new_tokens = 256;
   std::vector<int32_t> stop_ids;
   int prefill_chunk = 512;
+  // The sampler's penalties (lx_sampling's). A verify step's rows are penalised as plain steps are (lx_spec_penalize),
+  // with the counts SpecCounts gives; 1, 0, 0 disable them.
+  float repetition_penalty = 1.0f;
+  float presence_penalty = 0.0f;
+  float frequency_penalty = 0.0f;
 };
+
+// The sampler's count tables (kernels.h, lx_sampler_reset), whole: a verify step reads its sequence's slot for the
+// penalties, and adds the tokens it emits to it, as the sampler adds the tokens it draws. Either may be null when the
+// config has no penalties, and then nothing is counted.
+struct SpecCounts {
+  int32_t* seen = nullptr;        // prompt and output
+  int32_t* out_counts = nullptr;  // output only
+};
+
+// Whether a config's penalties change the sampler's logits. Only a sequence with penalties keeps counts: nothing
+// else reads them.
+inline bool penalized(const SpecConfig& c) {
+  return c.repetition_penalty != 1.0f || c.presence_penalty != 0.0f || c.frequency_penalty != 0.0f;
+}
 
 struct SpecStats {
   int steps = 0, emitted = 0, drafted = 0, accepted = 0;
@@ -167,13 +186,17 @@ class SpecDecoder {
   // argmax, sampled by the standard acceptance under config's filter, drawn by (config.seed, position). `q` is the
   // drafts' distribution, or null when they are point masses (prompt lookup). Afterwards the slot holds the pending
   // token and the accepted drafts; the rest is truncated. `next` is the token after the accepted drafts.
+  // Penalties (config) judge each row as a plain step at its position would, from `counts`, which then count the
+  // emitted tokens.
   void verify(int slot, const SpecConfig& config, const std::vector<int32_t>& step, const float* q, uint64_t position,
-              int& accepted, int32_t& next, void* stream);
+              SpecCounts counts, int& accepted, int32_t& next, void* stream);
 
  private:
   // Picks the step's tokens: accepted drafts and the final token. rows = 1 + drafts.
-  void accept(const SpecConfig& config, const std::vector<int32_t>& step, const float* q, uint64_t position,
-              int& accepted, int32_t& next, void* stream);
+  void accept(const SpecConfig& config, const std::vector<int32_t>& step, const float* q, uint64_t position, int slot,
+              SpecCounts counts, int& accepted, int32_t& next, void* stream);
+  // Adds tokens to a slot's counts: prompt tokens to seen, output tokens to both (lx_sampler_observe).
+  void observe(SpecCounts counts, int slot, const int32_t* tokens, int n, bool is_output, void* stream);
 
   MetisModel& target_;
   int max_rows_;
@@ -182,6 +205,9 @@ class SpecDecoder {
   lx_spec_filter* d_filters_ = nullptr;
   lx_spec_rng* d_rng_ = nullptr;
   int32_t* h_out_ = nullptr;
+  int32_t *d_seen_ = nullptr, *d_out_counts_ = nullptr;  // generate's own counts, slot 0
+  int32_t* d_observed_ = nullptr;
+  int observed_cap_ = 0;
 };
 
 }  // namespace lx::runtime

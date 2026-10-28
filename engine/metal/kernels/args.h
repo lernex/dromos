@@ -432,6 +432,16 @@ struct SpecProbsArgs {
   LX_PTR(float) probs;
   int V;
 };
+struct SpecPenalizeArgs {
+  LX_PTR(float) logits;  // the step's rows, penalised in place
+  LX_CPTR(int) tokens;   // the step's tokens: row r adds tokens[1 .. r] to the counts
+  LX_CPTR(int) seen;     // the slot's counts
+  LX_CPTR(int) out_counts;
+  float repetition_penalty;
+  float presence_penalty;
+  float frequency_penalty;
+  int V;
+};
 struct SpecVerifyArgs {
   LX_CPTR(float) p;
   LX_CPTR(float) q;  // 0: the drafter proposes tokens outright

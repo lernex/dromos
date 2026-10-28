@@ -260,23 +260,34 @@ SpecDecoder::SpecDecoder(MetisModel& target) : target_(target), max_rows_(target
   d_filters_ = device_alloc<lx_spec_filter>(max_rows_);
   d_rng_ = device_alloc<lx_spec_rng>(1);
   h_out_ = host_alloc<int32_t>(2);
+  d_seen_ = device_alloc<int32_t>(V);
+  d_out_counts_ = device_alloc<int32_t>(V);
 }
 
 SpecDecoder::~SpecDecoder() {
   for (void* p : {static_cast<void*>(logits_), static_cast<void*>(probs_), static_cast<void*>(d_tokens_),
                   static_cast<void*>(d_cu_), static_cast<void*>(d_argmax_), static_cast<void*>(d_out_),
-                  static_cast<void*>(d_filters_), static_cast<void*>(d_rng_)})
+                  static_cast<void*>(d_filters_), static_cast<void*>(d_rng_), static_cast<void*>(d_seen_),
+                  static_cast<void*>(d_out_counts_), static_cast<void*>(d_observed_)})
     lx_rt_free(p);
   lx_rt_host_free(h_out_);
 }
 
 void SpecDecoder::accept(const SpecConfig& config, const std::vector<int32_t>& step, const float* q,
-                         uint64_t position, int& accepted, int32_t& next, void* s) {
+                         uint64_t position, int slot, SpecCounts counts, int& accepted, int32_t& next, void* s) {
   const int rows = static_cast<int>(step.size());
   const int V = target_.vocab_size();
   const int32_t cu[2] = {0, rows};
   LX_CHECK(lx_rt_copy(d_tokens_, step.data(), static_cast<int64_t>(sizeof(int32_t) * rows), LX_COPY_H2D, s));
   LX_CHECK(lx_rt_copy(d_cu_, cu, static_cast<int64_t>(sizeof(cu)), LX_COPY_H2D, s));
+  if (penalized(config)) {
+    if (!counts.seen || !counts.out_counts) throw std::runtime_error("penalties need the sequence's sampler counts");
+    // Row j sees the slot's counts plus the drafts before it: the penalised distribution a plain step at its position
+    // samples from (lx_spec_penalize).
+    const lx_spec_penalty pen{config.repetition_penalty, config.presence_penalty, config.frequency_penalty};
+    LX_CHECK(lx_spec_penalize(logits_, V, pen, d_tokens_, rows, counts.seen + static_cast<size_t>(slot) * V,
+                              counts.out_counts + static_cast<size_t>(slot) * V, s));
+  }
   if (!(config.filter.temperature > 0.0f)) {
     LX_CHECK(lx_spec_verify_greedy(logits_, V, d_tokens_, d_cu_, 1, rows, d_argmax_, d_out_, d_out_ + 1, s));
   } else {
@@ -289,10 +300,31 @@ void SpecDecoder::accept(const SpecConfig& config, const std::vector<int32_t>& s
   LX_CHECK(lx_rt_stream_sync(s));
   accepted = h_out_[0];
   next = h_out_[1];
+  // The emitted tokens, the accepted drafts and the final one, are output: the sampler counts what it draws the
+  // same way.
+  if (counts.seen) {
+    std::vector<int32_t> emitted(step.begin() + 1, step.begin() + 1 + accepted);
+    emitted.push_back(next);
+    observe(counts, slot, emitted.data(), static_cast<int>(emitted.size()), true, s);
+  }
+}
+
+void SpecDecoder::observe(SpecCounts counts, int slot, const int32_t* tokens, int n, bool is_output, void* s) {
+  if (n <= 0 || !counts.seen || !counts.out_counts) return;
+  if (n > observed_cap_) {
+    lx_rt_free(d_observed_);
+    d_observed_ = device_alloc<int32_t>(static_cast<size_t>(n));
+    observed_cap_ = n;
+  }
+  LX_CHECK(lx_rt_copy(d_observed_, tokens, static_cast<int64_t>(sizeof(int32_t) * n), LX_COPY_H2D, s));
+  LX_CHECK(lx_sampler_observe(counts.seen, counts.out_counts, slot, static_cast<int>(target_.vocab_size()), d_observed_,
+                              n, is_output ? 1 : 0, s));
+  // The caller's tokens may be freed once this returns, so the copy has to have run.
+  LX_CHECK(lx_rt_stream_sync(s));
 }
 
 void SpecDecoder::verify(int slot, const SpecConfig& config, const std::vector<int32_t>& step, const float* q,
-                         uint64_t position, int& accepted, int32_t& next, void* s) {
+                         uint64_t position, SpecCounts counts, int& accepted, int32_t& next, void* s) {
   const int rows = static_cast<int>(step.size());
   if (rows < 1 || rows > max_rows_)
     throw std::runtime_error("a verify step takes 1 to " + std::to_string(max_rows_) + " rows");
@@ -300,7 +332,7 @@ void SpecDecoder::verify(int slot, const SpecConfig& config, const std::vector<i
   const std::vector<lx_spec_filter> filters(rows, config.filter);
   LX_CHECK(lx_rt_copy(d_filters_, filters.data(), static_cast<int64_t>(sizeof(lx_spec_filter) * rows), LX_COPY_H2D, s));
   target_.forward_spec({step, {0, rows}, {slot}}, logits_, s);
-  accept(config, step, q, position, accepted, next, s);
+  accept(config, step, q, position, slot, counts, accepted, next, s);
   target_.truncate(slot, before + accepted + 1);
 }
 
@@ -320,11 +352,15 @@ std::vector<int32_t> SpecDecoder::generate(Drafter* drafter, const std::vector<i
   // the prompt, and the first token from its last row
   const auto t0 = Clock::now();
   target_.reset_slot(0);
+  // Counts are kept only for a penalised config: the rest never reads them.
+  const SpecCounts counts = penalized(config) ? SpecCounts{d_seen_, d_out_counts_} : SpecCounts{};
+  if (counts.seen) LX_CHECK(lx_sampler_reset(d_seen_, d_out_counts_, 0, static_cast<int>(target_.vocab_size()), s));
   if (drafter) drafter->begin(prompt, s);
   const float* features = nullptr;
   for (size_t off = 0; off < prompt.size(); off += config.prefill_chunk) {
     const int n = static_cast<int>(std::min<size_t>(config.prefill_chunk, prompt.size() - off));
     target_.forward({{prompt.begin() + off, prompt.begin() + off + n}, {0, n}, {0}}, logits_, false, s);
+    observe(counts, 0, prompt.data() + off, n, false, s);
     if (F) {
       drafter->observe_features(target_.features(), n, F, s);
       features = target_.features() + static_cast<size_t>(n - 1) * F;
@@ -332,7 +368,7 @@ std::vector<int32_t> SpecDecoder::generate(Drafter* drafter, const std::vector<i
   }
   int accepted = 0;
   int32_t next = 0;
-  accept(config, {prompt.back()}, nullptr, 0, accepted, next, s);
+  accept(config, {prompt.back()}, nullptr, 0, 0, counts, accepted, next, s);
   stats.prefill_s = std::chrono::duration<double>(Clock::now() - t0).count();
 
   std::vector<int32_t> context = prompt, out;
@@ -366,7 +402,7 @@ std::vector<int32_t> SpecDecoder::generate(Drafter* drafter, const std::vector<i
       target_.forward_spec(b, logits_, s);
     else
       target_.forward(b, logits_, false, s);
-    accept(config, step, draft.q, out.size(), accepted, next, s);
+    accept(config, step, draft.q, out.size(), 0, counts, accepted, next, s);
     if (drafter && k > 0) target_.truncate(0, before + accepted + 1);
     if (F) {
       drafter->observe_features(target_.features(), accepted + 1, F, s);

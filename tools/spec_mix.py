@@ -41,6 +41,9 @@ def main():
     ap.add_argument("--tokens", type=int, default=512, help="tokens per prompt (512, the scoreboard's)")
     ap.add_argument("--repeat", type=int, default=2, help="runs per prompt, median reported (2)")
     ap.add_argument("--temp", type=float, help="sample at this temperature (greedy by default)")
+    ap.add_argument("--rep", type=float, help="repetition penalty for both drafters (none by default)")
+    ap.add_argument("--presence", type=float, help="presence penalty (none by default)")
+    ap.add_argument("--frequency", type=float, help="frequency penalty (none by default)")
     ap.add_argument("--only", help="comma list: aggregate only these mix prompts (the scoreboard's think row is think_chat)")
     ap.add_argument("--json", help="keep lernex spec's per-prompt numbers in this file")
     args = ap.parse_args()
@@ -55,6 +58,9 @@ def main():
         cmd += ["--weights", args.weights]
     if args.temp is not None:
         cmd += ["--temp", str(args.temp), "--top-p", "0.95", "--top-k", "20", "--seed", "1"]
+    for flag, value in (("--rep", args.rep), ("--presence", args.presence), ("--frequency", args.frequency)):
+        if value is not None:
+            cmd += [flag, str(value)]
     subprocess.run(cmd, check=True)
 
     with open(out) as f:

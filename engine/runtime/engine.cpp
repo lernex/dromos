@@ -737,8 +737,8 @@ bool Engine::Impl::accept(const std::shared_ptr<Sequence>& s, int32_t token, flo
   return false;
 }
 
-// A decoding sequence may verify drafts: it has its first token, and nothing it asks for needs the sampler's penalties,
-// logprobs or a grammar (the verify step's sampling is the plain sampler's filter, without the penalties).
+// A decoding sequence may verify drafts: it has its first token, and nothing it asks for needs logprobs or a grammar.
+// Its penalties are judged row by row by the verify step, as the plain sampler judges them (SpecDecoder::verify).
 // A constrained row never speculates: a verify step has no grammar mask, so a draft the schema forbids would be
 // accepted or rejected by the target alone. Constrained rows (q.json for response_format, q.grammar for tool calls)
 // always take the plain step, where the mask is applied before every sample.
@@ -747,7 +747,6 @@ bool Engine::Impl::spec_eligible(const std::shared_ptr<Sequence>& s) const {
   const Sequence& q = *s;
   const SamplingParams& sp = q.request.sampling;
   return q.has_pending && !q.ended && !q.cancelled && !q.grammar && !q.json && !sp.logprobs &&
-         sp.repetition_penalty == 1.0f && sp.presence_penalty == 0.0f && sp.frequency_penalty == 0.0f &&
          q.prompt_fed == static_cast<int>(q.request.prompt.size());
 }
 
@@ -785,9 +784,16 @@ bool Engine::Impl::spec_step(const std::shared_ptr<Sequence>& s) {
   config.filter = lx_spec_filter{sp.temperature, sp.top_p, sp.top_k, sp.min_p};
   config.seed = sp.seed;
   config.stop_ids = q.stop_ids;
+  config.repetition_penalty = sp.repetition_penalty;
+  config.presence_penalty = sp.presence_penalty;
+  config.frequency_penalty = sp.frequency_penalty;
+  // A penalised sequence's counts are its slot's rows of the sampler's tables, as lx_sample keeps them.
+  const SpecCounts counts = penalized(config) ? SpecCounts{static_cast<int32_t*>(seen.data()),
+                                                           static_cast<int32_t*>(out_counts.data())}
+                                              : SpecCounts{};
   int accepted = 0;
   int32_t next = 0;
-  spec->verify(q.slot, config, step, draft.q, r.position, accepted, next, stream);
+  spec->verify(q.slot, config, step, draft.q, r.position, counts, accepted, next, stream);
   q.drafter->observe(accepted, next, stream);
   s->spec_steps += 1;
   s->spec_drafted += static_cast<int>(draft.tokens.size());

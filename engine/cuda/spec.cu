@@ -607,6 +607,27 @@ __device__ void filter_row(const float* __restrict__ l, float* __restrict__ w, i
   top_out = top;
 }
 
+// One block per row of a verify step: sample_kernel's penalties (sampler.cu, step 1) on the row, with the counts the
+// step's drafts before the row add (tokens[1 .. r]). The expressions are sample_kernel's, so a row is penalised the way
+// a plain step at its position is.
+__global__ void __launch_bounds__(kThreads) penalize_kernel(float* __restrict__ logits, int V, lx_spec_penalty pen,
+                                                             const int32_t* __restrict__ tokens,
+                                                             const int32_t* __restrict__ seen,
+                                                             const int32_t* __restrict__ out_counts) {
+  const int r = blockIdx.x;
+  float* l = logits + static_cast<int64_t>(r) * V;
+  for (int e = threadIdx.x; e < V; e += blockDim.x) {
+    int32_t extra = 0;
+    for (int t = 1; t <= r; ++t) extra += tokens[t] == e;
+    const int32_t sc = seen[e] + extra;
+    const int32_t co = out_counts[e] + extra;
+    float x = l[e];
+    if (pen.repetition_penalty != 1.0f && sc > 0) x = x > 0.0f ? x / pen.repetition_penalty : x * pen.repetition_penalty;
+    if (co > 0) x -= pen.frequency_penalty * static_cast<float>(co) + pen.presence_penalty;
+    l[e] = x;
+  }
+}
+
 // One block per row: the row's filtered distribution, in place of its scaled logits.
 __global__ void __launch_bounds__(kThreads) probs_kernel(const float* __restrict__ logits, int V,
                                                          const lx_spec_filter* __restrict__ filters,
@@ -931,6 +952,15 @@ extern "C" int lx_spec_probs(const float* logits, int V, const lx_spec_filter* f
   if (rows <= 0) return 0;
   if (V <= 0 || V > (1 << 24) || !logits || !filters || !probs) return static_cast<int>(cudaErrorInvalidValue);
   lx::launch_pdl(probs_kernel, rows, kThreads, 0, static_cast<cudaStream_t>(stream), logits, V, filters, probs);
+  return lx::launch_status();
+}
+
+extern "C" int lx_spec_penalize(float* logits, int V, lx_spec_penalty pen, const int32_t* tokens, int rows,
+                                const int32_t* seen, const int32_t* out_counts, void* stream) {
+  if (rows <= 0) return 0;
+  if (V <= 0 || V > (1 << 24) || !logits || !tokens || !seen || !out_counts)
+    return static_cast<int>(cudaErrorInvalidValue);
+  penalize_kernel<<<rows, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(logits, V, pen, tokens, seen, out_counts);
   return lx::launch_status();
 }
 

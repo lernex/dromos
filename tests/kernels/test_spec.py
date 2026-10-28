@@ -17,6 +17,7 @@ import pytest
 import torch
 
 from conftest import close
+from test_sampler import Sampler, ref_penalized
 
 NAN = float("nan")
 MAX_PENDING = 8
@@ -598,3 +599,63 @@ def test_spec_block_attention(lx, B, H, KVH, Dh, n_ctx):
                                     Dh, scale)
     close(out[:, : H * Dh], ref, atol=2e-5, rtol=2e-5)
     assert torch.isnan(out[:, H * Dh :]).all()
+
+
+# ---- Penalties over a verify step ----------------------------------------------------------------
+
+
+class Penalty(ctypes.Structure):
+    """lx_spec_penalty, passed by value."""
+
+    _fields_ = [
+        ("repetition_penalty", ctypes.c_float),
+        ("presence_penalty", ctypes.c_float),
+        ("frequency_penalty", ctypes.c_float),
+    ]
+
+
+PENALTY_CASES = [(1.05, 0.0, 0.0), (1.0, 0.5, 0.0), (1.0, 0.0, 0.25), (1.05, 0.3, 0.1), (1.0, 0.0, 0.0)]
+
+
+@pytest.mark.parametrize("rep,pres,freq", PENALTY_CASES)
+@pytest.mark.parametrize("V", [1000, 32003])
+def test_spec_penalize_rows_are_plain_penalties_after_their_drafts(lx, V, rep, pres, freq):
+    """Row r of a verify step sees the counts plus the drafts before it, tokens[1 .. r]. Three checks: the rows match
+    a PyTorch reference, each row alone penalised with those counts observed is bit for bit the same, and lx_sample
+    picks the argmax of the row the way a plain step after those tokens would."""
+    torch.manual_seed(V + int(1000 * rep) + int(100 * pres) + int(10 * freq))
+    rows = 5
+    out = (torch.rand(V, device="cuda") < 0.1).to(torch.int32) * torch.randint(
+        1, 3, (V,), device="cuda", dtype=torch.int32
+    )
+    seen = out + (torch.rand(V, device="cuda") < 0.2).to(torch.int32)
+    tokens = torch.randint(0, V, (rows,), device="cuda", dtype=torch.int32)
+    tokens[2] = tokens[1]  # a repeated draft: its count must add twice
+    tokens[3] = int(seen.nonzero()[0])  # a draft already in the context
+    logits = torch.randn(rows, V, device="cuda") * 3.0
+    pen = Penalty(rep, pres, freq)
+
+    got = logits.clone()
+    lx("spec_penalize", got, V, pen, tokens, rows, seen, out)
+
+    for r in range(rows):
+        extra = torch.bincount(tokens[1 : r + 1].long(), minlength=V).to(torch.int32) if r else torch.zeros_like(seen)
+        want = ref_penalized(logits[r].cpu(), (seen + extra).cpu(), (out + extra).cpu(), rep, pres, freq)
+        close(got[r].cpu(), want.float(), atol=1e-5, rtol=1e-5)
+
+        s_seen, s_out = seen.clone(), out.clone()
+        if r:
+            lx("sampler_observe", s_seen, s_out, 0, V, tokens[1 : r + 1].clone(), r, 1)
+        alone = logits[r : r + 1].clone()
+        lx("spec_penalize", alone, V, pen, tokens, 1, s_seen, s_out)
+        assert torch.equal(got[r], alone[0]), f"row {r} differs from the row penalised alone"
+
+        sampler = Sampler(lx, V, 1)
+        sampler.seen[0].copy_(s_seen)
+        sampler.out[0].copy_(s_out)
+        picked, *_ = sampler.sample(
+            logits[r : r + 1].clone(),
+            [{"temperature": 0.0, "row": 0, "slot": 0, "repetition_penalty": rep,
+              "presence_penalty": pres, "frequency_penalty": freq}],
+        )
+        assert picked[0] == int(torch.argmax(got[r])), f"row {r}: the plain sampler's pick is not the penalised argmax"

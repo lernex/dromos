@@ -12,6 +12,7 @@
 //     --cost LIST       verify cost of T = 1, 2, .. tokens in plain steps (default: the 5070 Ti, Praxis)
 //     --draft DIR       the draft model for `model` (a Metis model with the same tokenizer)
 //     --temp T --top-p P --top-k K --min-p P --seed S    sampling (temp 0, the default, is greedy)
+//     --rep R --presence P --frequency F                 the sampler's penalties (1, 0, 0: none), in both drafters
 //     --ngram MAX,MIN   prompt-lookup match lengths (4,1)
 //     --min-conf C      a model drafter stops drafting below this probability of its proposal (0)
 //     --json FILE       every number, per prompt and drafter
@@ -424,6 +425,9 @@ int cmd_spec(int argc, char** argv) {
       else if (a == "--top-k") cfg.filter.top_k = std::stoi(val());
       else if (a == "--min-p") cfg.filter.min_p = std::stof(val());
       else if (a == "--seed") cfg.seed = std::stoull(val());
+      else if (a == "--rep") cfg.repetition_penalty = std::stof(val());
+      else if (a == "--presence") cfg.presence_penalty = std::stof(val());
+      else if (a == "--frequency") cfg.frequency_penalty = std::stof(val());
       else if (a == "--min-conf") min_conf = std::stof(val());
       else if (a == "--json") json_out = val();
       else if (a == "--repeat") repeat = std::stoi(val());
@@ -593,6 +597,7 @@ struct Sampling {
   double temp = 0.0, top_p = 1.0, min_p = 0.0, rep = 1.0;
   int top_k = 0;
   uint64_t seed = 1;
+  double presence = 0.0, frequency = 0.0;
 };
 
 // The sampler's distribution over the vocabulary for one row (kernels.h, lx_sample): repetition penalty on the tokens
@@ -603,11 +608,14 @@ struct Dist {
   int argmax = 0;
 };
 
-Dist make_dist(const float* logits, int V, const std::vector<char>& seen, const Sampling& sm) {
+Dist make_dist(const float* logits, int V, const std::vector<char>& seen, const Sampling& sm,
+               const std::vector<int32_t>* out_counts = nullptr) {
   std::vector<double> x(V);
   for (int i = 0; i < V; ++i) {
     const double v = logits[i];
-    x[i] = seen[i] && sm.rep != 1.0 ? (v > 0 ? v / sm.rep : v * sm.rep) : v;
+    double y = seen[i] && sm.rep != 1.0 ? (v > 0 ? v / sm.rep : v * sm.rep) : v;
+    if (out_counts && (*out_counts)[i] > 0) y -= sm.frequency * static_cast<double>((*out_counts)[i]) + sm.presence;
+    x[i] = y;
   }
   Dist d;
   d.p.assign(V, 0.0);
@@ -1054,8 +1062,8 @@ int cmd_pass1(int argc, char** argv) {
 }
 
 // dromos spec-exactness: the next token of one prompt, drawn DRAWS times by the verify path and DRAWS times by the plain
-// sampler, at the think setting (temperature 0.8, top-p 0.95, top-k 20). Speculation runs without penalties
-// (engine.cpp spec_eligible), so the distributions compared are the unpenalised ones. The verify path draws against a
+// sampler, at the think setting (temperature 0.8, top-p 0.95, top-k 20). The penalties (--rep,
+// --presence, --frequency; none by default) apply to both paths alike. The verify path draws against a
 // forced draft: a point mass on one token, the way the n-gram drafter proposes (SpecDecoder::verify, q null). The
 // reference is make_dist, the host reading of sampler.cu's distribution. Each set uses its own seed, and speculative
 // positions are spaced 4 apart, so no two draws share a Philox key.
@@ -1113,7 +1121,7 @@ void check_rc(int rc, const char* what) {
 }
 
 int run_exactness(const std::string& dir, const std::string& prompts_path, const std::string& name, int draws,
-                  const lx::cli::FormatFlags& format) {
+                  const lx::cli::FormatFlags& format, double rep, double presence, double frequency) {
   nlohmann::json prompts;
   std::ifstream(prompts_path) >> prompts;
   if (!prompts.contains(name)) throw std::runtime_error("no prompt named " + name + " in " + prompts_path);
@@ -1122,7 +1130,13 @@ int run_exactness(const std::string& dir, const std::string& prompts_path, const
   const std::vector<int32_t> prefix(ids.begin(), ids.end() - 1);
   const int32_t last = ids.back();
   const int N = static_cast<int>(prefix.size());
-  const Sampling sm{0.8, 0.95, 0.0, 1.0, 20, 0};  // temp, top_p, min_p, rep, top_k, seed (unused: the seeds below)
+  Sampling sm{0.8, 0.95, 0.0, rep, 20, 0};  // temp, top_p, min_p, rep, top_k, seed (unused: the seeds below)
+  sm.presence = presence;
+  sm.frequency = frequency;
+  // The context is seen (repetition), and its last 16 tokens are output (presence and frequency), as after a
+  // generated tail.
+  const int tail = std::min(16, static_cast<int>(ids.size()) - 1);
+  const int head_n = static_cast<int>(ids.size()) - tail;
 
   Loaded l = load(dir, 1, 512, format, false);
   lx::MetisModel& model = *l.model;
@@ -1146,7 +1160,11 @@ int run_exactness(const std::string& dir, const std::string& prompts_path, const
   std::vector<float> base(static_cast<size_t>(V));
   check_rc(lx_rt_copy(base.data(), d_logits, static_cast<int64_t>(sizeof(float)) * V, LX_COPY_D2H, s), "copy of logits");
   check_rc(lx_rt_stream_sync(s), "stream sync");
-  const Dist ref = make_dist(base.data(), V, std::vector<char>(static_cast<size_t>(V), 0), sm);
+  std::vector<char> seen_mask(static_cast<size_t>(V), 0);
+  std::vector<int32_t> out_host(static_cast<size_t>(V), 0);
+  for (int32_t t : ids) seen_mask[static_cast<size_t>(t)] = 1;
+  for (size_t i = static_cast<size_t>(head_n); i < ids.size(); ++i) out_host[static_cast<size_t>(ids[i])] += 1;
+  const Dist ref = make_dist(base.data(), V, seen_mask, sm, &out_host);
 
   // The plain sampler (lx_sample) on the same logits, as the engine calls it.
   float* d_base = nullptr;
@@ -1160,10 +1178,18 @@ int run_exactness(const std::string& dir, const std::string& prompts_path, const
   check_rc(lx_rt_alloc(reinterpret_cast<void**>(&d_tok), sizeof(int32_t)), "alloc");
   check_rc(lx_rt_alloc(reinterpret_cast<void**>(&d_params), sizeof(lx_sampling)), "alloc");
   check_rc(lx_rt_copy(d_base, base.data(), static_cast<int64_t>(sizeof(float)) * V, LX_COPY_H2D, s), "copy");
-  check_rc(lx_sampler_reset(d_seen, d_counts, 0, V, s), "sampler reset");
+  int32_t* d_ids = nullptr;
+  check_rc(lx_rt_alloc(reinterpret_cast<void**>(&d_ids), static_cast<int64_t>(sizeof(int32_t)) * ids.size()), "alloc");
+  check_rc(lx_rt_copy(d_ids, ids.data(), static_cast<int64_t>(sizeof(int32_t)) * ids.size(), LX_COPY_H2D, s), "copy");
+  auto restore_counts = [&]() {
+    check_rc(lx_sampler_reset(d_seen, d_counts, 0, V, s), "sampler reset");
+    check_rc(lx_sampler_observe(d_seen, d_counts, 0, V, d_ids, head_n, 0, s), "sampler observe");
+    check_rc(lx_sampler_observe(d_seen, d_counts, 0, V, d_ids + head_n, tail, 1, s), "sampler observe");
+  };
   auto plain_draws = [&](uint64_t seed) {
     std::vector<long> counts(static_cast<size_t>(V), 0);
     for (int i = 0; i < draws; ++i) {
+      restore_counts();
       lx_sampling sp{};
       sp.seed = seed;
       sp.position = static_cast<uint64_t>(i);
@@ -1173,7 +1199,9 @@ int run_exactness(const std::string& dir, const std::string& prompts_path, const
       sp.top_p = static_cast<float>(sm.top_p);
       sp.top_k = sm.top_k;
       sp.min_p = 0.0f;
-      sp.repetition_penalty = 1.0f;
+      sp.repetition_penalty = static_cast<float>(rep);
+      sp.presence_penalty = static_cast<float>(presence);
+      sp.frequency_penalty = static_cast<float>(frequency);
       check_rc(lx_rt_copy(d_params, &sp, static_cast<int64_t>(sizeof(sp)), LX_COPY_H2D, s), "copy of params");
       check_rc(lx_sample(d_base, V, d_params, 1, d_seen, d_counts, d_work, d_tok, nullptr, 0, nullptr, nullptr, s),
                "lx_sample");
@@ -1191,16 +1219,20 @@ int run_exactness(const std::string& dir, const std::string& prompts_path, const
   config.filter = lx_spec_filter{static_cast<float>(sm.temp), static_cast<float>(sm.top_p), sm.top_k,
                                  static_cast<float>(sm.min_p)};
   config.seed = 3;
+  config.repetition_penalty = static_cast<float>(rep);
+  config.presence_penalty = static_cast<float>(presence);
+  config.frequency_penalty = static_cast<float>(frequency);
   auto spec_draws = [&](int draft, long& accepted_total) {
     std::vector<long> counts(static_cast<size_t>(V), 0);
     prefill();
     const int before = model.slot_length(0);
     for (int i = 0; i < draws; ++i) {
       model.truncate(0, before);
+      restore_counts();
       int accepted = 0;
       int32_t next = 0;
-      decoder.verify(0, config, {last, static_cast<int32_t>(draft)}, nullptr, static_cast<uint64_t>(4 * i), accepted,
-                     next, s);
+      decoder.verify(0, config, {last, static_cast<int32_t>(draft)}, nullptr, static_cast<uint64_t>(4 * i),
+                     lx::runtime::SpecCounts{d_seen, d_counts}, accepted, next, s);
       const int32_t first = accepted >= 1 ? static_cast<int32_t>(draft) : next;
       counts[static_cast<size_t>(first)] += 1;
       accepted_total += accepted;
@@ -1228,6 +1260,19 @@ int run_exactness(const std::string& dir, const std::string& prompts_path, const
 
   std::printf("%s: %d prefix tokens, the next token drawn %d times at temperature %.1f, top-p %.2f, top-k %d\n",
               name.c_str(), N, draws, sm.temp, sm.top_p, sm.top_k);
+  // How far the penalties move this distribution: a check is only informative when they change it.
+  double moved = 0.0;
+  {
+    Sampling unpenalised = sm;
+    unpenalised.rep = 1.0;
+    unpenalised.presence = 0.0;
+    unpenalised.frequency = 0.0;
+    const Dist plain_ref = make_dist(base.data(), V, seen_mask, unpenalised, nullptr);
+    for (int t = 0; t < V; ++t) moved += std::abs(ref.p[static_cast<size_t>(t)] - plain_ref.p[static_cast<size_t>(t)]);
+    moved *= 0.5;
+  }
+  std::printf("penalties (rep %.3f, presence %.3f, frequency %.3f) move the reference by total variation %.4f\n", rep,
+              presence, frequency, moved);
   std::printf("reference: %zu tokens kept, most likely %d (p %.3f)\n", kept.size(), kept[0],
               ref.p[static_cast<size_t>(kept[0])]);
   bool ok = true;
@@ -1252,6 +1297,7 @@ int run_exactness(const std::string& dir, const std::string& prompts_path, const
   lx_rt_free(d_base);
   lx_rt_free(d_seen);
   lx_rt_free(d_counts);
+  lx_rt_free(d_ids);
   lx_rt_free(d_work);
   lx_rt_free(d_tok);
   lx_rt_free(d_params);
@@ -1265,13 +1311,29 @@ int cmd_spec_exactness(int argc, char** argv) {
   try {
     lx::cli::FormatFlags format;
     std::vector<char*> args = without_format_flags(argc, argv, format);
-    const int n = static_cast<int>(args.size());
+    double rep = 1.0, presence = 0.0, frequency = 0.0;
+    std::vector<char*> pos;
+    for (size_t i = 0; i < args.size(); ++i) {
+      const std::string a = args[i];
+      auto val = [&]() -> std::string {
+        if (i + 1 >= args.size()) throw std::runtime_error("missing value for " + a);
+        return args[++i];
+      };
+      if (a == "--rep") rep = std::stod(val());
+      else if (a == "--presence") presence = std::stod(val());
+      else if (a == "--frequency") frequency = std::stod(val());
+      else pos.push_back(args[i]);
+    }
+    const int n = static_cast<int>(pos.size());
     if (n != 4 && n != 5) {
-      std::fprintf(stderr, "usage: dromos spec-exactness MODEL_DIR PROMPTS_JSON PROMPT [DRAWS] %s\n", lx::cli::kFormatUsage);
+      std::fprintf(stderr,
+                   "usage: dromos spec-exactness MODEL_DIR PROMPTS_JSON PROMPT [DRAWS] [--rep R] [--presence P] "
+                   "[--frequency F] %s\n",
+                   lx::cli::kFormatUsage);
       return 2;
     }
-    const int draws = n == 5 ? std::stoi(args[4]) : 2000;
-    return run_exactness(args[1], args[2], args[3], draws, format);
+    const int draws = n == 5 ? std::stoi(pos[4]) : 2000;
+    return run_exactness(pos[1], pos[2], pos[3], draws, format, rep, presence, frequency);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "error: %s\n", e.what());
     return 1;

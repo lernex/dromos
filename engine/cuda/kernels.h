@@ -810,6 +810,21 @@ typedef struct {
 LX_API int lx_spec_probs(const float* logits, int V, const lx_spec_filter* filters, int rows, float* probs,
                          void* stream);
 
+// Sampling penalties of one sequence: lx_sampling's, without the filters.
+typedef struct {
+  float repetition_penalty;  // > 0; 1 disables
+  float presence_penalty;    // 0 disables
+  float frequency_penalty;   // 0 disables
+} lx_spec_penalty;
+
+// The penalties lx_sample applies to its logits (sampler.cu, step 1), for the rows of a verify step of one sequence, in
+// place on logits [rows, V]. Row j is the distribution after the step's first j + 1 tokens, so it is penalised with the
+// sequence's counts (seen and out_counts: its slot's rows of the sampler's tables) plus tokens[1 .. j], the drafts the
+// step fed before that row, which count as output once they are accepted. Each row is then the distribution a plain
+// step at that position samples from, and the verify path draws from the same one. tokens is device data.
+LX_API int lx_spec_penalize(float* logits, int V, lx_spec_penalty pen, const int32_t* tokens, int rows,
+                            const int32_t* seen, const int32_t* out_counts, void* stream);
+
 // Speculative sampling over a verify step. Sequence s fed tokens[cu[s] .. cu[s + 1] - 1]: its pending
 // token, then k_s drafts. Row cu[s] + j of p (from lx_spec_probs on the target's logits) is the
 // target's distribution after the step's first j + 1 tokens; row cu[s] + j of q is the drafter's

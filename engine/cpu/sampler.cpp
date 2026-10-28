@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <vector>
 
 #include "cpu/cpu.h"
 
@@ -390,6 +391,32 @@ int lx_mask_logits(float* logits, int V, const int32_t* rows, const uint32_t* bi
         if (!((mask[v >> 5] >> (v & 31)) & 1u)) row[v] = -kInf;
     }
   });
+  return kOk;
+}
+
+int lx_spec_penalize(float* logits, int V, lx_spec_penalty pen, const int32_t* tokens, int rows, const int32_t* seen,
+                     const int32_t* out_counts, void* stream) {
+  LX_PROFILE("spec_penalize");
+  (void)stream;
+  if (rows < 0) return fail(kInvalid);
+  if (rows == 0) return kOk;
+  if (V <= 0 || !logits || !tokens || !seen || !out_counts) return fail(kInvalid);
+  lx_sampling p{};
+  p.repetition_penalty = pen.repetition_penalty;
+  p.presence_penalty = pen.presence_penalty;
+  p.frequency_penalty = pen.frequency_penalty;
+  std::vector<int32_t> sc(static_cast<size_t>(V)), co(static_cast<size_t>(V));
+  for (int r = 0; r < rows; ++r) {
+    // Row r sees the counts plus the step's drafts before it, tokens[1 .. r].
+    for (int64_t e = 0; e < V; ++e) {
+      int32_t extra = 0;
+      for (int t = 1; t <= r; ++t) extra += tokens[t] == e;
+      sc[static_cast<size_t>(e)] = seen[e] + extra;
+      co[static_cast<size_t>(e)] = out_counts[e] + extra;
+    }
+    float* row = logits + static_cast<int64_t>(r) * V;
+    penalize(row, sc.data(), co.data(), V, p, row);
+  }
   return kOk;
 }
 
