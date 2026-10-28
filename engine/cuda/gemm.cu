@@ -3,7 +3,8 @@
 // cuBLASLt is column-major, and a row-major y[M, N] is the column-major y^T[N, M] with leading
 // dimension ld_y. So the product is computed as y^T = w x^T: w is the left operand, transposed
 // (its row-major [N, K] memory is a column-major [K, N] matrix), and x the right operand as stored.
-// M = 1 (decode) is the n = 1 case of the same call; the heuristic picks a GEMV-shaped kernel.
+// One algorithm serves every row count of a shape (pinned_algo): it is chosen at kPinRows without split-K and
+// reused. Its K loop is then the same at every M, so a row's bits never depend on how many rows share its step.
 //
 // The bias goes through cuBLASLt's bias epilogue, which adds after alpha and beta, so the bias
 // has to be alpha * bias. cuBLASLt also wants the bias in the output's dtype. Those two rules mean
@@ -11,7 +12,7 @@
 // (the bf16 GEMM with bf16 y, and the f32 GEMM). Anything else is one small scale-and-convert
 // kernel into a scratch buffer first; the model runs only the direct cases.
 //
-// Plans (descriptors, layouts and the chosen algorithm) are cached per shape. Each device has one
+// Plans (descriptors and layouts) are cached per problem, and each shape's pinned algorithm once. Each device has one
 // handle, one workspace and one bias scratch, shared by every call on it, so the engine issues a
 // device's GEMMs on one stream. The mutex only orders host-side use of those objects.
 
@@ -34,6 +35,8 @@ constexpr size_t kWorkspaceBytes = size_t{32} << 20;
 constexpr int kMaxDevices = 16;
 // Prefill lengths vary, so shapes keep arriving. Flushing a full cache is cheaper than letting it grow.
 constexpr size_t kMaxPlans = 2048;
+// The row count each shape's algorithm is chosen at: the prefill chunk. Every row count of the shape then runs it.
+constexpr int kPinRows = 512;
 
 cudaError_t to_cuda(cublasStatus_t status) {
   switch (status) {
@@ -54,6 +57,19 @@ struct PlanKey {
   uint32_t align_a, align_b, align_c;
   auto operator<=>(const PlanKey&) const = default;
 };
+
+// A PlanKey without the row count: the pinned algorithm is one per shape, whatever M is.
+struct AlgoKey {
+  int N, K, ld_x, ld_y;
+  bool bf16_in, bf16_out;
+  bool bias;
+  uint32_t align_a, align_b, align_c;
+  auto operator<=>(const AlgoKey&) const = default;
+};
+
+AlgoKey algo_key(const PlanKey& k) {
+  return AlgoKey{k.N, k.K, k.ld_x, k.ld_y, k.bf16_in, k.bf16_out, k.bias, k.align_a, k.align_b, k.align_c};
+}
 
 struct Plan {
   cublasLtMatmulDesc_t op = nullptr;
@@ -80,6 +96,7 @@ struct DeviceState {
   void* bias_scratch = nullptr;
   size_t bias_scratch_bytes = 0;
   std::map<PlanKey, Plan> plans;
+  std::map<AlgoKey, cublasLtMatmulAlgo_t> algos;  // never flushed: one entry per shape
 };
 
 // Created on first use, on the device that is current then. Never destroyed: tearing handles down
@@ -118,8 +135,9 @@ cublasStatus_t set_pref_attr(cublasLtMatmulPreference_t pref, cublasLtMatmulPref
   return cublasLtMatmulPreferenceSetAttribute(pref, attr, &v, sizeof(T));
 }
 
-// Builds the plan for one key into p. On failure p holds whatever was created; the caller destroys it.
-cublasStatus_t build_plan(DeviceState& s, const PlanKey& k, cudaDataType bias_type, Plan& p) {
+// The matmul descriptor and the three layouts for one key, no algorithm yet. On failure p holds whatever was
+// created; the caller destroys it.
+cublasStatus_t describe(const PlanKey& k, cudaDataType bias_type, Plan& p) {
   const cudaDataType in = k.bf16_in ? CUDA_R_16BF : CUDA_R_32F;
   const cudaDataType out = k.bf16_out ? CUDA_R_16BF : CUDA_R_32F;
   const uint64_t M = k.M, N = k.N, K = k.K;
@@ -148,22 +166,76 @@ cublasStatus_t build_plan(DeviceState& s, const PlanKey& k, cudaDataType bias_ty
   if (auto st = cublasLtMatrixLayoutCreate(&p.b, in, K, M, k.ld_x); st != CUBLAS_STATUS_SUCCESS) return st;
   if (auto st = cublasLtMatrixLayoutCreate(&p.c, out, N, M, k.ld_y); st != CUBLAS_STATUS_SUCCESS) return st;
 
-  cublasLtMatmulPreference_t pref = nullptr;
-  if (auto st = cublasLtMatmulPreferenceCreate(&pref); st != CUBLAS_STATUS_SUCCESS) return st;
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+// The workspace, the key's alignments, and which reduction schemes a candidate may use.
+cublasStatus_t set_prefs(cublasLtMatmulPreference_t pref, const PlanKey& k, uint32_t reductions) {
   cublasStatus_t st = set_pref_attr(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, kWorkspaceBytes);
   if (st == CUBLAS_STATUS_SUCCESS) st = set_pref_attr(pref, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, k.align_a);
   if (st == CUBLAS_STATUS_SUCCESS) st = set_pref_attr(pref, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES, k.align_b);
   if (st == CUBLAS_STATUS_SUCCESS) st = set_pref_attr(pref, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES, k.align_c);
   if (st == CUBLAS_STATUS_SUCCESS) st = set_pref_attr(pref, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES, k.align_c);
+  if (st == CUBLAS_STATUS_SUCCESS) st = set_pref_attr(pref, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, reductions);
+  return st;
+}
 
-  cublasLtMatmulHeuristicResult_t best{};
+// The algorithm every row count of this shape runs: the heuristic's best at kPinRows among the candidates that do not
+// split K, with split-K checked in the algorithm's own config as well. cuBLASLt's K loop is fixed by the algorithm, so
+// each output element reduces over K in the same order at any M. Without split-K, nothing reorders that reduction.
+cublasStatus_t pinned_algo(DeviceState& s, const PlanKey& key, cudaDataType bias_type, cublasLtMatmulAlgo_t& out) {
+  const AlgoKey ak = algo_key(key);
+  if (auto it = s.algos.find(ak); it != s.algos.end()) {
+    out = it->second;
+    return CUBLAS_STATUS_SUCCESS;
+  }
+  PlanKey ref = key;
+  ref.M = kPinRows;
+  Plan probe;
+  cublasStatus_t st = describe(ref, bias_type, probe);
+  cublasLtMatmulPreference_t pref = nullptr;
+  if (st == CUBLAS_STATUS_SUCCESS) st = cublasLtMatmulPreferenceCreate(&pref);
+  if (st == CUBLAS_STATUS_SUCCESS) st = set_prefs(pref, ref, CUBLASLT_REDUCTION_SCHEME_NONE);
+
+  constexpr int kCandidates = 16;
+  std::array<cublasLtMatmulHeuristicResult_t, kCandidates> candidates{};
   int found = 0;
   if (st == CUBLAS_STATUS_SUCCESS)
-    st = cublasLtMatmulAlgoGetHeuristic(s.handle, p.op, p.a, p.b, p.c, p.c, pref, 1, &best, &found);
-  cublasLtMatmulPreferenceDestroy(pref);
+    st = cublasLtMatmulAlgoGetHeuristic(s.handle, probe.op, probe.a, probe.b, probe.c, probe.c, pref, kCandidates,
+                                        candidates.data(), &found);
+  if (pref) cublasLtMatmulPreferenceDestroy(pref);
+  bool chosen = false;
+  for (int i = 0; st == CUBLAS_STATUS_SUCCESS && i < found && !chosen; ++i) {
+    if (candidates[i].state != CUBLAS_STATUS_SUCCESS) continue;
+    uint32_t splitk = 0, scheme = 1;
+    size_t written = 0;
+    if (cublasLtMatmulAlgoConfigGetAttribute(&candidates[i].algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &splitk,
+                                             sizeof splitk, &written) != CUBLAS_STATUS_SUCCESS)
+      continue;
+    if (cublasLtMatmulAlgoConfigGetAttribute(&candidates[i].algo, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, &scheme,
+                                             sizeof scheme, &written) != CUBLAS_STATUS_SUCCESS)
+      continue;
+    if (splitk != 1 || scheme != CUBLASLT_REDUCTION_SCHEME_NONE) continue;
+    out = candidates[i].algo;
+    chosen = true;
+  }
+  probe.destroy();
   if (st != CUBLAS_STATUS_SUCCESS) return st;
-  if (found == 0 || best.state != CUBLAS_STATUS_SUCCESS) return CUBLAS_STATUS_NOT_SUPPORTED;
-  p.algo = best.algo;
+  if (!chosen) return CUBLAS_STATUS_NOT_SUPPORTED;
+  s.algos.emplace(ak, out);
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+// The plan for one key into p: its descriptor and layouts, and the shape's pinned algorithm, checked to run at this row
+// count. On failure p holds whatever was created; the caller destroys it.
+cublasStatus_t build_plan(DeviceState& s, const PlanKey& k, cudaDataType bias_type, Plan& p) {
+  if (auto st = describe(k, bias_type, p); st != CUBLAS_STATUS_SUCCESS) return st;
+  cublasLtMatmulAlgo_t algo{};
+  if (auto st = pinned_algo(s, k, bias_type, algo); st != CUBLAS_STATUS_SUCCESS) return st;
+  cublasLtMatmulHeuristicResult_t check{};
+  if (auto st = cublasLtMatmulAlgoCheck(s.handle, p.op, p.a, p.b, p.c, p.c, &algo, &check); st != CUBLAS_STATUS_SUCCESS)
+    return st;
+  p.algo = algo;
   return CUBLAS_STATUS_SUCCESS;
 }
 
