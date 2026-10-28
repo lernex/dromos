@@ -11,6 +11,8 @@
 //   per stream      decode tok/s divided by the streams
 //   TTFT p50        from submit to the first token, the median across streams
 //   prefill tok/s   prompt tokens of every stream, over the time until the last one starts decoding
+//   per-token tok/s the per-token formula other engines report: streams over the mean time per token after the
+//                   first, per stream (concurrency x 1000 / mean TPOT). The table publishes this one for every engine.
 // --sample draws with the model's own recommended settings (temperature 0.6, top-p 0.95, top-k 20)
 // instead of greedy, which is what a chat user gets.
 //
@@ -122,6 +124,7 @@ std::vector<StreamTiming> run_batch(runtime::Engine& engine, int streams, int pr
 struct Row {
   int streams;
   double decode_tps, per_stream_tps, ttft_p50, prefill_tps, ttft_p90;
+  double per_token_tps;  // streams / mean TPOT, the per-token formula
   int generated_each;
 };
 
@@ -148,6 +151,14 @@ Row measure(const std::vector<StreamTiming>& timings, int prompt_tokens, double 
   row.ttft_p90 = ttft[std::min(ttft.size() - 1, ttft.size() * 9 / 10)];
   const double prefill_window = std::max(all_decoding - submitted_at, 1e-9);
   row.prefill_tps = static_cast<double>(n) * prompt_tokens / prefill_window;
+  // Each stream's mean time per token after its first, averaged over the streams; n of them per that time.
+  double tpot_sum = 0.0;
+  for (const auto& t : timings) {
+    const size_t k = t.token_times.size();
+    if (k > 1) tpot_sum += (t.token_times.back() - t.token_times.front()) / static_cast<double>(k - 1);
+  }
+  const double mean_tpot = tpot_sum / n;
+  row.per_token_tps = mean_tpot > 0 ? n / mean_tpot : 0.0;
   row.generated_each = static_cast<int>(timings.front().token_times.size());
   return row;
 }
@@ -202,8 +213,8 @@ int cmd_bench(int argc, char** argv) {
     std::printf("  %d prompt tokens, %d generated tokens per stream, %s\n", args.prompt_tokens, args.gen_tokens,
                 args.sample ? "sampled (temperature 0.6, top-p 0.95, top-k 20)" : "greedy");
     std::printf("  each stream count loads its own engine, so it runs on the plan a standalone run at that count gets\n");
-    std::printf("%8s %12s %12s %10s %10s %13s %15s %9s %9s\n", "streams", "decode tok/s", "per stream", "TTFT p50",
-                "TTFT p90", "prefill tok/s", "roofline tok/s", "% of spec", "% of peak");
+    std::printf("%8s %12s %12s %10s %10s %13s %15s %9s %9s %15s\n", "streams", "decode tok/s", "per stream", "TTFT p50",
+                "TTFT p90", "prefill tok/s", "roofline tok/s", "% of spec", "% of peak", "per-token tok/s");
     std::fflush(stdout);
     bool refused = false;
     for (int streams : args.streams) {
@@ -299,9 +310,9 @@ int cmd_bench(int argc, char** argv) {
     std::snprintf(buf, sizeof buf, "%.1f%%", 100.0 * row.decode_tps / spec_ceiling);
     of_spec = buf;
   }
-  std::printf("%8d %12.1f %12.1f %10s %10s %13.0f %15s %9s %9s\n", row.streams, row.decode_tps, row.per_stream_tps,
+  std::printf("%8d %12.1f %12.1f %10s %10s %13.0f %15s %9s %9s %15.1f\n", row.streams, row.decode_tps, row.per_stream_tps,
               human_seconds(row.ttft_p50).c_str(), human_seconds(row.ttft_p90).c_str(), row.prefill_tps, roof.c_str(),
-              of_spec.c_str(), of_peak.c_str());
+              of_spec.c_str(), of_peak.c_str(), row.per_token_tps);
   std::fflush(stdout);
   return 0;
 }
