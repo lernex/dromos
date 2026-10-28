@@ -377,10 +377,17 @@ main() {
   mv "$stage" "$dest"
   stage=""
 
-  # Switch, then tidy. The previous version stays for one rollback; everything older goes.
-  previous=""
-  if [ -n "$current" ]; then previous=$(basename "$current"); fi
-  ln -s "versions/$ver" "$HOME/.lernex/.current-link.$$"
+  # Switch, then tidy. The version this one replaces stays for one rollback, and so does the one before it when this
+  # is a re-install of the current version; everything older goes. The links are absolute, as `lernex update` makes them.
+  was=""
+  if [ -n "$current" ]; then was=$(basename "$current"); fi
+  previous=$was
+  if [ "$was" = "$ver" ]; then
+    old=$(readlink "$HOME/.lernex/previous" 2>/dev/null || true)
+    previous=""
+    if [ -n "$old" ]; then previous=$(basename "$old"); fi
+  fi
+  ln -s "$versions/$ver" "$HOME/.lernex/.current-link.$$"
   replace_link "$HOME/.lernex/.current-link.$$" "$HOME/.lernex/current"
   for old in "$versions"/*; do
     [ -d "$old" ] || continue
@@ -390,8 +397,14 @@ main() {
       *) rm -rf "$old" ;;
     esac
   done
-  if [ -n "$previous" ] && [ "$previous" != "$ver" ]; then
-    say "installed lernex $ver in $(short "$dest") (was $previous)"
+  if [ -n "$previous" ] && [ "$previous" != "$ver" ] && [ -d "$versions/$previous" ]; then
+    ln -s "$versions/$previous" "$HOME/.lernex/.previous-link.$$"
+    replace_link "$HOME/.lernex/.previous-link.$$" "$HOME/.lernex/previous"
+  else
+    rm -f "$HOME/.lernex/previous"
+  fi
+  if [ -n "$was" ] && [ "$was" != "$ver" ]; then
+    say "installed lernex $ver in $(short "$dest") (was $was)"
   else
     say "installed lernex $ver in $(short "$dest")"
   fi
