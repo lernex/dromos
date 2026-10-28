@@ -42,7 +42,7 @@ int max_tokens_from_env() {
 Hold hold_from_env() {
   if (const char* off = std::getenv("LX_NO_L2_PIN"); off && *off && std::strcmp(off, "0") != 0) return Hold::Off;
   const char* v = std::getenv("LX_L2_PIN");
-  if (!v || !*v) return Hold::Weights;
+  if (!v || !*v) return Hold::Off;  // opt-in: the rebased measurements found no reliable gain (see pin.h)
   const std::string s = v;
   if (s == "off" || s == "0") return Hold::Off;
   if (s == "weights") return Hold::Weights;

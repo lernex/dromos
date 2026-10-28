@@ -20,7 +20,9 @@ namespace lx::pin {
 // What the window may hold: nothing, the weights, the Mamba states, or both.
 enum class Hold { Off, Weights, States, Both };
 
-// LX_NO_L2_PIN=1 turns the window off. LX_L2_PIN=weights|states|both picks the hold (default weights).
+// LX_L2_PIN=weights|states|both picks the hold; unset (or off) keeps the window off. The default is off because the
+// rebased measurements (Praxis, all four formats, one, eight and 32 streams) found no reliable one-stream gain and a
+// 2 to 4 percent cost at eight and 32 streams when the window is on every step. LX_NO_L2_PIN=1 forces it off.
 Hold hold_from_env();
 
 // One device range the decode reads with its siblings (a projection's data, or its scales), and how the model
