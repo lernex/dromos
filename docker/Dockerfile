@@ -48,7 +48,7 @@ LABEL org.opencontainers.image.title="Lernex engine" \
       org.opencontainers.image.description="The Lernex inference engine for Praxis and Logos, serving the OpenAI API on port 8080" \
       org.opencontainers.image.source="https://github.com/lernex/lernex-engine" \
       org.opencontainers.image.version="${LERNEX_VERSION}" \
-      org.opencontainers.image.licenses="NOASSERTION"
+      org.opencontainers.image.licenses="Apache-2.0"
 # The NVIDIA runtime hooks need these to hand the GPU to the container. curl brings the libcurl.so.4 the engine
 # opens to download models (the package's name differs by Ubuntu release; the package manager picks it).
 ENV NVIDIA_VISIBLE_DEVICES=all \

@@ -1,6 +1,7 @@
 # Homebrew formula for Lernex's inference engine on Apple silicon. It belongs in the lernex/homebrew-tap repository
 # as Formula/lernex.rb, so `brew install lernex/tap/lernex` finds it. The asset is the darwin-arm64 tarball of
-# docs/RELEASE.md: bin/lernex, lib/liblernex_metal.dylib, share/lernex/channel and LICENSE.
+# docs/RELEASE.md: bin/lernex, lib/liblernex_metal.dylib, share/lernex/channel, LICENSE and NOTICE (Homebrew keeps those in the
+# prefix itself), and the third-party licenses in share/lernex/licenses.
 # packaging/homebrew-tap/bump-formula.sh moves version, url and sha256 to a release.
 class Lernex < Formula
   desc "Metis inference engine on the Metal GPU of an Apple silicon Mac"
@@ -8,6 +9,7 @@ class Lernex < Formula
   url "https://github.com/lernex/lernex-engine/releases/download/v0.1.0/lernex-darwin-arm64.tar.gz"
   version "0.1.0"
   sha256 "cdd136284cdea38b7a8773ef5a5dbfa7f6064e0744829ad7fc081ff7138b7662"
+  license "Apache-2.0"
 
   depends_on arch: :arm64
   depends_on macos: :sonoma

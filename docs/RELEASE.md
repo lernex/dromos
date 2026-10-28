@@ -42,7 +42,8 @@ Every tarball unpacks, with no top directory, to:
     lib/libcudart.so.N  lib/libcublasLt.so.N      (CUDA flavor only, the toolkit's own)
     share/lernex/tuning/*.json
     share/lernex/channel                           tarball | homebrew | pip | docker
-    LICENSE
+    share/lernex/licenses/                         third-party licenses (and NVIDIA's EULA, CUDA flavor)
+    LICENSE  NOTICE                                Apache-2.0, and what else ships under which terms
 
 `bin/lernex` finds its backends in `../lib` (already done by engine/dispatch), and the backends find
 the bundled CUDA libraries through an `$ORIGIN` rpath. Tuning tables are read from `../share/lernex/tuning`

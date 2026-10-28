@@ -199,6 +199,18 @@ if(LX_BACKEND_CUDA)
       endif()
       install(FILES "${lib_real}" DESTINATION "${LX_INSTALL_LIBDIR}" RENAME "${lib_soname}")
     endforeach()
+    # NVIDIA's license for the libraries goes with them (NOTICE): the toolkit's EULA.txt.
+    set(LX_CUDA_EULA "")
+    foreach(dir IN ITEMS "${CUDAToolkit_LIBRARY_ROOT}" "${CUDAToolkit_BIN_DIR}/..")
+      if(NOT LX_CUDA_EULA AND EXISTS "${dir}/EULA.txt")
+        set(LX_CUDA_EULA "${dir}/EULA.txt")
+      endif()
+    endforeach()
+    if(NOT LX_CUDA_EULA)
+      message(FATAL_ERROR "LX_BUNDLE_CUDA: the toolkit has no EULA.txt to ship beside its libraries "
+                          "(install its documentation package, cuda-documentation-MAJOR-MINOR)")
+    endif()
+    install(FILES "${LX_CUDA_EULA}" DESTINATION share/lernex/licenses RENAME NVIDIA-CUDA-EULA.txt)
   endif()
 endif()
 
@@ -279,7 +291,8 @@ if(LX_SLOT_STATE AND TARGET lernex_core)
 endif()
 
 # The install tree (docs/RELEASE.md, `cmake --install BUILD --prefix DIR`): bin/lernex, lib/ with the backends (and the
-# toolkit's libraries, LX_BUNDLE_CUDA), share/lernex/tuning, and LICENSE. The packager writes share/lernex/channel.
+# toolkit's libraries and their EULA, LX_BUNDLE_CUDA), share/lernex/tuning, LICENSE, NOTICE and the third-party licenses
+# in share/lernex/licenses. The packager writes share/lernex/channel.
 # Relocatable: the CLI finds its backends in ../lib, and each backend finds the libraries beside it ($ORIGIN). The
 # build tree keeps CMake's own rpath.
 if(APPLE)
@@ -300,6 +313,5 @@ foreach(backend lernex_kernels lernex_cpu lernex_metal)
   endif()
 endforeach()
 install(DIRECTORY tuning/ DESTINATION share/lernex/tuning FILES_MATCHING PATTERN "*.json")
-if(EXISTS "${CMAKE_SOURCE_DIR}/LICENSE")
-  install(FILES "${CMAKE_SOURCE_DIR}/LICENSE" DESTINATION .)
-endif()
+install(FILES LICENSE NOTICE DESTINATION .)
+install(DIRECTORY licenses/ DESTINATION share/lernex/licenses)

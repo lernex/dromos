@@ -1,0 +1,26 @@
+Lernex engine
+Copyright 2026 Lernex
+
+Licensed under the Apache License, Version 2.0 (LICENSE).
+
+This product includes software developed by others, under their own licenses. The full texts
+are in licenses/ in the source, and in share/lernex/licenses/ in every installed tree:
+
+  cpp-httplib (third_party/httplib), MIT License, Copyright (c) 2017 yhirose
+    licenses/cpp-httplib.txt
+  JSON for Modern C++ (third_party/nlohmann), MIT License, Copyright (c) 2013-2022 Niels Lohmann
+    licenses/nlohmann-json.txt
+  Unicode character tables (engine/text/unicode_tables.inc), generated from the Unicode
+    Character Database, Unicode License v3, Copyright (c) 1991-2026 Unicode, Inc.
+    licenses/unicode.txt
+
+doctest (third_party/doctest, MIT License) is used by the tests only and is not part of any
+release.
+
+The Linux CUDA release carries NVIDIA's CUDA runtime (libcudart) and cuBLASLt (libcublasLt) in
+lib/, redistributed under the NVIDIA CUDA Toolkit End User License Agreement, whose text ships
+beside them as share/lernex/licenses/NVIDIA-CUDA-EULA.txt. Those libraries remain NVIDIA's and
+are governed by that agreement, not by the Apache License. The pip package does not include
+them: it depends on NVIDIA's own nvidia-cuda-runtime and nvidia-cublas packages, which carry
+NVIDIA's terms. The container image is built on NVIDIA's CUDA base image, under NVIDIA's terms
+for that image.

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds one release flavor into a tarball (docs/RELEASE.md): lernex-FLAVOR.tar.gz, which unpacks with no top
 # directory to bin/lernex, lib/ (the backends, and the CUDA runtime for the CUDA flavors), share/lernex/tuning,
-# share/lernex/channel (tarball) and LICENSE when the repository has one.
+# share/lernex/channel (tarball), LICENSE, NOTICE and share/lernex/licenses (with NVIDIA's EULA for the CUDA runtime).
 #
 #   scripts/release/build.sh FLAVOR OUTDIR
 #
@@ -94,9 +94,12 @@ if ! ls "$stage"/share/lernex/tuning/*.json >/dev/null 2>&1; then
   echo "build.sh: no tuning tables in the install tree" >&2
   exit 1
 fi
-if [ ! -f "$stage/LICENSE" ]; then
-  echo "build.sh: warning: the repository has no LICENSE, so the tarball has none" >&2
-fi
+for f in LICENSE NOTICE share/lernex/licenses/cpp-httplib.txt; do
+  [ -f "$stage/$f" ] || { echo "build.sh: the install tree has no $f" >&2; exit 1; }
+done
+case "$flavor" in
+  *cuda*) [ -f "$stage/share/lernex/licenses/NVIDIA-CUDA-EULA.txt" ] || { echo "build.sh: no NVIDIA EULA beside the CUDA runtime" >&2; exit 1; } ;;
+esac
 
 # Packed with no top directory and fixed owners, so the same tree gives the same bytes.
 tarball="$outdir/lernex-$flavor.tar.gz"
