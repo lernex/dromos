@@ -59,6 +59,8 @@ both about 5.5 bits per weight in the file, which is the fair pairing for 4-bit.
 - `tools/rivals/structured.py`: chat requests with thinking off, 160 generated, 64 requests with 32
   in flight. Constrained replies use `response_format` `json_schema`, free replies do not. A reply is
   valid when it parses and matches the schema (title string, year integer, up to five tags).
+- `tools/rivals/structured_fixed.py`: the equal-length control for that cell. The same excerpts as free
+  requests that each generate exactly `--gen` tokens (`ignore_eos`), at the same concurrency.
 - `tools/rivals/serve.sh`: starts one server, waits for `/v1/models`, runs the cells, stops the
   whole process group. Each GPU window holds the lock for one engine's cells, back to back.
 - `tools/rivals/single.sh`: llama-bench and `lernex bench` single-stream and CPU cells.
@@ -94,30 +96,48 @@ is where the high p90 TTFT comes from. Per-stream decode at 64 streams is 44 tok
 
 ### 1b. Structured output (JSON schema, 32 in flight, 64 requests, 160 generated)
 
-| Mode | SGLang e2e tok/s | Valid replies | Lernex (commit `c64e94f`, not final main) |
+Measured on commit `05d1855` (rebased onto `c7342e0`, which carries the lone-stream speculation), not final main. The server ran with `--sequences 32`, so all 32 requests are resident; the default plan held 31 on this GPU and queued the 32nd.
+
+| Mode | SGLang e2e tok/s | Valid replies | Lernex |
 |---|---|---|---|
-| Free (no `response_format`) | 789 | 49 of 64 | 1,215 and 1,483 (two waves), 46 and 48 of 64 valid |
-| `json_schema` (xgrammar) | 957 | 64 of 64 | 1,357 and 1,380 (two waves), 64 of 64 valid, 1.42 to 1.44 times SGLang |
+| Free (no `response_format`) | 789 | 49 of 64 | 1,303 and 1,519 (two waves), 49 and 47 of 64 valid |
+| `json_schema` (xgrammar) | 957 | 64 of 64 | 1,400 and 1,422 (two waves), 64 of 64 valid, 1.46 to 1.49 times SGLang |
 
-Lernex now enforces `response_format` `json_object` and `json_schema` on chat and completions:
-a schema compiles to a byte-level pushdown automaton, every decode step masks the logits of the
-constrained rows through `lx_mask_logits`, and the reply stops when its grammar completes. Lernex
-never speculates constrained rows, since the serving engine has no speculative path.
+Lernex enforces `response_format` `json_object` and `json_schema` on chat and completions. A schema
+compiles to a byte-level pushdown automaton, every decode step masks the logits of the constrained
+rows through `lx_mask_logits`, and the reply stops when its grammar completes. Compiling this schema
+takes 0.015 milliseconds.
 
-The free and constrained e2e rates above are not a like-for-like step cost: a free reply runs
-longer (54 to 56 tokens) than a constrained one (38 to 42 tokens). The step cost at equal length,
-64 requests with 32 in flight, is the free wave with `ignore_eos` at 42 tokens: constrained
-1,384 tok/s against free 1,443 tok/s (95.9 percent, second round; the first round's free wave was
-cold at 534 tok/s and is not used). Free rates move about 10 percent between runs, so the margin
-over the 95 percent bar is thin.
+Constrained rows never speculate. Prompt-lookup speculation runs only for a lone stream, and
+`spec_eligible` excludes a JSON-constrained row. In both json_schema waves the engine verified zero
+drafts. The same server verified 7 to 9 drafts during each free wave's lone-stream tail, so the guard
+is exercised, not idle.
 
-The mask costs per decode step at 32 in flight: p50 141 microseconds and p99 479 microseconds once
-warm (13 milliseconds at p99 in the first, cold wave). Of the constrained rows, 4.7 percent have
-exactly one allowed token, two per reply; strict jump-forward is not implemented because it would
-only merge adjacent forced tokens and their adjacency was not measured. Grammar compile for this
-schema is 0.015 milliseconds. Logits and KL are unchanged on the unconstrained path: prefill and
-decode logits match the `orch` baseline byte for byte on all three reference prompts, and
-`lernex spec-check` is bit-identical on every row (40 of 40).
+Free and constrained e2e rates are not comparable as they stand: a free reply runs longer (54 to 56
+tokens) than a constrained one (about 42). `tools/rivals/structured_fixed.py` is the equal-length
+control: the same excerpts as free requests, each generating exactly 42 tokens. On this build the
+json_schema waves run at 89.6 and 91.1 percent of that control (1,400 against 1,563 tok/s, and 1,422
+against 1,561). **The 95 percent bar is not met on this e2e definition.**
+
+The gap comes from steps, not the mask. Each wave was run alone with the engine's step counter read
+around it: the json_schema waves took 115 steps for 2,681 tokens (23.3 tokens per step, 16.8 ms per
+step), and the control took 89 steps for 2,688 tokens (30.2 per step, 19.4 ms per step). A json_schema
+wave's replies vary in length, so the batch drains at the tail, where the control has none. The mask
+build costs 0.15 milliseconds at p50 per step (0.43 at p99), about 1 percent of a step, measured
+before its overlap with the forward pass; the accept side is not timed separately.
+
+Before the rebase, the same control gave 95.9 percent (1,384 against 1,443 tok/s, second round, on
+the default 31 slots). On the rebased build the free control rose to about 1,560 tok/s while the
+constrained wave stayed near 1,400. The cause of the free rise was not isolated.
+
+Each wave's first free request after server start ran at about half speed (725 tok/s against 1,501
+warm), so the first wave is a warm-up wave. Of the constrained rows, 4.7 percent have exactly one
+allowed token, two per reply. Strict jump-forward is not implemented: those steps are a small share,
+and a jump would only merge adjacent forced tokens.
+
+Logits and KL on the unconstrained path were checked before the rebase: prefill and decode logits
+match the `orch` baseline byte for byte on all three reference prompts. `lernex spec-check` is
+bit-identical on the rebased build on every row (40 of 40).
 
 ### 1c. Plain batched decode (independent 512-token prompts, 256 generated)
 
