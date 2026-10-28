@@ -17,6 +17,9 @@ cudaStream_t as_stream(void* s) { return static_cast<cudaStream_t>(s); }
 
 extern "C" {
 
+// The persisting L2 window's graph hook (l2.cu).
+void lx_l2_apply(void* graph);
+
 int lx_rt_backend(void) { return LX_BACKEND_CUDA; }
 
 int lx_rt_device_count(void) {
@@ -86,6 +89,7 @@ int lx_rt_capture_end(void* stream, void** graph) {
   *graph = nullptr;
   cudaGraph_t g = nullptr;
   if (cudaError_t e = cudaStreamEndCapture(as_stream(stream), &g); e != cudaSuccess) return status(e);
+  lx_l2_apply(g);  // the persisting L2 window, if one is set (l2.cu)
   cudaGraphExec_t exec = nullptr;
   const cudaError_t e = cudaGraphInstantiate(&exec, g, 0);
   cudaGraphDestroy(g);

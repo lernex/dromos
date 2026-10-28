@@ -369,6 +369,15 @@ int lx_rt_graph_destroy(void* graph) {
   return kOk;
 }
 
+// No persisting L2 on the CPU (kernels.h, lx_rt_l2_persist): the model runs unpinned. Declining is an answer the
+// model asks for, not a failure, so it does not set lx_rt_last_error.
+int lx_rt_l2_persist(const void* base, int64_t bytes, float hit_ratio) {
+  (void)base;
+  (void)bytes;
+  (void)hit_ratio;
+  return kNotSupported;
+}
+
 // Free and total memory of the machine, in bytes: what the offload planner sizes RAM tiers from. Free is
 // the memory the kernel can hand out without reclaiming (MemAvailable on Linux, free pages on macOS).
 int lx_rt_mem_info(int64_t* free_bytes, int64_t* total_bytes) {

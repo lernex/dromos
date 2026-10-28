@@ -548,6 +548,14 @@ LX_API int lx_rt_stream_wait(void* stream, void* event);
 // Free and total device memory, in bytes.
 LX_API int lx_rt_mem_info(int64_t* free_bytes, int64_t* total_bytes);
 
+// The persisting L2 window: the kernels of every graph captured after this call get an access policy window over
+// [base, base + bytes), and their accesses to it are kept in L2 (persisting) while the rest of their traffic streams
+// past. The device's persisting carve-out is sized to the window (clamped to what the device allows). hit_ratio is the
+// fraction of the window's accesses given the persisting property (1 keeps all of them). Calling with bytes 0 or base
+// null clears the window and the persisting lines. Eager launches are not windowed: a backend without the carve-out
+// (and every backend but CUDA) returns LX_ERR_NOT_SUPPORTED, and the model then runs unpinned.
+LX_API int lx_rt_l2_persist(const void* base, int64_t bytes, float hit_ratio);
+
 // One expert's weights where they are now (VRAM, or pinned host memory through its mapped address),
 // in the layout of one entry of the expert stacks ("Weight formats"): gate_up [2I, L], down [L, I];
 // scales f32 [2I] / [L] for INT8 and FP8 (null for BF16). A null gate_up means "no expert here":

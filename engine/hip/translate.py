@@ -45,8 +45,9 @@ BANNER = (
 VERBATIM = {"kernels.h", "tunable.h"}
 
 # Files whose HIP form is written by hand under include/: the CUDA file's place in src/ is taken by the
-# include/ file, unchanged. mma.cuh is the PTX tensor-core header; lx_mma.cuh has the same interface.
-HANDWRITTEN = {"mma.cuh": "lx_mma.cuh"}
+# include/ file, unchanged. mma.cuh is the PTX tensor-core header; lx_mma.cuh has the same interface. l2.cu is the
+# persisting L2 window, which HIP does not have (lx_l2.cu declines it).
+HANDWRITTEN = {"mma.cuh": "lx_mma.cuh", "l2.cu": "lx_l2.cu"}
 
 # Identifier renames, applied in order. The generic cuda -> hip and cublas -> hipblas rules come last,
 # so the specific ones above them win.

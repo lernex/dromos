@@ -19,6 +19,9 @@ hipStream_t as_stream(void* s) { return static_cast<hipStream_t>(s); }
 
 extern "C" {
 
+// The persisting L2 window's graph hook (l2.cu).
+void lx_l2_apply(void* graph);
+
 int lx_rt_backend(void) { return LX_BACKEND_HIP; }
 
 int lx_rt_device_count(void) {
@@ -88,6 +91,7 @@ int lx_rt_capture_end(void* stream, void** graph) {
   *graph = nullptr;
   hipGraph_t g = nullptr;
   if (hipError_t e = hipStreamEndCapture(as_stream(stream), &g); e != hipSuccess) return status(e);
+  lx_l2_apply(g);  // the persisting L2 window, if one is set (l2.cu)
   hipGraphExec_t exec = nullptr;
   const hipError_t e = hipGraphInstantiate(&exec, g, nullptr, nullptr, 0);
   (void)hipGraphDestroy(g);  // the instance is self-contained, so the template is no longer needed
