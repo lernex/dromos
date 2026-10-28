@@ -2,7 +2,7 @@
 """Builds one lernex wheel from a prebuilt tree (docs/RELEASE.md): the release tarball's contents, or the output of
 `cmake --install`. Nothing here compiles; the binaries are the caller's, byte for byte.
 
-    build_wheel.py --tree DIR --out DIR --version X.Y.Z --plat TAG [--cuda 13]
+    build_wheel.py --tree DIR --out DIR --version X.Y.Z --plat TAG [--cuda 12]
 
 --plat is the wheel's platform tag. The caller picks it, because the build decides it: a manylinux tag for the glibc
 the Linux binaries need (auditwheel show), macosx_14_0_arm64 for the Metal build. --cuda names the CUDA toolkit major
@@ -28,7 +28,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # The NVIDIA wheels per CUDA major: the distribution names and the exact versions the toolkit build used. The
 # requirement is that version up to the next major, so a user gets the same ABI and any later 13.x.
 CUDA_WHEELS = {
-    "13": [("nvidia-cuda-runtime", "13.4.92"), ("nvidia-cublas", "13.8.0.4")],
+    "12": [("nvidia-cuda-runtime-cu12", "12.8.90"), ("nvidia-cublas-cu12", "12.8.5.5")],
 }
 
 # Files a tree may carry that belong to the NVIDIA wheels, not to the wheel.

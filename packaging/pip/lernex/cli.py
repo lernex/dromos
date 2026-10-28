@@ -19,8 +19,8 @@ _ENGINE = os.path.join(_PACKAGE, "_bin", "bin", "lernex")
 
 # The NVIDIA distributions the CUDA backend was built against (its toolkit's cudart and cuBLASLt), and the
 # shared libraries of each that the backend loads.
-_NVIDIA_DISTRIBUTIONS = ("nvidia-cuda-runtime", "nvidia-cublas")
-_NVIDIA_SONAMES = ("libcudart.so", "libcublasLt.so")
+_NVIDIA_DISTRIBUTIONS = ("nvidia-cuda-runtime-cu12", "nvidia-cublas-cu12")
+_NVIDIA_SONAMES = ("libcudart.so.12", "libcublasLt.so.12")
 
 
 def _nvidia_library_dirs():

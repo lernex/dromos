@@ -29,7 +29,7 @@ concurrency:
 
 env:
   # The CUDA toolkit major of the release's CUDA tarball (its name carries it); the NVIDIA wheels follow it.
-  CUDA_MAJOR: "13"
+  CUDA_MAJOR: "12"
 
 jobs:
   wheels:
@@ -40,7 +40,7 @@ jobs:
       matrix:
         include:
           - runner: ubuntu-24.04
-            asset: lernex-linux-x86_64-cuda13.tar.gz
+            asset: lernex-linux-x86_64-cuda12.tar.gz
             plat: manylinux_2_28_x86_64
             cuda: true
           - runner: ubuntu-24.04-arm
