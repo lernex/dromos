@@ -215,12 +215,15 @@ Device::Device() {
       break;
     }
   }
-  MTLResidencySetDescriptor* desc = [MTLResidencySetDescriptor new];
-  desc.label = @"lernex";
-  desc.initialCapacity = 512;
-  NSError* err = nil;
-  residency_ = [device_ newResidencySetWithDescriptor:desc error:&err];
-  if (!residency_) std::fprintf(stderr, "lernex metal: no residency set (%s)\n", err.localizedDescription.UTF8String);
+  // Residency sets are macOS 15 and later (the package targets 14): before that, Metal manages residency by itself.
+  if (@available(macOS 15.0, *)) {
+    MTLResidencySetDescriptor* desc = [MTLResidencySetDescriptor new];
+    desc.label = @"lernex";
+    desc.initialCapacity = 512;
+    NSError* err = nil;
+    residency_ = [device_ newResidencySetWithDescriptor:desc error:&err];
+    if (!residency_) std::fprintf(stderr, "lernex metal: no residency set (%s)\n", err.localizedDescription.UTF8String);
+  }
 }
 
 id<MTLLibrary> Device::build(const char* source, MTLLanguageVersion version, const char* what) {
@@ -228,8 +231,12 @@ id<MTLLibrary> Device::build(const char* source, MTLLanguageVersion version, con
     MTLCompileOptions* opt = [MTLCompileOptions new];
     // IEEE semantics and precise transcendentals: the tests hold f32 kernels to 1e-5. Kernels opt into
     // the fast functions (fast::exp and friends) where the CUDA kernels use the intrinsics.
-    opt.mathMode = MTLMathModeSafe;
-    opt.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsPrecise;
+    if (@available(macOS 15.0, *)) {
+      opt.mathMode = MTLMathModeSafe;
+      opt.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsPrecise;
+    } else {
+      opt.fastMathEnabled = NO;  // macOS 14: the same IEEE contract, through the older switch
+    }
     opt.languageVersion = version;
     NSError* err = nil;
     id<MTLLibrary> lib = [device_ newLibraryWithSource:@(source) options:opt error:&err];
@@ -239,7 +246,10 @@ id<MTLLibrary> Device::build(const char* source, MTLLanguageVersion version, con
 }
 
 void Device::compile() {
-  library_ = build(lx_metal_source(), MTLLanguageVersion3_2, "the kernel library");
+  // Metal 3.2 is macOS 15 and later; the kernels build as 3.1 on macOS 14.
+  MTLLanguageVersion version = MTLLanguageVersion3_1;
+  if (@available(macOS 15.0, *)) version = MTLLanguageVersion3_2;
+  library_ = build(lx_metal_source(), version, "the kernel library");
   if (!library_) std::abort();
 }
 
