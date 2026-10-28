@@ -44,6 +44,16 @@ BANNER = (
 # Files copied verbatim: the ABI and the tuning interface.
 VERBATIM = {"kernels.h", "tunable.h"}
 
+# The HIP decode group is hand-ported: src/ holds the port, which no patch records, and it is a version behind the CUDA
+# decode kernel (it has no BF16X). Regenerating it from engine/cuda would replace the port with unported rules output, so
+# the generator leaves these files as they are. The CUDA decode family copies (one kernel per weight-format family), their
+# shared body and the family header are CUDA-only for now: their HIP port is its own change, and it writes its own files.
+HAND_PORTED = {"decode_kernel.cu", "decode_ops.h", "decode_program.cu"}
+CUDA_ONLY = {
+    "decode_family.h", "decode_kernel_body.cuh", "decode_kernel_bf16.cu", "decode_kernel_int8.cu",
+    "decode_kernel_fp8.cu", "decode_kernel_nvfp4.cu",
+}
+
 # Files whose HIP form is written by hand under include/: the CUDA file's place in src/ is taken by the
 # include/ file, unchanged. mma.cuh is the PTX tensor-core header; lx_mma.cuh has the same interface. l2.cu is the
 # persisting L2 window, which HIP does not have (lx_l2.cu declines it).
@@ -140,8 +150,13 @@ def base_text(name):
 
 
 def sources():
-    names = sorted(n for n in os.listdir(CUDA) if n.endswith((".cu", ".cuh", ".h")))
+    names = sorted(n for n in os.listdir(CUDA) if n.endswith((".cu", ".cuh", ".h")) and n not in CUDA_ONLY)
     return names
+
+
+def generated():
+    """The CUDA sources the generator writes: sources() less the hand-ported decode group."""
+    return [n for n in sources() if n not in HAND_PORTED]
 
 
 def patch_path(name):
@@ -171,13 +186,13 @@ def generate():
     os.makedirs(SRC, exist_ok=True)
     os.makedirs(PATCHES, exist_ok=True)
     with tempfile.TemporaryDirectory() as work:
-        for name in sources():
+        for name in generated():
             generate_one(name, work)
-    # Drop generated files whose CUDA source is gone.
+    # Drop generated files whose CUDA source is gone (the hand-ported group is kept as it is).
     for name in os.listdir(SRC):
-        if name not in sources():
+        if name not in sources() and name not in HAND_PORTED:
             os.remove(os.path.join(SRC, name))
-    print(f"translate: wrote {len(sources())} files to {SRC}")
+    print(f"translate: wrote {len(generated())} files to {SRC}")
 
 
 def save(names):
@@ -206,7 +221,7 @@ def save(names):
 def check():
     with tempfile.TemporaryDirectory() as work:
         bad = []
-        for name in sources():
+        for name in generated():
             # Regenerate into a scratch directory and compare with what is committed.
             base = os.path.join(work, name)
             with open(base, "w", encoding="utf-8") as f:
