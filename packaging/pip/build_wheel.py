@@ -16,6 +16,7 @@ left out, and the wheel depends on the NVIDIA wheels that carry them instead.
 import argparse
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -36,6 +37,67 @@ NVIDIA_PREFIXES = ("libcudart", "libcublas", "libnvrtc", "libnvJitLink", "libcur
 
 def fail(message):
     sys.exit("build_wheel: " + message)
+
+
+def engine_binaries(tree):
+    """The files this package ships that the platform floor applies to: the engine and its backends."""
+    found = []
+    for root, _, names in os.walk(tree):
+        for name in names:
+            path = os.path.join(root, name)
+            if os.path.islink(path):
+                continue
+            if name == "lernex" or name.startswith("liblernex_"):
+                found.append(path)
+    return sorted(found)
+
+
+def macos_targets(otool_output):
+    """The deployment targets (major, minor) an otool -l listing declares: LC_BUILD_VERSION's minos and the older
+    LC_VERSION_MIN_MACOSX's version. A dylib's own versions are not targets and are not read."""
+    targets = []
+    mode = None
+    for line in otool_output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("cmd "):
+            command = stripped[4:]
+            mode = command if command in ("LC_BUILD_VERSION", "LC_VERSION_MIN_MACOSX") else None
+        elif mode == "LC_BUILD_VERSION" and stripped.startswith("minos "):
+            targets.append(stripped.split()[1])
+        elif mode == "LC_VERSION_MIN_MACOSX" and stripped.startswith("version "):
+            targets.append(stripped.split()[1])
+    parsed = []
+    for text in targets:
+        match = re.match(r"(\d+)\.(\d+)", text)
+        if match:
+            parsed.append((int(match.group(1)), int(match.group(2))))
+    return parsed
+
+
+def floor_check(tree, plat):
+    """The binaries must need no newer glibc than the manylinux tag claims, or no newer macOS than the macosx tag."""
+    manylinux = re.match(r"manylinux_(\d+)_(\d+)_", plat)
+    macos = re.match(r"macosx_(\d+)_(\d+)_", plat)
+    if manylinux:
+        claimed = (int(manylinux.group(1)), int(manylinux.group(2)))
+        worst = (0, 0)
+        for path in engine_binaries(tree):
+            out = subprocess.run(["objdump", "-T", path], capture_output=True, text=True, check=True).stdout
+            for major, minor in re.findall(r"GLIBC_(\d+)\.(\d+)", out):
+                worst = max(worst, (int(major), int(minor)))
+        if worst > claimed:
+            fail("the binaries need glibc %d.%d, newer than the %s tag claims" % (worst[0], worst[1], plat))
+        print("build_wheel: glibc floor %d.%d (tag %s)" % (worst[0], worst[1], plat))
+    elif macos:
+        claimed = (int(macos.group(1)), int(macos.group(2)))
+        worst = (0, 0)
+        for path in engine_binaries(tree):
+            out = subprocess.run(["otool", "-l", path], capture_output=True, text=True, check=True).stdout
+            for target in macos_targets(out):
+                worst = max(worst, target)
+        if worst > claimed:
+            fail("the binaries target macOS %d.%d, newer than the %s tag claims" % (worst[0], worst[1], plat))
+        print("build_wheel: macOS target %d.%d (tag %s)" % (worst[0], worst[1], plat))
 
 
 def requirements(cuda):
@@ -88,6 +150,7 @@ def build(args):
     tree = os.path.abspath(args.tree)
     out = os.path.abspath(args.out)
     check_tree(tree, args.cuda)
+    floor_check(tree, args.plat)
     os.makedirs(out, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="lernex-wheel-") as work:
         stage = os.path.join(work, "pip")
