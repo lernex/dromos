@@ -330,7 +330,8 @@ Linear make_linear(Impl& m, const ModelWeights& weights, const std::string& name
   l.K = static_cast<int>(K);
   if (m.formats.bf16x_decode && planned == LX_W_BF16 && w->type == LX_W_BF16 && bf16x_smaller(K))
     l.x16 = encode_bf16x(m, w->data, N, K);
-  if (w->type == LX_W_BF16X) m.unpack_bytes = std::max(m.unpack_bytes, static_cast<size_t>(N) * K * 2);
+  if (w->type == LX_W_BF16X)
+    m.unpack_bytes = std::max(m.unpack_bytes, static_cast<size_t>(N) * static_cast<size_t>(K) * 2);
   return l;
 }
 
