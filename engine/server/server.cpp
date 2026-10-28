@@ -346,12 +346,13 @@ class Wire {
     std::string out;
     for (const TokenDelta& d : batch) {
       if (!role_sent_) {
-        role_sent_ = true;
-        out += sse(chat_ ? chunk_with(json::object({{"role", "assistant"}, {"content", ""}}), nullptr, nullptr)
-                             : chunk_text("", nullptr, nullptr));
+        role_sent_ = true;  // text completions have no role: their first chunk is the first token
+        if (chat_) out += sse(chunk_with(json::object({{"role", "assistant"}, {"content", ""}}), nullptr, nullptr));
       }
       if (!d.reasoning.empty()) out += sse(chunk_with(json{{"reasoning_content", d.reasoning}}, nullptr, nullptr));
-      if (!d.content.empty() || (logprobs_ && d.token >= 0)) {
+      // A text completion carries one chunk per generated token, even when the token's text is still incomplete
+      // (empty), so a client can count and time tokens (vLLM does the same); chat keeps its own rule.
+      if (!d.content.empty() || (d.token >= 0 && (logprobs_ || !chat_))) {
         out += sse(chat_ ? chunk_with(json{{"content", d.content}}, nullptr, token_logprobs(d))
                              : chunk_text(d.content, nullptr, token_logprobs(d)));
       }
@@ -376,7 +377,7 @@ class Wire {
       out += "data: [DONE]\n\n";
       return out;
     }
-    if (!role_sent_) out += sse(chat_ ? chunk_with(json::object({{"role", "assistant"}, {"content", ""}}), nullptr, nullptr) : chunk_text("", nullptr, nullptr));
+    if (!role_sent_ && chat_) out += sse(chunk_with(json::object({{"role", "assistant"}, {"content", ""}}), nullptr, nullptr));
     const char* reason = finish_name(r.reason, tools_);
     out += sse(chat_ ? chunk_with(json::object(), reason, nullptr, true) : chunk_text("", reason, nullptr));
     if (include_usage_) {
