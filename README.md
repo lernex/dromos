@@ -13,7 +13,8 @@ scripts/remote.sh <slot> x 'build/lernex tune MODEL_DIR --out PATH'   # time the
 ```
 
 Commands: `lernex run MODEL` (chat), `lernex serve MODEL` (OpenAI API), `lernex pull MODEL`,
-`lernex list`, `lernex bench MODEL --streams 1,8,32,64`. MODEL is `praxis`, `logos`, an alias with
+`lernex list`, `lernex bench MODEL --streams 1,8,32,64`, `lernex update` (the latest release, for installs made from a
+release tarball), `lernex version`. MODEL is `praxis`, `logos`, an alias with
 a format (`praxis:fp8`), a folder, or `owner/name` on the hub.
 
 Weights run in the format the file stores: no hidden quantization, so every speed is the speed of a named

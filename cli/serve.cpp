@@ -12,6 +12,7 @@
 #include <string>
 
 #include "cli/common.h"
+#include "core/update.h"
 #include "core/hub.h"
 #include "runtime/engine.h"
 #include "server/server.h"
@@ -59,6 +60,7 @@ int cmd_serve(int argc, char** argv) {
     return 2;
   }
 
+  update::start_daily_check();
   const cli::Model model = cli::find_model(name, true);
   runtime::EngineOptions engine_options;
   engine_options.prefix_cache = prefix_cache;

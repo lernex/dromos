@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "cli/common.h"
+#include "core/update.h"
 #include "runtime/engine.h"
 #include "text/tokenizer.h"
 
@@ -323,6 +324,7 @@ int cmd_run(int argc, char** argv) {
     return 2;
   }
 
+  update::start_daily_check();
   const cli::Model model = cli::find_model(name, true);
   runtime::EngineOptions engine_options;
   engine_options.prefix_cache = prefix_cache;

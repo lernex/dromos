@@ -4,9 +4,10 @@
 
 #include <cctype>
 #include <cstdlib>
-#include <memory>
 #include <mutex>
 #include <stdexcept>
+
+#include "lx_version.h"
 
 namespace lx::http {
 namespace {
@@ -22,6 +23,8 @@ constexpr int kOptUrl = 10002, kOptWriteData = 10001, kOptHeaderData = 10029, kO
               kOptFollowLocation = 52, kOptConnectTimeout = 78, kOptLowSpeedLimit = 19, kOptLowSpeedTime = 20,
               kOptNoSignal = 99;
 constexpr int kInfoResponseCode = 0x200002;
+constexpr int kInfoEffectiveUrl = 0x100001;  // CURLINFO_EFFECTIVE_URL: the string, after redirects
+constexpr int kOptTimeout = 13;              // CURLOPT_TIMEOUT: seconds for the whole transfer
 
 struct Curl {
   void* handle = nullptr;
@@ -37,8 +40,9 @@ struct Curl {
 };
 
 Curl* load() {
+  // Never freed: a detached thread (the daily update check) may still be inside libcurl when the process exits.
   static std::once_flag once;
-  static std::unique_ptr<Curl> loaded;
+  static Curl* loaded = nullptr;
   std::call_once(once, [] {
     void* h = nullptr;
     for (const char* name : {"libcurl.so.4", "libcurl.4.dylib", "libcurl.dylib", "libcurl.so"}) {
@@ -46,7 +50,7 @@ Curl* load() {
       if (h) break;
     }
     if (!h) return;
-    auto c = std::make_unique<Curl>();
+    auto* c = new Curl();
     c->handle = h;
     auto sym = [h](const char* name) { return dlsym(h, name); };
     c->easy_init = reinterpret_cast<decltype(c->easy_init)>(sym("curl_easy_init"));
@@ -61,10 +65,13 @@ Curl* load() {
     if (!c->easy_init || !c->setopt || !c->perform || !c->cleanup || !c->getinfo || !c->strerror ||
         !c->slist_append || !c->slist_free_all || !c->global_init)
       return;
-    if (c->global_init(kGlobalDefault) != 0) return;
-    loaded = std::move(c);
+    if (c->global_init(kGlobalDefault) != 0) {
+      delete c;
+      return;
+    }
+    loaded = c;
   });
-  return loaded.get();
+  return loaded;
 }
 
 std::string lower(std::string s) {
@@ -115,7 +122,8 @@ size_t on_header(char* data, size_t size, size_t count, void* user) {
 
 bool available() { return load() != nullptr; }
 
-Response get(const std::string& url, const std::vector<std::string>& headers, const BodySink& body) {
+Response get(const std::string& url, const std::vector<std::string>& headers, const BodySink& body,
+             long timeout_seconds) {
   Curl* c = load();
   if (!c) throw std::runtime_error("libcurl is not available on this system");
   CURL* easy = c->easy_init();
@@ -140,7 +148,8 @@ Response get(const std::string& url, const std::vector<std::string>& headers, co
   // a connection that moves less than a kilobyte a second for a minute is dead
   c->setopt(easy, kOptLowSpeedLimit, 1024L);
   c->setopt(easy, kOptLowSpeedTime, 60L);
-  c->setopt(easy, kOptUserAgent, "lernex/0.1");
+  c->setopt(easy, kOptUserAgent, "lernex/" LX_VERSION_STRING);
+  if (timeout_seconds > 0) c->setopt(easy, kOptTimeout, timeout_seconds);
   if (guard.list) c->setopt(easy, kOptHttpHeader, guard.list);
   c->setopt(easy, kOptWriteFunction, reinterpret_cast<CurlWrite>(&on_body));
   c->setopt(easy, kOptWriteData, &ctx);
@@ -151,6 +160,8 @@ Response get(const std::string& url, const std::vector<std::string>& headers, co
   long code = 0;
   c->getinfo(easy, kInfoResponseCode, &code);
   response.status = code ? code : response.status;
+  const char* effective = nullptr;
+  if (c->getinfo(easy, kInfoEffectiveUrl, &effective) == 0 && effective) response.url = effective;
   return response;
 }
 

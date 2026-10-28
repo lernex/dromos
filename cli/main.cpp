@@ -22,6 +22,7 @@ int cmd_features(int argc, char** argv);
 int cmd_block_check(int argc, char** argv);
 int cmd_weights(int argc, char** argv);
 int cmd_prefill(int argc, char** argv);
+int cmd_update(int argc, char** argv);
 
 namespace {
 
@@ -33,6 +34,8 @@ void usage() {
                "                                            the OpenAI API on this machine\n"
                "  pull MODEL                                download a model into the cache\n"
                "  list                                      the models and which are installed\n"
+               "  update [--check|--rollback]               the latest release of this install, verified and switched to;\n"
+               "                                            --check only reports, --rollback returns to the last version\n"
                "  version                                   the version, the release flavor and the commit\n"
                "  bench MODEL [--streams 1,8,32,64] [--prompt-tokens N] [--gen-tokens N]\n"
                "                                            throughput of the engine on this GPU\n"
@@ -86,6 +89,7 @@ int main(int argc, char** argv) {
     if (!std::strcmp(cmd, "block-check")) return cmd_block_check(argc - 1, argv + 1);
     if (!std::strcmp(cmd, "weights")) return cmd_weights(argc - 1, argv + 1);
     if (!std::strcmp(cmd, "prefill")) return cmd_prefill(argc - 1, argv + 1);
+    if (!std::strcmp(cmd, "update")) return cmd_update(argc - 1, argv + 1);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "lernex: %s\n", e.what());
     return 1;

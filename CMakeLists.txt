@@ -216,7 +216,8 @@ file(GLOB LX_CORE_SOURCES CONFIGURE_DEPENDS engine/core/*.cpp engine/model/*.cpp
 if(LX_CORE_SOURCES)
   add_library(lernex_core STATIC ${LX_CORE_SOURCES})
   target_include_directories(lernex_core PUBLIC engine third_party third_party/httplib)
-  target_link_libraries(lernex_core PUBLIC lernex_dispatch)
+  find_package(Threads REQUIRED)
+  target_link_libraries(lernex_core PUBLIC lernex_dispatch Threads::Threads)
   # The architectures this build has code for, for the device report. A header, not a definition: nvcc
   # splits a -D value on its commas.
   file(WRITE "${CMAKE_BINARY_DIR}/generated/lx_build_info.h"
