@@ -257,7 +257,7 @@ int cmd_bench(int argc, char** argv) {
   if (!engine.placement().empty()) std::printf("%s", engine.placement().c_str());
 
   // The traffic the engine counts, against the config's count for the same format: they must agree (traffic.h).
-  const lx::DecodeTraffic from_config = lx::config_decode_traffic(engine.config(), plan.weights, plan.bf16x_decode, context);
+  const lx::DecodeTraffic from_config = lx::config_decode_traffic(engine.config(), plan.weights, plan.bf16x_decode, context, &plan.bf16x_dropped);
   bool agree = true;
   for (int n : {1, 8, 32}) {
     const double a = traffic.step_bytes(n), b = from_config.step_bytes(n);

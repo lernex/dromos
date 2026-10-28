@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <exception>
 #include <stdexcept>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -188,9 +189,10 @@ std::string tps_text(double tps) {
 
 // The roofline of a model folder in `target`: the bytes one decode step moves, against the card's bandwidth and tensor
 // throughput, as ceilings (bandwidth / bytes), with the binding limit named. With a plan's formats (`options`), every
-// loadable format gets a row too.
+// loadable format gets a row too. `dropped`: the BF16X copy units the plan left out, so the count matches the model's.
 void print_roofline(const lx::MetisConfig& config, lx_wtype target, bool bf16x_decode,
-                    const lx::runtime::DeviceInfo& device, const std::vector<lx::runtime::FormatOption>* options) {
+                    const lx::runtime::DeviceInfo& device, const std::vector<lx::runtime::FormatOption>* options,
+                    const std::set<std::string>* dropped = nullptr) {
   using namespace lx::cli;
   using lx::DecodeTraffic;
   using lx::config_decode_traffic;
@@ -210,8 +212,8 @@ void print_roofline(const lx::MetisConfig& config, lx_wtype target, bool bf16x_d
   else
     std::printf("compute    no tensor peak in the table for this device: the compute ceiling is not shown\n");
 
-  const DecodeTraffic at = config_decode_traffic(config, target, bf16x_decode, contexts[0]);
-  const DecodeTraffic at_long = config_decode_traffic(config, target, bf16x_decode, contexts[1]);
+  const DecodeTraffic at = config_decode_traffic(config, target, bf16x_decode, contexts[0], dropped);
+  const DecodeTraffic at_long = config_decode_traffic(config, target, bf16x_decode, contexts[1], dropped);
   const std::string title = "components of " + lx::runtime::format_name(target) + (bf16x_decode ? " (BF16X decode copies)" : "") +
                             " at context " + std::to_string(contexts[0]) + ":";
   print_components(at, title.c_str());
@@ -331,7 +333,7 @@ int cmd_doctor(int argc, char** argv) {
         if (const char* v = std::getenv("LX_RAM_BUDGET_GB")) req.ram_budget = static_cast<size_t>(std::atof(v) * 1073741824.0);
         const Plan plan = make_plan(device, config, checkpoint, req);
         print_plan(plan);
-        print_roofline(config, plan.weights, plan.bf16x_decode, device, &plan.options);
+        print_roofline(config, plan.weights, plan.bf16x_decode, device, &plan.options, &plan.bf16x_dropped);
       }
     }
   } catch (const std::exception& e) {

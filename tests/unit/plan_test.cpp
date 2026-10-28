@@ -15,6 +15,7 @@
 #include "core/checkpoint.h"
 #include "core/config.h"
 #include "core/safetensors.h"
+#include "model/traffic.h"
 #include "doctest.h"
 #include "runtime/plan.h"
 
@@ -392,6 +393,13 @@ TEST_CASE("the copies never take a sequence: Logos FP8 on 16 GB holds the 32 ask
   CHECK(x.bf16x_bytes <= all);
   if (x.bf16x_dropped.empty()) CHECK(x.bf16x_bytes == all);
   else CHECK(has_note(x, "Copies left out"));
+  // The traffic count reads the copies the plan left out in BF16, as the loaded model does (bench checks the two
+  // agree at 32 streams): the same dropped set goes to the config count and to the planner's bytes.
+  const double with_plan = config_decode_traffic(logos(), LX_W_FP8, x.bf16x_decode, 784, &x.bf16x_dropped).bytes_per_token();
+  const double all_copies = config_decode_traffic(logos(), LX_W_FP8, x.bf16x_decode, 784).bytes_per_token();
+  CHECK(with_plan == decode_bytes_per_token(logos(), LX_W_FP8, x.bf16x_decode, 784, &x.bf16x_dropped));
+  if (x.bf16x_dropped.empty()) CHECK(with_plan == all_copies);
+  else CHECK(with_plan > all_copies);
   // A single stream keeps every copy: they fit beside it.
   PlanRequest one;
   one.sequences = 1;
