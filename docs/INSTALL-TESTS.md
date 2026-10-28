@@ -38,6 +38,7 @@ round; the Open items say what it needs.
 | 12 | amd64 Ubuntu 22.04 and 24.04 under emulation: install, `doctor`, upgrade | Docker Desktop, linux/amd64 | cpu, `build.sh` (x86_64) | not run in this round |
 | 13 | Image build `linux/amd64` from `docker/Dockerfile` on main (cuda12 default), `--version` in the image, saved to the server | this Mac, Docker Desktop, one heavy.sh session | cuda12, `build.sh` (out12) | pass (13a) |
 | 14 | The image on the GPU server: serve praxis and one curl on the GPU | GPU server, udocker 1.3.17 (P1, `setup --nvidia`) | the image from row 13, flattened | pass with workarounds (14a) |
+| 14b | The image on the GPU server through Docker's own GPU path: `docker run --gpus all`, the image's ENTRYPOINT and CMD, one curl | GPU server, Docker 29.1.3 with the NVIDIA Container Toolkit | the image from row 13, `docker load` as saved | pass (14b) |
 
 ### 1a. ubuntu:22.04, wget only (udocker on the GPU server)
 
@@ -123,7 +124,8 @@ docker build --platform linux/amd64 -t lernex/engine:0.1.0-test \
   quit started). The session log is `~/installer-gpu/logs/session.log`.
 
 What this row does not show: `docker run` of the container with the GPU and its own `ENTRYPOINT` (serve on port 8080).
-There is no Docker on the GPU server, so the same image was run under udocker in row 14 instead.
+There was no Docker on the GPU server at the time, so the same image was run under udocker in row 14; 14b later ran it
+through Docker itself.
 
 ### 14a. The image on the GPU server (udocker 1.3.17)
 
@@ -197,6 +199,29 @@ Before this change install.sh pointed `current` at a relative path and never wro
 `lernex update --rollback` (which reads `~/.lernex/previous` and checks the target as a directory from wherever it
 runs) reported no previous version after an install.sh upgrade.
 
+### 14b. The image on the GPU server through Docker (2026-10-28)
+
+The owner installed docker.io 29.1.3 and the NVIDIA Container Toolkit on the GPU server (runtimes runc and nvidia).
+This is the path people will use: the saved image from row 13 loads as it is (`docker load`, no flattening), and runs
+with its own ENTRYPOINT (`lernex serve --host 0.0.0.0 --port 8080`) and CMD (`praxis`), the GPU through `--gpus all`
+and the models folder mounted, with no `LX_KERNELS` or other workaround:
+
+    docker run -d --gpus all -p 127.0.0.1:8094:8080 -v ~/.cache/lernex/models:/root/.cache/lernex/models lernex/engine:0.1.0-test
+
+```
+--version: lernex 0.1.0 (linux-x86_64-cuda12, 0609dd3)
+/health: up after 10 polls at 2 s
+GPU compute app: lernex, 14,510 MiB
+POST /v1/chat/completions ("What is 17 times 3?", thinking off): rc 0, "51"
+doctor (docker exec): RTX 5070 Ti sm_120; CUDA driver 13.2, runtime 12.8; backend CUDA, liblernex_kernels.so (/opt/lernex/lib); missing none
+serve: up to 31 sequences of 8192 tokens; about 290 tok/s at one stream planned
+stopped (docker stop); the GPU is free afterwards (0%, 10 MiB)
+```
+
+The run held the GPU lock. Script and logs: `~/installer-gpu/docker-run/` (`serve.sh`, `version.txt`, `log.txt`,
+`chat.json`, `doctor.txt`, `serve.log`). The image is the row 13 build at 0609dd3, so the release candidate's image
+gets the same run once it is built from the RC tarball.
+
 ## Findings
 
 - The CPU and Metal backends do not export the 15 `lx_program_*` symbols that `kernels.h` declares; `doctor` lists
@@ -229,14 +254,15 @@ runs) reported no previous version after an install.sh upgrade.
   `release.yml`), not on the tag push. A tag push starts before the draft is published, so the image would wait on
   assets that do not exist yet. A manual run (`workflow_dispatch` with a version) builds the image and pushes nothing.
   `packages: write` is set on the job for the GHCR push. `:latest` is not set for a prerelease. The flavor is cuda12.
-- Not verified: `docker run` of the image itself (with the GPU, or its own entrypoint). Row 13 covers the build and the
-  `--version` check; row 14 covers the same tree under udocker.
+- Verified: `docker run --gpus all` of the image with its own entrypoint and default command, serve and one chat
+  request on the GPU (row 14b). Row 13 covers the build and the `--version` check.
 
 ## Open items
 
 - Rows 4, 11 and 12 are not run in this round. Row 4 (darwin native install) is a light test on this Mac once a darwin
   build is ready. Rows 11 and 12 need Docker Desktop on the Mac for a second session; they were left out so the image
   session stayed alone on the machine.
-- Row 14 with Docker's own GPU path needs Docker with the NVIDIA Container Toolkit on a Linux GPU host (owner). udocker
-  R1 needs `kernel.apparmor_restrict_unprivileged_userns` relaxed on the server (owner).
+- Row 14 with Docker's own GPU path passed as 14b. udocker R1 is not pursued: the server keeps
+  `kernel.apparmor_restrict_unprivileged_userns = 1` on purpose, and Docker with the NVIDIA runtime replaces udocker there.
+- Rows 13 and 14b ran the image built at 0609dd3. The release candidate's image needs both runs again.
 - The release tarball behind rows 10 and 13 needs a rebuild from main for the `doctor` alias.
