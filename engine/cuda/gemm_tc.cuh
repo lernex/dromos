@@ -121,7 +121,10 @@ struct Config {
   static constexpr int kMT = kWTM / 16, kNT = kWTN / 8;
   static constexpr int kARow = RB;                         // A bytes per row per k-tile (64 or 128)
   static constexpr int kKTile = kARow * 8 / T::kABits;     // K per k-tile
-  static constexpr int kBRow = kKTile * T::kBBits / 8;     // B bytes per row per k-tile
+  // B bytes per row per k-tile. Keep it at 128 or more: a weight row read in 64-byte segments streams at 604 GB/s on the
+  // RTX 5070 Ti, against 853 GB/s for 128-byte segments and for contiguous tiles (measured 2026-10-28, seg_bw in the
+  // logos scratch). Every 64-byte B row costs about 30% of the card's bandwidth, so widen the k-tile (RB = 256) first.
+  static constexpr int kBRow = kKTile * T::kBBits / 8;
   static constexpr int kSfRow = kKTile / 16;               // scale bytes per row per k-tile (FP4 / NVFP4)
   // Scale tiles. An FP4 scale load reads one 4-byte word from each of 32 rows: with 8-byte rows the tile
   // is stored word-major ([word][row]) so those rows fall in 32 banks; otherwise rows are padded by one

@@ -257,6 +257,8 @@ LX_MOEG_FAMILY(kW4A8, 120)
 #undef LX_MOEG_FAMILY
 
 // A variant: BMxBN (BM one of the table heights), warps, stages, A bytes per row per k-tile; both stages.
+// B rows must be 128 bytes or more per k-tile (gemm_tc.cuh, Config::kBRow): a 64-byte row segment streams at 604 GB/s
+// against 853 GB/s for 128 bytes. The W8F8 family's variants are RB = 256 for that reason. Check any new variant's kBRow.
 #define LX_MVP(K, A, BM, BN, WM, WN, ST, RB, MINP, MAXP)                                             \
   Variant {                                                                                          \
     #BM "x" #BN "_w" #WM "x" #WN "_s" #ST "_k" #RB, BM,                                              \
