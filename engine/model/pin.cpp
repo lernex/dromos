@@ -19,6 +19,13 @@ int64_t aligned(int64_t n) { return (n + kAlign - 1) / kAlign * kAlign; }
 
 bool logging() { return std::getenv("LX_L2_PIN_LOG") != nullptr; }
 
+// LX_L2_PIN_MIN_READS=n: only regions a token reads at least n times are held (the depth memory's projections read
+// 6 to 26 times a token; the per-pass projections 2). Experiments use it to pin the memory alone.
+double min_reads_from_env() {
+  const char* v = std::getenv("LX_L2_PIN_MIN_READS");
+  return v && *v ? std::atof(v) : 0.0;
+}
+
 }  // namespace
 
 Hold hold_from_env() {
@@ -86,9 +93,11 @@ bool Arena::open(int64_t budget) {
                    [this](size_t a, size_t b) { return items_[a].reads > items_[b].reads; });
   std::vector<size_t> chosen;
   int64_t room = budget;
+  const double min_reads = min_reads_from_env();
   for (size_t i : order) {
     if (room <= 0) break;
     const Item& it = items_[i];
+    if (it.reads < min_reads) continue;
     if (it.state && it.bytes > room) continue;  // a state is never split: it is whole or in DRAM
     chosen.push_back(i);
     room -= it.bytes;  // a weight may straddle the budget: its head is then the window's, the rest streams
@@ -139,6 +148,9 @@ bool Arena::open(int64_t budget) {
     std::fprintf(stderr, "L2 window: %lld bytes (budget %lld), arena %lld bytes, %zu weight regions, %zu states\n",
                  static_cast<long long>(window), static_cast<long long>(budget), static_cast<long long>(bytes),
                  weights, states);
+    for (size_t i : chosen)
+      std::fprintf(stderr, "  %s %10lld bytes at %10lld, %g reads a token\n", items_[i].state ? "state " : "weight",
+                   static_cast<long long>(items_[i].bytes), static_cast<long long>(items_[i].offset), items_[i].reads);
   }
   return true;
 }
