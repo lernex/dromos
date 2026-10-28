@@ -4,6 +4,11 @@ Written 2026-10-24 by the speculative decoding workstream. Numbers marked *measu
 runs in this clone on the RTX 5070 Ti; numbers marked *computed* are arithmetic on tensor shapes
 and measured rates; numbers from papers are the papers' own and say so.
 
+**Status, 2026-10-28: not for 1.6.** The owner decided Metis-1.6 ships without a trained drafter: its
+speculation is prompt lookup only, and the 1.6 work stays on kernels. Metis-1.7 has drafters built in,
+trained by the owner. The engine path below (the feature taps, `BlockDrafter`, chain verification)
+stays as the place they plug in; the recommendation that follows is kept as the record of the study.
+
 ## Recommendation
 
 Train a **block drafter** for Praxis now: DFlash's one-pass backbone (the target's hidden states
