@@ -166,12 +166,16 @@ Held held_bytes(lx_wtype target, bool bf16x_decode, const std::string& key, Kind
 
 // A BF16X decode copy, by the unit it belongs to (metis.h, bf16x_copy_made): a projection, a layer's routed experts
 // (both stacks, which the decode kernel reads together), or the LM head. `bytes` is what the copies hold, `saved` the
-// bytes decode stops reading per token: a projection once per pass, the routed experts' share a token's top_k choices
-// read in each pass, the head once.
+// bytes decode stops reading per step: a projection once per pass, the head once, and a routed expert's stacks the
+// share of them the planned sequences touch each pass, 1 - (1 - top_k/E)^N (the expected experts touched, over E).
+// Every-step units (everything but the routed experts) are read whole each step, so they come first; the routed experts
+// follow. Within a tier, the saving per byte held decides (a projection is read once per pass, the head once a step, so
+// a projection saves twice what the head does per byte: the head goes after them when the room is short).
 struct CopyUnit {
   std::string unit;
   size_t bytes = 0;
   double saved = 0;
+  bool every_step = true;
   double density() const { return bytes ? saved / static_cast<double>(bytes) : 0.0; }
 };
 
@@ -179,29 +183,32 @@ std::string copy_unit(const std::string& key, Kind kind) {
   return kind == Kind::Experts ? key.substr(0, key.rfind('.')) : key;
 }
 
-// Every copy the target makes, the ones with the most bytes saved per byte held first (ties by name).
-std::vector<CopyUnit> copy_units(const MetisConfig& c, lx_wtype target) {
+// Every copy the target makes, in the order the room goes to them (see CopyUnit), for `sequences` in the plan.
+std::vector<CopyUnit> copy_units(const MetisConfig& c, lx_wtype target, int sequences) {
   std::map<std::string, CopyUnit> by;
-  const double passes = c.num_passes, expert_share = static_cast<double>(c.num_experts_per_tok) / c.n_routed_experts;
-  each_projection(c, [&](const std::string& key, Kind kind, int64_t E, int64_t N, int64_t K) {
-    if (projection_format(target, key) != LX_W_BF16 || (kind != Kind::Experts && !bf16x_smaller(K))) return;
-    const double held = static_cast<double>(projection_bytes(LX_W_BF16, E * N, K, E > 1 ? E : 0));
-    const double copy = static_cast<double>(projection_bytes(LX_W_BF16X, E * N, K));
+  const double passes = c.num_passes, k = c.num_experts_per_tok, E = c.n_routed_experts;
+  const double touched = 1.0 - std::pow(1.0 - k / E, std::max(1, sequences));  // the share of the experts a step touches
+  each_projection(c, [&](const std::string& key, Kind kind, int64_t e, int64_t n, int64_t kk) {
+    if (projection_format(target, key) != LX_W_BF16 || (kind != Kind::Experts && !bf16x_smaller(kk))) return;
+    const double held = static_cast<double>(projection_bytes(LX_W_BF16, e * n, kk, e > 1 ? e : 0));
+    const double copy = static_cast<double>(projection_bytes(LX_W_BF16X, e * n, kk));
     const std::string unit = copy_unit(key, kind);
     CopyUnit& u = by[unit];
     u.unit = unit;
     u.bytes += static_cast<size_t>(copy);
-    u.saved += (held - copy) * (kind == Kind::Experts ? passes * expert_share : passes);
+    u.saved += (held - copy) * passes * (kind == Kind::Experts ? touched : 1.0);
+    u.every_step = kind != Kind::Experts;
   });
   if (projection_format(target, "embedding") == LX_W_BF16 && bf16x_smaller(c.hidden_size)) {
     const double held = static_cast<double>(projection_bytes(LX_W_BF16, c.vocab_size, c.hidden_size));
     const double copy = static_cast<double>(projection_bytes(LX_W_BF16X, c.vocab_size, c.hidden_size));
-    by["lm_head"] = CopyUnit{"lm_head", static_cast<size_t>(copy), held - copy};
+    by["lm_head"] = CopyUnit{"lm_head", static_cast<size_t>(copy), held - copy, true};
   }
   std::vector<CopyUnit> units;
   for (const auto& kv : by)
     if (kv.second.bytes > 0) units.push_back(kv.second);
   std::sort(units.begin(), units.end(), [](const CopyUnit& a, const CopyUnit& b) {
+    if (a.every_step != b.every_step) return a.every_step;
     if (a.density() != b.density()) return a.density() > b.density();
     return a.unit < b.unit;
   });
@@ -802,7 +809,7 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
   const size_t reserved = chosen.wb.total() + scratch_bytes(c, chosen.step, chosen.slots, chosen.formats) +
                           static_cast<size_t>(chosen.slots) * (per_slot_state + per_position * static_cast<size_t>(chosen.context));
   size_t room = budget > reserved ? budget - reserved : 0;
-  const std::vector<CopyUnit> units = copies_wanted ? copy_units(c, target) : std::vector<CopyUnit>{};
+  const std::vector<CopyUnit> units = copies_wanted ? copy_units(c, target, chosen.slots) : std::vector<CopyUnit>{};
   for (const CopyUnit& u : units) {
     if (u.bytes <= room) {
       room -= u.bytes;
