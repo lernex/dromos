@@ -25,8 +25,13 @@ is a stable link:
 | `install.sh` | the installer |
 | `SHA256SUMS` | `sha256sum` format, one line per asset above |
 
-The CUDA flavor's name follows its toolkit major (`cuda12` or `cuda13`); which ships, or both, is
-decided by measurement (does a 12.8 build run as fast and as correctly as the 13.x one).
+One CUDA flavor ships, built with CUDA 12.8. Measured 2026-10-28 on an RTX 5070 Ti (driver 595), Praxis:
+the 12.8 build decodes 293.9 / 1,140 tok/s at 1 / 8 streams against 295.2 / 1,165 for a 13.4 build, with
+the same KL to the reference, and 12.8 runs on older drivers. The driver it needs: 570.26 or newer for the
+12.8 toolkit (and for any RTX 50 card), 525.60.13 or newer for older cards through NVIDIA's minor-version
+compatibility (the build carries real code for every architecture, no PTX to JIT; drivers below 595 are
+untested). An older driver, or no GPU, gets the CPU flavor. `scripts/release/build.sh` still builds a
+`cuda13` flavor, and install.sh prefers it when a release lists one.
 
 ## The tree
 

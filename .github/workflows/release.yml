@@ -81,7 +81,8 @@ jobs:
 
   linux-x86_64-cuda12:
     runs-on: ubuntu-24.04
-    # Sizing (measured on the GPU server at 2 jobs, see the release report): TODO fill in from the CUDA 12.8 build.
+    # The one CUDA build ships on CUDA 12.8: as fast as 13.4 on an RTX 5070 Ti (docs/RELEASE.md) and it runs on older
+    # drivers. Every architecture took 21 minutes at 2 jobs on a 20-core server; the limit leaves room for a 4-core runner.
     timeout-minutes: 350
     steps:
       - name: Free disk space on the runner
@@ -104,34 +105,10 @@ jobs:
           path: ${{ runner.temp }}/release/lernex-linux-x86_64-cuda12.tar.gz
           if-no-files-found: error
 
-  linux-x86_64-cuda13:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 350
-    steps:
-      - name: Free disk space on the runner
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/.ghcup
-          df -h /
-      - uses: actions/checkout@v4
-      - name: Version and commit
-        run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then echo "LX_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"; fi
-          echo "LX_GIT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
-      - name: Toolkit and build in the manylinux_2_28 base
-        run: |
-          docker run --rm -v "$GITHUB_WORKSPACE:/src" -v "$RUNNER_TEMP/release:/out" \
-            -e LX_VERSION -e LX_GIT_SHA -e LX_JOBS -e CUDA_HOME=/usr/local/cuda-13.4 quay.io/pypa/manylinux_2_28_x86_64 \
-            bash -c 'export PATH=/opt/python/cp312-cp312/bin:$PATH && python3 -m pip install -q ninja && /src/scripts/release/cuda-toolkit.sh 13.4 && /src/scripts/release/build.sh linux-x86_64-cuda13 /out'
-      - uses: actions/upload-artifact@v4
-        with:
-          name: lernex-linux-x86_64-cuda13
-          path: ${{ runner.temp }}/release/lernex-linux-x86_64-cuda13.tar.gz
-          if-no-files-found: error
-
   publish:
     # Only a tag publishes. A dispatch run stops at the artifacts above.
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [linux-x86_64-cpu, linux-aarch64-cpu, darwin-arm64, linux-x86_64-cuda12, linux-x86_64-cuda13]
+    needs: [linux-x86_64-cpu, linux-aarch64-cpu, darwin-arm64, linux-x86_64-cuda12]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

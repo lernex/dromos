@@ -12,15 +12,14 @@
 # (its libcudart and libcublasLt come with the tarball, so the base needs no toolkit): the smallest one with the
 # NVIDIA runtime hooks. Arguments:
 #   LERNEX_VERSION   the release, X.Y.Z (required)
-#   LERNEX_FLAVOR    the build: cuda13 (default) or cuda12
+#   LERNEX_FLAVOR    the build: cuda12 (the CUDA build a release ships)
 #   LERNEX_RELEASES  the release host, laid out like GitHub's
-#   CUDA_BASE        the base; the default is the CUDA 13.4 base for cuda13. For cuda12 pass
-#                    --build-arg CUDA_BASE=nvidia/cuda:12.8.1-base-ubuntu24.04
+#   CUDA_BASE        the base, NVIDIA's CUDA base for the tarball's toolkit (12.8 for cuda12)
 
 ARG LERNEX_VERSION
-ARG LERNEX_FLAVOR=cuda13
+ARG LERNEX_FLAVOR=cuda12
 ARG LERNEX_RELEASES=https://github.com/lernex/lernex-engine/releases
-ARG CUDA_BASE=nvidia/cuda:13.4.3-base-ubuntu24.04
+ARG CUDA_BASE=nvidia/cuda:12.8.1-base-ubuntu24.04
 
 # Fetch and check the tree on a plain Ubuntu: the runtime image gets the tree, not the download tooling.
 FROM ubuntu:24.04 AS fetch
