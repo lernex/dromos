@@ -594,6 +594,10 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
     const int need_slots = std::min(want_slots, slot_cap);
     for (int ctx = context_wanted;; ctx = std::max(floor_ctx, ctx / 2)) {
       const size_t per_slot = per_slot_state + per_position * static_cast<size_t>(ctx);
+      // The largest step tier that holds the sequences. An explicit count is held in full when some tier does: the
+      // full step first, then the smaller one, so 32 asked for never settle for the 23 a 2048-token step leaves room
+      // for. Without a count, the first tier that holds the useful sequences is kept, as before.
+      int got = -1;
       for (const int step : {kMaxStepTokens, kMinStepTokens}) {
         const size_t fixed = f.wb.total() + scratch_bytes(c, step, 0, f.formats);
         if (budget <= fixed || per_slot == 0) continue;
@@ -602,12 +606,15 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
         while (slots > 0 && fixed + scratch_bytes(c, step, slots, f.formats) - scratch_bytes(c, step, 0, f.formats) +
                                     static_cast<size_t>(slots) * per_slot > budget)
           --slots;
-        if (slots >= need_slots) {
-          f.context = ctx;
-          f.slots = slots;
-          f.ok = true;
-          return f;
-        }
+        if (slots < need_slots) continue;
+        got = std::max(got, slots);
+        if (req.sequences <= 0 || got >= slot_cap) break;
+      }
+      if (got >= 0) {
+        f.context = ctx;
+        f.slots = got;
+        f.ok = true;
+        return f;
       }
       if (req.context > 0 || ctx <= floor_ctx) break;  // an explicit context is kept, or nothing smaller helps
     }
@@ -698,7 +705,8 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
         notes.push_back("It does not fit this GPU usefully (" + gb(self ? self->weight_bytes : 0) + " of weights, " +
                         gb(budget) + " free for the model), so its routed experts are offloaded:");
         for (const std::string& n : p.notes) notes.push_back("  " + n);
-        notes.push_back("Weights in VRAM " + gb(p.weight_bytes) + " (" + recipe_text(target) + "), one sequence of " +
+        notes.push_back("Weights in VRAM " + gb(p.weight_bytes) + " (" + recipe_text(target) + "), " +
+                        std::to_string(p.max_slots) + (p.max_slots == 1 ? " sequence" : " sequences") + " of " +
                         std::to_string(p.kv_capacity) + " tokens.");
         if (!p.bf16x_reason.empty()) notes.push_back(p.bf16x_reason);
         notes.push_back("Dense products multiply in " + math_name(p.prefill_math, d) +

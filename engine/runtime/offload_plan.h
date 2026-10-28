@@ -2,8 +2,9 @@
 // accounting for everything but the routed experts, and the tiers of runtime/offload.h for those.
 //
 // make_plan sizes a model that is resident; when its format does not fit the GPU usefully, it plans the same
-// model, in the same format, with the experts offloaded (this), before anything else: one sequence, the dense
-// weights, its state, KV cache and scratch in VRAM, and whatever is left as the expert cache. The format is the
+// model, in the same format, with the experts offloaded (this), before anything else: the dense weights, the state
+// and KV cache of the sequences asked for (one when none were), the scratch in VRAM, and whatever is left as the
+// expert cache. The format is the
 // file's, or the one the request names; it is never narrowed to cache more (make_plan's notes name the narrower
 // format that would fit instead). Measured on Logos FP8 (RTX 5070 Ti, PCIe 5), decode against fully resident:
 // with 66%, 42% and 19% of the experts cached, 4%, 12% and 24% slower (int8 decode copies, bf16 dense on the

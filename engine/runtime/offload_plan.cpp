@@ -42,19 +42,28 @@ Plan make_offload_plan(const DeviceInfo& d, const MetisConfig& c, const Checkpoi
   // expert cache), and the experts multiplied weight-only by the offload kernels.
   lx::ModelFormats formats = model_formats(format, d, false);
   formats.expert_math = LX_MATH_BF16;
-  const size_t state = state_bytes_per_slot(c) + kv_bytes_per_position(c) * static_cast<size_t>(context);
-  const size_t scratch = scratch_bytes(c, kOffloadStepTokens, 1, formats);
+  // Each sequence holds its state and KV cache in VRAM beside the dense weights. The sequences are the ones asked for,
+  // or one (the cache gets the most VRAM) when none were; fewer when the cache would not hold one step's experts beside
+  // them. Every sequence the plan gives is one the engine can run concurrently (the offloaded steps batch).
+  const size_t per_slot = state_bytes_per_slot(c) + kv_bytes_per_position(c) * static_cast<size_t>(context);
   const int64_t n_experts = static_cast<int64_t>(c.num_hidden_layers) * c.n_routed_experts;
 
   const WeightBytes wb = weight_bytes(c, format);
-  const size_t fixed = wb.total() - wb.experts + state + scratch;
+  const size_t dense = wb.total() - wb.experts;
+  auto fixed_for = [&](int n) {
+    return dense + static_cast<size_t>(n) * per_slot + scratch_bytes(c, kOffloadStepTokens, n, formats);
+  };
   const size_t expert = wb.experts / static_cast<size_t>(n_experts);
   // At the least, every layer holds one step's experts (top_k slots).
   const size_t least = expert * static_cast<size_t>(c.num_hidden_layers) * static_cast<size_t>(c.num_experts_per_tok);
-  if (budget < fixed + least)
+  int slots = std::max(1, req.sequences);
+  while (slots > 1 && budget < fixed_for(slots) + least) --slots;
+  if (budget < fixed_for(slots) + least)
     throw std::runtime_error("the model does not run on this GPU even with its experts offloaded: " + name_of(format) +
-                             " needs " + gb(fixed + least) + " (dense weights, one sequence of " + std::to_string(context) +
+                             " needs " + gb(fixed_for(1) + least) + " (dense weights, one sequence of " + std::to_string(context) +
                              " tokens and one step of experts); " + gb(budget) + " is available");
+  const size_t fixed = fixed_for(slots);
+  const size_t scratch = scratch_bytes(c, kOffloadStepTokens, slots, formats);
   const size_t cache = std::min(budget - fixed, wb.experts) / expert * expert;
   const double resident = static_cast<double>(cache) / static_cast<double>(wb.experts);
 
@@ -65,13 +74,13 @@ Plan make_offload_plan(const DeviceInfo& d, const MetisConfig& c, const Checkpoi
   p.convert_at_load = ck.stored != format;
   p.prefill_math = p.batch_math = formats.prefill_math;
   p.expert_math = formats.expert_math;
-  p.max_slots = 1;
+  p.max_slots = slots;
   p.kv_capacity = context;
   p.max_step_tokens = kOffloadStepTokens;
   p.prefill_chunk = kOffloadStepTokens - 1;
-  p.weight_bytes = fixed - state - scratch + cache;
-  p.state_bytes = state_bytes_per_slot(c);
-  p.kv_bytes = kv_bytes_per_position(c) * static_cast<size_t>(context);
+  p.weight_bytes = dense + cache;
+  p.state_bytes = state_bytes_per_slot(c) * static_cast<size_t>(slots);
+  p.kv_bytes = kv_bytes_per_position(c) * static_cast<size_t>(context) * static_cast<size_t>(slots);
   p.scratch_bytes = scratch;
   p.budget_bytes = budget;
   p.decode_ceiling_tps = 0;  // set by the misses, which only a run measures
