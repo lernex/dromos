@@ -638,6 +638,8 @@ bool Server::run() {
       if (job.top_logprobs > 0 && !job.logprobs) invalid("top_logprobs needs logprobs: true", "top_logprobs");
       job.request.sampling.logprobs = job.logprobs;
       job.request.sampling.top_logprobs = job.top_logprobs;
+      // Same as /v1/completions: a benchmark client asks for exactly max_tokens.
+      job.request.ignore_eos = body.value("ignore_eos", false);
 
       bool has_tools = false;
       const std::string tools_text = read_tools(body, has_tools);
