@@ -3,7 +3,7 @@ measures the engine in process, so `lernex serve` and vLLM are timed by the same
 
     python bench/endpoint_bench.py --url http://127.0.0.1:8811 --model NAME --vocab 65536 \
         --streams 1,8,32,64 --prompt-tokens 512 --gen-tokens 256 --repeats 3 \
-        --prefill 512,2048,8192 --prefill-runs 5 --prompts PROMPTS_JSON --out OUT.json
+        --prefill 512,2048,8192 --prefill-runs 5 --prompts PROMPTS_JSON --metrics --out OUT.json
 
 Decode (per stream count, per repeat), with the definitions of cli/bench.cpp:
   every stream gets the prompt cli/bench.cpp builds for it (xorshift64 seeded per stream, ids in
@@ -17,6 +17,13 @@ Decode (per stream count, per repeat), with the definitions of cli/bench.cpp:
 Each streamed chunk that carries a token is one token event; the count per stream is checked against the
 server's usage.completion_tokens (mismatch counts are reported, and must be zero for the run to be valid).
 
+Output, in vllm bench serve's definitions, from the same token events:
+  peak_output_tps_1s   the most tokens in one whole second counted from the first submit (its max_output_tokens_per_s)
+  overall_output_tps   every output token over the time from the first submit to the last token (its output_throughput)
+  running_over_tpot_tps  the formula with the count actually resident: peak_running x 1000 / mean TPOT
+  --metrics polls the server's /metrics every 0.25 s for vllm:num_requests_running and _waiting while the cells run;
+  peak_running and peak_waiting are the largest values seen between a repeat's submit and its last token.
+
 Prefill (per T): one request of exactly T prompt tokens with max_tokens 1, the tokens cli/prefill.cpp builds
 (the prompts JSON's sequences concatenated in key order, repeated to T). Runs after one warm-up; the median of
 --prefill-runs is reported as T / TTFT.
@@ -27,6 +34,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import statistics
 import sys
 import time
@@ -34,6 +42,8 @@ import time
 import aiohttp
 
 MASK64 = (1 << 64) - 1
+# vLLM's gauges, one line per engine label set (summed over engines); a server without them yields no samples.
+METRIC_RE = re.compile(r"^vllm:num_requests_(running|waiting)(?:\{[^}]*\})? +([0-9.eE+-]+)", re.M)
 
 
 def bench_prompt(stream: int, n: int, vocab: int) -> list[int]:
@@ -129,13 +139,64 @@ async def wait_ready(session: aiohttp.ClientSession, base: str, timeout: float) 
         await asyncio.sleep(2.0)
 
 
-async def run_streams(session, url, name, streams, prompt_tokens, gen_tokens, vocab) -> dict:
+async def sample_metrics(session: aiohttp.ClientSession, base: str, samples: list, stop: asyncio.Event,
+                         every: float = 0.25) -> None:
+    """Polls the server's gauges until `stop` is set. Each sample is (perf_counter, running, waiting)."""
+    while not stop.is_set():
+        try:
+            async with session.get(base + "/metrics") as resp:
+                text = await resp.text()
+            totals = {"running": 0.0, "waiting": 0.0}
+            found = set()
+            for kind, value in METRIC_RE.findall(text):
+                totals[kind] += float(value)
+                found.add(kind)
+            if found == {"running", "waiting"}:
+                samples.append((time.perf_counter(), int(totals["running"]), int(totals["waiting"])))
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            pass
+        try:
+            await asyncio.wait_for(stop.wait(), every)
+        except asyncio.TimeoutError:
+            pass
+
+
+def cell_metrics(results: list[dict], submitted: float, samples: list) -> dict:
+    """The output and residency numbers of one repeat, from its token events and the sampled gauges."""
+    stamps = [t for r in results for t in r["events"]]
+    span = max(r["events"][-1] for r in results) - submitted
+    buckets: dict[int, int] = {}
+    for t in stamps:
+        second = int(t - submitted)
+        buckets[second] = buckets.get(second, 0) + 1
+    inside = [s for s in samples if submitted <= s[0] <= submitted + span]
+    return {
+        "span_s": span,
+        "output_tokens": len(stamps),
+        "overall_output_tps": len(stamps) / max(span, 1e-9),
+        "peak_output_tps_1s": max(buckets.values()),
+        "metric_samples": len(inside),
+        "peak_running": max((s[1] for s in inside), default=None),
+        "peak_waiting": max((s[2] for s in inside), default=None),
+    }
+
+
+async def run_streams(session, url, name, streams, prompt_tokens, gen_tokens, vocab, samples=None) -> dict:
     prompts = [bench_prompt(i, prompt_tokens, vocab) for i in range(streams)]
     submitted = time.perf_counter()
+    wall = time.time()
     results = await asyncio.gather(
         *(stream_one(session, url, completion_body(name, p, gen_tokens)) for p in prompts)
     )
-    return summarize(results, prompt_tokens, submitted, gen_tokens)
+    row = summarize(results, prompt_tokens, submitted, gen_tokens)
+    row.update(cell_metrics(results, submitted, samples or []))
+    row["running_over_tpot_tps"] = (
+        row["peak_running"] * 1000.0 / row["mean_tpot_ms"] if row["peak_running"] else None
+    )
+    # Wall clock of this host, which is the clock the server writes its log in, for matching its stat lines.
+    row["clock_start"] = time.strftime("%H:%M:%S", time.localtime(wall))
+    row["clock_end"] = time.strftime("%H:%M:%S", time.localtime(wall + row["span_s"]))
+    return row
 
 
 def summarize(results: list[dict], prompt_tokens: int, submitted: float, gen_tokens: int) -> dict:
@@ -195,38 +256,50 @@ async def main_async(args) -> dict:
         "decode": {},
         "prefill": {},
     }
+    samples: list = []
+    stop = asyncio.Event()
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         await wait_ready(session, base, args.ready_timeout)
-        for n in streams_list:
-            # Warm-up, as cli/bench.cpp does: min(prompt, 64) prompt tokens, 8 generated tokens.
-            await run_streams(session, url, args.model, n, min(args.prompt_tokens, 64), 8, args.vocab)
-            rows = []
-            for r in range(args.repeats):
-                row = await run_streams(session, url, args.model, n, args.prompt_tokens, args.gen_tokens, args.vocab)
-                row["repeat"] = r
-                rows.append(row)
-                print(
-                    f"{args.label} streams={n:>3} rep={r} decode={row['decode_tps']:8.1f} tok/s "
-                    f"per-stream={row['per_stream_tps']:7.1f} TTFT p50={row['ttft_p50']:.3f}s "
-                    f"prefill={row['prefill_tps']:8.0f} tok/s tpot-formula={row['concurrency_over_tpot_tps']:8.1f} "
-                    f"mismatch={row['event_vs_usage_mismatch_streams']} "
-                    f"short={row['streams_not_at_gen_tokens']}",
-                    flush=True,
-                )
-            out["decode"][str(n)] = rows
-        for T in prefill_list:
-            tokens = prefill_tokens(args.prompts, T)
-            await prefill_once(session, url, args.model, tokens)  # warm-up
-            ms = []
-            for _ in range(args.prefill_runs):
-                ms.append(await prefill_once(session, url, args.model, tokens))
-            med = statistics.median(ms)
-            out["prefill"][str(T)] = {
-                "ttft_median_s": med,
-                "runs_s": ms,
-                "prefill_tps": T / med,
-            }
-            print(f"{args.label} prefill T={T}: TTFT median {med * 1e3:.1f} ms, {T / med:.0f} tok/s", flush=True)
+        sampler = asyncio.create_task(sample_metrics(session, base, samples, stop)) if args.metrics else None
+        try:
+            for n in streams_list:
+                # Warm-up, as cli/bench.cpp does: min(prompt, 64) prompt tokens, 8 generated tokens.
+                await run_streams(session, url, args.model, n, min(args.prompt_tokens, 64), 8, args.vocab)
+                rows = []
+                for r in range(args.repeats):
+                    row = await run_streams(
+                        session, url, args.model, n, args.prompt_tokens, args.gen_tokens, args.vocab, samples
+                    )
+                    row["repeat"] = r
+                    rows.append(row)
+                    print(
+                        f"{args.label} streams={n:>3} rep={r} decode={row['decode_tps']:8.1f} tok/s "
+                        f"per-stream={row['per_stream_tps']:7.1f} TTFT p50={row['ttft_p50']:.3f}s "
+                        f"prefill={row['prefill_tps']:8.0f} tok/s tpot-formula={row['concurrency_over_tpot_tps']:8.1f} "
+                        f"overall={row['overall_output_tps']:8.1f} peak1s={row['peak_output_tps_1s']} "
+                        f"running={row['peak_running']} waiting={row['peak_waiting']} "
+                        f"mismatch={row['event_vs_usage_mismatch_streams']} "
+                        f"short={row['streams_not_at_gen_tokens']}",
+                        flush=True,
+                    )
+                out["decode"][str(n)] = rows
+            for T in prefill_list:
+                tokens = prefill_tokens(args.prompts, T)
+                await prefill_once(session, url, args.model, tokens)  # warm-up
+                ms = []
+                for _ in range(args.prefill_runs):
+                    ms.append(await prefill_once(session, url, args.model, tokens))
+                med = statistics.median(ms)
+                out["prefill"][str(T)] = {
+                    "ttft_median_s": med,
+                    "runs_s": ms,
+                    "prefill_tps": T / med,
+                }
+                print(f"{args.label} prefill T={T}: TTFT median {med * 1e3:.1f} ms, {T / med:.0f} tok/s", flush=True)
+        finally:
+            stop.set()
+            if sampler is not None:
+                await sampler
     return out
 
 
@@ -242,6 +315,8 @@ def main() -> None:
     ap.add_argument("--prefill", default="", help="comma list of T for the prefill test (empty: none)")
     ap.add_argument("--prefill-runs", type=int, default=5)
     ap.add_argument("--prompts", default="", help="prompts JSON for the prefill tokens (cli/prefill.cpp)")
+    ap.add_argument("--metrics", action="store_true",
+                    help="poll the server's /metrics for the running and waiting request counts")
     ap.add_argument("--ready-timeout", type=float, default=1800.0)
     ap.add_argument("--label", default="")
     ap.add_argument("--out", required=True)

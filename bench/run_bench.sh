@@ -122,9 +122,12 @@ case "$cmd" in
         > "$OUT/$tag.vllm.log" 2>&1 &
     pid=$!
     if wait_ready "$url" "$pid" 2400; then
-      "$PY" bench/endpoint_bench.py --url "$url" --model "$tag" --vocab "$vocab" --streams 1,8,32,64 \
-        --prompt-tokens 512 --gen-tokens 256 --repeats 3 --prefill 512,2048,8192 --prefill-runs 5 \
-        --prompts "$PROMPTS" --label "$tag vllm" --out "$OUT/$tag.vllm.json" \
+      # LX_VLLM_STREAMS narrows the stream counts; LX_VLLM_PREFILL narrows the prefill lengths (empty: none). A
+      # context shorter than a prefill length cannot take that request, so set LX_VLLM_PREFILL to lengths that fit.
+      "$PY" bench/endpoint_bench.py --url "$url" --model "$tag" --vocab "$vocab" \
+        --streams "${LX_VLLM_STREAMS-1,8,32,64}" \
+        --prompt-tokens 512 --gen-tokens 256 --repeats 3 --prefill "${LX_VLLM_PREFILL-512,2048,8192}" --prefill-runs 5 \
+        --prompts "$PROMPTS" --metrics --label "$tag vllm" --out "$OUT/$tag.vllm.json" \
         > "$OUT/$tag.vllm.txt" 2>&1
       log "client exit $?"
     fi
