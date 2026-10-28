@@ -1,0 +1,60 @@
+/home/aiadmin/kronos-scratch/logos/engines/praxis/hf  (/home/aiadmin/kronos-scratch/logos/engines/praxis/hf)
+  512 prompt tokens, 256 generated tokens per stream, greedy
+  each stream count loads its own engine, so it runs on the plan a standalone run at that count gets
+ streams decode tok/s   per stream   TTFT p50   TTFT p90 prefill tok/s  roofline tok/s % of spec % of peak per-token tok/s
+
+1 streams: 1 slots, 784-token context, 2048 tokens per step; Decode reads lossless BF16X copies of the BF16 weights (4.47 GB more): the same logits to the bit from about 1.3x fewer bytes. Prefill reads the BF16 copy.
+  Holding the weights as BF16, the format the file stores.
+  Weights 10.36 GB: every projection BF16.
+  Decode reads lossless BF16X copies of the BF16 weights (4.47 GB more): the same logits to the bit from about 1.3x fewer bytes. Prefill reads the BF16 copy.
+  Dense products multiply in BF16 tensor cores; routed experts in BF16 tensor cores.
+  Up to 1 sequences, 784 tokens each (0.05 GB of state and cache).
+  A step takes up to 2048 tokens; prompts are prefilled 2047 tokens at a time.
+  One stream reads about 1830 MB per token, so it decodes at about 274 tokens per second.
+  --weights fp8 would decode at about 308 tok/s against 274 here (round-to-nearest from the BF16 file).
+  Memory: 11.40 GB planned of 14.78 GB available.
+  roofline  896 GB/s spec, 853 GB/s measured, 87 TFLOPS BF16 tensor, context 640 (mean over the run)
+  traffic   1828.4 MB per token at one stream: the model's count and the config's agree
+       1        303.5        303.5      40 ms      40 ms         12811             466     61.9%     65.1%           303.5
+
+8 streams: 8 slots, 784-token context, 2048 tokens per step; Decode reads lossless BF16X copies of the BF16 weights (4.47 GB more): the same logits to the bit from about 1.3x fewer bytes. Prefill reads the BF16 copy.
+  Holding the weights as BF16, the format the file stores.
+  Weights 10.36 GB: every projection BF16.
+  Decode reads lossless BF16X copies of the BF16 weights (4.47 GB more): the same logits to the bit from about 1.3x fewer bytes. Prefill reads the BF16 copy.
+  Dense products multiply in BF16 tensor cores; routed experts in BF16 tensor cores.
+  Up to 8 sequences, 784 tokens each (0.40 GB of state and cache).
+  A step takes up to 2048 tokens; prompts are prefilled 2040 tokens at a time.
+  One stream reads about 1830 MB per token, so it decodes at about 274 tokens per second.
+  --weights fp8 would decode at about 308 tok/s against 274 here (round-to-nearest from the BF16 file).
+  Memory: 11.75 GB planned of 14.78 GB available.
+  roofline  896 GB/s spec, 853 GB/s measured, 87 TFLOPS BF16 tensor, context 640 (mean over the run)
+  traffic   1828.4 MB per token at one stream: the model's count and the config's agree
+       8       1223.0        152.9     221 ms     262 ms         15610            1752     66.4%     69.8%          1169.0
+
+32 streams: 32 slots, 784-token context, 2048 tokens per step; Decode reads lossless BF16X copies of the BF16 weights (4.47 GB more): the same logits to the bit from about 1.3x fewer bytes. Prefill reads the BF16 copy.
+  Holding the weights as BF16, the format the file stores.
+  Weights 10.36 GB: every projection BF16.
+  Decode reads lossless BF16X copies of the BF16 weights (4.47 GB more): the same logits to the bit from about 1.3x fewer bytes. Prefill reads the BF16 copy.
+  Dense products multiply in BF16 tensor cores; routed experts in BF16 tensor cores.
+  Up to 32 sequences, 784 tokens each (1.59 GB of state and cache).
+  A step takes up to 2048 tokens; prompts are prefilled 2016 tokens at a time.
+  One stream reads about 1830 MB per token, so it decodes at about 274 tokens per second.
+  --weights fp8 would decode at about 308 tok/s against 274 here (round-to-nearest from the BF16 file).
+  Memory: 12.94 GB planned of 14.78 GB available.
+  roofline  896 GB/s spec, 853 GB/s measured, 87 TFLOPS BF16 tensor, context 640 (mean over the run)
+  traffic   1828.4 MB per token at one stream: the model's count and the config's agree
+      32       2214.8         69.2     569 ms     940 ms         16643            2983     70.7%     74.2%          2055.6
+
+64 streams: 64 slots, 784-token context, 2048 tokens per step; Decode reads lossless BF16X copies of the BF16 weights (4.47 GB more): the same logits to the bit from about 1.3x fewer bytes. Prefill reads the BF16 copy.
+  Holding the weights as BF16, the format the file stores.
+  Weights 10.36 GB: every projection BF16.
+  Decode reads lossless BF16X copies of the BF16 weights (4.47 GB more): the same logits to the bit from about 1.3x fewer bytes. Prefill reads the BF16 copy.
+  Dense products multiply in BF16 tensor cores; routed experts in BF16 tensor cores.
+  Up to 64 sequences, 784 tokens each (3.19 GB of state and cache).
+  A step takes up to 2048 tokens; prompts are prefilled 1984 tokens at a time.
+  One stream reads about 1830 MB per token, so it decodes at about 274 tokens per second.
+  --weights fp8 would decode at about 308 tok/s against 274 here (round-to-nearest from the BF16 file).
+  Memory: 14.54 GB planned of 14.78 GB available.
+  roofline  896 GB/s spec, 853 GB/s measured, 87 TFLOPS BF16 tensor, context 640 (mean over the run)
+  traffic   1828.4 MB per token at one stream: the model's count and the config's agree
+      64       3149.9         49.2      1.0 s      1.8 s         16326            3955     75.8%     79.6%          2801.1

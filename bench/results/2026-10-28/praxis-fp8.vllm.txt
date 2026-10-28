@@ -1,0 +1,16 @@
+praxis-fp8 vllm streams=  1 rep=0 decode=   235.0 tok/s per-stream=  235.0 TTFT p50=0.421s prefill=    1217 tok/s tpot-formula=   235.0 mismatch=0 short=0
+praxis-fp8 vllm streams=  1 rep=1 decode=   234.6 tok/s per-stream=  234.6 TTFT p50=0.042s prefill=   12223 tok/s tpot-formula=   234.6 mismatch=0 short=0
+praxis-fp8 vllm streams=  1 rep=2 decode=   234.6 tok/s per-stream=  234.6 TTFT p50=0.042s prefill=   12192 tok/s tpot-formula=   234.6 mismatch=0 short=0
+praxis-fp8 vllm streams=  8 rep=0 decode=  1220.8 tok/s per-stream=  152.6 TTFT p50=0.759s prefill=    5398 tok/s tpot-formula=  1213.1 mismatch=0 short=0
+praxis-fp8 vllm streams=  8 rep=1 decode=  1221.3 tok/s per-stream=  152.7 TTFT p50=0.253s prefill=   16175 tok/s tpot-formula=  1213.3 mismatch=0 short=0
+praxis-fp8 vllm streams=  8 rep=2 decode=  1221.4 tok/s per-stream=  152.7 TTFT p50=0.252s prefill=   16229 tok/s tpot-formula=  1213.4 mismatch=0 short=0
+praxis-fp8 vllm streams= 32 rep=0 decode=  2495.4 tok/s per-stream=   78.0 TTFT p50=0.909s prefill=   18016 tok/s tpot-formula=  2422.7 mismatch=0 short=0
+praxis-fp8 vllm streams= 32 rep=1 decode=  2496.8 tok/s per-stream=   78.0 TTFT p50=0.910s prefill=   17991 tok/s tpot-formula=  2423.0 mismatch=0 short=0
+praxis-fp8 vllm streams= 32 rep=2 decode=  2496.6 tok/s per-stream=   78.0 TTFT p50=0.914s prefill=   17927 tok/s tpot-formula=  2422.7 mismatch=0 short=0
+praxis-fp8 vllm streams= 64 rep=0 decode=  3435.3 tok/s per-stream=   53.7 TTFT p50=1.623s prefill=   18047 tok/s tpot-formula=  3144.0 mismatch=0 short=0
+praxis-fp8 vllm streams= 64 rep=1 decode=  3437.4 tok/s per-stream=   53.7 TTFT p50=1.623s prefill=   18042 tok/s tpot-formula=  3145.4 mismatch=0 short=0
+praxis-fp8 vllm streams= 64 rep=2 decode=  3436.6 tok/s per-stream=   53.7 TTFT p50=1.623s prefill=   18064 tok/s tpot-formula=  3145.4 mismatch=0 short=0
+praxis-fp8 vllm prefill T=512: TTFT median 35.1 ms, 14592 tok/s
+praxis-fp8 vllm prefill T=2048: TTFT median 130.1 ms, 15748 tok/s
+praxis-fp8 vllm prefill T=8192: TTFT median 467.8 ms, 17510 tok/s
+wrote /home/aiadmin/lernex-engine-dev/bench-results/2026-10-28/praxis-fp8.vllm.json

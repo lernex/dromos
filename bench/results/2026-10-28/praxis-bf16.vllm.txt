@@ -1,0 +1,16 @@
+praxis-bf16 vllm streams=  1 rep=0 decode=   200.8 tok/s per-stream=  200.8 TTFT p50=0.049s prefill=   10411 tok/s tpot-formula=   200.8 mismatch=0 short=0
+praxis-bf16 vllm streams=  1 rep=1 decode=   200.7 tok/s per-stream=  200.7 TTFT p50=0.049s prefill=   10429 tok/s tpot-formula=   200.7 mismatch=0 short=0
+praxis-bf16 vllm streams=  1 rep=2 decode=   200.7 tok/s per-stream=  200.7 TTFT p50=0.049s prefill=   10425 tok/s tpot-formula=   200.7 mismatch=0 short=0
+praxis-bf16 vllm streams=  8 rep=0 decode=   998.4 tok/s per-stream=  124.8 TTFT p50=0.267s prefill=   15340 tok/s tpot-formula=   992.6 mismatch=0 short=0
+praxis-bf16 vllm streams=  8 rep=1 decode=   998.8 tok/s per-stream=  124.8 TTFT p50=0.277s prefill=   14764 tok/s tpot-formula=   993.1 mismatch=0 short=0
+praxis-bf16 vllm streams=  8 rep=2 decode=   998.3 tok/s per-stream=  124.8 TTFT p50=0.282s prefill=   14507 tok/s tpot-formula=   992.4 mismatch=0 short=0
+praxis-bf16 vllm streams= 32 rep=0 decode=  2047.1 tok/s per-stream=   64.0 TTFT p50=1.011s prefill=   16200 tok/s tpot-formula=  1992.6 mismatch=0 short=0
+praxis-bf16 vllm streams= 32 rep=1 decode=  2047.3 tok/s per-stream=   64.0 TTFT p50=1.009s prefill=   16231 tok/s tpot-formula=  1993.1 mismatch=0 short=0
+praxis-bf16 vllm streams= 32 rep=2 decode=  2046.4 tok/s per-stream=   64.0 TTFT p50=1.009s prefill=   16235 tok/s tpot-formula=  1992.1 mismatch=0 short=0
+praxis-bf16 vllm streams= 64 rep=0 decode=  2900.3 tok/s per-stream=   45.3 TTFT p50=1.808s prefill=   16203 tok/s tpot-formula=  2670.1 mismatch=0 short=0
+praxis-bf16 vllm streams= 64 rep=1 decode=  2897.7 tok/s per-stream=   45.3 TTFT p50=1.800s prefill=   16280 tok/s tpot-formula=  2668.4 mismatch=0 short=0
+praxis-bf16 vllm streams= 64 rep=2 decode=  2898.1 tok/s per-stream=   45.3 TTFT p50=1.806s prefill=   16223 tok/s tpot-formula=  2668.7 mismatch=0 short=0
+praxis-bf16 vllm prefill T=512: TTFT median 42.2 ms, 12119 tok/s
+praxis-bf16 vllm prefill T=2048: TTFT median 142.2 ms, 14398 tok/s
+praxis-bf16 vllm prefill T=8192: TTFT median 513.8 ms, 15945 tok/s
+wrote /home/aiadmin/lernex-engine-dev/bench-results/2026-10-28/praxis-bf16.vllm.json

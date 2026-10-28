@@ -1,0 +1,127 @@
+GPU        NVIDIA GeForce RTX 5070 Ti (device 0)
+arch       sm_120
+SMs        70, L2 50 MB
+memory     16.61 GB total, 16.36 GB free now
+bandwidth  896 GB/s (memory clock x bus width)
+math       tensor cores: BF16, INT8, FP8, FP4
+clusters   yes (sm_90 and up: the cluster paths run)
+CUDA       driver 13.2, runtime 13.4
+build      kernels for sm_120
+backend    CUDA, liblernex_kernels.so (/home/aiadmin/lernex-engine-dev/bench/build/liblernex_kernels.so)
+missing    none
+tuning     /home/aiadmin/lernex-engine-dev/bench/tuning/NVIDIA_GeForce_RTX_5070_Ti_sm120_0.2.json
+
+model      praxis: 12 layers (2 attention), hidden 2048, 128 routed experts, 2 passes
+checkpoint BF16 checkpoint, 6.16 GB on disk
+
+formats           fits    weights  decode est. maths          with --fast-math   loads
+           BF16   yes     5.89 GB   270 tok/s* BF16           -                  as stored
+           BF16X  yes     4.79 GB    259 tok/s BF16           -                  lossless encoding of the BF16 file
+           INT8   yes     3.32 GB   315 tok/s* BF16           INT8               round-to-nearest from the BF16 file
+           FP8    yes     3.26 GB   308 tok/s* BF16           FP8                round-to-nearest from the BF16 file
+           NVFP4  yes     2.28 GB   332 tok/s* BF16           dense FP8, experts FP4 no: NVFP4 from a BF16 checkpoint is refused: round-to-nearest conversion fails its KL. Use the GPTQ NVFP4 checkpoint at /home/aiadmin/kronos-scratch/logos/engines/praxis/nvfp4 instead.
+           * decoding from the BF16X copies of the BF16 tensors (4.47 GB more)
+           * decoding from the BF16X copies of the BF16 tensors (0.13 GB more)
+           * decoding from the BF16X copies of the BF16 tensors (0.44 GB more)
+           * decoding from the BF16X copies of the BF16 tensors (0.17 GB more)
+           fits: resident with room for 4 sequences of 4096 tokens; decode est.: one stream, the measured share of the card's bandwidth over the bytes a token reads
+
+stored     BF16
+chosen     BF16, the format the file stores
+offload    no: the model is resident (31 sequences of 8192 tokens)
+BF16X      on: Decode reads lossless BF16X copies of the BF16 weights (4.47 GB more): the same logits to the bit from about 1.3x fewer bytes. Prefill reads the BF16 copy.
+decode     about 265 tokens per second for one stream (the measured share of the card's bandwidth over the bytes a token reads)
+
+plan
+  Holding the weights as BF16, the format the file stores.
+  Weights 10.36 GB: every projection BF16.
+  Decode reads lossless BF16X copies of the BF16 weights (4.47 GB more): the same logits to the bit from about 1.3x fewer bytes. Prefill reads the BF16 copy.
+  Dense products multiply in BF16 tensor cores; routed experts in BF16 tensor cores.
+  Up to 31 sequences, 8192 tokens each (3.43 GB of state and cache).
+  A step takes up to 2048 tokens; prompts are prefilled 2017 tokens at a time.
+  One stream reads about 1890 MB per token, so it decodes at about 265 tokens per second.
+  --weights fp8 would decode at about 308 tok/s against 265 here (round-to-nearest from the BF16 file).
+  Memory: 14.77 GB planned of 14.78 GB available.
+
+roofline   a decode step's memory traffic against the card (one stream unless said; passes included)
+bandwidth  896 GB/s spec, 853 GB/s measured (1 GiB read, best of 5)
+compute    87.9 TFLOPS BF16 tensor, dense with FP32 accumulate (GeForce RTX 5070 Ti, sm_120; NVIDIA RTX 5070 Ti product page (1406 AI TOPS, sparse FP4), halved to dense; hmc-tech spec tables)
+components of BF16 (BF16X decode copies) at context 512:
+  group                                                    MB/token    share
+  mixer                                                       958.6    52.5%
+  state and cache                                              91.0     5.0%
+  connections                                                   0.2     0.0%
+  moe                                                         455.4    24.9%
+  depth memory                                                118.7     6.5%
+  head                                                        203.4    11.1%
+  total                                                      1827.3   100.0%
+
+  component                                   instances    MB/token    share
+  mixer
+    Mamba in_proj                                    20      639.67    35.0%
+    Mamba out_proj                                   20      253.62    13.9%
+    Mamba conv weights                               20        1.23     0.1%
+    Mamba gated norm and scan constants              20        0.18     0.0%
+    attention qkv                                     4       38.14     2.1%
+    attention out                                     4       25.43     1.4%
+    attention pass LoRA down                          4        0.10     0.0%
+    attention pass LoRA up                            4        0.20     0.0%
+  state and cache
+    Mamba state                                      20       86.84     4.8%
+    attention cache read                              4        4.19     0.2%
+    attention cache write                             4        0.01     0.0%
+  connections
+    hyper-connection norms                           24        0.20     0.0%
+    hyper-connection mixes                           24        0.00     0.0%
+  moe
+    latent_down                                      24       76.28     4.2%
+    latent_up                                        24       76.28     4.2%
+    shared expert gate_up                            24       38.14     2.1%
+    shared expert down                               24       19.27     1.1%
+    router (f32)                                     24       15.73     0.9%
+    router and selection bias                        24        0.02     0.0%
+    routed experts gate_up                           24      152.57     8.3%
+    routed experts down                              24       77.07     4.2%
+    expert embeddings                                24        0.05     0.0%
+  depth memory
+    depth memory routing features                    26       64.38     3.5%
+    depth memory read query                          21       16.69     0.9%
+    depth memory read output                         21       17.20     0.9%
+    depth memory read gate                           21        0.34     0.0%
+    depth memory bank read                           63        0.13     0.0%
+    depth memory bank write                           6        0.01     0.0%
+    depth memory pass and anchor rows                 6        0.01     0.0%
+    depth memory entry state                          6        4.77     0.3%
+    depth memory entry metadata                       6        0.80     0.0%
+    depth memory entry key                            6        0.61     0.0%
+    depth memory entry value                          6        0.61     0.0%
+    depth head (f32)                                  2       13.11     0.7%
+  head
+    embedding row                                     1        0.00     0.0%
+    residual stream embeddings                        1        0.02     0.0%
+    final norm                                        1        0.00     0.0%
+    LM head                                           1      203.42    11.1%
+
+  layers, MB per token over their passes (A attention, M Mamba-2)
+     0 M   136.12  1 M   136.12  2 M   136.12  3 M   136.12
+     4 A    72.00  5 M   136.12  6 M   136.12  7 M   136.12
+     8 A    72.00  9 M   136.12 10 M   136.12 11 M   136.12
+     reads: 1736.1 MB of weights and scales, 91.2 MB of state, cache and per-stream rows (at context 512)
+
+one stream   bytes per token      ceiling at spec     ceiling at measured
+  context   512     1827.3 MB             490 tok/s             467 tok/s
+  context  4096     1856.7 MB             483 tok/s             459 tok/s
+  compute ceiling, any stream count: 36693 tok/s (1.20 GMAC per token)
+
+batched    streams  experts/layer-pass   step MB at 512   tok/s spec   tok/s measured   step MB at 4096   tok/s spec   tok/s measured   binds
+                 8                28.7           3884.7         1845             1756            4119.6         1740             1656   bandwidth
+                32                81.7           9114.3         3146             2993           10053.8         2852             2714   bandwidth
+                64               111.2          13731.5         4176             3974           15610.6         3674             3495   bandwidth
+           the union is E (1 - (1 - k / E)^n) experts per layer-pass for uniform routing; real routing is
+           more concentrated, so the union is an upper bound. Ceilings count the weights once per step.
+
+formats           bytes per token  ceiling at spec ceiling at measured   decode copies
+           BF16        1827.3 MB           490 tok/s           467 tok/s   BF16X
+           BF16X       1909.6 MB           469 tok/s           446 tok/s   as held
+           INT8        1336.1 MB           671 tok/s           638 tok/s   BF16X
+           FP8         1511.1 MB           593 tok/s           564 tok/s   BF16X

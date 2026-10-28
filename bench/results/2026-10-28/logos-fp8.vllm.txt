@@ -1,0 +1,16 @@
+logos-fp8 vllm streams=  1 rep=0 decode=   117.9 tok/s per-stream=  117.9 TTFT p50=0.468s prefill=    1094 tok/s tpot-formula=   117.9 mismatch=0 short=0
+logos-fp8 vllm streams=  1 rep=1 decode=   117.9 tok/s per-stream=  117.9 TTFT p50=0.090s prefill=    5716 tok/s tpot-formula=   117.9 mismatch=0 short=0
+logos-fp8 vllm streams=  1 rep=2 decode=   117.8 tok/s per-stream=  117.8 TTFT p50=0.090s prefill=    5710 tok/s tpot-formula=   117.8 mismatch=0 short=0
+logos-fp8 vllm streams=  8 rep=0 decode=   602.5 tok/s per-stream=   75.3 TTFT p50=1.044s prefill=    3921 tok/s tpot-formula=   600.2 mismatch=0 short=0
+logos-fp8 vllm streams=  8 rep=1 decode=   602.5 tok/s per-stream=   75.3 TTFT p50=0.535s prefill=    7656 tok/s tpot-formula=   600.1 mismatch=0 short=0
+logos-fp8 vllm streams=  8 rep=2 decode=   601.5 tok/s per-stream=   75.2 TTFT p50=0.533s prefill=    7681 tok/s tpot-formula=   599.2 mismatch=0 short=0
+logos-fp8 vllm streams= 32 rep=0 decode=   896.0 tok/s per-stream=   28.0 TTFT p50=1.094s prefill=    2049 tok/s tpot-formula=  1559.6 mismatch=0 short=0
+logos-fp8 vllm streams= 32 rep=1 decode=   896.1 tok/s per-stream=   28.0 TTFT p50=1.092s prefill=    2051 tok/s tpot-formula=  1559.8 mismatch=0 short=0
+logos-fp8 vllm streams= 32 rep=2 decode=   895.4 tok/s per-stream=   28.0 TTFT p50=1.089s prefill=    2050 tok/s tpot-formula=  1558.7 mismatch=0 short=0
+logos-fp8 vllm streams= 64 rep=0 decode=   806.6 tok/s per-stream=   12.6 TTFT p50=8.109s prefill=    1511 tok/s tpot-formula=  2907.7 mismatch=0 short=0
+logos-fp8 vllm streams= 64 rep=1 decode=   806.8 tok/s per-stream=   12.6 TTFT p50=8.098s prefill=    1511 tok/s tpot-formula=  2907.2 mismatch=0 short=0
+logos-fp8 vllm streams= 64 rep=2 decode=   807.0 tok/s per-stream=   12.6 TTFT p50=8.096s prefill=    1511 tok/s tpot-formula=  2907.3 mismatch=0 short=0
+logos-fp8 vllm prefill T=512: TTFT median 83.4 ms, 6141 tok/s
+logos-fp8 vllm prefill T=2048: TTFT median 269.9 ms, 7587 tok/s
+logos-fp8 vllm prefill T=8192: TTFT median 1018.0 ms, 8047 tok/s
+wrote /home/aiadmin/lernex-engine-dev/bench-results/2026-10-28/logos-fp8.vllm.json
