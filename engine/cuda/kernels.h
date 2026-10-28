@@ -424,8 +424,9 @@ LX_API int64_t lx_gemm_workspace_bytes(int M, int K, lx_math math);
 //      do not depend on M, on where the row sits in the call, or on the other rows, whether they are present or not.
 //      So a decode token's bits are the same whatever the number of streams in its step, from one row up.
 //      tests/kernels/test_gemm_skinny.py checks this at M = 1, 2, 8, 32, 64 and across chunks of 64.
-// Bias and y are bf16 or f32 (bias may be null). The bf16-weight kernel needs N a multiple of 32 and K a multiple of
-// 64, and returns LX_ERR_NOT_SUPPORTED otherwise. Other formats are added to this family with the same order.
+// x is bf16; bias and y are bf16 or f32 (bias may be null). The bf16-weight kernel needs N a multiple of 16 and K a
+// multiple of 64, and returns LX_ERR_NOT_SUPPORTED otherwise (also for f32 x, until its loads are pipelined). The tile
+// shape (BM rows, BN columns) is chosen per call; it does not change any bits. Other formats join with the same order.
 LX_API int lx_gemm_skinny(const void* x, lx_dtype x_dtype, int ld_x, const lx_weight* w, const void* bias,
                           lx_dtype bias_dtype, void* y, lx_dtype y_dtype, int ld_y, int M, int N, int K, float alpha,
                           float beta, void* stream);

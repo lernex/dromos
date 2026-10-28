@@ -61,7 +61,7 @@ def bitwise(a, b):
 
 
 @pytest.mark.parametrize("N,K", SHAPES)
-@pytest.mark.parametrize("M", [1, 2, 8, 32, 64, 100])
+@pytest.mark.parametrize("M", [1, 2, 8, 16, 32, 64, 100])
 def test_bf16_matches_reference(lx, N, K, M):
     w = random_weight(W_BF16, N, K, seed=N + K)
     x = torch.randn(M, K, device="cuda").to(torch.bfloat16)
@@ -88,7 +88,7 @@ def test_rows_are_batch_invariant(lx, N, K):
     w = random_weight(W_BF16, N, K, seed=7)
     x = torch.randn(100, K, device="cuda").to(torch.bfloat16)
     full = run(lx, x, w, None, torch.empty(100, N, dtype=torch.bfloat16, device="cuda"), 1.0, 0.0, 100, N, K)
-    for M in (1, 2, 8, 32, 64):
+    for M in (1, 2, 8, 16, 32, 64):
         y = run(lx, x[:M].contiguous(), w, None, torch.empty(M, N, dtype=torch.bfloat16, device="cuda"), 1.0, 0.0, M, N, K)
         assert bitwise(y, full[:M]), f"M={M}: rows differ from the M=100 launch"
     for r in (0, 1, 37, 63, 64, 99):
