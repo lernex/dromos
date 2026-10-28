@@ -164,7 +164,13 @@ if(LX_BACKEND_CUDA)
   enable_language(CUDA)
   set(CMAKE_CUDA_STANDARD 20)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr -lineinfo")
+  # Line tables (-lineinfo) are most of the device code's size: the release flavors drop them
+  # (scripts/release/build.sh, -DLX_LINEINFO=OFF). Dev builds keep them, for the profilers and cuda-gdb.
+  option(LX_LINEINFO "Keep line tables in the CUDA device code (dev builds; the release flavors drop them)" ON)
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr")
+  if(LX_LINEINFO)
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -lineinfo")
+  endif()
 
   find_package(CUDAToolkit REQUIRED)
 
