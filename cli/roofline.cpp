@@ -116,8 +116,8 @@ double expert_bytes(const DecodeTraffic& traffic, int streams) {
   return total;
 }
 
-void print_components(const DecodeTraffic& traffic, const char* title) {
-  const double total = traffic.bytes_per_token();
+void print_components(const DecodeTraffic& traffic, const char* title, int streams) {
+  const double total = traffic.step_bytes(streams);
   std::printf("%s\n", title);
 
   // The groups, in the order their first component appears, then every component under its group.
@@ -130,7 +130,7 @@ void print_components(const DecodeTraffic& traffic, const char* title) {
   std::map<std::string, double> group_bytes;
   std::vector<std::string> groups;
   for (const TrafficItem& it : traffic.items) {
-    const double bytes = traffic.item_bytes(it, 1);
+    const double bytes = traffic.item_bytes(it, streams);
     auto found = row_of.find(it.name);
     if (found == row_of.end()) {
       found = row_of.emplace(it.name, rows.size()).first;

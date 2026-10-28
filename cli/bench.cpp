@@ -45,6 +45,7 @@ struct BenchArgs {
   bool sample = false;
   bool prefix_cache = true;  // --no-prefix-cache measures the cold path
   bool one_count = false;    // a child run: one stream count, the plan and its row (no header); see cmd_bench
+  bool components = false;   // print the step's bytes by component at each stream count (the profile's byte floor)
   FormatFlags format;
 };
 
@@ -174,6 +175,7 @@ int cmd_bench(int argc, char** argv) {
     else if (a == "--sample") args.sample = true;
     else if (a == "--no-prefix-cache") args.prefix_cache = false;
     else if (a == "--one-count") args.one_count = true;
+    else if (a == "--components") args.components = true;
     else if (args.model.empty() && a[0] != '-') args.model = a;
     else throw std::runtime_error("unknown option " + a);
   }
@@ -276,6 +278,7 @@ int cmd_bench(int argc, char** argv) {
                                                                      : "no bandwidth measured");
   }
 
+  if (args.components) print_components(traffic, ("components at " + std::to_string(streams) + " streams, context " + std::to_string(context) + ":").c_str(), streams);
   run_batch(engine, streams, std::min(args.prompt_tokens, 64), 8, engine.config().vocab_size, args.sample);  // warm up
   const double submitted = engine.now();
   const auto timings = run_batch(engine, streams, args.prompt_tokens, args.gen_tokens, engine.config().vocab_size, args.sample);

@@ -39,7 +39,8 @@ double ceiling_tps(const DecodeTraffic& traffic, int streams, double gbs, double
 
 // The components of one decode token at one stream: the groups, then every component with its count per token, its
 // bytes per token and its share, then each layer's total. `title` heads the block.
-void print_components(const DecodeTraffic& traffic, const char* title);
+// Bytes per step at `streams` streams (one by default: per token), by component.
+void print_components(const DecodeTraffic& traffic, const char* title, int streams = 1);
 
 // The bytes a step of `streams` streams reads for the routed experts: the expert items of step_bytes, each over the
 // union of the streams' choices.
