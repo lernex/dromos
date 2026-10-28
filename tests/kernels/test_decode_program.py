@@ -862,3 +862,39 @@ def test_chain_and_experts_do_not_depend_on_m(lx, kind):
         res[M] = [t[3 if M == 8 else 0] for t in (streams, latent, logits, rw, out)]
     for a, b in zip(res[8], res[1]):
         assert torch.equal(a, b)
+
+
+# ---- Kernel families ----------------------------------------------------------------------------
+
+LX_ERR_NOT_SUPPORTED = 801  # kernels.h: a program whose formats no kernel family reads has no copy to run
+
+
+@pytest.mark.parametrize("kinds,runs", [
+    (("bf16", "bf16x"), True),  # the BF16 family, with the BF16X copies
+    (("int8", "bf16x"), True),  # INT8, with the BF16X copies a model's BF16 projections get
+    (("fp8", "bf16"), True),    # the FP8 family
+    (("nvfp4", "fp8"), True),   # NVFP4 with its FP8 dense projections
+    (("nvfp4", "bf16"), True),  # NVFP4 with BF16 parts
+    (("int8", "fp8"), False),   # no family reads INT8 and FP8 together
+    (("int8", "nvfp4"), False),
+])
+def test_families(lx, kinds, runs):
+    """Each family's copy runs the programs of its formats; a mix no family reads is refused, not run wrong."""
+    torch.manual_seed(len(kinds) * 17)
+    M, N, K = 3, 256, 512
+    x = torch.randn(M, K, device="cuda").to(torch.bfloat16)
+    prog = Program(lx, M)
+    cases = []
+    for kind in kinds:
+        w, wd, keep = weight(N, K, kind)
+        out = torch.zeros(M, N, device="cuda")
+        prog.gemv(fx_plain(x), w, fy_store(out), N, K)
+        cases.append((out, x.double() @ wd.T, w, keep))
+    if not runs:
+        assert prog.lib.lx_program_build(prog.p) == LX_ERR_NOT_SUPPORTED
+        return
+    prog.build()
+    for _ in range(2):
+        prog.run()
+        for out, want, _, _ in cases:
+            check(out, want)

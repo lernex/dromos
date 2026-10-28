@@ -14,6 +14,7 @@
 #include <stdexcept>
 
 #include "core/checkpoint.h"
+#include "cuda/decode_family.h"
 #include "cuda/kernels.h"
 #include "dispatch/dispatch.h"
 #include "model/glue.h"
@@ -759,15 +760,14 @@ MetisModel::MetisModel(const MetisConfig& c, const ModelWeights& weights, const 
   m.c_out_w = static_cast<const float*>(need(weights, "continuation.output.weight", LX_F32, {1, R}));
   m.c_out_b = static_cast<const float*>(need(weights, "continuation.output.bias", LX_F32, {1}));
   // The decode program (LX_PROGRAM, opt-in: any value but 0) runs the decode steps it covers as one persistent
-  // kernel (decode_program_covers). It reads BF16, BF16X (the copies), INT8, FP8 and NVFP4 weights; the depth
-  // memory's metadata write is read as bf16 (a dequantized copy where the model holds it wider). A model in
-  // another format keeps the kernel-per-op path.
+  // kernel (decode_program_covers), on the kernel copy of the weight-format family its GEMV and expert formats sit in
+  // (decode_family.h): BF16 with the BF16X copies, INT8, FP8, or NVFP4 with its FP8 dense and BF16 parts. The depth
+  // memory's metadata write is read as bf16 (a dequantized copy where the model holds it wider). A model whose formats
+  // no family reads keeps the kernel-per-op path.
   const char* program = std::getenv("LX_PROGRAM");
-  const auto plain = [](lx_wtype f) {
-    return f == LX_W_BF16 || f == LX_W_BF16X || f == LX_W_INT8 || f == LX_W_FP8 || f == LX_W_NVFP4;
-  };
-  m.use_program = program && std::strcmp(program, "0") != 0 && !speculative && !experts && plain(formats.dense) &&
-                  plain(formats.experts) && plain(formats.latent_up);
+  const unsigned quant = (1u << formats.dense) | (1u << formats.experts) | (1u << formats.latent_up);
+  m.use_program = program && std::strcmp(program, "0") != 0 && !speculative && !experts &&
+                  lx::decode::family_for(quant) != lx::decode::kNoFamily;
   if (m.use_program) {
     // A backend built without the program (-DLX_DECODE_PROGRAM=OFF, as the release flavors are, or one that has
     // none) says so once, plainly, and decodes kernel by kernel.

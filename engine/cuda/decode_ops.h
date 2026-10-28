@@ -1,4 +1,4 @@
-// A decode program as the persistent kernel reads it (decode_kernel.cu) and the builder writes it
+// A decode program as the persistent kernel reads it (decode_kernel_body.cuh) and the builder writes it
 // (decode_program.cu): one descriptor per op, and per block the list of tasks it runs in order.
 // Plain data only; kernels.h ("Decode programs") is the contract these implement.
 #pragma once
@@ -260,22 +260,28 @@ struct Program {
   int prefetch_bytes;        // how far past a run's start its block keeps L2 fetched (0: off)
 };
 
-// decode_kernel.cu: the kernel's shared memory for a layout, its attributes, and the launch.
-// The kernel's copies: decode_kernel.cu (every weight format, any program) and decode_kernel_i8.cu and
-// decode_kernel_bf16.cu (one format family each, for the programs that read only it). lx_program_build picks the copy
-// from the formats its program reads (decode_program.cu, variant).
-namespace variant_gen {
+// decode_kernel_body.cuh, one copy per weight-format family (decode_family.h): decode_kernel_bf16.cu, decode_kernel_int8.cu,
+// decode_kernel_fp8.cu and decode_kernel_nvfp4.cu. lx_program_build picks the copy from the formats its program reads
+// (decode_program.cu). Each copy defines the same three functions in its own namespace.
+namespace family_bf16 {
 size_t step_smem_bytes(int x_bytes);
 int step_configure(size_t smem);
 int step_launch(const Program& P, int blocks, size_t smem, cudaStream_t stream);
-}  // namespace variant_gen
-namespace variant_i8 {
+}  // namespace family_bf16
+namespace family_int8 {
+size_t step_smem_bytes(int x_bytes);
 int step_configure(size_t smem);
 int step_launch(const Program& P, int blocks, size_t smem, cudaStream_t stream);
-}  // namespace variant_i8
-namespace variant_bf16 {
+}  // namespace family_int8
+namespace family_fp8 {
+size_t step_smem_bytes(int x_bytes);
 int step_configure(size_t smem);
 int step_launch(const Program& P, int blocks, size_t smem, cudaStream_t stream);
-}  // namespace variant_bf16
+}  // namespace family_fp8
+namespace family_nvfp4 {
+size_t step_smem_bytes(int x_bytes);
+int step_configure(size_t smem);
+int step_launch(const Program& P, int blocks, size_t smem, cudaStream_t stream);
+}  // namespace family_nvfp4
 
 }  // namespace lx::decode

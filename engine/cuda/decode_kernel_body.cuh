@@ -86,16 +86,36 @@ template <>
 struct Word<LX_W_INT8> {
   using F = WordI8;
 };
+// BF16X's quad, the copy's own. bf16x::patched() loops over a row's patch slots (and an overflow record); inlined at every
+// quad of every reader step it made the copy's compile superlinear, so the copies with BF16X took about twelve times as long
+// to compile as the same copies without. Out of line, the patch fix-up is one call per quad, and a row without patches takes
+// the same first compare. The bits are the same as bf16x::quad's.
+__device__ __noinline__ uint32_t bf16x_patched(const uint8_t* row, int K, uint32_t k, uint32_t e) {
+  return bf16x::patched(row, K, k, e);
+}
+__device__ __forceinline__ uint2 bf16x_quad(const uint8_t* row, int K, int k) {
+  const int blk = k / bf16x::kBlock, off = k - blk * bf16x::kBlock;
+  const uint8_t* b = row + bf16x::header_bytes(K) + static_cast<int64_t>(blk) * bf16x::kBlockBytes;
+  const uint32_t sm = *reinterpret_cast<const uint32_t*>(b + off);
+  const uint32_t codes = *reinterpret_cast<const uint32_t*>(b + bf16x::kCodes + (off & ~7) / 2);
+  const uint32_t base = row[bf16x::base_offset(K) + blk];
+  const uint32_t e = bf16x::exponents(base, (off & 4) ? codes >> 4 : codes);
+  return bf16x::assemble(sm, bf16x_patched(row, K, static_cast<uint32_t>(k), e));
+}
+__device__ __forceinline__ uint4 bf16x_chunk8(const uint8_t* row, int K, int k) {
+  const uint2 lo = bf16x_quad(row, K, k), hi = bf16x_quad(row, K, k + 4);
+  return make_uint4(lo.x, lo.y, hi.x, hi.y);
+}
 // BF16X words are decoded as they are fetched (WordLoad): the bf16 bits of four values, then the BF16 word.
 struct WordBf16X : WordFormat<LX_W_BF16> {};
 template <>
 struct Word<LX_W_BF16X> {
   using F = WordBf16X;
 };
-// The formats this copy of the kernel reads. The generic copy reads them all; a variant copy (decode_kernel_i8.cu,
-// decode_kernel_bf16.cu) reads the formats its programs read, and the host picks the copy from the program's formats.
+// The formats this copy of the kernel reads: its family's (decode_family.h), defined by the copy's TU. No default: a copy
+// that read every format would be the generic kernel, which no program needs.
 #ifndef LX_DECODE_FMTS
-#define LX_DECODE_FMTS 0xFFFFFFFFu
+#error "a decode kernel copy defines LX_DECODE_FMTS (decode_family.h)"
 #endif
 // A format as a type, so a dispatched call can take it as a template argument.
 template <int V>
@@ -320,7 +340,7 @@ struct WordLoad<WordFormat<LX_W_NVFP4>> {
 template <>
 struct WordLoad<WordBf16X> {
   __device__ __forceinline__ static void load(const RowRef& r, int w, uint2& word, float& bs) {
-    word = bf16x::quad(r.row, r.K, r.kb + 4 * w);
+    word = bf16x_quad(r.row, r.K, r.kb + 4 * w);
     bs = 1.0f;
   }
 };
@@ -597,7 +617,7 @@ __device__ __forceinline__ uint4 chunk_load(const uint8_t* row, const uint8_t* s
   if constexpr (kType == LX_W_BF16X) {
     aux = make_uint2(0u, 0u);
     (void)sc;
-    return bf16x::chunk8(row, K, k);
+    return bf16x_chunk8(row, K, k);
   }
   (void)K;
   if constexpr (kType == LX_W_NVFP4) {
@@ -1139,9 +1159,21 @@ __device__ __forceinline__ void gemv_mma(const Gemv& g, int b0, int nb, int sh, 
 }
 
 // The tensor-core reader for the product's format (kPlanes 2: f32 x in two 16-bit planes).
-template <int kPlanes>
-__device__ __forceinline__ void gemv_mma_w(const Gemv& g, int b0, int nb, int sh, float* red) {
-  dispatch_w<false>(g.wtype, [&](auto lx_tag) { gemv_mma<decltype(lx_tag)::value, kPlanes>(g, b0, nb, sh, red); });
+// One format's products for a batch of a run's rows: the tensor-core reader when the product has mma, else the FMA reader.
+// Out of line per format: gemv_run dispatches to these, so the readers of one format are not inlined beside another's
+// (with every format's readers in gemv_run, the copies compiled superlinearly in the number of formats).
+template <int kType>
+__device__ __noinline__ void gemv_products(const Gemv& g, int b0, int nb, int sh, float* red) {
+  if constexpr (kType != kF32) {
+    if (g.mma) {
+      if (g.mma <= 2) gemv_mma<kType, 1>(g, b0, nb, sh, red);
+      else gemv_mma<kType, 2>(g, b0, nb, sh, red);
+      return;
+    }
+  }
+  if constexpr (kType == kF32) gemv_dots<kType, false>(g, b0, nb, sh, red);
+  else if (g.xs_bf16) gemv_dots<kType, true>(g, b0, nb, sh, red);
+  else gemv_dots<kType, false>(g, b0, nb, sh, red);
 }
 
 // A block's run of tasks of one product: stage x once, then all its rows at once across the warps
@@ -1188,17 +1220,7 @@ __device__ __noinline__ void gemv_run(int op, const uint32_t* entries, int count
     const int nb = min(cap, R - b0);
     float* red = scratch();
     float* sq = red + nb * S * M;
-    if (g.mma) {
-      if (g.mma <= 2) gemv_mma_w<1>(g, b0, nb, sh, red);
-      else gemv_mma_w<2>(g, b0, nb, sh, red);
-    } else {
-      dispatch_w<true>(g.wtype, [&](auto lx_tag) {
-        constexpr int F = decltype(lx_tag)::value;
-        if constexpr (F == kF32) gemv_dots<F, false>(g, b0, nb, sh, red);
-        else if (g.xs_bf16) gemv_dots<F, true>(g, b0, nb, sh, red);
-        else gemv_dots<F, false>(g, b0, nb, sh, red);
-      });
-    }
+    dispatch_w<true>(g.wtype, [&](auto lx_tag) { gemv_products<decltype(lx_tag)::value>(g, b0, nb, sh, red); });
     csync();
     for (int e = tid, j = 0; e < nb * M; e += kCT, ++j) {
       const int r = e / M, m = e % M, n = run_row(g, b0 + r);
