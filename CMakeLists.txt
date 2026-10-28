@@ -117,14 +117,13 @@ endif()
 
 # The static runtime for the Linux release builds: libstdc++ and libgcc are part of the binaries, so the release runs
 # on any distribution from the build base's glibc up. The backends hide what they link (their interface is C).
-# The C++ targets take the flags as the driver's; nvcc (the CUDA backend's link) takes them through its host compiler.
+# Each target gets them from the driver that links it. The CUDA kernels library is linked by the host C++ driver (g++),
+# not nvcc, so it takes the same flags.
 if(LX_STATIC_LIBSTDCXX AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
   set(LX_STATIC_RUNTIME -static-libstdc++ -static-libgcc)
-  set(LX_STATIC_RUNTIME_CUDA "SHELL:-Xcompiler -static-libstdc++,-static-libgcc")
   set(LX_HIDE_LINK_SYMBOLS "LINKER:--exclude-libs,ALL")
 else()
   set(LX_STATIC_RUNTIME "")
-  set(LX_STATIC_RUNTIME_CUDA "")
   set(LX_HIDE_LINK_SYMBOLS "")
 endif()
 
@@ -174,8 +173,8 @@ if(LX_BACKEND_CUDA)
   add_library(lernex_kernels SHARED ${LX_CUDA_SOURCES})
   target_include_directories(lernex_kernels PUBLIC engine)
   target_link_libraries(lernex_kernels PUBLIC CUDA::cudart CUDA::cublasLt)
-  if(LX_STATIC_RUNTIME_CUDA)
-    target_link_options(lernex_kernels PRIVATE "${LX_STATIC_RUNTIME_CUDA}")
+  if(LX_STATIC_RUNTIME)
+    target_link_options(lernex_kernels PRIVATE ${LX_STATIC_RUNTIME})
   endif()
   if(LX_HIDE_LINK_SYMBOLS)
     target_link_options(lernex_kernels PRIVATE "${LX_HIDE_LINK_SYMBOLS}")
