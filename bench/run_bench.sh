@@ -6,6 +6,7 @@
 #   scripts/remote.sh bench x 'bash bench/run_bench.sh serve-engine MODEL TAG [format flags]'
 #   scripts/remote.sh bench x 'bash bench/run_bench.sh serve-vllm MODEL TAG VOCAB [vllm flags]'
 #   scripts/remote.sh bench x 'bash bench/run_bench.sh spec MODEL TAG [format flags]'
+#   scripts/remote.sh bench x 'bash bench/run_bench.sh profile MODEL TAG STREAMS [format flags]'
 #
 # MODEL is a folder. TAG names the outputs. Format flags (--weights, --no-bf16x) go to lernex, as they are.
 # Results go to $LX_BENCH_OUT (default ~/lernex-engine-dev/bench-results/2026-10-28), which is outside the slot
@@ -111,6 +112,18 @@ case "$cmd" in
     fi
     systemctl --user stop "$unit.scope" 2>/dev/null
     wait "$pid" 2>/dev/null
+    ;;
+
+  profile)
+    # Kernel time of one lernex bench run at one stream count (CUDA graph nodes traced), for docs/BENCH.md's
+    # "where the engine loses": nsys over the whole run, warm-up and prefill included, so read the decode kernels.
+    model=$1; tag=$2; streams=$3; shift 3
+    rep="$OUT/$tag.s$streams"
+    nsys profile -t cuda --cuda-graph-trace=node --force-overwrite=true -o "$rep" \
+      "$LX" bench "$model" --streams "$streams" --prompt-tokens 512 --gen-tokens 256 --no-prefix-cache "$@" \
+      > "$rep.run.txt" 2>&1
+    nsys stats --report cuda_gpu_kern_sum --format csv --force-export=true "$rep.nsys-rep" > "$rep.kern.csv" 2>"$rep.stats.err"
+    log "profile $tag s=$streams exit $?"
     ;;
 
   *)
