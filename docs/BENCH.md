@@ -1,8 +1,8 @@
 # Batched serving and prefill: Lernex against vLLM
 
-Status: partial. The vLLM cells and the prefix-cache check are measured. The Logos FP8 cell at 0.96 GPU memory is queued
-behind other jobs on the GPU lock and is not in this file yet. The Lernex format sweep (every format, the serve view,
-prefill, spec-check and the profile) waits for final main.
+Status: partial. The vLLM cells and the prefix-cache check are measured. The Logos FP8 run at a 1024-token context and
+0.96 GPU memory (32 and 64 streams) is queued on the GPU lock and is not in this file yet. The Lernex format sweep
+(every format, the serve view, prefill, spec-check and the profile) waits for final main.
 
 Measured 2026-10-28 on `ssh lernex`. Every GPU run went through the lock (`scripts/remote.sh bench x`).
 
@@ -14,8 +14,8 @@ Measured 2026-10-28 on `ssh lernex`. Every GPU run went through the lock (`scrip
 | Driver, CUDA | driver 595.91.07; CUDA 13.4 toolkit and runtime (driver API 13.2) |
 | Host | Ubuntu 26.04.1 LTS, kernel 7.0.0-38-generic, 30 GB RAM. The server also runs CI runners, so each vLLM run is under a memory cap |
 | Lernex | engine commit `71aa511`. Local main is 8 commits above origin/main `dd0fed5`: four engine and CLI changes (`88b182b`, `156341d`, `b1f9ff6`, `71aa511`) and four bench-driver commits. None is pushed. CMake's default build is `LX_ARCHS=120a-real` |
-| vLLM | 0.31.0 in `~/venvs/vllm-metis`, with the vllm-metis plugin |
-| Client | `bench/endpoint_bench.py` (aiohttp), on the same host; one streamed `/v1/completions` per stream |
+| vLLM | 0.31.0 from `~/venvs/vllm`, started by `~/venvs/vllm-metis/bin/python`. That venv's `.pth` adds the vLLM packages and loads the vllm-metis plugin |
+| Client | `bench/endpoint_bench.py` (aiohttp), on the same host; one streamed `/v1/completions` per stream. `--metrics` polls the server's `/metrics` every 0.25 s for the running and waiting counts |
 
 vLLM is started with the same flags for every format:
 
@@ -23,7 +23,8 @@ vLLM is started with the same flags for every format:
       --no-enable-prefix-caching --max-model-len 9216 --max-num-seqs 64 \
       --max-num-batched-tokens 8192 --gpu-memory-utilization 0.90
 
-It runs in a transient systemd user scope with `MemoryMax=20G` and `MAX_JOBS=2`. Extra flags are appended after these.
+It runs in a transient systemd user scope with `MemoryMax=20G` and `MAX_JOBS=2`. Extra flags are appended after these,
+so the Logos runs at other settings pass `--max-model-len` and `--gpu-memory-utilization` again.
 
 | Format | Folder | Notes |
 |---|---|---|
@@ -36,8 +37,9 @@ Workload, the same for both engines:
 - **Decode.** Each stream gets its own prompt from the generator in `cli/bench.cpp` (xorshift64 seeded per stream,
   ids in [1000, vocab - 1000)). 512 prompt tokens, 256 greedy tokens, `ignore_eos`. Each stream count runs a warm-up
   (min(prompt, 64) prompt tokens, 8 generated), then three measured repeats. Stream counts 1, 8, 32 and 64.
-- **Prefill.** One request with exactly T prompt tokens and `max_tokens` 1, for T = 512, 2048 and 8192. The prompt is
-  the token sequences from the prompts file, concatenated and repeated to T. Median of five.
+- **Prefill.** One request with exactly T prompt tokens and `max_tokens` 1, for T = 512, 2048 and 8192 (only 512 when
+  the context is 1024). The prompt is the token sequences from the prompts file, concatenated and repeated to T. Median
+  of five.
 - **Correctness.** Every streamed token is counted. Every vLLM decode run had zero mismatched and zero short streams.
 
 ## Two definitions of decode throughput
@@ -118,9 +120,22 @@ Median of three runs, with the min-max range beside it.
 
 ## vLLM: Logos FP8
 
-At 0.90 GPU memory, Logos FP8's KV cache holds 74,342 tokens. vLLM reports 8.07 concurrent requests at its
-9,216-token maximum, and the log peaks at 17 running with 47 waiting (KV usage 99.2%). At 32 and 64 streams, neither
-definition measures decode at that concurrency, so those cells are shown only as the record.
+Logos FP8's KV cache is what limits vLLM here. At the default settings it admits 17 requests, so the 32- and 64-stream
+cells measure a queue, not a decode rate. Four runs, all on the same checkpoint and driver:
+
+| run | context | GPU memory | 32 streams | 64 streams |
+|---|---:|---:|---|---|
+| parent (their harness, `vllm bench serve`) | 4096 | 0.92 | 29 running, 3 waiting, KV 99.5%; peak output 1,102 tok/s, overall 667 tok/s; mean TPOT 28.2 ms | not run |
+| ours, default | 9216 | 0.90 | 17 running, 47 waiting (the peaks), KV 99.2%; both formulas measure the queue | the same queue |
+| ours, 0.96 at 9216 | 9216 | 0.96 | 26 running, 6 waiting, KV 100%; the third repeat ran out of GPU memory | not reached |
+| ours, this rerun | 1024 | 0.96 | pending | pending |
+
+**The parent's run.** Their server log peaks at 29 running and 3 waiting, which is the 32 streams less the queue.
+Their `vllm bench serve` numbers are in `parent-logos-fp8-ctx4096-u092.vllm-c32.json` beside this file's data. Its
+per-token formula at the nominal 32 streams is 1,135 tok/s (32,000 / 28.19 ms); at the 29 that were resident it is
+1,029 tok/s (29,000 / 28.19 ms).
+
+**Ours, default (0.90, 9216).** The record, from the first Logos run (its harness did not sample the gauges):
 
 | | 1 stream | 8 streams | 32 streams | 64 streams |
 |---|---:|---:|---:|---:|
@@ -130,9 +145,15 @@ definition measures decode at that concurrency, so those cells are shown only as
 
 Prefill at 0.90: 6,141 / 7,587 / 8,047 tok/s at T = 512 / 2048 / 8192.
 
-**0.96 rerun (pending).** The same run with `--gpu-memory-utilization 0.96` is queued behind other jobs on the GPU
-lock. Its peak running count decides whether 32 and 64 streams are measurable at all; the numbers go here once it
-finishes.
+**Ours, 0.96 at 9216 (crashed).** The first two 32-stream repeats completed: window 452.5 and 452.3 tok/s, per-token
+formula 1,268.2 and 1,268.0. The third repeat failed with `torch.OutOfMemoryError`: the engine asked for 160 MiB with
+125 MiB free on the 15.47 GiB card. The client then reported "the stream carried no usage", because the engine core had
+died. The cause is in the server log (`logos-fp8-u96-9216-oom.vllm.log.gz`), not in the client.
+
+**Ours, this rerun (1024 context, 0.96).** Pending. The cells read as the coordinator set them: "N of 32 streams
+resident, X tok/s", where N is the peak running count from the server log (the client's gauge sampler is beside it),
+and X is the per-token formula at N, N x 1000 / mean TPOT. The overall output, the peak one-second output and the
+window are shown beside it, with the definitions of `vllm bench serve`.
 
 ## Caveats
 
@@ -145,6 +166,9 @@ finishes.
 - **Start-up compiles.** vLLM compiles at engine start (flashinfer `fused_moe_120`, Triton kernels, "JIT kernel
   warmup"), before any measured cell. The first FP8 repeats at 1 and 8 streams had TTFT 421 ms and 759 ms, against 42 ms
   and 253 ms in the other repeats. The medians absorb this; decode is unaffected (235.0 against 234.6 tok/s).
+- **Logos Triton compiles during inference.** The 9216 Logos run logged two Triton JIT compiles while serving
+  (`fused_moe_kernel` at 08:54:37, `_causal_conv1d_fwd_kernel` at 08:54:44), both before its 32-stream cell. The 1024
+  run's log is checked for the same lines inside its timed repeats.
 - **Shutdown.** The Praxis FP8 server log ends with an `EngineDeadError` during shutdown. It came after the client had
   written its results, and the server was stopped on purpose.
 - **NVFP4.** No vLLM cell. vLLM 0.31.0 does not load the Metis GPTQ NVFP4 folder.
@@ -177,8 +201,9 @@ finishes.
     scripts/remote.sh bench x 'bash bench/run_bench.sh serve-vllm /home/aiadmin/kronos-scratch/logos/engines/praxis/hf praxis-bf16 65536'
     scripts/remote.sh bench x 'bash bench/run_bench.sh serve-vllm /home/aiadmin/kronos-scratch/logos/engines/praxis/fp8 praxis-fp8 65536'
     scripts/remote.sh bench x 'bash bench/run_bench.sh serve-vllm /home/aiadmin/kronos-scratch/logos/hfport/fp8 logos-fp8 65536'
+    scripts/remote.sh bench x 'LX_VLLM_STREAMS=32,64 LX_VLLM_PREFILL=512 bash bench/run_bench.sh serve-vllm /home/aiadmin/kronos-scratch/logos/hfport/fp8 logos-fp8-ctx1024-u96 65536 --max-model-len 1024 --gpu-memory-utilization 0.96'
     scripts/remote.sh bench x 'bash bench/run_bench.sh cachecheck /home/aiadmin/kronos-scratch/logos/engines/praxis/hf praxis-bf16'
     scripts/remote.sh bench x 'bash bench/run_bench.sh cacheoff /home/aiadmin/kronos-scratch/logos/engines/praxis/hf praxis-bf16'
 
 Raw outputs are in `bench/results/2026-10-28/`. `bench/make_tables.py` turns a results directory into the tables and
-`summary.csv`.
+`summary.csv`. `bench/vllm_cells.py` prints each repeat's server-log and client counts for a vLLM run.

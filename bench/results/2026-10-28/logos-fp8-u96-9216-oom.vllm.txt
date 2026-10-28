@@ -1,0 +1,36 @@
+logos-fp8-u96 vllm streams=  1 rep=0 decode=   118.0 tok/s per-stream=  118.0 TTFT p50=0.100s prefill=    5142 tok/s tpot-formula=   118.0 mismatch=0 short=0
+logos-fp8-u96 vllm streams=  1 rep=1 decode=   118.0 tok/s per-stream=  118.0 TTFT p50=0.088s prefill=    5813 tok/s tpot-formula=   118.0 mismatch=0 short=0
+logos-fp8-u96 vllm streams=  1 rep=2 decode=   118.0 tok/s per-stream=  118.0 TTFT p50=0.088s prefill=    5798 tok/s tpot-formula=   118.0 mismatch=0 short=0
+logos-fp8-u96 vllm streams=  8 rep=0 decode=   602.4 tok/s per-stream=   75.3 TTFT p50=0.545s prefill=    7517 tok/s tpot-formula=   600.1 mismatch=0 short=0
+logos-fp8-u96 vllm streams=  8 rep=1 decode=   602.1 tok/s per-stream=   75.3 TTFT p50=0.531s prefill=    7706 tok/s tpot-formula=   599.7 mismatch=0 short=0
+logos-fp8-u96 vllm streams=  8 rep=2 decode=   601.9 tok/s per-stream=   75.2 TTFT p50=0.531s prefill=    7715 tok/s tpot-formula=   599.6 mismatch=0 short=0
+logos-fp8-u96 vllm streams= 32 rep=0 decode=   452.5 tok/s per-stream=   14.1 TTFT p50=1.637s prefill=    1841 tok/s tpot-formula=  1268.2 mismatch=0 short=0
+logos-fp8-u96 vllm streams= 32 rep=1 decode=   452.3 tok/s per-stream=   14.1 TTFT p50=1.638s prefill=    1840 tok/s tpot-formula=  1268.0 mismatch=0 short=0
+Traceback (most recent call last):
+  File "/home/aiadmin/lernex-engine-dev/bench/bench/endpoint_bench.py", line 258, in <module>
+    main()
+    ~~~~^^
+  File "/home/aiadmin/lernex-engine-dev/bench/bench/endpoint_bench.py", line 251, in main
+    result = asyncio.run(main_async(args))
+  File "/usr/lib/python3.14/asyncio/runners.py", line 204, in run
+    return runner.run(main)
+           ~~~~~~~~~~^^^^^^
+  File "/usr/lib/python3.14/asyncio/runners.py", line 127, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/usr/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/home/aiadmin/lernex-engine-dev/bench/bench/endpoint_bench.py", line 205, in main_async
+    row = await run_streams(session, url, args.model, n, args.prompt_tokens, args.gen_tokens, args.vocab)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/aiadmin/lernex-engine-dev/bench/bench/endpoint_bench.py", line 135, in run_streams
+    results = await asyncio.gather(
+              ^^^^^^^^^^^^^^^^^^^^^
+        *(stream_one(session, url, completion_body(name, p, gen_tokens)) for p in prompts)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/home/aiadmin/lernex-engine-dev/bench/bench/endpoint_bench.py", line 93, in stream_one
+    raise RuntimeError("the stream carried no usage (stream_options.include_usage is needed)")
+RuntimeError: the stream carried no usage (stream_options.include_usage is needed)
