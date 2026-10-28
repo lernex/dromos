@@ -3,11 +3,11 @@
 # docs/RELEASE.md: bin/lernex, lib/liblernex_metal.dylib, share/lernex/channel and LICENSE.
 # packaging/homebrew-tap/bump-formula.sh moves version, url and sha256 to a release.
 class Lernex < Formula
-  desc "Inference engine for Lernex's Metis models, on the Metal GPU of an Apple silicon Mac"
+  desc "Metis inference engine on the Metal GPU of an Apple silicon Mac"
   homepage "https://github.com/lernex/lernex-engine"
-  version "0.1.0"
   url "https://github.com/lernex/lernex-engine/releases/download/v0.1.0/lernex-darwin-arm64.tar.gz"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  version "0.1.0"
+  sha256 "cdd136284cdea38b7a8773ef5a5dbfa7f6064e0744829ad7fc081ff7138b7662"
 
   depends_on arch: :arm64
   depends_on macos: :sonoma
@@ -17,8 +17,8 @@ class Lernex < Formula
     lib.install Dir["lib/*.dylib"]
     # The tuning tables and the channel file the tarball ships. The channel names this install path, so
     # `lernex update` and the daily notice point at brew upgrade lernex.
-    (share/"lernex").install Dir["share/lernex/*"] if Dir.exist?("share/lernex")
-    (share/"lernex/channel").atomic_write "homebrew\n"
+    pkgshare.install Dir["share/lernex/*"] if Dir.exist?("share/lernex")
+    (pkgshare/"channel").atomic_write "homebrew\n"
     prefix.install "LICENSE" if File.exist?("LICENSE")
   end
 
@@ -35,6 +35,6 @@ class Lernex < Formula
     assert_match "lernex #{version}", shell_output("#{bin}/lernex --version")
     doctor = shell_output("#{bin}/lernex doctor")
     assert_match "Metal", doctor
-    assert_equal "homebrew\n", (share/"lernex/channel").read
+    assert_equal "homebrew\n", (pkgshare/"channel").read
   end
 end
