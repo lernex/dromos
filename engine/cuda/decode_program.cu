@@ -861,6 +861,39 @@ int lx_program_build(lx_program* p) {
       cudaMalloc(&p->d_done, (nops + 1) * 4) != cudaSuccess)
     return static_cast<int>(cudaErrorMemoryAllocation);
   cudaMemset(p->d_done, 0, (nops + 1) * 4);
+  // LX_PROGRAM_TRACE with LX_PROGRAM_TRACE_OUT: each op's kind, shape, tasks, blocks, dependencies and the bytes its
+  // tasks read (weights, scales, and the Mamba states), for the timeline analysis (tools/decode_program_trace.py).
+  if (std::getenv("LX_PROGRAM_TRACE") && std::getenv("LX_PROGRAM_TRACE_OUT")) {
+    const std::string path = std::string(std::getenv("LX_PROGRAM_TRACE_OUT")) + "/opinfo_M" + std::to_string(p->M) + ".txt";
+    if (FILE* f = std::fopen(path.c_str(), "w")) {
+      static const char* const names[] = {"embed", "memread", "gemv", "ssm", "convbc", "select",
+                                          "expup", "expdown", "attention", "entry", "continuation"};
+      std::fprintf(f, "op kind ntasks nblocks pool waited N K bytes write_bytes deps\n");
+      for (int op = 0; op < nops; ++op) {
+        const OpDesc& d = p->ops[op];
+        double bytes = 0, wbytes = 0;
+        if (d.pool == kStatic) {
+          std::vector<PfSpan> tmp;
+          for (int t = 0; t < d.ntasks; ++t) {
+            tmp.clear();
+            task_spans(d, t, tmp);
+            for (const PfSpan& s : tmp) bytes += s.bytes;
+          }
+        } else if (d.kind == kExpUp) {
+          bytes = 2.0 * d.up.rows * d.up.row_bytes * d.ntasks;
+        } else if (d.kind == kExpDown) {
+          bytes = static_cast<double>(d.down.top_k) * d.down.rows * d.down.row_bytes * d.ntasks;
+        }
+        if (d.kind == kSsm) wbytes = bytes;  // the Mamba state is written back as it is read
+        const int N = d.kind == kGemv ? d.gemv.N : 0, K = d.kind == kGemv ? d.gemv.K : 0;
+        std::fprintf(f, "%d %s %d %d %d %d %d %d %.0f %.0f", op, names[d.kind], d.ntasks, d.nblocks, d.pool, d.waited, N,
+                     K, bytes, wbytes);
+        for (int k = 0; k < d.ndeps; ++k) std::fprintf(f, " %d", d.deps[k] & 0xffff);
+        std::fprintf(f, "\n");
+      }
+      std::fclose(f);
+    }
+  }
   if (std::getenv("LX_PROGRAM_TRACE")) {
     if (cudaMalloc(&p->d_trace, static_cast<size_t>(p->total_tasks) * 2 * 4 * 8) != cudaSuccess)
       return static_cast<int>(cudaErrorMemoryAllocation);

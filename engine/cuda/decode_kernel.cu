@@ -2,8 +2,9 @@
 //
 // One block of 16 warps per SM runs its list of tasks in program order. Products read their weight
 // rows straight from global memory on the tensor cores (dots_mma: 16 rows per warp at a time, several
-// steps per lane in flight) or, for f32 weights and odd shapes, with FMAs (dots_rows), and finish the
-// outputs themselves: x staging and norms before the reader, the epilogue after it. At the start of
+// steps per lane in flight; dots_mma_lines for the products, the same with whole-line loads) or, for
+// f32 weights and odd shapes, with FMAs (dots_rows), and finish the outputs themselves: x staging and
+// norms before the reader, the epilogue after it. At the start of
 // each run of an op's tasks, warp 1 has L2 fetch the block's coming weights up to a fixed number of
 // bytes ahead (spans the builder lists), so DRAM keeps streaming while warp 0 waits for the ops the
 // run reads (per-op counters in global memory, acquire); after the run the block counts itself into
@@ -662,6 +663,176 @@ __device__ __forceinline__ void dots_mma(int nunits, UnitOf&& unit_of, Sink&& si
   }
 }
 
+// The partner lane's value: lane ^ 4, the same t in row group g ^ 1.
+__device__ __forceinline__ uint4 shfl_partner(uint4 v) {
+  v.x = __shfl_xor_sync(0xffffffffu, v.x, 4);
+  v.y = __shfl_xor_sync(0xffffffffu, v.y, 4);
+  v.z = __shfl_xor_sync(0xffffffffu, v.z, 4);
+  v.w = __shfl_xor_sync(0xffffffffu, v.w, 4);
+  return v;
+}
+__device__ __forceinline__ uint2 shfl_partner(uint2 v) {
+  v.x = __shfl_xor_sync(0xffffffffu, v.x, 4);
+  v.y = __shfl_xor_sync(0xffffffffu, v.y, 4);
+  return v;
+}
+// The partner lane's pointer (a row, or a row's scales; null when the partner has none).
+template <class P>
+__device__ __forceinline__ P shfl_partner_ptr(P p) {
+  const uint64_t v = reinterpret_cast<uintptr_t>(p);
+  const uint32_t lo = __shfl_xor_sync(0xffffffffu, static_cast<uint32_t>(v), 4);
+  const uint32_t hi = __shfl_xor_sync(0xffffffffu, static_cast<uint32_t>(v >> 32), 4);
+  return reinterpret_cast<P>(static_cast<uintptr_t>((static_cast<uint64_t>(hi) << 32) | lo));
+}
+// A lane's chunk of one row as chunk_load returns it: the 16 bytes and, for NVFP4, the chunk's scales.
+struct LineChunk {
+  uint4 w;
+  uint2 aux;
+};
+__device__ __forceinline__ LineChunk shfl_partner_chunk(LineChunk c) {
+  c.w = shfl_partner(c.w);
+  c.aux = shfl_partner(c.aux);
+  return c;
+}
+
+// dots_mma with every load reading whole 128-byte lines. In dots_mma a load covers 64 bytes of each of
+// eight rows, half a line, and the other half follows in the next step's load: two requests per line,
+// and DRAM serves that pattern worse the more of it is in flight (measured: a bare stream of it loses
+// a quarter of its bandwidth going from 8 to 16 loads a lane in flight, where whole lines lose nothing).
+// Here two steps of a unit go out together: row groups 2i and 2i + 1 both read rows 2i and 2i + 1 (and
+// + 8), the even group at the first step and the odd group at the second, so each load covers 128
+// contiguous bytes of four rows. One swap with the partner group (lane ^ 4) then gives every lane
+// exactly the chunks dots_mma would have loaded for it (the chunk, its scales and its row pointers
+// move together), and the steps are consumed in the same order, so the products are the same bits. A
+// unit's last step goes out alone when its count is odd. kU pairs of steps per lane are in flight across
+// the ends of units, and a pair's loads go out before the oldest pair is used.
+template <int kType, int kU, int kPlanes, int kCols, class UnitOf, class Sink>
+__device__ __forceinline__ void dots_mma_lines(int nunits, UnitOf&& unit_of, Sink&& sink, const uint16_t* xs,
+                                               int xst, int nx) {
+  using C = Chunk<kType>;
+  constexpr int kV = C::kValues, kR = kV / 2;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+  const bool odd = (g & 1) != 0;
+  const int mine = nunits > warp ? (nunits - warp + kComputeWarps - 1) / kComputeWarps : 0;
+  if (mine == 0) return;
+  int lv = 0, ls = 0;
+  UnitRef lr = unit_of(warp);
+  UnitRef ln = mine > 1 ? unit_of(warp + kComputeWarps) : lr;
+  // the current unit's rows 2i, 2i + 1, 2i + 8 and 2i + 9 (i = g / 2) and their scale rows, from the lane and its
+  // partner (warp-uniform calls, so the shuffles see every lane)
+  const uint8_t *q0 = nullptr, *q1 = nullptr, *q2 = nullptr, *q3 = nullptr;
+  const uint8_t *s0 = nullptr, *s1 = nullptr, *s2 = nullptr, *s3 = nullptr;
+  auto rows_of = [&]() {
+    const uint8_t *pa = shfl_partner_ptr(lr.a), *pb = shfl_partner_ptr(lr.b);
+    q0 = odd ? pa : lr.a;
+    q1 = odd ? lr.a : pa;
+    q2 = odd ? pb : lr.b;
+    q3 = odd ? lr.b : pb;
+    if constexpr (kType == LX_W_NVFP4) {
+      const uint8_t *sa = shfl_partner_ptr(lr.sa), *sb = shfl_partner_ptr(lr.sb);
+      s0 = odd ? sa : lr.sa;
+      s1 = odd ? lr.sa : sa;
+      s2 = odd ? sb : lr.sb;
+      s3 = odd ? lr.sb : sb;
+    }
+  };
+  rows_of();
+  // the chunk of a row at this lane's index j of the unit (value k = kabs + j * kV), with its scales; zero for no row
+  auto fetch = [&](const uint8_t* row, const uint8_t* sc, int j, LineChunk& out) {
+    out.w = make_uint4(0u, 0u, 0u, 0u);
+    out.aux = make_uint2(0u, 0u);
+    if (row) out.w = chunk_load<kType>(row, sc, lr.K, lr.kabs + j * kV, out.aux);
+  };
+  // the lane's next loads: w[0..3] rows 2i, 2i + 1, 2i + 8, 2i + 9 at its step of a pair, or w[0] and w[2] its own
+  // rows g and g + 8 for a lone step; the x offset of the (first) step (-1: none, the same in every lane; -2: this
+  // lane's column has no x); the unit it ends (-1: none); whether it is a pair
+  auto produce = [&](LineChunk (&w)[4], int& xo, int& end, int& two) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) w[i] = LineChunk{make_uint4(0u, 0u, 0u, 0u), make_uint2(0u, 0u)};
+    xo = -1;
+    end = -1;
+    two = 0;
+    if (lv < mine) {
+      two = ls + 1 < lr.steps;
+      if (two) {
+        const int j = 4 * ls + (odd ? 4 : 0) + t;
+        fetch(q0, s0, j, w[0]);
+        fetch(q1, s1, j, w[1]);
+        fetch(q2, s2, j, w[2]);
+        fetch(q3, s3, j, w[3]);
+      } else {  // the lane's own rows g and g + 8
+        const int j = 4 * ls + t;
+        fetch(odd ? q1 : q0, odd ? s1 : s0, j, w[0]);
+        fetch(odd ? q3 : q2, odd ? s3 : s2, j, w[2]);
+      }
+      const int row = lr.xr + g;
+      xo = g < kCols && row < nx ? row * xst + lr.kb + (4 * ls + t) * kV : -2;
+      ls += two ? 2 : 1;
+      if (ls == lr.steps) {
+        end = warp + lv * kComputeWarps;
+        ls = 0;
+        if (++lv < mine) {
+          lr = ln;
+          rows_of();
+          if (lv + 1 < mine) ln = unit_of(warp + (lv + 1) * kComputeWarps);
+        }
+      }
+    }
+  };
+  float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  // one step: the lane's chunks of rows g and g + 8 against x at xo, as in dots_mma
+  auto step = [&](const LineChunk& wa, const LineChunk& wb, int xo) {
+    uint32_t ra[kR], rb[kR];
+    C::decode(wa.w, wa.aux, ra);
+    C::decode(wb.w, wb.aux, rb);
+#pragma unroll
+    for (int h = 0; h < kPlanes; ++h) {  // x, or its planes in order
+      uint32_t rx[kR];
+#pragma unroll
+      for (int i = 0; i < kR / 4; ++i) {
+        const uint4 q =
+            xo >= 0 ? *reinterpret_cast<const uint4*>(xs + h * nx * xst + xo + 8 * i) : make_uint4(0u, 0u, 0u, 0u);
+        rx[4 * i] = q.x;
+        rx[4 * i + 1] = q.y;
+        rx[4 * i + 2] = q.z;
+        rx[4 * i + 3] = q.w;
+      }
+#pragma unroll
+      for (int j = 0; j < kV / 4; ++j)
+        mma16816<C::kF16>(c, ra[2 * j], rb[2 * j], ra[2 * j + 1], rb[2 * j + 1], rx[2 * j], rx[2 * j + 1]);
+    }
+  };
+  LineChunk bw[kU][4];
+  int bx[kU], be[kU], b2[kU];
+#pragma unroll
+  for (int u = 0; u < kU; ++u) produce(bw[u], bx[u], be[u], b2[u]);
+  for (int left = mine; left > 0;) {
+#pragma unroll
+    for (int u = 0; u < kU; ++u) {
+      const LineChunk w0 = bw[u][0], w1 = bw[u][1], w2 = bw[u][2], w3 = bw[u][3];
+      const int xo = bx[u], end = be[u], two = b2[u];
+      produce(bw[u], bx[u], be[u], b2[u]);
+      if (xo != -1) {  // warp-uniform
+        if (two) {     // warp-uniform
+          // the even lane holds its rows at the first step and the partner's at it; the odd lane the
+          // partner's rows at the second step and its own: each hands the other what it holds of the
+          // other's rows
+          const LineChunk sa = shfl_partner_chunk(odd ? w0 : w1), sb = shfl_partner_chunk(odd ? w2 : w3);
+          step(odd ? sa : w0, odd ? sb : w2, xo);
+          step(odd ? w1 : sa, odd ? w3 : sb, xo >= 0 ? xo + 4 * kV : xo);
+        } else {
+          step(w0, w2, xo);
+        }
+      }
+      if (end >= 0) {  // warp-uniform
+        sink(end, c);
+        c[0] = c[1] = c[2] = c[3] = 0.0f;
+        --left;
+      }
+    }
+  }
+}
+
 // ---- Products: prologue (x staging) and epilogues -----------------------------------------------
 
 // x storage in the x buffer: f32, bf16, or f16 (for the int8 tensor-core reader).
@@ -928,8 +1099,12 @@ __device__ __forceinline__ void gemv_mma(const Gemv& g, int b0, int nb, int sh, 
     }
   };
   const int units = ((nb + 15) >> 4) << sh;
-  dots_mma<kType, 4, kPlanes, 8>(units, unit_of, sink, reinterpret_cast<const uint16_t*>(xbuf()),
-                                 Kc + (kXsF16<kType> ? 8 : 32), M);
+  const uint16_t* xs = reinterpret_cast<const uint16_t*>(xbuf());
+  const int xst = Kc + (kXsF16<kType> ? 8 : 32);
+  // Whole-line loads take two steps of a unit at a time: when every unit has at least two (most
+  // shapes), they keep as many steps in flight as dots_mma does; units of one step keep dots_mma.
+  if ((spr >> sh) >= 2) dots_mma_lines<kType, 2, kPlanes, 8>(units, unit_of, sink, xs, xst, M);
+  else dots_mma<kType, 4, kPlanes, 8>(units, unit_of, sink, xs, xst, M);
 }
 
 // The tensor-core reader for the product's format (kPlanes 2: f32 x in two 16-bit planes).
@@ -2169,8 +2344,20 @@ __device__ __forceinline__ void work(const Program& P, int block) {
   int pf = 0;  // warp 1: the next of the block's prefetch spans
   for (int i = 0; i < n;) {
     const int op = static_cast<int>(__ldg(list + i) >> 16);
+    // The run's end: the first entry past i of another op, or the run's limit. Each warp reads 32
+    // entries a load and finds the first other op by ballot, so a run of R tasks costs R / 32 loads
+    // in a row rather than R (a run of 118 product tasks spent 15 us here, the weights not yet asked for).
     int j = i + 1;
-    while (j < n && j - i < kMaxRunTasks && static_cast<int>(__ldg(list + j) >> 16) == op) ++j;
+    for (int b = i + 1;; b += 32) {
+      const int k = b + (tid & 31);
+      bool stop = true;
+      if (k < n && k - i < kMaxRunTasks) stop = static_cast<int>(__ldg(list + k) >> 16) != op;
+      const unsigned m = __ballot_sync(0xffffffffu, stop);
+      if (m) {
+        j = b + __ffs(m) - 1;
+        break;
+      }
+    }
     const bool more = op == prev;  // a further piece of the same run
     csync();
     // Everything the previous run wrote is visible to this thread through the barrier; the release
