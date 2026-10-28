@@ -41,6 +41,10 @@ double ceiling_tps(const DecodeTraffic& traffic, int streams, double gbs, double
 // bytes per token and its share, then each layer's total. `title` heads the block.
 void print_components(const DecodeTraffic& traffic, const char* title);
 
+// The bytes a step of `streams` streams reads for the routed experts: the expert items of step_bytes, each over the
+// union of the streams' choices.
+double expert_bytes(const DecodeTraffic& traffic, int streams);
+
 // The bytes a token of the stream reads, split by what they are: weights (shared, expert) and state, cache and the
 // streams' own rows.
 struct ByteSplit {

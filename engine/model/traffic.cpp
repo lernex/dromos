@@ -122,6 +122,9 @@ DecodeTraffic count_decode_traffic(const MetisConfig& c, const MatrixLookup& loo
     const MatrixDesc d = lookup(key, Ne, Nn, Kk);
     const MatrixBytes b = matrix_bytes(d.format, d.copy, Nn, Kk);
     push(name, group, layer, Scope::Shared, count, b.data, b.scales, 0, rows * double(Nn) * double(Kk));
+    items.back().matrix = true;
+    items.back().format = d.format;
+    items.back().copy = d.copy;
   };
   // One routed expert's matrix. A NVFP4 expert also reads its global, one f32, with its rows.
   auto expert = [&](const std::string& key, const std::string& name, int layer, double count, int64_t Nn, int64_t Kk) {
@@ -129,6 +132,9 @@ DecodeTraffic count_decode_traffic(const MetisConfig& c, const MatrixLookup& loo
     MatrixBytes b = matrix_bytes(d.format, d.copy, Nn, Kk);
     if (d.format == LX_W_NVFP4) b.scales += 4.0;
     push(name, "moe", layer, Scope::Expert, count, b.data, b.scales, 0, double(Nn) * double(Kk));
+    items.back().matrix = true;
+    items.back().format = d.format;
+    items.back().copy = d.copy;
   };
 
   // ---- each layer, once per pass ----

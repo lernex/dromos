@@ -1,4 +1,7 @@
-// lernex doctor [MODEL] [--weights bf16|int8|fp8|nvfp4|bf16x] [--no-bf16x] [--context N] [--sequences N]
+// lernex doctor [MODEL] [--weights bf16|int8|fp8|nvfp4|bf16x] [--no-bf16x] [--context N] [--sequences N] [--modelled]
+//
+// --modelled counts the roofline of a folder in a format it cannot be loaded in yet: the loader's recipe for that
+// format applied to the folder's config, with nothing read from the folder (NVFP4 needs a GPTQ folder to load).
 //
 // Prints what this GPU or CPU can do, which kernels this build has, which tuning table is in use, and, with a
 // model folder, the plan the engine would run it under, in plain language: the format the file stores,
@@ -183,10 +186,11 @@ std::string tps_text(double tps) {
   return buf;
 }
 
-// The roofline of a model folder in the plan's format: the bytes one decode step moves, against the card's bandwidth
-// and tensor throughput, as ceilings (bandwidth / bytes), with the binding limit named. Every loadable format gets a row.
-void print_roofline(const lx::MetisConfig& config, const lx::runtime::Plan& plan,
-                    const lx::runtime::DeviceInfo& device) {
+// The roofline of a model folder in `target`: the bytes one decode step moves, against the card's bandwidth and tensor
+// throughput, as ceilings (bandwidth / bytes), with the binding limit named. With a plan's formats (`options`), every
+// loadable format gets a row too.
+void print_roofline(const lx::MetisConfig& config, lx_wtype target, bool bf16x_decode,
+                    const lx::runtime::DeviceInfo& device, const std::vector<lx::runtime::FormatOption>* options) {
   using namespace lx::cli;
   using lx::DecodeTraffic;
   using lx::config_decode_traffic;
@@ -206,9 +210,9 @@ void print_roofline(const lx::MetisConfig& config, const lx::runtime::Plan& plan
   else
     std::printf("compute    no tensor peak in the table for this device: the compute ceiling is not shown\n");
 
-  const DecodeTraffic at = config_decode_traffic(config, plan.weights, plan.bf16x_decode, contexts[0]);
-  const DecodeTraffic at_long = config_decode_traffic(config, plan.weights, plan.bf16x_decode, contexts[1]);
-  const std::string title = "components of " + lx::runtime::format_name(plan.weights) + (plan.bf16x_decode ? " (BF16X decode copies)" : "") +
+  const DecodeTraffic at = config_decode_traffic(config, target, bf16x_decode, contexts[0]);
+  const DecodeTraffic at_long = config_decode_traffic(config, target, bf16x_decode, contexts[1]);
+  const std::string title = "components of " + lx::runtime::format_name(target) + (bf16x_decode ? " (BF16X decode copies)" : "") +
                             " at context " + std::to_string(contexts[0]) + ":";
   print_components(at, title.c_str());
   const ByteSplit parts = split(at);
@@ -227,7 +231,7 @@ void print_roofline(const lx::MetisConfig& config, const lx::runtime::Plan& plan
               tflops > 0 ? tps_text(ceiling_tps(at, 1, 0, tflops)).c_str() : "n/a", at.macs_per_token() / 1e9);
 
   // Batched: the routed experts a step reads are the union of the streams' choices, the dense weights are read once.
-  std::printf("\nbatched    streams  experts/layer-pass   step MB at 512   tok/s spec   tok/s measured   "
+  std::printf("\nbatched    streams  experts/layer-pass   step MB at 512   experts MB (share)   tok/s spec   tok/s measured   "
               "step MB at %d   tok/s spec   tok/s measured   binds\n", contexts[1]);
   for (int n : {8, 32, 64}) {
     const double step = at.step_bytes(n), step_long = at_long.step_bytes(n);
@@ -237,8 +241,10 @@ void print_roofline(const lx::MetisConfig& config, const lx::runtime::Plan& plan
     const double bw_meas_long = bw.measured_gbs > 0 ? ceiling_tps(at_long, n, bw.measured_gbs, 0) : 0;
     const double compute = tflops > 0 ? ceiling_tps(at, n, 0, tflops) : 0;
     const bool compute_binds = compute > 0 && bw_meas > 0 && compute < bw_meas;
-    std::printf("           %7d  %18.1f  %15.1f  %11s  %15s   %15.1f  %11s  %15s   %s\n", n, at.expected_experts(n),
-                step / 1e6, bw_spec > 0 ? tps_text(bw_spec).c_str() : "n/a",
+    const double experts = expert_bytes(at, n);
+    std::printf("           %7d  %18.1f  %15.1f  %8.1f (%4.1f%%)  %11s  %15s   %15.1f  %11s  %15s   %s\n", n,
+                at.expected_experts(n), step / 1e6, experts / 1e6, 100.0 * experts / step,
+                bw_spec > 0 ? tps_text(bw_spec).c_str() : "n/a",
                 bw_meas > 0 ? tps_text(bw_meas).c_str() : "n/a", step_long / 1e6,
                 bw_spec_long > 0 ? tps_text(bw_spec_long).c_str() : "n/a",
                 bw_meas_long > 0 ? tps_text(bw_meas_long).c_str() : "n/a",
@@ -247,10 +253,11 @@ void print_roofline(const lx::MetisConfig& config, const lx::runtime::Plan& plan
   std::printf("           the union is E (1 - (1 - k / E)^n) experts per layer-pass for uniform routing; real routing is\n"
               "           more concentrated, so the union is an upper bound. Ceilings count the weights once per step.\n");
 
+  if (!options) return;
   // Every format the model loads in, at one stream and context 512.
   std::printf("\nformats    %-6s %14s %16s %16s   %s\n", "", "bytes per token", "ceiling at spec", "ceiling at measured",
               "decode copies");
-  for (const lx::runtime::FormatOption& o : plan.options) {
+  for (const lx::runtime::FormatOption& o : *options) {
     if (!o.loadable) continue;
     const bool copies = o.format != LX_W_BF16X && lx::runtime::bf16x_available();
     const DecodeTraffic t = config_decode_traffic(config, o.format, copies, 512);
@@ -267,6 +274,7 @@ void print_roofline(const lx::MetisConfig& config, const lx::runtime::Plan& plan
 int cmd_doctor(int argc, char** argv) {
   using namespace lx::runtime;
   std::string dir;
+  bool modelled = false;
   PlanRequest req;
   try {
     for (int i = 1; i < argc; ++i) {
@@ -281,6 +289,8 @@ int cmd_doctor(int argc, char** argv) {
         req.context = std::stoi(argv[++i]);
       } else if (arg == "--sequences" && i + 1 < argc) {
         req.sequences = std::stoi(argv[++i]);
+      } else if (arg == "--modelled") {
+        modelled = true;
       } else if (!arg.empty() && arg[0] != '-' && dir.empty()) {
         dir = arg;
       } else {
@@ -298,20 +308,31 @@ int cmd_doctor(int argc, char** argv) {
                                                       "(lernex tune MODEL_DIR makes one)"
                                                 : table.c_str());
 
+    if (modelled && dir.empty()) throw std::runtime_error("--modelled needs a model folder");
+    if (modelled && req.weights < 0) throw std::runtime_error("--modelled needs --weights: the format to count");
     if (!dir.empty()) {
       // MODEL is a folder, or an alias or repository installed in the cache (praxis, logos:fp8), as for bench.
       if (!std::filesystem::is_directory(dir)) dir = lx::cli::find_model(dir, false).dir.string();
       const lx::MetisConfig config = lx::load_config(dir);
-      const CheckpointInfo checkpoint = inspect_checkpoint(dir);
       std::printf("\nmodel      %s: %d layers (%zu attention), hidden %d, %d routed experts, %d passes\n",
                   config.family.c_str(), config.num_hidden_layers, config.attention_layer_indices.size(),
                   config.hidden_size, config.n_routed_experts, config.num_passes);
-      std::printf("checkpoint %s\n", checkpoint.description.c_str());
-      if (const char* v = std::getenv("LX_VRAM_BUDGET_GB")) req.vram_budget = static_cast<size_t>(std::atof(v) * 1073741824.0);
-      if (const char* v = std::getenv("LX_RAM_BUDGET_GB")) req.ram_budget = static_cast<size_t>(std::atof(v) * 1073741824.0);
-      const Plan plan = make_plan(device, config, checkpoint, req);
-      print_plan(plan);
-      print_roofline(config, plan, device);
+      if (modelled) {
+        // The format the folder is not stored in: the loader's recipe for it, applied to this config. Nothing is read, so
+        // a folder converted or stored in that format reads the same bytes per token.
+        const lx_wtype target = static_cast<lx_wtype>(req.weights);
+        std::printf("checkpoint not read: counted as the loader's %s recipe holds this config (--modelled)\n",
+                    format_name(target).c_str());
+        print_roofline(config, target, req.bf16x && bf16x_available(), device, nullptr);
+      } else {
+        const CheckpointInfo checkpoint = inspect_checkpoint(dir);
+        std::printf("checkpoint %s\n", checkpoint.description.c_str());
+        if (const char* v = std::getenv("LX_VRAM_BUDGET_GB")) req.vram_budget = static_cast<size_t>(std::atof(v) * 1073741824.0);
+        if (const char* v = std::getenv("LX_RAM_BUDGET_GB")) req.ram_budget = static_cast<size_t>(std::atof(v) * 1073741824.0);
+        const Plan plan = make_plan(device, config, checkpoint, req);
+        print_plan(plan);
+        print_roofline(config, plan.weights, plan.bf16x_decode, device, &plan.options);
+      }
     }
   } catch (const std::exception& e) {
     std::fprintf(stderr, "error: %s\n", e.what());

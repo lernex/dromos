@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "cuda/kernels.h"
+#include "runtime/plan.h"
 
 namespace lx::cli {
 namespace {
@@ -101,13 +102,27 @@ ByteSplit split(const DecodeTraffic& traffic) {
   return s;
 }
 
+// What a component is held as: a projection's format, "BF16X read" where decode reads the lossless copy of a BF16
+// projection, and "plain" for the tensors that are not projections (norms, the state, the cache, the router's bias).
+static std::string held_label(const TrafficItem& it) {
+  if (!it.matrix) return "plain";
+  return it.copy ? std::string("BF16X read") : lx::runtime::format_name(it.format);
+}
+
+double expert_bytes(const DecodeTraffic& traffic, int streams) {
+  double total = 0;
+  for (const TrafficItem& it : traffic.items)
+    if (it.scope == Scope::Expert) total += traffic.item_bytes(it, streams);
+  return total;
+}
+
 void print_components(const DecodeTraffic& traffic, const char* title) {
   const double total = traffic.bytes_per_token();
   std::printf("%s\n", title);
 
   // The groups, in the order their first component appears, then every component under its group.
   struct Row {
-    std::string name, group;
+    std::string name, group, held;
     double count = 0, bytes = 0;
   };
   std::vector<Row> rows;
@@ -120,6 +135,7 @@ void print_components(const DecodeTraffic& traffic, const char* title) {
     if (found == row_of.end()) {
       found = row_of.emplace(it.name, rows.size()).first;
       rows.push_back(Row{it.name, it.group});
+      rows.back().held = held_label(it);
     }
     rows[found->second].count += it.count;
     rows[found->second].bytes += bytes;
@@ -133,13 +149,13 @@ void print_components(const DecodeTraffic& traffic, const char* title) {
                 total > 0 ? 100.0 * group_bytes[g] / total : 0.0);
   std::printf("  %-40s %12s %11.1f %7.1f%%\n", "total", "", total / 1e6, 100.0);
 
-  std::printf("\n  %-40s %12s %11s %8s\n", "component", "instances", "MB/token", "share");
+  std::printf("\n  %-40s %12s %11s %8s   %s\n", "component", "instances", "MB/token", "share", "held as");
   for (const std::string& g : groups) {
     std::printf("  %s\n", g.c_str());
     for (const Row& r : rows) {
       if (r.group != g) continue;
-      std::printf("    %-38s %12.0f %11.2f %7.1f%%\n", r.name.c_str(), r.count, r.bytes / 1e6,
-                  total > 0 ? 100.0 * r.bytes / total : 0.0);
+      std::printf("    %-38s %12.0f %11.2f %7.1f%%   %s\n", r.name.c_str(), r.count, r.bytes / 1e6,
+                  total > 0 ? 100.0 * r.bytes / total : 0.0, r.held.c_str());
     }
   }
 

@@ -52,6 +52,10 @@ struct TrafficItem {
   double scales = 0;  // bytes per instance: quantization scales (INT8/FP8 row scales, NVFP4 block scales and globals)
   double per_position = 0;  // bytes per instance per context position (the attention cache read)
   double macs = 0;    // multiply-accumulates per instance (per expert pick for Expert items), for the compute ceiling
+  // A projection (matrix items): the format it is held in, and whether decode reads its BF16X copy of it instead.
+  bool matrix = false;
+  lx_wtype format = LX_W_BF16;
+  bool copy = false;
 };
 
 struct DecodeTraffic {
