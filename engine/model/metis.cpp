@@ -220,6 +220,9 @@ struct MetisModel::Impl {
   // route_projection without its difference columns, for the routing inside a pass (where the
   // difference is zero); the same rows and scales, so it multiplies exactly as the full weight
   Linear route_in;
+  // The metadata write as bf16 for the program's memory entry: a dequantized copy when the model holds it wider
+  // (FP8, NVFP4 or BF16X), else null and the entry reads m_meta.w.
+  const void* meta_bf16 = nullptr;
   // The depth memory's composite bank projection: an entry e becomes U | P | c (2D + 4 rows), with
   // U = Wq^T k_e, P = Wout v_e + out bias and c = bq . k_e, so a read needs no projections of its own.
   lx_weight bank_w{};
@@ -433,14 +436,27 @@ float* connection_params(Impl& m, const ModelWeights& weights, const std::string
   return d;
 }
 
-// A projection as the program products read it: its weight in the format the model holds it (BF16 or INT8).
-lx_weight wview(const Linear& l) { return l.w; }
+// A projection as the program products read it: its BF16X copy when it has one (the same bf16 values, decoded as
+// read), else its weight in the format the model holds it.
+lx_weight wview(const Linear& l) { return l.x16 ? lx_weight{LX_W_BF16X, l.x16, nullptr, 1.0f, nullptr} : l.w; }
+
+// A bf16 copy of a projection's weight on the device (dequantized from its format), for reads that take bf16 only.
+const void* dequantized_bf16(Impl& m, const Linear& l) {
+  void* bf = m.alloc<char>(static_cast<size_t>(l.N) * static_cast<size_t>(l.K) * 2);
+  LX_CHECK(lx_dequantize_weight(&l.w, bf, l.N, l.K, nullptr));
+  check(lx_rt_stream_sync(nullptr), "dequantizing a weight");
+  return bf;
+}
 
 // route_projection [R, 3D + R] without the difference columns [2D, 3D): [R, 2D + R], in the
-// decode format of the full weight (an int8 copy keeps its rows' scales).
+// decode format of the full weight (an int8 or FP8 copy keeps its rows' scales; a bf16 one is re-encoded as BF16X
+// when the decode reads BF16X copies).
 Linear route_without_difference(Impl& m, const Linear& full, int D, int R) {
+  if (full.w.type != LX_W_BF16 && full.w.type != LX_W_INT8 && full.w.type != LX_W_FP8)
+    throw std::runtime_error("the decode program's route projection is in an unsupported format");
   Linear l = full;
-  const int K = 3 * D + R, Kin = 2 * D + R, elem = full.w.type == LX_W_INT8 ? 1 : 2;
+  l.x16 = nullptr;  // the full-width BF16X copy does not describe the sliced rows
+  const int K = 3 * D + R, Kin = 2 * D + R, elem = full.w.type == LX_W_BF16 ? 2 : 1;
   const void* src = full.w.data;
   std::vector<char> h(static_cast<size_t>(R) * K * elem), out(static_cast<size_t>(R) * Kin * elem);
   check(lx_rt_copy(h.data(), src, static_cast<int64_t>(h.size()), LX_COPY_D2H, nullptr), "device to host copy");
@@ -457,6 +473,7 @@ Linear route_without_difference(Impl& m, const Linear& full, int D, int R) {
   check(lx_rt_stream_sync(nullptr), "host to device copy");
   l.w.data = d;  // the same type and row scales as the full weight
   l.K = Kin;
+  if (m.formats.bf16x_decode && l.w.type == LX_W_BF16 && bf16x_smaller(Kin)) l.x16 = encode_bf16x(m, d, R, Kin);
   return l;
 }
 
@@ -741,13 +758,15 @@ MetisModel::MetisModel(const MetisConfig& c, const ModelWeights& weights, const 
   m.c_out_w = static_cast<const float*>(need(weights, "continuation.output.weight", LX_F32, {1, R}));
   m.c_out_b = static_cast<const float*>(need(weights, "continuation.output.bias", LX_F32, {1}));
   // The decode program (LX_PROGRAM, opt-in: any value but 0) runs the decode steps it covers as one persistent
-  // kernel (decode_program_covers). It reads BF16 and INT8 weights, and the depth memory's metadata write as bf16,
-  // so a model in another format, or with BF16X copies, keeps the kernel-per-op path.
+  // kernel (decode_program_covers). It reads BF16, BF16X (the copies), INT8, FP8 and NVFP4 weights; the depth
+  // memory's metadata write is read as bf16 (a dequantized copy where the model holds it wider). A model in
+  // another format keeps the kernel-per-op path.
   const char* program = std::getenv("LX_PROGRAM");
-  const auto plain = [](lx_wtype f) { return f == LX_W_BF16 || f == LX_W_INT8; };
+  const auto plain = [](lx_wtype f) {
+    return f == LX_W_BF16 || f == LX_W_BF16X || f == LX_W_INT8 || f == LX_W_FP8 || f == LX_W_NVFP4;
+  };
   m.use_program = program && std::strcmp(program, "0") != 0 && !speculative && !experts && plain(formats.dense) &&
-                  plain(formats.experts) && plain(formats.latent_up) && !formats.bf16x_decode &&
-                  m.m_meta.w.type == LX_W_BF16;
+                  plain(formats.experts) && plain(formats.latent_up);
   if (m.use_program) {
     lx_program* probe = lx_program_create(1, nullptr, nullptr, nullptr, nullptr);
     m.use_program = probe != nullptr;
@@ -755,6 +774,7 @@ MetisModel::MetisModel(const MetisConfig& c, const ModelWeights& weights, const 
   }
   if (m.use_program) {
     m.route_in = route_without_difference(m, m.m_route, D, R);
+    if (m.m_meta.w.type != LX_W_BF16) m.meta_bf16 = dequantized_bf16(m, m.m_meta);
     build_bank_projection(m, weights, dm);
   }
   // The fused Mamba decode step: a probe with no sequences (every backend answers 0 to that, and one without the
@@ -1404,7 +1424,7 @@ void program_memory_write(Impl& m, const MetisConfig& c, lx_program* p, const fl
   e.continuation = m.continuation;
   e.mean_k = static_cast<float>(c.num_experts_per_tok) / static_cast<float>(c.max_routed_k);
   e.inv_log_e = c.n_routed_experts > 1 ? 1.0f / std::log(static_cast<float>(c.n_routed_experts)) : 1.0f;
-  e.w_meta = m.m_meta.w.data;
+  e.w_meta = m.meta_bf16 ? m.meta_bf16 : m.m_meta.w.data;
   e.b_meta = m.m_meta.bias;
   e.pass_emb = static_cast<const uint16_t*>(m.m_pass_emb) + pass * Mm;
   e.anchor_emb = static_cast<const uint16_t*>(m.m_anchor_emb) + anchor * Mm;
@@ -1595,8 +1615,9 @@ lx_program* build_program(Impl& m, const MetisConfig& c, int T, float* logits) {
           a.latent = m.latent_bf;
           a.ids = m.route_ids;
           a.weights = m.route_w;
-          a.gate_up = layer.gate_up;
-          a.down = layer.down;
+          a.gate_up = layer.gate_up_x16 ? lx_weight{LX_W_BF16X, layer.gate_up_x16, nullptr, 1.0f, nullptr}
+                                        : layer.gate_up;
+          a.down = layer.down_x16 ? lx_weight{LX_W_BF16X, layer.down_x16, nullptr, 1.0f, nullptr} : layer.down;
           a.shared_gate_up = wview(layer.shared_gate_up);
           a.shared_down = wview(layer.shared_down);
           a.out = m.routed;
@@ -1689,7 +1710,7 @@ lx_program* build_program(Impl& m, const MetisConfig& c, int T, float* logits) {
 // Whether the decode program runs this step: a decode step (one token per sequence, at most 8) of a
 // model whose program was built (LX_PROGRAM, and none of what it does not cover yet: speculative
 // models, so a verify step and the steps around it share one path, offloaded experts, projections
-// in host memory, BF16X copies), with no route trace or feature taps to write.
+// in host memory), with no route trace or feature taps to write.
 bool decode_program_covers(const Impl& m, int T, int n_seq, bool spec) {
   if (!m.use_program || spec || T != n_seq || T > 8 || m.route_trace || m.census) return false;
   for (int col : m.tap_col)

@@ -822,7 +822,7 @@ LX_API int lx_dequantize_weight(const lx_weight* w, void* out, int64_t rows, int
 // once per shape as a program of ops (products, the depth-memory read, the Mamba step, routing,
 // experts, attention, the memory write, the depth head), each op is split into tasks spread evenly
 // over the SMs, and every SM runs its tasks in program order. Products read their weight rows
-// straight from global memory on the tensor cores (bf16, and int8 converted to f16 exactly), with the
+// straight from global memory on the tensor cores (bf16, and the other formats as in the note below), with the
 // x staging and norms before the reader and the epilogue (bias, activations, the hyper-connection
 // write) after it, in the same task. Each SM has L2 fetch the weights of its coming tasks a fixed
 // number of bytes ahead, so DRAM keeps streaming while tasks wait, through counters in global
@@ -836,8 +836,11 @@ LX_API int lx_dequantize_weight(const lx_weight* w, void* out, int64_t rows, int
 //   once per step. Every pointer is fixed at build time; what changes per step (token ids, slots,
 //   start positions) is read on the device from the buffers named at create.
 //
-// Runs on sm_80 and newer (mma.sync; bulk L2 prefetches from sm_90). Products read BF16, INT8 and
-// LX_W_F32 weights; a caller falls back to the per-kernel path for other formats.
+// Runs on sm_80 and newer (mma.sync; bulk L2 prefetches from sm_90). Products and experts read BF16, BF16X, INT8,
+// FP8 and NVFP4 weights, and the routers and the depth head read LX_W_F32; the memory entry reads its w_state in any
+// of these but LX_W_F32. Each format's values reach the tensor cores exactly as f16 (INT8, FP8, NVFP4: the block
+// scale of an NVFP4 word is folded in exactly) or as bf16 (BF16, BF16X: decoded from the record as they are read),
+// and a caller falls back to the per-kernel path for other formats.
 
 typedef struct lx_program lx_program;
 

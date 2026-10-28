@@ -17,6 +17,7 @@
 #include "cuda/common.cuh"
 #include "cuda/decode_ops.h"
 #include "cuda/decode_sync.cuh"
+#include "cuda/bf16x.cuh"
 #include "cuda/wformat.cuh"
 
 namespace lx::decode {
@@ -83,6 +84,21 @@ template <>
 struct Word<LX_W_INT8> {
   using F = WordI8;
 };
+// BF16X words are decoded as they are fetched (WordLoad): the bf16 bits of four values, then the BF16 word.
+struct WordBf16X : WordFormat<LX_W_BF16> {};
+template <>
+struct Word<LX_W_BF16X> {
+  using F = WordBf16X;
+};
+// fn<kType>(args) for the format wt: the expert and entry readers are templates over the formats they read.
+#define LX_DISPATCH_W(wt, fn, ...)                      \
+  switch (wt) {                                         \
+    case LX_W_INT8: fn<LX_W_INT8>(__VA_ARGS__); break;  \
+    case LX_W_FP8: fn<LX_W_FP8>(__VA_ARGS__); break;    \
+    case LX_W_NVFP4: fn<LX_W_NVFP4>(__VA_ARGS__); break;\
+    case LX_W_BF16X: fn<LX_W_BF16X>(__VA_ARGS__); break;\
+    default: fn<LX_W_BF16>(__VA_ARGS__); break;         \
+  }
 // Formats whose tiles carry one f32 scale per row after the rows.
 template <int kType>
 constexpr bool kRowScaled = kType == LX_W_INT8 || kType == LX_W_FP8;
@@ -241,9 +257,56 @@ __device__ __forceinline__ uint2 ldg_word(const uint2* p) {
 // A virtual row of a product: words [0, words) at p (null: none, it reads as zeros) times the staged
 // x rows xrow .. xrow + mc - 1, from word xw of the x row.
 struct RowRef {
-  const uint2* p;
-  int words, xw, xrow;
+  const uint2* p;       // the row's first word (formats read by words); null past the row's range
+  int words, xw, xrow;  // words in the range, the x offset of its first word, and the x row
+  const uint8_t* sc;    // NVFP4: the block scales of the range's first word (a byte a word); else null
+  const uint8_t* row;   // BF16X: the row record, whose words are decoded as they are read; else null
+  int kb, K;            // BF16X: the value index of the range's first word, and the row's K
 };
+
+// The bits a value takes in each format (NVFP4's 4 bits are its code; its block scales come apart).
+template <int kType>
+constexpr int kValueBits = kType == LX_W_BF16 || kType == LX_W_BF16X ? 16 : kType == LX_W_NVFP4 ? 4
+                           : kType == kF32                          ? 32
+                                                                    : 8;
+
+// One word of a row for the FMA reader: its bits, and the block scale its decode applies (NVFP4; 1 otherwise).
+template <class F>
+struct WordLoad {
+  __device__ __forceinline__ static void load(const RowRef& r, int w, uint2& word, float& bs) {
+    word = ldg_word(r.p + w);
+    bs = 1.0f;
+  }
+};
+template <>
+struct WordLoad<WordFormat<LX_W_NVFP4>> {
+  __device__ __forceinline__ static void load(const RowRef& r, int w, uint2& word, float& bs) {
+    word = ldg_word(r.p + w);
+    bs = e4m3_to_f32(__ldg(r.sc + w));
+  }
+};
+template <>
+struct WordLoad<WordBf16X> {
+  __device__ __forceinline__ static void load(const RowRef& r, int w, uint2& word, float& bs) {
+    word = bf16x::quad(r.row, r.K, r.kb + 4 * w);
+    bs = 1.0f;
+  }
+};
+
+// The RowRef of the words from value kb of row `row` of a weight whose rows are row_bytes apart (full records).
+template <int kType>
+__device__ __forceinline__ RowRef row_ref(const uint8_t* data, const lx_weight& w, int64_t row, int64_t row_bytes,
+                                          int kb, int K, int words, int xrow) {
+  RowRef r{nullptr, words, 0, xrow, nullptr, nullptr, kb, K};
+  const uint8_t* rec = data + row * row_bytes;
+  if constexpr (kType == LX_W_BF16X) {
+    r.row = rec;
+  } else {
+    r.p = reinterpret_cast<const uint2*>(rec + (static_cast<int64_t>(kb) * kValueBits<kType>) / 8);
+    if constexpr (kType == LX_W_NVFP4) r.sc = static_cast<const uint8_t*>(w.scale) + row * (K / 16) + kb / 16;
+  }
+  return r;
+}
 
 // Dot products of virtual rows with staged x rows, straight from global memory (from L2 where the
 // block fetched them ahead): warp w takes virtual rows w, w + 16, ... < nv; a warp step reads 32
@@ -268,16 +331,17 @@ __device__ __forceinline__ void dots_rows(int nv, RowOf&& row_of, const float* x
   RowRef lr = row_of(warp);
   int lsteps = max(1, (lr.words + 31) >> 5);
   RowRef ln = mine > 1 ? row_of(warp + kComputeWarps) : lr;
-  // the next word of the warp's rows: the word, its x offset (-1: none), the slot of the row it ends
-  // (-1: none)
-  auto produce = [&](uint2& word, int& xo, int& end) {
+  // the next word of the warp's rows: the word and its block scale, its x offset (-1: none), the slot of the row it
+  // ends (-1: none)
+  auto produce = [&](uint2& word, float& bs, int& xo, int& end) {
     word = make_uint2(0u, 0u);
+    bs = 1.0f;
     xo = -1;
     end = -1;
     if (lv < mine) {
       const int w = ls * 32 + lane;
-      if (lr.p != nullptr && w < lr.words) {
-        word = ldg_word(lr.p + w);
+      if ((lr.p != nullptr || lr.row != nullptr) && w < lr.words) {
+        WordLoad<F>::load(lr, w, word, bs);
         xo = lr.xrow * x_stride + (lr.xw + w) * kV;
       }
       if (++ls == lsteps) {
@@ -292,9 +356,10 @@ __device__ __forceinline__ void dots_rows(int nv, RowOf&& row_of, const float* x
     }
   };
   uint2 buf[kU];
+  float bsb[kU];
   int bx[kU], be[kU];
 #pragma unroll
-  for (int u = 0; u < kU; ++u) produce(buf[u], bx[u], be[u]);
+  for (int u = 0; u < kU; ++u) produce(buf[u], bsb[u], bx[u], be[u]);
   float acc[kM];
 #pragma unroll
   for (int j = 0; j < kM; ++j) acc[j] = 0.0f;
@@ -302,11 +367,12 @@ __device__ __forceinline__ void dots_rows(int nv, RowOf&& row_of, const float* x
 #pragma unroll
     for (int u = 0; u < kU; ++u) {
       const uint2 word = buf[u];
+      const float bs = bsb[u];
       const int xo = bx[u], end = be[u];
-      produce(buf[u], bx[u], be[u]);
+      produce(buf[u], bsb[u], bx[u], be[u]);
       if (xo >= 0) {
         float wf[kV];
-        F::decode(word, 1.0f, wf);
+        F::decode(word, bs, wf);
 #pragma unroll
         for (int j = 0; j < kM; ++j)
           if (kM == 1 || j < mc) {
@@ -376,27 +442,35 @@ __device__ __forceinline__ void mma16816(float (&c)[4], uint32_t a0, uint32_t a1
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
-// A weight format for the tensor-core reader: a 16-byte chunk as kValues 16-bit values (in pairs,
-// the lower k in the low half), bf16 or f16.
+// A weight format for the tensor-core reader: a 16-byte chunk of a row, as kValues values (in pairs, the lower k in
+// the low half), bf16 or f16. aux carries an NVFP4 chunk's two block scales as f16 pairs (scale_pair); other formats
+// ignore it.
+template <int kType>
+constexpr bool kXsF16 = kType != LX_W_BF16 && kType != LX_W_BF16X;  // the x of the reader: f16 (else bf16)
 template <int kType>
 struct Chunk;
 template <>
 struct Chunk<LX_W_BF16> {
   static constexpr int kValues = 8;
   static constexpr bool kF16 = false;
-  __device__ __forceinline__ static void decode(uint4 v, uint32_t (&r)[4]) {
+  __device__ __forceinline__ static void decode(uint4 v, uint2 aux, uint32_t (&r)[4]) {
+    (void)aux;
     r[0] = v.x;
     r[1] = v.y;
     r[2] = v.z;
     r[3] = v.w;
   }
 };
+// BF16X chunks are decoded as they are fetched (chunk_load), so the chunk is the bf16 one.
+template <>
+struct Chunk<LX_W_BF16X> : Chunk<LX_W_BF16> {};
 // int8 to f16 exactly: 0x6400 | (q ^ 0x80) is the f16 1024 + 128 + q, and 1152 comes off in pairs.
 template <>
 struct Chunk<LX_W_INT8> {
   static constexpr int kValues = 16;
   static constexpr bool kF16 = true;
-  __device__ __forceinline__ static void decode(uint4 v, uint32_t (&r)[8]) {
+  __device__ __forceinline__ static void decode(uint4 v, uint2 aux, uint32_t (&r)[8]) {
+    (void)aux;
     const uint32_t w[4] = {v.x, v.y, v.z, v.w};
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -407,15 +481,102 @@ struct Chunk<LX_W_INT8> {
     }
   }
 };
-
-// A unit of the tensor-core reader, for one lane: its first chunks in rows g and g + 8 (null: the row
-// reads as zeros), the k of the unit's first value, its steps (a step: four chunks per row), and the
-// first of the eight x rows its products' columns are (xr + j for column j).
-struct UnitRef {
-  const uint4* a;
-  const uint4* b;
-  int kb, steps, xr;
+// e4m3 to f16, exact (every e4m3 value is an f16): the hardware converts a byte pair, the lower byte the lower k.
+__device__ __forceinline__ uint32_t e4m3x2_to_f16x2(uint32_t pair) {
+  const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2(static_cast<uint16_t>(pair), __NV_E4M3);
+  return *reinterpret_cast<const uint32_t*>(&h);
+}
+template <>
+struct Chunk<LX_W_FP8> {
+  static constexpr int kValues = 16;
+  static constexpr bool kF16 = true;
+  __device__ __forceinline__ static void decode(uint4 v, uint2 aux, uint32_t (&r)[8]) {
+    (void)aux;
+    const uint32_t w[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      r[2 * i] = e4m3x2_to_f16x2(w[i] & 0xffffu);
+      r[2 * i + 1] = e4m3x2_to_f16x2(w[i] >> 16);
+    }
+  }
 };
+// The two block scales of a chunk, e4m3 bytes at k / 16 and k / 16 + 1 (low byte first), as f16 pairs: .x holds the
+// first block's scale in both halves, .y the second block's.
+__device__ __forceinline__ uint2 scale_pair(uint16_t s) {
+  const __half2 h = __half2(__nv_cvt_fp8x2_to_halfraw2(s, __NV_E4M3));
+  const __half2 a = __half2half2(__low2half(h)), b = __half2half2(__high2half(h));
+  return make_uint2(*reinterpret_cast<const uint32_t*>(&a), *reinterpret_cast<const uint32_t*>(&b));
+}
+// NVFP4: 32 values in 16 bytes. Byte i holds values 2i (low nibble) and 2i + 1 (high), so word i is the pair 2i, 2i + 1
+// and belongs to block i / 8. e2m1 times its e4m3 block scale is exact in f16 (at most 6 significant bits, in range).
+template <>
+struct Chunk<LX_W_NVFP4> {
+  static constexpr int kValues = 32;
+  static constexpr bool kF16 = true;
+  __device__ __forceinline__ static void decode(uint4 v, uint2 aux, uint32_t (&r)[16]) {
+    const uint32_t w[4] = {v.x, v.y, v.z, v.w};
+    const __half2 s0 = *reinterpret_cast<const __half2*>(&aux.x), s1 = *reinterpret_cast<const __half2*>(&aux.y);
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+      const uint8_t byte = static_cast<uint8_t>(w[i >> 2] >> (8 * (i & 3)));
+      const __half2 e = __half2(__nv_cvt_fp4x2_to_halfraw2(byte, __NV_E2M1));
+      const __half2 p = __hmul2(e, i < 8 ? s0 : s1);
+      r[i] = *reinterpret_cast<const uint32_t*>(&p);
+    }
+  }
+};
+
+// A unit of the tensor-core reader, for one lane: its first chunks in rows g and g + 8 (null: the row reads as zeros),
+// the NVFP4 block scales of those rows, the unit's first value (local to the staged x, and in the row record), its
+// steps (a step: four chunks per row), the first of the eight x rows its products' columns are (xr + j for column j),
+// and the row's K.
+struct UnitRef {
+  const uint8_t* a;
+  const uint8_t* b;
+  const uint8_t* sa;
+  const uint8_t* sb;
+  int kb, kabs;
+  int steps, xr, K;
+};
+
+// Two rows of a unit of experts: row ra and row rb of the stack (rows row_bytes apart), the unit's first value kb.
+template <int kType>
+__device__ __forceinline__ UnitRef unit_rows(const uint8_t* data, const lx_weight& w, int64_t ra, int64_t rb,
+                                             int64_t row_bytes, int kb, int steps, int xr, int K) {
+  UnitRef u{};
+  u.a = data + ra * row_bytes;
+  u.b = data + rb * row_bytes;
+  if constexpr (kType == LX_W_NVFP4) {
+    u.sa = static_cast<const uint8_t*>(w.scale) + ra * (K / 16);
+    u.sb = static_cast<const uint8_t*>(w.scale) + rb * (K / 16);
+  }
+  u.kb = kb;
+  u.kabs = kb;
+  u.steps = steps;
+  u.xr = xr;
+  u.K = K;
+  return u;
+}
+
+// The 16-byte chunk of a row record at value k (a multiple of the chunk's values), as stored, and for NVFP4 also the
+// chunk's two block scales in aux.
+template <int kType>
+__device__ __forceinline__ uint4 chunk_load(const uint8_t* row, const uint8_t* sc, int K, int k, uint2& aux) {
+  if constexpr (kType == LX_W_BF16X) {
+    aux = make_uint2(0u, 0u);
+    (void)sc;
+    return bf16x::chunk8(row, K, k);
+  }
+  (void)K;
+  if constexpr (kType == LX_W_NVFP4) {
+    aux = scale_pair(__ldg(reinterpret_cast<const uint16_t*>(sc + k / 16)));
+    return ldg_chunk(reinterpret_cast<const uint4*>(row + k / 2));
+  } else {
+    (void)sc;
+    (void)aux;
+    return ldg_chunk(reinterpret_cast<const uint4*>(row + (static_cast<int64_t>(k) * kValueBits<kType>) / 8));
+  }
+}
 
 // Units of 16 rows by a run of steps: warp w takes units w, w + 16, ... < nunits; kU steps per lane
 // are in flight, across the ends of units. unit_of(u) gives a unit; sink(u, c) takes its products.
@@ -433,16 +594,19 @@ __device__ __forceinline__ void dots_mma(int nunits, UnitOf&& unit_of, Sink&& si
   int lv = 0, ls = 0;
   UnitRef lr = unit_of(warp);
   UnitRef ln = mine > 1 ? unit_of(warp + kComputeWarps) : lr;
-  // the lane's next chunks: the words, the x offset of the step (-1: no step, the same in every lane;
+  // the lane's next chunks and their aux, the x offset of the step (-1: no step, the same in every lane;
   // -2: this lane's column has no x), the unit it ends (-1: none)
-  auto produce = [&](uint4& wa, uint4& wb, int& xo, int& end) {
+  auto produce = [&](uint4& wa, uint4& wb, uint2& aa, uint2& ab, int& xo, int& end) {
     wa = make_uint4(0u, 0u, 0u, 0u);
     wb = wa;
+    aa = make_uint2(0u, 0u);
+    ab = aa;
     xo = -1;
     end = -1;
     if (lv < mine) {
-      if (lr.a) wa = ldg_chunk(lr.a + 4 * ls);
-      if (lr.b) wb = ldg_chunk(lr.b + 4 * ls);
+      const int k = lr.kabs + (4 * ls + t) * kV;  // this lane's chunk, in the row record
+      if (lr.a) wa = chunk_load<kType>(lr.a, lr.sa, lr.K, k, aa);
+      if (lr.b) wb = chunk_load<kType>(lr.b, lr.sb, lr.K, k, ab);
       const int row = lr.xr + g;
       xo = g < kCols && row < nx ? row * xst + lr.kb + (4 * ls + t) * kV : -2;
       if (++ls == lr.steps) {
@@ -456,20 +620,22 @@ __device__ __forceinline__ void dots_mma(int nunits, UnitOf&& unit_of, Sink&& si
     }
   };
   uint4 ba[kU], bb[kU];
+  uint2 baa[kU], bab[kU];
   int bx[kU], be[kU];
 #pragma unroll
-  for (int u = 0; u < kU; ++u) produce(ba[u], bb[u], bx[u], be[u]);
+  for (int u = 0; u < kU; ++u) produce(ba[u], bb[u], baa[u], bab[u], bx[u], be[u]);
   float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
   for (int left = mine; left > 0;) {
 #pragma unroll
     for (int u = 0; u < kU; ++u) {
       const uint4 wa = ba[u], wb = bb[u];
+      const uint2 aa = baa[u], ab = bab[u];
       const int xo = bx[u], end = be[u];
-      produce(ba[u], bb[u], bx[u], be[u]);
+      produce(ba[u], bb[u], baa[u], bab[u], bx[u], be[u]);
       if (xo != -1) {  // warp-uniform
         uint32_t ra[kR], rb[kR];
-        C::decode(wa, ra);
-        C::decode(wb, rb);
+        C::decode(wa, aa, ra);
+        C::decode(wb, ab, rb);
 #pragma unroll
         for (int h = 0; h < kPlanes; ++h) {  // x, or its planes in order
           uint32_t rx[kR];
@@ -689,7 +855,12 @@ __device__ __forceinline__ float partial_sums(const Gemv& g, int m, int n, int64
   return add;
 }
 __device__ __forceinline__ float row_factor(const Gemv& g, int n) {
+  if (g.wtype == LX_W_NVFP4) return g.w.global;  // the matrix's global; the block scales are inside the words
   return row_scaled(g.wtype) ? __ldg(static_cast<const float*>(g.w.scale) + n) : 1.0f;
+}
+// The NVFP4 global of expert e of a stack: its own, or the stack's.
+__device__ __forceinline__ float expert_global(const lx_weight& w, int e) {
+  return w.expert_global ? __ldg(w.expert_global + e) : w.global;
 }
 // The output row of the run's local row lr (rows past N are the op's last task's padding).
 __device__ __forceinline__ int run_row(const Gemv& g, int lr) {
@@ -700,37 +871,50 @@ template <int kType, bool kXsBf16>
 __device__ __forceinline__ void gemv_dots(const Gemv& g, int b0, int nb, int sh, float* red) {
   using F = typename Word<kType>::F;
   const int M = ctx().M, Kc = g.k1 - g.k0, W = Kc / F::kValues;
-  const int bpv = g.row_bytes / Kc;
-  const char* base = static_cast<const char*>(g.w.data) + static_cast<int64_t>(g.k0) * bpv;
-  const int64_t ld = static_cast<int64_t>(g.K) * bpv;
+  const uint8_t* data = static_cast<const uint8_t*>(g.w.data);
   auto row_of = [&](int v) -> RowRef {
     const int p = v & ((1 << sh) - 1), n = run_row(g, b0 + (v >> sh));
     const int wb = (p * W) >> sh, we = ((p + 1) * W) >> sh;
     if (n >= g.N) return {nullptr, we - wb, wb, 0};
-    return {reinterpret_cast<const uint2*>(base + n * ld) + wb, we - wb, wb, 0};
+    RowRef r = row_ref<kType>(data, g.w, n, g.ld, g.k0 + wb * F::kValues, g.K, we - wb, 0);
+    r.xw = wb;
+    return r;
   };
   dots_rows_m<F, kXsBf16>(nb << sh, row_of, xbuf(), Kc, M, red, false);
 }
 
-// The tensor-core reader on a batch of a run's rows: units of 16 rows by one of S = 2^sh parts of k.
+// The tensor-core reader on a batch of a run's rows: units of 16 rows by one of S = 2^sh parts of k. A chunk is read
+// from its row record at its absolute value (chunk_load); x is the staged rows, bf16 for the bf16 readers.
 template <int kType, int kPlanes>
 __device__ __forceinline__ void gemv_mma(const Gemv& g, int b0, int nb, int sh, float* red) {
   constexpr int kV = Chunk<kType>::kValues;
   const int M = ctx().M, Kc = g.k1 - g.k0, spr = Kc / (4 * kV), S = 1 << sh;
-  const int bpv = g.row_bytes / Kc;
-  const char* base = static_cast<const char*>(g.w.data) + static_cast<int64_t>(g.k0) * bpv;
-  const int64_t ld = static_cast<int64_t>(g.K) * bpv;
+  const uint8_t* data = static_cast<const uint8_t*>(g.w.data);
   const int lane = threadIdx.x & 31, gr = lane >> 2, t = lane & 3;
-  auto row_ptr = [&](int r, int kb) -> const uint4* {
-    if (r >= nb) return nullptr;
+  // the weight row of unit row r, or -1 when it reads as zeros
+  auto row_n = [&](int r) -> int {
+    if (r >= nb) return -1;
     const int n = run_row(g, b0 + r);
-    if (n >= g.N) return nullptr;
-    return reinterpret_cast<const uint4*>(base + n * ld) + kb / kV + t;
+    return n < g.N ? n : -1;
   };
   auto unit_of = [&](int u) -> UnitRef {
     const int r0 = (u >> sh) * 16 + gr, p = u & (S - 1);
     const int s0 = (p * spr) >> sh, s1 = ((p + 1) * spr) >> sh, kb = s0 * 4 * kV;
-    return {row_ptr(r0, kb), row_ptr(r0 + 8, kb), kb, s1 - s0, 0};
+    const int na = row_n(r0), nc = row_n(r0 + 8);
+    UnitRef ur{};
+    ur.a = na < 0 ? nullptr : data + na * g.ld;
+    ur.b = nc < 0 ? nullptr : data + nc * g.ld;
+    if constexpr (kType == LX_W_NVFP4) {
+      const uint8_t* sc = static_cast<const uint8_t*>(g.w.scale);
+      ur.sa = na < 0 ? nullptr : sc + na * (g.K / 16);
+      ur.sb = nc < 0 ? nullptr : sc + nc * (g.K / 16);
+    }
+    ur.kb = kb;
+    ur.kabs = g.k0 + kb;
+    ur.steps = s1 - s0;
+    ur.xr = 0;
+    ur.K = g.K;
+    return ur;
   };
   auto sink = [&](int u, const float (&c)[4]) {
     const int r0 = (u >> sh) * 16 + gr, p = u & (S - 1), m0 = 2 * t;
@@ -745,7 +929,20 @@ __device__ __forceinline__ void gemv_mma(const Gemv& g, int b0, int nb, int sh, 
   };
   const int units = ((nb + 15) >> 4) << sh;
   dots_mma<kType, 4, kPlanes, 8>(units, unit_of, sink, reinterpret_cast<const uint16_t*>(xbuf()),
-                                 Kc + (kType == LX_W_BF16 ? 32 : 8), M);
+                                 Kc + (kXsF16<kType> ? 8 : 32), M);
+}
+
+// The tensor-core reader for the product's format (kPlanes 2: f32 x in two 16-bit planes).
+template <int kPlanes>
+__device__ __forceinline__ void gemv_mma_w(const Gemv& g, int b0, int nb, int sh, float* red) {
+  switch (g.wtype) {
+    case LX_W_BF16: gemv_mma<LX_W_BF16, kPlanes>(g, b0, nb, sh, red); break;
+    case LX_W_INT8: gemv_mma<LX_W_INT8, kPlanes>(g, b0, nb, sh, red); break;
+    case LX_W_FP8: gemv_mma<LX_W_FP8, kPlanes>(g, b0, nb, sh, red); break;
+    case LX_W_NVFP4: gemv_mma<LX_W_NVFP4, kPlanes>(g, b0, nb, sh, red); break;
+    case LX_W_BF16X: gemv_mma<LX_W_BF16X, kPlanes>(g, b0, nb, sh, red); break;
+    default: break;
+  }
 }
 
 // A block's run of tasks of one product: stage x once, then all its rows at once across the warps
@@ -792,11 +989,10 @@ __device__ __noinline__ void gemv_run(int op, const uint32_t* entries, int count
     const int nb = min(cap, R - b0);
     float* red = scratch();
     float* sq = red + nb * S * M;
-    if (g.mma == 1) gemv_mma<LX_W_BF16, 1>(g, b0, nb, sh, red);
-    else if (g.mma == 2) gemv_mma<LX_W_INT8, 1>(g, b0, nb, sh, red);
-    else if (g.mma == 3) gemv_mma<LX_W_BF16, 2>(g, b0, nb, sh, red);
-    else if (g.mma == 4) gemv_mma<LX_W_INT8, 2>(g, b0, nb, sh, red);
-    else switch (g.wtype) {
+    if (g.mma) {
+      if (g.mma <= 2) gemv_mma_w<1>(g, b0, nb, sh, red);
+      else gemv_mma_w<2>(g, b0, nb, sh, red);
+    } else switch (g.wtype) {
       case LX_W_BF16:
         if (g.xs_bf16) gemv_dots<LX_W_BF16, true>(g, b0, nb, sh, red);
         else gemv_dots<LX_W_BF16, false>(g, b0, nb, sh, red);
@@ -804,6 +1000,18 @@ __device__ __noinline__ void gemv_run(int op, const uint32_t* entries, int count
       case LX_W_INT8:
         if (g.xs_bf16) gemv_dots<LX_W_INT8, true>(g, b0, nb, sh, red);
         else gemv_dots<LX_W_INT8, false>(g, b0, nb, sh, red);
+        break;
+      case LX_W_FP8:
+        if (g.xs_bf16) gemv_dots<LX_W_FP8, true>(g, b0, nb, sh, red);
+        else gemv_dots<LX_W_FP8, false>(g, b0, nb, sh, red);
+        break;
+      case LX_W_NVFP4:
+        if (g.xs_bf16) gemv_dots<LX_W_NVFP4, true>(g, b0, nb, sh, red);
+        else gemv_dots<LX_W_NVFP4, false>(g, b0, nb, sh, red);
+        break;
+      case LX_W_BF16X:
+        if (g.xs_bf16) gemv_dots<LX_W_BF16X, true>(g, b0, nb, sh, red);
+        else gemv_dots<LX_W_BF16X, false>(g, b0, nb, sh, red);
         break;
       case kF32: gemv_dots<kF32, false>(g, b0, nb, sh, red); break;
       default: break;
@@ -1373,10 +1581,10 @@ __device__ __noinline__ void expup_task(int op, int task) {
     if (threadIdx.x == 0) misc() = op * 16 + t + 1;
   }
   const int64_t row0 = static_cast<int64_t>(e) * 2 * a.I + i0;  // the first gate row; up rows are I on
-  const char* base = static_cast<const char*>(a.w.data);
+  const uint8_t* base = static_cast<const uint8_t*>(a.w.data);
   auto row_of = [&](int v) -> RowRef {
     const int64_t row = v < rows ? row0 + v : row0 + a.I + (v - rows);
-    return {reinterpret_cast<const uint2*>(base + row * a.row_bytes), a.L / F::kValues, 0, 0};
+    return row_ref<kType>(base, a.w, row, a.row_bytes, 0, a.L, a.L / F::kValues, 0);
   };
   float* red = scratch();
   dots_rows<F, true, 1, 8>(2 * rows, row_of, xbuf(), a.L, 1, red, false);
@@ -1387,6 +1595,11 @@ __device__ __noinline__ void expup_task(int op, int task) {
       const float* sc = static_cast<const float*>(a.w.scale);
       gt *= __ldg(sc + row0 + i);
       up *= __ldg(sc + row0 + a.I + i);
+    }
+    if constexpr (kType == LX_W_NVFP4) {
+      const float gl = expert_global(a.w, e);
+      gt *= gl;
+      up *= gl;
     }
     static_cast<bf16*>(a.inter)[static_cast<int64_t>(pair) * a.I + i0 + i] = __float2bfloat16_rn(lx::silu(gt) * up);
   }
@@ -1407,11 +1620,11 @@ __device__ __noinline__ void expdown_task(int op, int task) {
   } else {
     csync();
   }
-  const char* base = static_cast<const char*>(a.w.data);
+  const uint8_t* base = static_cast<const uint8_t*>(a.w.data);
   auto row_of = [&](int v) -> RowRef {
     const int k = v / rows;
     const int64_t row = static_cast<int64_t>(ids[k]) * a.L + l0 + v % rows;
-    return {reinterpret_cast<const uint2*>(base + row * a.row_bytes), a.I / F::kValues, 0, k};
+    return row_ref<kType>(base, a.w, row, a.row_bytes, 0, a.I, a.I / F::kValues, k);
   };
   float* red = scratch();
   dots_rows<F, true, 1, 8>(K * rows, row_of, xbuf(), a.I, 1, red, false);
@@ -1422,6 +1635,7 @@ __device__ __noinline__ void expdown_task(int op, int task) {
       float c = __ldcg(a.route_w + static_cast<int64_t>(t) * K + k);
       if constexpr (kRowScaled<kType>)
         c *= __ldg(static_cast<const float*>(a.w.scale) + static_cast<int64_t>(ids[k]) * a.L + l0 + i);
+      if constexpr (kType == LX_W_NVFP4) c *= expert_global(a.w, ids[k]);
       acc += c * red[k * rows + i];
     }
     const int64_t at = static_cast<int64_t>(t) * a.L + l0 + i;
@@ -1473,14 +1687,14 @@ __device__ __noinline__ void expup_run(int op, const uint32_t* entries, int coun
   const ExpUp& a = desc().up;
   const int tid = threadIdx.x, lane = tid & 31, gr = lane >> 2, tq = lane & 3;
   const int K = a.top_k, bpp = a.blocks_per_pair, L = a.L, I = a.I, sh = a.sh, S = 1 << sh;
-  const int xst = L + (kType == LX_W_BF16 ? 32 : 8), spr = L / (4 * kV), bpv = a.row_bytes / L;
+  const int xst = L + (kXsF16<kType> ? 8 : 32), spr = L / (4 * kV);
   const int64_t t0 = trace_now();
   const uint16_t* tasks = run_tasks();
   const int p0 = tasks[0] / bpp, p1 = tasks[count - 1] / bpp + 1;
   const int tlo = p0 / K, thi = (p1 - 1) / K + 1;
   int* eid = reinterpret_cast<int*>(scratch() + kScratchFloats - kExpReserve);  // pair p0 + i's expert
   for (int i = tid; i < p1 - p0; i += kCT) eid[i] = __ldcg(a.ids + p0 + i);
-  stage_rows<kType == LX_W_INT8>(a.latent, tlo, thi, L, xst);
+  stage_rows<kXsF16<kType>>(a.latent, tlo, thi, L, xst);
   if (tid == 0) misc() = -1;
   csync();
   const int64_t t1 = trace_now();
@@ -1496,8 +1710,7 @@ __device__ __noinline__ void expup_run(int op, const uint32_t* entries, int coun
       su = __ldg(sc + I);
     }
   }
-  const char* base = static_cast<const char*>(a.w.data);
-  const int64_t up_off = static_cast<int64_t>(I) * a.row_bytes;
+  const uint8_t* base = static_cast<const uint8_t*>(a.w.data);
   for (int b0 = 0; b0 < count; b0 += cap) {
     const int nb = min(cap, count - b0);
     float* red = scratch();
@@ -1505,9 +1718,7 @@ __device__ __noinline__ void expup_run(int op, const uint32_t* entries, int coun
       const int task = tasks[b0 + (u >> sh)], p = u & (S - 1), pair = task / bpp;
       const int64_t row = static_cast<int64_t>(eid[pair - p0]) * 2 * I + (task % bpp) * 8 + gr;
       const int s0 = (p * spr) >> sh, s1 = ((p + 1) * spr) >> sh, kb = s0 * 4 * kV;
-      const char* pa = base + row * a.row_bytes + kb * bpv;
-      return {reinterpret_cast<const uint4*>(pa) + tq, reinterpret_cast<const uint4*>(pa + up_off) + tq, kb, s1 - s0,
-              pair / K - tlo};
+      return unit_rows<kType>(base, a.w, row, row + I, a.row_bytes, kb, s1 - s0, pair / K - tlo, L);
     };
     auto sink = [&](int u, const float (&c)[4]) {
       if (tq == 0) {
@@ -1535,6 +1746,11 @@ __device__ __noinline__ void expup_run(int op, const uint32_t* entries, int coun
           up *= __ldg(sc + I);
         }
       }
+      if constexpr (kType == LX_W_NVFP4) {
+        const float gl = expert_global(a.w, eid[pair - p0]);
+        gt *= gl;
+        up *= gl;
+      }
       static_cast<bf16*>(a.inter)[static_cast<int64_t>(pair) * I + i] = __float2bfloat16_rn(lx::silu(gt) * up);
     }
     if (b0 + cap < count) csync();  // the next batch reuses the scratch
@@ -1554,7 +1770,7 @@ __device__ __noinline__ void expdown_run(int op, const uint32_t* entries, int co
   const ExpDown& a = desc().down;
   const int tid = threadIdx.x, lane = tid & 31, gr = lane >> 2, tq = lane & 3;
   const int K = a.top_k, bpt = a.blocks_per_token, L = a.L, I = a.I, sh = a.sh, S = 1 << sh;
-  const int xst = I + (kType == LX_W_BF16 ? 32 : 8), spr = I / (4 * kV), bpv = a.row_bytes / I;
+  const int xst = I + (kXsF16<kType> ? 8 : 32), spr = I / (4 * kV);
   const int64_t t0 = trace_now();
   const uint16_t* tasks = run_tasks();
   const int tlo = tasks[0] / bpt, thi = tasks[count - 1] / bpt + 1;
@@ -1564,7 +1780,7 @@ __device__ __noinline__ void expdown_run(int op, const uint32_t* entries, int co
     eid[i] = __ldcg(a.ids + tlo * K + i);
     rw[i] = __ldcg(a.route_w + tlo * K + i);
   }
-  stage_rows<kType == LX_W_INT8>(a.inter, tlo * K, thi * K, I, xst);
+  stage_rows<kXsF16<kType>>(a.inter, tlo * K, thi * K, I, xst);
   if (tid == 0) misc() = -1;
   csync();
   const int64_t t1 = trace_now();
@@ -1585,8 +1801,7 @@ __device__ __noinline__ void expdown_run(int op, const uint32_t* entries, int co
               __ldg(static_cast<const float*>(a.w.scale) + static_cast<int64_t>(eid[(t - tlo) * K + k]) * L + l);
     }
   }
-  const char* base = static_cast<const char*>(a.w.data);
-  const int64_t half = 8ll * a.row_bytes;
+  const uint8_t* base = static_cast<const uint8_t*>(a.w.data);
   for (int b0 = 0; b0 < count; b0 += cap) {
     const int nb = min(cap, count - b0);
     float* red = scratch();
@@ -1595,8 +1810,7 @@ __device__ __noinline__ void expdown_run(int op, const uint32_t* entries, int co
       const int t = task / bpt, x = (t - tlo) * K + k;
       const int64_t row = static_cast<int64_t>(eid[x]) * L + (task % bpt) * 16 + gr;
       const int s0 = (p * spr) >> sh, s1 = ((p + 1) * spr) >> sh, kb = s0 * 4 * kV;
-      const char* pa = base + row * a.row_bytes + kb * bpv;
-      return {reinterpret_cast<const uint4*>(pa) + tq, reinterpret_cast<const uint4*>(pa + half) + tq, kb, s1 - s0, x};
+      return unit_rows<kType>(base, a.w, row, row + 8, a.row_bytes, kb, s1 - s0, x, I);
     };
     auto sink = [&](int u, const float (&c)[4]) {
       if (tq == 0) {
@@ -1619,6 +1833,7 @@ __device__ __noinline__ void expdown_run(int op, const uint32_t* entries, int co
         if constexpr (kRowScaled<kType>)
           c *= pre ? pre_sc[k]
                    : __ldg(static_cast<const float*>(a.w.scale) + static_cast<int64_t>(eid[(t - tlo) * K + k]) * L + l);
+        if constexpr (kType == LX_W_NVFP4) c *= expert_global(a.w, eid[(t - tlo) * K + k]);
         float v = 0.0f;
         for (int p = 0; p < S; ++p) v += red[((j * K + k) * 16 + r) * S + p];
         acc += c * v;
@@ -1787,7 +2002,6 @@ __device__ __noinline__ void entry_task(int op, int task) {
   const int r0 = task * a.rows, rows = min(a.rows, a.mem_dim - r0);
   float* red = scratch();
   float* red2 = scratch() + a.rows * M;
-  const int bpv = a.state_bytes / D;
   for (int c0 = 0; c0 < D; c0 += kc) {
     if (!(whole && cached)) {
       if (c0 > 0) csync();  // the previous chunk's dots are done with the buffer
@@ -1798,11 +2012,10 @@ __device__ __noinline__ void entry_task(int op, int task) {
       }
       csync();
     }
-    const char* base = static_cast<const char*>(a.w_state.data) + static_cast<int64_t>(c0) * bpv;
     auto row_of = [&](int v) -> RowRef {
       if (v >= rows) return {nullptr, kc / F::kValues, 0, 0};
-      const char* row = base + static_cast<int64_t>(r0 + v) * a.state_bytes;
-      return {reinterpret_cast<const uint2*>(row), kc / F::kValues, 0, 0};
+      return row_ref<kType>(static_cast<const uint8_t*>(a.w_state.data), a.w_state, r0 + v, a.state_bytes, c0, D,
+                            kc / F::kValues, 0);
     };
     dots_rows_m<F, false>(rows, row_of, xs, kc, M, red, c0 > 0);
   }
@@ -1818,6 +2031,7 @@ __device__ __noinline__ void entry_task(int op, int task) {
     const int i = e / M, m = e % M, r = r0 + i;
     float ds = red[i * M + m];
     if constexpr (kRowScaled<kType>) ds *= __ldg(static_cast<const float*>(a.w_state.scale) + r);
+    if constexpr (kType == LX_W_NVFP4) ds *= a.w_state.global;
     const float v = ds + bf(a.b_state, r);
     const float vm = red2[i * M + m] + bf(a.b_meta, r);
     float en = vm + v;
@@ -1920,20 +2134,17 @@ __device__ __noinline__ void run_segment(int op, const uint32_t* entries, int co
       case kConvBC: conv_bc_task(task); break;
       case kSelect: select_task(); break;
       case kExpUp:
-        if (d.up.wtype == LX_W_INT8) expup_task<LX_W_INT8>(op, task);
-        else expup_task<LX_W_BF16>(op, task);
+        LX_DISPATCH_W(d.up.wtype, expup_task, op, task);
         break;
       case kExpDown:
-        if (d.down.wtype == LX_W_INT8) expdown_task<LX_W_INT8>(op, task);
-        else expdown_task<LX_W_BF16>(op, task);
+        LX_DISPATCH_W(d.down.wtype, expdown_task, op, task);
         break;
       case kAttention:
         attention_task(task);
         if (threadIdx.x == 0) misc() = -1;  // the x buffer was its scratch
         break;
       case kEntry:
-        if (d.entry.wtype == LX_W_INT8) entry_task<LX_W_INT8>(op, task);
-        else entry_task<LX_W_BF16>(op, task);
+        LX_DISPATCH_W(d.entry.wtype, entry_task, op, task);
         break;
       case kContinuation: continuation_task(); break;
       default: break;
@@ -1999,11 +2210,9 @@ __device__ __forceinline__ void work(const Program& P, int block) {
     const OpDesc& od = desc();
     if (od.kind == kGemv) gemv_run(op, list + i, j - i, i);
     else if (od.kind == kExpUp && od.up.mma) {
-      if (od.up.wtype == LX_W_INT8) expup_run<LX_W_INT8>(op, list + i, j - i, i);
-      else expup_run<LX_W_BF16>(op, list + i, j - i, i);
+      LX_DISPATCH_W(od.up.wtype, expup_run, op, list + i, j - i, i);
     } else if (od.kind == kExpDown && od.down.mma) {
-      if (od.down.wtype == LX_W_INT8) expdown_run<LX_W_INT8>(op, list + i, j - i, i);
-      else expdown_run<LX_W_BF16>(op, list + i, j - i, i);
+      LX_DISPATCH_W(od.down.wtype, expdown_run, op, list + i, j - i, i);
     } else {
       run_segment(op, list + i, j - i, i);
     }

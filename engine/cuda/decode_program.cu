@@ -10,6 +10,7 @@
 #include <cstring>
 #include <vector>
 
+#include "cuda/bf16x.cuh"
 #include "cuda/decode_ops.h"
 #include "cuda/kernels.h"
 #include "cuda/tunable.h"
@@ -30,13 +31,34 @@ int round_up(int a, int b) { return (a + b - 1) / b * b; }
 
 bool row_scaled_type(int wtype) { return wtype == LX_W_INT8 || wtype == LX_W_FP8; }
 
-int bytes_per_value(int wtype) {
+// Bits per value in a weight format (NVFP4's 4 are its code; its block scales are a separate array).
+int value_bits(int wtype) {
   switch (wtype) {
-    case LX_W_BF16: return 2;
-    case LX_W_F32: return 4;
-    case LX_W_INT8: return 1;
+    case LX_W_BF16: return 16;
+    case LX_W_BF16X: return 16;
+    case LX_W_F32: return 32;
+    case LX_W_INT8:
+    case LX_W_FP8: return 8;
+    case LX_W_NVFP4: return 4;
     default: return 0;
   }
+}
+
+// Values in a 16-byte chunk of the tensor-core reader (0: the format has none).
+int chunk_values(int wtype) {
+  switch (wtype) {
+    case LX_W_BF16: return 8;
+    case LX_W_BF16X: return 8;
+    case LX_W_INT8:
+    case LX_W_FP8: return 16;
+    case LX_W_NVFP4: return 32;
+    default: return 0;
+  }
+}
+
+// Bytes of a row of k values.
+int64_t row_bytes_of(int wtype, int k) {
+  return wtype == LX_W_BF16X ? lx::bf16x::row_bytes(k) : static_cast<int64_t>(k) * value_bits(wtype) / 8;
 }
 
 }  // namespace
@@ -219,7 +241,7 @@ static int k_split(const Gemv& g, int ntasks, int blocks, bool parts) {
   const int R = ceil_div(ntasks, blocks) * g.rows, Kc = g.k1 - g.k0;
   int sh = 0;
   if (g.mma) {
-    const int spr = Kc / (g.mma == 1 || g.mma == 3 ? 32 : 64), groups = ceil_div(R, 16);
+    const int spr = Kc / (4 * chunk_values(g.wtype)), groups = ceil_div(R, 16);  // the device's steps per unit
     int best = 1 << 30;
     for (int k = 0; (1 << k) <= spr && k <= 6; ++k) {
       const int cost = ceil_div(groups << k, kComputeWarps) * (ceil_div(spr, 1 << k) + 1);
@@ -237,8 +259,8 @@ static int k_split(const Gemv& g, int ntasks, int blocks, bool parts) {
 
 int lx_program_gemv(lx_program* p, const lx_fx* x, const lx_weight* w, const lx_fy* y, int N, int K) {
   if (!p || p->built || !x || !w || !y || N < 1 || K < 8 || K % 8) return -1;
-  const int M = p->M, wtype = static_cast<int>(w->type), bpv = bytes_per_value(wtype);
-  if (!bpv) return -1;
+  const int M = p->M, wtype = static_cast<int>(w->type);
+  if (!value_bits(wtype)) return -1;
   // How x is staged: bf16 when its values are bf16 already (or rounded to bf16 on the way in).
   bool xs_bf16 = x->kind == LX_FX_RMS || x->kind == LX_FX_GATED || x->kind == LX_FX_SWIGLU ||
                  (x->kind == LX_FX_PLAIN && x->dtype == LX_BF16) ||
@@ -246,10 +268,11 @@ int lx_program_gemv(lx_program* p, const lx_fx* x, const lx_weight* w, const lx_
   if (wtype == LX_W_F32) xs_bf16 = false;
   // The tensor-core reader takes bf16 rows, and int8 rows (which convert to f16 exactly), in whole
   // steps of four 16-byte chunks; x is staged as bf16 or f16, its rows padded against bank conflicts.
-  const int cv = wtype == LX_W_BF16 ? 8 : wtype == LX_W_INT8 ? 16 : 0;  // values per 16-byte chunk
+  const int cv = chunk_values(wtype);  // values per 16-byte chunk
   int mma = 0;
-  if (cv && K % (4 * cv) == 0 && reinterpret_cast<uintptr_t>(w->data) % 16 == 0 && !std::getenv("LX_PROGRAM_FMA"))
-    mma = (wtype == LX_W_BF16 ? 1 : 2) + (xs_bf16 ? 0 : 2);
+  if (cv && K % (4 * cv) == 0 && (wtype == LX_W_BF16X || reinterpret_cast<uintptr_t>(w->data) % 16 == 0) &&
+      (wtype != LX_W_NVFP4 || reinterpret_cast<uintptr_t>(w->scale) % 2 == 0) && !std::getenv("LX_PROGRAM_FMA"))
+    mma = (wtype == LX_W_BF16 || wtype == LX_W_BF16X ? 1 : 2) + (xs_bf16 ? 0 : 2);
   const int xe = mma >= 3 ? 4 : mma || xs_bf16 ? 2 : 4;  // bytes of x staged per value
   const int xpad = mma == 1 || mma == 3 ? 32 : mma ? 8 : 0;
   const int kstep = mma ? 4 * cv : 8;
@@ -318,7 +341,8 @@ int lx_program_gemv(lx_program* p, const lx_fx* x, const lx_weight* w, const lx_
     Gemv g = base;
     g.k0 = c * Kc;
     g.k1 = std::min(K, g.k0 + Kc);
-    g.row_bytes = (g.k1 - g.k0) * bpv;
+    g.row_bytes = row_bytes_of(wtype, g.k1 - g.k0);
+    g.ld = row_bytes_of(wtype, K);
     g.rows = tile_rows(N, g.row_bytes, p->blocks);
     const int ntasks = ceil_div(N, g.rows);
     g.sh = k_split(g, ntasks, p->blocks, y->kind == LX_FY_WRITE && y->next_parts && c == chunks - 1);
@@ -505,9 +529,7 @@ int lx_program_experts(lx_program* p, const lx_experts_args* a) {
   if (select < 0) return -1;
   const int gt = static_cast<int>(a->gate_up.type), dt = static_cast<int>(a->down.type);
   const int sgt = static_cast<int>(a->shared_gate_up.type);
-  if (gt != LX_W_BF16 && gt != LX_W_INT8) return -1;
-  if (dt != LX_W_BF16 && dt != LX_W_INT8) return -1;
-  if (sgt != LX_W_BF16 && sgt != LX_W_INT8) return -1;
+  if (!chunk_values(gt) || !chunk_values(dt) || !chunk_values(sgt)) return -1;
   if (K * I * 2 > p->x_cap) return -1;
   float* shared_gu = static_cast<float*>(p->alloc(static_cast<size_t>(M) * 2 * Is * 4));
   void* inter_r = p->alloc(static_cast<size_t>(M) * K * I * 2);
@@ -543,8 +565,9 @@ int lx_program_experts(lx_program* p, const lx_experts_args* a) {
   // whatever the step's batch.
   const bool fma = std::getenv("LX_PROGRAM_FMA") != nullptr;
   auto tc_ok = [&](const lx_weight& w, int k) {
-    const int cv = w.type == LX_W_BF16 ? 8 : w.type == LX_W_INT8 ? 16 : 0;
-    return !fma && cv && k % (4 * cv) == 0 && reinterpret_cast<uintptr_t>(w.data) % 16 == 0;
+    const int cv = chunk_values(w.type);
+    return !fma && cv && k % (4 * cv) == 0 && (w.type == LX_W_BF16X || reinterpret_cast<uintptr_t>(w.data) % 16 == 0) &&
+           (w.type != LX_W_NVFP4 || reinterpret_cast<uintptr_t>(w.scale) % 2 == 0);
   };
   // 2^sh parts per unit for the least time per warp (units per warp times steps per unit, plus about
   // a step per unit), with a block's share of one token's units.
@@ -560,14 +583,14 @@ int lx_program_experts(lx_program* p, const lx_experts_args* a) {
     return sh;
   };
   {
-    const int rb = L * bytes_per_value(gt);
+    const int rb = static_cast<int>(row_bytes_of(gt, L));
     const bool tc = tc_ok(a->gate_up, L) && I % 8 == 0 && M * (L + 32) * 2 <= p->x_cap;
     const int rows = tc ? 8 : tile_rows(I, rb, p->blocks, 2);
     if (I % rows) return -1;
     const int bpp = I / rows;
     int sh = 0;
     if (tc) {
-      const int spr = L / (gt == LX_W_BF16 ? 32 : 64);
+      const int spr = L / (4 * chunk_values(gt));
       sh = unit_split(ceil_div(K * bpp, p->blocks), spr, 16);
     }
     OpDesc d = blank(kExpUp, M * K * bpp);
@@ -580,14 +603,14 @@ int lx_program_experts(lx_program* p, const lx_experts_args* a) {
     if (p->add(d, std::move(regs), 2.0 * rows * rb) < 0) return -1;
   }
   {
-    const int rb = I * bytes_per_value(dt);
+    const int rb = static_cast<int>(row_bytes_of(dt, I));
     const bool tc = tc_ok(a->down, I) && L % 16 == 0 && M * K * (I + 32) * 2 <= p->x_cap;
     const int rows = tc ? 16 : tile_rows(L, rb, p->blocks, K);
     if (L % rows) return -1;
     const int bpt = L / rows;
     int sh = 0;
     if (tc) {
-      const int spr = I / (dt == LX_W_BF16 ? 32 : 64);
+      const int spr = I / (4 * chunk_values(dt));
       sh = unit_split(ceil_div(bpt, p->blocks) * K, spr, 16 * K);
     }
     OpDesc d = blank(kExpDown, M * bpt);
@@ -620,7 +643,7 @@ int lx_program_attention(lx_program* p, const lx_attention_args* a) {
 int lx_program_memory_entry(lx_program* p, const lx_entry_args* a) {
   if (!p || !a || a->D % 8 || (a->R + 4) % 4) return -1;
   const int M = p->M, D = a->D, Km = a->R + 4, wt = static_cast<int>(a->w_state.type);
-  if (wt != LX_W_BF16 && wt != LX_W_INT8) return -1;
+  if (wt != LX_W_BF16 && wt != LX_W_INT8 && wt != LX_W_FP8 && wt != LX_W_NVFP4 && wt != LX_W_BF16X) return -1;
   OpDesc d = blank(kEntry, 0);
   Entry& e = d.entry;
   e.state = a->state;
@@ -641,7 +664,7 @@ int lx_program_memory_entry(lx_program* p, const lx_entry_args* a) {
   e.D = D;
   e.R = a->R;
   e.mem_dim = a->mem_dim;
-  e.state_bytes = D * bytes_per_value(wt);
+  e.state_bytes = static_cast<int>(row_bytes_of(wt, D));
   const int mb = Km * 2;
   const int rows = tile_rows(a->mem_dim, e.state_bytes + mb, p->blocks);
   e.rows = rows;
@@ -689,14 +712,17 @@ static void task_spans(const OpDesc& d, int task, std::vector<PfSpan>& out) {
     case kGemv: {
       const Gemv& g = d.gemv;
       const int n0 = task * g.rows, rows = std::min(g.rows, g.N - n0);
-      const int64_t bpv = g.row_bytes / (g.k1 - g.k0);
+      const int64_t bits = value_bits(g.wtype);
       const char* w = static_cast<const char*>(g.w.data);
       // a K chunk's rows are not contiguous: the span runs from the first row's chunk to the last
       // row's (the other chunks' bytes in between are read by their own ops right after)
-      const int64_t a = (static_cast<int64_t>(n0) * g.K + g.k0) * bpv;
-      const int64_t b = (static_cast<int64_t>(n0 + rows - 1) * g.K + g.k1) * bpv;
+      // a BF16X row is a record: its span is whole rows
+      const int64_t a = g.wtype == LX_W_BF16X ? n0 * g.ld : (static_cast<int64_t>(n0) * g.K + g.k0) * bits / 8;
+      const int64_t b =
+          g.wtype == LX_W_BF16X ? (n0 + rows) * g.ld : (static_cast<int64_t>(n0 + rows - 1) * g.K + g.k1) * bits / 8;
       span(w + a, b - a);
       if (row_scaled_type(g.wtype)) span(static_cast<const float*>(g.w.scale) + n0, rows * 4);
+      if (g.wtype == LX_W_NVFP4) span(static_cast<const char*>(g.w.scale) + n0 * (g.K / 16), rows * (g.K / 16));
       break;
     }
     case kSsm: {

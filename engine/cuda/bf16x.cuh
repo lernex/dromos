@@ -128,4 +128,45 @@ struct Patches {
   __device__ __forceinline__ uint32_t pos() const { return next >> 8; }
 };
 
+// The row's exponent bytes of values k .. k + 3 with its patches applied: the header's slots (ascending, unused
+// kNoPatch), or, for a row whose slot 0 holds an overflow record's offset, the record (u32 count, count patches).
+__device__ __forceinline__ uint32_t patched(const uint8_t* row, int K, uint32_t k, uint32_t e) {
+  const uint32_t* hdr = reinterpret_cast<const uint32_t*>(row);
+  const uint32_t s0 = hdr[0];
+  // kNoPatch (an unused slot, and what a row without patches holds in slot 0) has the overflow bit too
+  if (s0 != kNoPatch && (s0 & 0x80000000u)) {
+    const uint32_t* rec =
+        reinterpret_cast<const uint32_t*>(row + static_cast<int64_t>(s0 & 0x7fffffffu) * kOverflowAlign);
+    const uint32_t n = rec[0];
+    for (uint32_t i = 0; i < n; ++i) e = patch(e, rec[1 + i], k);
+    return e;
+  }
+  const int slots = patch_slots(K);
+  for (int i = 0; i < slots; ++i) {
+    const uint32_t slot = hdr[i];
+    if (slot == kNoPatch) break;
+    e = patch(e, slot, k);
+  }
+  return e;
+}
+
+// Four bf16 values from value k (a multiple of 4, below K) of the row record at row: their bits as a uint2 (values
+// 0 and 1 in x, 2 and 3 in y). Everything is read from the record: the block's sign|mantissa bytes, its codes (a
+// quad at k % 8 == 4 takes the codes' high nibbles), its base and the row's patches.
+__device__ __forceinline__ uint2 quad(const uint8_t* row, int K, int k) {
+  const int blk = k / kBlock, off = k - blk * kBlock;
+  const uint8_t* b = row + header_bytes(K) + static_cast<int64_t>(blk) * kBlockBytes;
+  const uint32_t sm = *reinterpret_cast<const uint32_t*>(b + off);
+  const uint32_t codes = *reinterpret_cast<const uint32_t*>(b + kCodes + (off & ~7) / 2);
+  const uint32_t base = row[base_offset(K) + blk];
+  const uint32_t e = exponents(base, (off & 4) ? codes >> 4 : codes);
+  return assemble(sm, patched(row, K, static_cast<uint32_t>(k), e));
+}
+
+// Eight bf16 values from value k (a multiple of 8): the 16-byte chunk the tensor-core reader takes.
+__device__ __forceinline__ uint4 chunk8(const uint8_t* row, int K, int k) {
+  const uint2 lo = quad(row, K, k), hi = quad(row, K, k + 4);
+  return make_uint4(lo.x, lo.y, hi.x, hi.y);
+}
+
 }  // namespace lx::bf16x

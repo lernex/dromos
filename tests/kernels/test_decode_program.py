@@ -8,11 +8,13 @@ must give the same result again.
 
 import ctypes
 import math
+import os
 
 import pytest
 import torch
 import torch.nn.functional as F
 
+import formats as fm
 from conftest import BF16, F32, close
 
 W_BF16, W_INT8, W_F32 = 0, 1, 16
@@ -23,6 +25,12 @@ c_int, c_float, c_void_p = ctypes.c_int, ctypes.c_float, ctypes.c_void_p
 
 def ptr(t):
     return c_void_p(t.data_ptr()) if t is not None else c_void_p(None)
+
+
+def from_fm(r):
+    """A formats.Weight as the lx_weight of this file (its tensors must stay alive while the program runs)."""
+    return Weight(r.fmt, r.data.data_ptr(), None if r.scale is None else r.scale.data_ptr(), r.glob,
+                  None if r.expert_global is None else r.expert_global.data_ptr())
 
 
 class Weight(ctypes.Structure):  # lx_weight
@@ -128,8 +136,36 @@ class Program:
             self.lib.lx_program_destroy(self.p)
 
 
+_LIB = None
+
+
+def encode_bf16x(w):
+    """A bf16 [rows, K] tensor as the BF16X encoding (lx_bf16x_encode), a uint8 tensor on the device."""
+    global _LIB
+    if _LIB is None:
+        _LIB = ctypes.CDLL(os.environ["LX_KERNELS"])
+        _LIB.lx_bf16x_bytes.restype = ctypes.c_int64
+        _LIB.lx_bf16x_bytes.argtypes = [c_void_p, ctypes.c_int64, c_int, c_void_p]
+        _LIB.lx_bf16x_encode.restype = c_int
+        _LIB.lx_bf16x_encode.argtypes = [c_void_p, ctypes.c_int64, c_int, c_void_p, ctypes.c_int64, c_void_p]
+    rows, K = w.shape
+    n = _LIB.lx_bf16x_bytes(c_void_p(w.data_ptr()), rows, K, None)
+    out = torch.full((n,), 0xAA, dtype=torch.uint8, device="cuda")  # poison: every byte must be written
+    status = _LIB.lx_bf16x_encode(c_void_p(w.data_ptr()), rows, K, c_void_p(out.data_ptr()), n, None)
+    assert status == 0, status
+    torch.cuda.synchronize()
+    return out
+
+
 def weight(N, K, kind):
     """(lx_weight, dequantized float64 [N, K], tensors to keep)."""
+    if kind == "bf16x":  # the bf16 values, in the lossless encoding the program reads decoded
+        w = (torch.randn(N, K, device="cuda") / math.sqrt(K)).to(torch.bfloat16)
+        enc = encode_bf16x(w)
+        return Weight(4, enc.data_ptr(), None, 1.0), w.double(), [w, enc]
+    if kind in ("fp8", "nvfp4"):
+        r = fm.random_weight(fm.W_FP8 if kind == "fp8" else fm.W_NVFP4, N, K, seed=N * 131 + K)
+        return from_fm(r), r.dense, [r.data, r.scale]
     if kind == "bf16":
         w = (torch.randn(N, K, device="cuda") / math.sqrt(K)).to(torch.bfloat16)
         return Weight(W_BF16, w.data_ptr(), None, 1.0), w.double(), [w]
@@ -170,14 +206,14 @@ def check(got, want, rel=2e-4):
 # ---- Products -----------------------------------------------------------------------------------
 
 GEMV_CASES = [  # N, K, weight kinds
-    (10304, 2048, ["int8", "bf16"]),  # in_proj
-    (2048, 4096, ["bf16"]),           # out_proj, kept bf16
-    (65536, 2048, ["int8"]),          # the head
-    (1024, 512, ["int8", "bf16"]),    # shared expert down
-    (256, 6400, ["f32"]),             # the depth head's hidden layer: rows wider than a page
-    (128, 1280, ["f32"]),             # a router
-    (4100, 256, ["int8", "bf16"]),    # the memory bank projection
-    (40, 72, ["int8", "bf16", "f32"]),
+    (10304, 2048, ["int8", "bf16", "fp8", "nvfp4", "bf16x"]),  # in_proj
+    (2048, 4096, ["bf16", "fp8", "nvfp4", "bf16x"]),           # out_proj
+    (65536, 2048, ["int8"]),                          # the head
+    (1024, 512, ["int8", "bf16", "fp8", "nvfp4", "bf16x"]),  # shared expert down
+    (256, 6400, ["f32"]),                             # the depth head's hidden layer: rows wider than a page
+    (128, 1280, ["f32"]),                             # a router
+    (4100, 256, ["int8", "bf16", "fp8", "nvfp4", "bf16x"]),  # the memory bank projection
+    (40, 72, ["int8", "bf16", "f32", "fp8", "bf16x"]),       # odd K: the FMA reader
 ]
 
 
@@ -557,12 +593,18 @@ def test_select(lx, M):
 
 def expert_stack(E, rows, cols, kind):
     """A stacked expert weight [E, rows, cols] as lx_weight and dequantized float64."""
+    if kind == "bf16x":  # the records of the stacked rows, one after another
+        w, wd, keep = weight(E * rows, cols, kind)
+        return w, wd.view(E, rows, cols), keep
+    if kind in ("fp8", "nvfp4"):  # NVFP4 experts each carry their own global, as checkpoints do
+        r = fm.stack_weight(fm.W_FP8 if kind == "fp8" else fm.W_NVFP4, E, rows, cols, seed=E * 17 + rows)
+        return from_fm(r), r.dense, [r.data, r.scale, r.expert_global]
     w, wd, keep = weight(E * rows, cols, kind)
     return w, wd.view(E, rows, cols), keep
 
 
 @pytest.mark.parametrize("M", [1, 3, 8])
-@pytest.mark.parametrize("kind", ["int8", "bf16"])
+@pytest.mark.parametrize("kind", ["int8", "bf16", "fp8", "nvfp4", "bf16x"])
 def test_experts(lx, M, kind):
     """Routing then the experts, so the expert tiles wait on the routing op inside the program."""
     torch.manual_seed(M)
@@ -643,7 +685,7 @@ def test_attention(lx, M, start):
 
 
 @pytest.mark.parametrize("M", [1, 3, 8])
-@pytest.mark.parametrize("kind", ["int8", "bf16"])
+@pytest.mark.parametrize("kind", ["int8", "bf16", "fp8", "nvfp4", "bf16x"])
 def test_memory_entry(lx, M, kind):
     torch.manual_seed(M)
     D, R, Md = 2048, 256, 256
@@ -727,6 +769,13 @@ INVARIANCE_CASES = [  # N, K, weight kind, x dtype
     (128, 1280, "f32", torch.float32),      # a router
     (4100, 256, "bf16", torch.bfloat16),
     (40, 72, "int8", torch.bfloat16),       # the FMA reader
+    (10304, 2048, "fp8", torch.bfloat16),
+    (2048, 4096, "nvfp4", torch.bfloat16),
+    (2048, 1024, "nvfp4", torch.float32),
+    (40, 72, "fp8", torch.bfloat16),
+    (2048, 4096, "bf16x", torch.bfloat16),
+    (2048, 1024, "bf16x", torch.float32),
+    (40, 72, "bf16x", torch.bfloat16),
 ]
 
 
@@ -748,7 +797,7 @@ def test_rows_do_not_depend_on_m(lx, N, K, kind, xdt):
     assert torch.equal(outs[8][5], outs[1][0])
 
 
-@pytest.mark.parametrize("kind", ["int8", "bf16"])
+@pytest.mark.parametrize("kind", ["int8", "bf16", "fp8", "nvfp4", "bf16x"])
 def test_chain_and_experts_do_not_depend_on_m(lx, kind):
     """A write, the RMS read of what it left, routing and the experts: token 3 among eight against
     token 3 alone, to the bit."""

@@ -22,7 +22,7 @@ constexpr int kMaxEntries = 8;               // depth-memory entries per token
 constexpr int kTileBytes = 16384;            // weight bytes of one product task, at most (one row may be more)
 constexpr int kMaxTileRows = 64;             // rows of a product task
 constexpr int kScratchFloats = 6144;         // per-block reduction space
-constexpr int kDescBytes = 512;              // shared-memory copy of an op's descriptor
+constexpr int kDescBytes = 576;              // shared-memory copy of an op's descriptor
 constexpr int kConvParts = 8;                // tasks per token of a B and C conv-state update
 
 // The kernel's shared memory: fixed slots, then the x buffer (as large as the rest allows).
@@ -59,6 +59,7 @@ struct Gemv {
   int N, K, k0, k1;     // this op multiplies columns [k0, k1) of the [N, K] weight
   int rows;             // rows per task (the last task may have fewer)
   int row_bytes;        // bytes of one row's [k0, k1)
+  int64_t ld;           // bytes of one full row of the weight (K values): row n starts at n * ld
   // x
   int x_kind, x_dtype, ld_x, n_parts, group, nseg, round_bf16, xs_bf16;
   const void* x;
