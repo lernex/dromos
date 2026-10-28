@@ -63,31 +63,33 @@ __device__ __forceinline__ void cp_async_wait() {
 __device__ __forceinline__ void ldmatrix_x4(uint32_t (&r)[4], uint32_t addr) {
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
                : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-               : "r"(addr));
+               : "r"(addr)
+               : "memory");
 }
 // Transposed: thread t gets rows 2 (t % 4), + 1 of column t / 4 of each 8x8 matrix (an mma B operand from a
 // row-major [k][n] tile).
 __device__ __forceinline__ void ldmatrix_x4_trans(uint32_t (&r)[4], uint32_t addr) {
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
                : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-               : "r"(addr));
+               : "r"(addr)
+               : "memory");
 }
 __device__ __forceinline__ void ldmatrix_x2(uint32_t (&r)[2], uint32_t addr) {
-  asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];" : "=r"(r[0]), "=r"(r[1]) : "r"(addr));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];" : "=r"(r[0]), "=r"(r[1]) : "r"(addr) : "memory");
 }
 __device__ __forceinline__ uint4 lds128(uint32_t addr) {
   uint4 v;
-  asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "r"(addr));
+  asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "r"(addr) : "memory");
   return v;
 }
 __device__ __forceinline__ uint2 lds64(uint32_t addr) {
   uint2 v;
-  asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];" : "=r"(v.x), "=r"(v.y) : "r"(addr));
+  asm volatile("ld.shared.v2.b32 {%0,%1}, [%2];" : "=r"(v.x), "=r"(v.y) : "r"(addr) : "memory");
   return v;
 }
 __device__ __forceinline__ uint32_t lds32(uint32_t addr) {
   uint32_t v;
-  asm volatile("ld.shared.b32 %0, [%1];" : "=r"(v) : "r"(addr));
+  asm volatile("ld.shared.b32 %0, [%1];" : "=r"(v) : "r"(addr) : "memory");
   return v;
 }
 

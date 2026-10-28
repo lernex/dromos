@@ -414,16 +414,20 @@ LX_API int64_t lx_gemm_workspace_bytes(int M, int K, lx_math math);
 // per decoding token, up to 64 rows per call. A larger M runs as chunks of 64, each row computed the same way.
 //
 // Reduction order (the contract, for every format of this family):
-//   1. Each output element is one f32 accumulation chain over k, starting from 0 and taking the K values in ascending
-//      order in 16-wide k-tiles: acc = mma.m16n8k16(x[m, k0:k0+16], w[n, k0:k0+16], acc), for k0 = 0, 16, 32, ...
-//      The mma sums its 16 products in the hardware's fixed order, so the chain is the same on every launch.
-//   2. No split-K and no atomics. A CTA streams all of K for its output columns.
-//   3. The epilogue is f32: v = alpha * (acc + bias[n]) + beta * y[m, n] (the beta term only when beta != 0), rounded
+//   1. The K-tiles (16-wide k-steps, 64 k per tile) of a (K, N) are cut into S(K, N) contiguous slices, slice r taking
+//      tiles [r * KT / S, (r + 1) * KT / S) of the KT = K / 64 tiles. Each slice is one f32 accumulation chain: it starts
+//      from 0 and takes its k-steps in ascending order: acc = mma.m16n8k16(x[m, k0:k0+16], w[n, k0:k0+16], acc).
+//      The mma sums its 16 products in the hardware's fixed order, so each chain is the same on every launch.
+//   2. The S partial sums of an output are added in f32 in ascending slice order: ((p0 + p1) + p2) + ... They are
+//      exchanged through the cluster's distributed shared memory: no atomics, no workspace, one launch.
+//   3. The epilogue is f32: v = alpha * (sum + bias[n]) + beta * y[m, n] (the beta term only when beta != 0), rounded
 //      once to y's dtype.
-//   4. Batch invariance: the bits of output row m depend only on x[m, :], the weight and the epilogue constants. They
-//      do not depend on M, on where the row sits in the call, or on the other rows, whether they are present or not.
-//      So a decode token's bits are the same whatever the number of streams in its step, from one row up.
-//      tests/kernels/test_gemm_skinny.py checks this at M = 1, 2, 8, 32, 64 and across chunks of 64.
+//   4. S and the tile shape depend only on (K, N) and the card's SM count (two CTAs per SM is the target), never on M.
+//      So the bits of output row m depend only on x[m, :], the weight and the epilogue constants: not on M, on where the
+//      row sits in the call, or on the other rows, present or not. A decode token's bits are the same whatever the
+//      number of streams in its step, from one row up. The bits do depend on the card's SM count, so a card with a
+//      different SM count may split K differently; each card is internally invariant.
+//      tests/kernels/test_gemm_skinny.py checks this at M = 1, 2, 8, 16, 32, 64 and across chunks of 64.
 // x is bf16; bias and y are bf16 or f32 (bias may be null). The bf16-weight kernel needs N a multiple of 16 and K a
 // multiple of 64, and returns LX_ERR_NOT_SUPPORTED otherwise (also for f32 x, until its loads are pipelined). The tile
 // shape (BM rows, BN columns) is chosen per call; it does not change any bits. Other formats join with the same order.
