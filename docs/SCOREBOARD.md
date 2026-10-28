@@ -3,7 +3,8 @@
 How fast the Lernex engine decodes, measured against the memory bandwidth of the card it runs on.
 
 Card: NVIDIA GeForce RTX 5070 Ti (16 GB, sm_120), on the lernex GPU server.
-Measured: 2026-10-27, on commit 4b25613 (`Add lx_bandwidth_probe and the decode roofline to doctor and bench`), under the GPU lock, on an otherwise idle card.
+Measured: 2026-10-27, on commit 4b25613 (`Add lx_bandwidth_probe and the decode roofline to doctor and bench`, landed on main as f1f60e3), under the GPU lock, on an otherwise idle card.
+The per-component, held-as, modelled NVFP4 and Logos sections were measured 2026-10-28 with the doctor changes that come with this file (`lernex doctor --modelled`, the "held as" column, the routed-experts column in the batched table).
 
 ## What the ceiling is
 
@@ -65,45 +66,154 @@ Run again at 26 streams, the slot count, so nothing queues (`--streams 26`): **1
 
 ## Where the bytes go
 
-Praxis BF16, one stream, context 512: 1827 MB per token.
+One stream, context 512, MB per token, from `lernex doctor` on each format. BF16, FP8 and NVFP4 are the stored Praxis folders. INT8 is round-to-nearest from the BF16 file. The modelled FP8 and NVFP4 counts (`lernex doctor --modelled`) match the stored folders on all 38 components.
 
-| Component | MB per token | Share |
-|---|---|---|
-| Mamba in_proj (20 layers) | 639.7 | 35.0% |
-| Mamba out_proj (20 layers) | 253.6 | 13.9% |
-| LM head | 203.4 | 11.1% |
-| Mamba state | 86.8 | 4.8% |
-| Routed experts, gate_up / down | 152.6 / 77.1 | 8.3% / 4.2% |
-| Latent down / up | 76.3 / 76.3 | 4.2% each |
-| Depth memory routing features | 64.4 | 3.5% |
-| Attention qkv / out | 38.1 / 25.4 | 2.1% / 1.4% |
-| Shared expert gate_up / down | 38.1 / 19.3 | 2.1% / 1.1% |
-| Router (f32) | 15.7 | 0.9% |
-| Depth memory query / output | 16.7 / 17.2 | 0.9% each |
-| Depth head (f32) | 13.1 | 0.7% |
+| Component | BF16 | INT8 | FP8 | NVFP4 |
+|---|---:|---:|---:|---:|
+| Mamba in_proj | 639.67 | 422.88 | 422.88 | 422.88 |
+| Mamba out_proj | 253.62 | 253.62 | 253.62 | 253.62 |
+| Mamba conv weights | 1.23 | 1.23 | 1.23 | 1.23 |
+| Mamba gated norm and scan constants | 0.18 | 0.18 | 0.18 | 0.18 |
+| attention qkv | 38.14 | 25.21 | 25.21 | 25.21 |
+| attention out | 25.43 | 16.81 | 16.81 | 16.81 |
+| attention pass LoRA down | 0.10 | 0.10 | 0.10 | 0.10 |
+| attention pass LoRA up | 0.20 | 0.20 | 0.20 | 0.20 |
+| Mamba state | 86.84 | 86.84 | 86.84 | 86.84 |
+| attention cache read | 4.19 | 4.19 | 4.19 | 4.19 |
+| attention cache write | 0.01 | 0.01 | 0.01 | 0.01 |
+| hyper-connection norms | 0.20 | 0.20 | 0.20 | 0.20 |
+| hyper-connection mixes | 0.00 | 0.00 | 0.00 | 0.00 |
+| latent_down | 76.28 | 50.43 | 76.28 | 50.43 |
+| latent_up | 76.28 | 50.53 | 76.28 | 76.28 |
+| shared expert gate_up | 38.14 | 25.26 | 38.14 | 25.26 |
+| shared expert down | 19.27 | 12.68 | 19.27 | 12.68 |
+| router (f32) | 15.73 | 15.73 | 15.73 | 15.73 |
+| router and selection bias | 0.02 | 0.02 | 0.02 | 0.02 |
+| routed experts gate_up | 152.57 | 101.06 | 101.06 | 56.62 |
+| routed experts down | 77.07 | 50.72 | 50.72 | 28.31 |
+| expert embeddings | 0.05 | 0.05 | 0.05 | 0.05 |
+| depth memory routing features | 64.38 | 42.63 | 64.38 | 42.63 |
+| depth memory read query | 16.69 | 11.03 | 16.69 | 11.03 |
+| depth memory read output | 17.20 | 11.18 | 17.20 | 11.18 |
+| depth memory read gate | 0.34 | 0.34 | 0.34 | 0.34 |
+| depth memory bank read | 0.13 | 0.13 | 0.13 | 0.13 |
+| depth memory bank write | 0.01 | 0.01 | 0.01 | 0.01 |
+| depth memory pass and anchor rows | 0.01 | 0.01 | 0.01 | 0.01 |
+| depth memory entry state | 4.77 | 3.15 | 4.77 | 3.15 |
+| depth memory entry metadata | 0.80 | 0.80 | 0.80 | 0.80 |
+| depth memory entry key | 0.61 | 0.61 | 0.61 | 0.40 |
+| depth memory entry value | 0.61 | 0.61 | 0.61 | 0.40 |
+| depth head (f32) | 13.11 | 13.11 | 13.11 | 13.11 |
+| embedding row | 0.00 | 0.00 | 0.00 | 0.00 |
+| residual stream embeddings | 0.02 | 0.02 | 0.02 | 0.02 |
+| final norm | 0.00 | 0.00 | 0.00 | 0.00 |
+| LM head | 203.42 | 134.48 | 203.42 | 134.48 |
+| **Total** | **1827.3** | **1336.1** | **1511.1** | **1294.6** |
 
-Groups: mixer 958.6, MoE 455.4, LM head 203.4, depth memory 118.7, state and cache 91.0 (MB per token).
+Group totals, MB per token:
 
-Praxis INT8, one stream, context 512: 1336 MB per token.
+| Group | BF16 | INT8 | FP8 | NVFP4 |
+|---|---:|---:|---:|---:|
+| mixer | 958.6 | 720.2 | 720.2 | 720.2 |
+| state and cache | 91.0 | 91.0 | 91.0 | 91.0 |
+| moe | 455.4 | 306.5 | 377.6 | 265.4 |
+| depth memory | 118.7 | 83.6 | 118.7 | 83.2 |
+| head | 203.4 | 134.5 | 203.4 | 134.5 |
+| connections | 0.2 | 0.2 | 0.2 | 0.2 |
 
-| Component | MB per token | Share |
-|---|---|---|
-| Mamba in_proj (20 layers) | 422.9 | 31.7% |
-| Mamba out_proj (20 layers, kept BF16) | 253.6 | 19.0% |
-| LM head | 134.5 | 10.1% |
-| Mamba state | 86.8 | 6.5% |
-| Routed experts, gate_up / down | 101.1 / 50.7 | 7.6% / 3.8% |
-| Latent down / up | 50.4 / 50.5 | 3.8% each |
-| Depth memory routing features | 42.6 | 3.2% |
-| Attention qkv / out | 25.2 / 16.8 | 1.9% / 1.3% |
-| Shared expert gate_up / down | 25.3 / 12.7 | 1.9% / 0.9% |
-| Router (f32) | 15.7 | 1.2% |
-| Depth memory query / output | 11.0 / 11.2 | 0.8% each |
-| Depth head (f32) | 13.1 | 1.0% |
+Held as, where the four formats differ. BF16X is the lossless copy decode reads for a BF16 tensor, about 1.5 bytes per weight; FP4 is NVFP4 (four-bit values with one 8-bit block scale per 16 values); every other projection is read at one byte per weight plus its row scale.
 
-Groups: mixer 720.2, MoE 306.5, LM head 134.5, depth memory 83.6, state and cache 91.0 (MB per token).
+| Component | BF16 | INT8 | FP8 | NVFP4 |
+|---|---|---|---|---|
+| Mamba in_proj | BF16X | INT8 | FP8 | FP8 |
+| attention qkv | BF16X | INT8 | FP8 | FP8 |
+| attention out | BF16X | INT8 | FP8 | FP8 |
+| latent_down | BF16X | INT8 | BF16X | FP8 |
+| latent_up | BF16X | INT8 | BF16X | BF16X |
+| shared expert gate_up | BF16X | INT8 | BF16X | FP8 |
+| shared expert down | BF16X | INT8 | BF16X | FP8 |
+| routed experts gate_up | BF16X | INT8 | FP8 | FP4 |
+| routed experts down | BF16X | INT8 | FP8 | FP4 |
+| depth memory routing features | BF16X | INT8 | BF16X | FP8 |
+| depth memory read query | BF16X | INT8 | BF16X | FP8 |
+| depth memory read output | BF16X | INT8 | BF16X | FP8 |
+| depth memory entry state | BF16X | INT8 | BF16X | FP8 |
+| depth memory entry key | BF16X | BF16X | BF16X | FP8 |
+| depth memory entry value | BF16X | BF16X | BF16X | FP8 |
+| LM head | BF16X | INT8 | BF16X | FP8 |
 
-Two things the INT8 breakdown shows. Mamba out_proj stays BF16 in the INT8 format, and at 253.6 MB it is now the second-largest read (19%). Quantizing it would remove about 127 MB per token, which bounds the one-stream ceiling near 700 tok/s at measured bandwidth. That is arithmetic only: its quality cost is not measured. Mamba state (86.8 MB) is read every token in every format.
+Mamba out_proj is BF16X in all four formats: 253.6 MB per token, the largest tensor each quantized format keeps wide.
+
+## Why FP8 reads more than INT8
+
+Both formats read one byte per weight for every projection they quantize, and the same bytes for Mamba in_proj, attention qkv and out, and the routed experts. The difference is elsewhere. At context 512 (doctor) FP8 reads 1511.1 MB per token and INT8 reads 1336.1 MB, a gap of 175.0 MB. The bench's context-640 figures are 1512 and 1337.
+
+The gap is nine tensors that the FP8 recipe keeps in BF16 and the INT8 recipe quantizes. A kept-wide tensor is read as its BF16X copy, which costs about 1.52 bytes per weight rather than 1: the LM head is 203.42 MB for 134.2 M weights in FP8 and 134.48 MB in INT8.
+
+| Tensor (instances per token) | INT8, one byte | FP8, BF16X | FP8 minus INT8 |
+|---|---:|---:|---:|
+| LM head (1) | 134.48 | 203.42 | +68.94 |
+| latent_down (24) | 50.43 | 76.28 | +25.85 |
+| latent_up (24) | 50.53 | 76.28 | +25.75 |
+| depth memory routing features (26) | 42.63 | 64.38 | +21.75 |
+| shared expert gate_up (24) | 25.26 | 38.14 | +12.88 |
+| depth memory read output (21) | 11.18 | 17.20 | +6.02 |
+| shared expert down (24) | 12.68 | 19.27 | +6.59 |
+| depth memory read query (21) | 11.03 | 16.69 | +5.66 |
+| depth memory entry state (6) | 3.15 | 4.77 | +1.62 |
+| **Total of the nine** | **341.37** | **516.43** | **+175.06** |
+
+The FP8 recipe keeps these nine in BF16 because they are the LM head, the MoE latent and shared projections, and the depth memory's read and write projections. The rest of the kept-wide bytes are the same in both formats: Mamba out_proj (253.62 MB), the depth memory key and value (0.61 MB each), the metadata write (0.80 MB, plain BF16) and the pass LoRA (0.30 MB). Those total 256 MB in both.
+
+So the two formats keep wide different amounts: FP8 reads 772 MB of its 1511 MB as BF16X or BF16 (51%), INT8 reads 256 MB of its 1336 MB (19%).
+
+Two notes from the same data. The BF16X copy is what keeps FP8 at 1.52 bytes per weight on those nine rather than the 2 that raw BF16 would cost. And the FP8 folder stores the head twice, as separate `embedding.weight` and `lm_head.weight` BF16 tensors, where the NVFP4 folder ties them. The traffic count reads one head; whether the loader keeps both resident is a memory question this measurement does not answer.
+
+## Which bytes NVFP4 actually 4-bits
+
+Praxis NVFP4, one stream, context 512: 1294.6 MB per token, split by what the bytes are.
+
+| Bytes | Format | MB per token | Share |
+|---|---|---:|---:|
+| Routed expert values | 4-bit e2m1, two per byte | 75.5 | 5.8% |
+| Routed expert block scales and per-expert globals | 8-bit e4m3 per 16 values, plus one f32 global per expert matrix | 9.4 | 0.7% |
+| Dense projections, LM head, depth memory | FP8 with a f32 row scale | 756.5 | 58.4% |
+| Kept wide: Mamba out_proj, latent_up, pass LoRA down | BF16X | 330.0 | 25.5% |
+| State, cache, routers, depth head and other plain tensors | f32, BF16 or as stored | 122.1 | 9.4% |
+| Pass LoRA up and depth metadata write | BF16 | 1.0 | 0.1% |
+
+Only the routed experts are 4-bit. Their values are 75.5 MB, 5.8% of the step, and their block scales add 9.4 MB. The split comes from the byte formula (values are n x k / 2, scales n x k / 16) and matches the doctor totals: the gate_up stack is 50.3 MB of values and 6.3 MB of scales, the down stack 25.2 and 3.2.
+
+Against FP8 the step is 216.5 MB smaller at context 512 (1511.1 to 1294.6). Routed experts account for 66.9 MB of that (151.8 MB in FP8, 84.9 MB in NVFP4, 31%). The other 149.7 MB (69%) is the dense tensors NVFP4 quantizes to FP8 and FP8 keeps wide: the LM head (68.9), latent_down (25.9), the shared expert (19.5), the depth memory routing features, query and output (33.4), the state write (1.6) and the key and value (0.4). So at one stream most of NVFP4's gain over FP8 on this model is not the experts.
+
+## Logos NVFP4, modelled
+
+No Logos NVFP4 checkpoint exists. This is the recipe the Praxis NVFP4 folder uses (`projection_format` in `engine/core/checkpoint.cpp`: experts NVFP4; dense projections, LM head and depth memory key and value FP8; latent_up and Mamba out_proj BF16; router f32) applied to Logos's config, counted with `lernex doctor --modelled --weights nvfp4`. Nothing is read from the folder.
+
+The same command on Praxis reproduces the stored Praxis NVFP4 folder on all 38 components (identical MB), and the FP8 counterpart reproduces the stored Praxis FP8 folder the same way. The recipe is checked against real folders, not only against itself. What this does not establish is the quality of a GPTQ Logos NVFP4 checkpoint, which has to be made and measured.
+
+Logos: 20 layers (3 attention), hidden 2560, 192 routed experts, 4 picks per token, 2 passes.
+
+| | Logos FP8 (stored) | Logos NVFP4 (modelled) | NVFP4 against FP8 |
+|---|---:|---:|---:|
+| MB per step, 1 stream (context 512) | 3453.5 | 3027.2 | -426.3 (-12.3%) |
+| Ceiling at spec / measured, 1 stream | 259 / 247 tok/s | 296 / 282 tok/s | +14% |
+| Expected experts per layer-pass, 8 / 32 / 64 streams | 29.8 / 94.1 / 142.1 | same | |
+| MB per step, 8 streams | 7245.0 | 5744.5 | -1500.5 (-20.7%) |
+| MB per step, 32 streams | 17972.3 | 13788.5 | -4183.8 (-23.3%) |
+| MB per step, 64 streams | 28690.4 | 22505.9 | -6184.5 (-21.6%) |
+| Measured-bandwidth ceiling, 8 / 32 / 64 streams | 941 / 1517 / 1901 tok/s | 1188 / 1980 / 2426 tok/s | +26% / +31% / +28% |
+
+Where the gain comes from, MB per step. The routed experts take the union of the streams' choices, so their share grows with the batch. The dense tensors are read once per step whatever the batch, so the non-expert part of the gain is fixed.
+
+| Streams | Gain per step | From routed experts | Share from experts | From everything else |
+|---|---:|---:|---:|---:|
+| 1 | 426.3 | 166.8 | 39% | 259.5 |
+| 8 | 1500.5 | 1240.9 | 83% | 259.6 |
+| 32 | 4183.8 | 3924.3 | 94% | 259.5 |
+| 64 | 6184.5 | 5925.0 | 96% | 259.4 |
+
+The 259.5 MB that does not scale is the same tensors as in the Praxis comparison: the LM head (85.7), latent_down (53.6), the shared expert (48.4), the depth memory routing features, query and output (68.5), the state write and key and value (3.3). At one stream it is 61% of the gain, and by 32 streams it is 6%. On this model the case for NVFP4 rests on the experts at batch sizes above one, and on quantizing the dense and depth-memory tensors at one stream.
 
 ## The gap at one stream
 
@@ -118,6 +228,22 @@ Time per token is 1 / measured tok/s. Bandwidth time is bytes per token over 853
 | Logos FP8 | 6.27 ms | 4.05 ms | 2.22 ms |
 
 For Praxis the non-bandwidth share is about 1.2 ms per token in every format, whatever the bytes. That is why the formats that read fewer bytes show a lower share of their roofline: their extra headroom is the same fixed cost. This is arithmetic from the table, not a profile. The per-step overhead (launches, synchronisation, sampling, the host loop) is the next thing to measure.
+
+## Beyond the bytes-per-token roofline
+
+Everything above assumes one token per weight sweep: a decode step reads the weights once and emits one token per stream. Two schemes break that assumption. Speculative decoding has a draft propose tokens that the target checks in one sweep. Pass-pipelined decoding overlaps the model's passes across tokens, so one sweep carries more than one token's work. For those, the bytes-per-token ceiling is no longer the limit to measure against, so this table is a second view with its own axis.
+
+Definitions, for whoever fills it:
+
+- **Tokens per weight sweep**: tokens a step emits divided by the weight bytes that step reads. It is 1 for the decode path reported above.
+- **One-token ceiling**: bandwidth divided by bytes per token, as in the roofline table. A scheme's bandwidth ceiling is its tokens per sweep times this.
+- **Share of the one-token ceiling**: measured tok/s over the one-token ceiling. It can exceed 100% when tokens per sweep exceed 1.
+- **Acceptance or pass utilisation**: the draft acceptance rate for speculative decoding, or the fraction of pass slots that carry a token for pipelined decoding.
+
+| Scheme | Model and format | Draft length or pass depth | Tokens per weight sweep | Weight MB per sweep | Streams | Measured tok/s | Share of one-token ceiling | Acceptance or pass utilisation | Commit | Notes |
+|---|---|---|---|---|---|---|---|---|---|---|
+
+Rows are not filled yet. They belong to the speculative and pass-pipelined work.
 
 ## Against other engines
 
@@ -135,9 +261,11 @@ Same bench shape as above (512 prompt tokens, 256 generated, greedy), same card,
 - Decode tok/s counts the tokens emitted after the last stream's first token, over the time to the last finish (`cli/bench.cpp`, `measure()`). Any batch larger than the engine's slot count is distorted by this, as the Logos 32-stream row shows.
 - Prefill tok/s is prompt tokens over the time to the last first token, so it includes queueing as well.
 - "% of spec" divides by 896 GB/s. "% of measured" divides by 853 GB/s.
+- Doctor counts a format it cannot load in yet with `--modelled`: the loader's recipe for that format applied to the folder's config, nothing read. Use it only after checking the recipe against a stored folder, as above.
 
 ## Open items
 
 - **Bench and slot count.** `lernex bench` should refuse, or at least flag, a stream count above the plan's slot count. Otherwise the row looks like a decode rate and is not one.
 - **Planner estimate.** `plan.cpp` (`decode_bytes_per_token`) estimates Praxis BF16 at 1730 MB per token and 290 tok/s. The counted figure is 1827 MB at context 512. The gap is the depth-memory routing features, the depth query and output, and the depth head. `doctor`'s "decode est." column uses the planner figure. Not changed here.
+- **Logos NVFP4 quality.** The modelled Logos NVFP4 roofline is a byte count. It needs a GPTQ checkpoint and a quality measurement before any speed is quoted for it.
 - **Compute peaks.** The 87.9 TFLOPS BF16 figure for sm_120 is derived from the 1406 sparse FP4 TOPS on NVIDIA's product page (halved to dense, then divided by 8 for BF16). Rows for other cards in `cli/roofline.cpp` come from datasheet values and have not been re-checked online.
