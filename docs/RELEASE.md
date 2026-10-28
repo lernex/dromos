@@ -79,11 +79,27 @@ release host, for tests.
 ## Install paths
 
     curl -fsSL https://github.com/lernex/lernex-engine/releases/latest/download/install.sh | sh
-    brew install lernex/tap/lernex
+    brew trust --formula lernex/tap/lernex && brew install lernex/tap/lernex
     pip install lernex
     docker run --gpus all -p 8080:8080 -v lernex:/root/.cache/lernex ghcr.io/lernex/lernex praxis
 
 install.sh picks the flavor from the OS, the architecture and the NVIDIA driver; re-running it upgrades.
+Homebrew 7 loads a formula from a third-party tap only once it is trusted, so the brew install is two
+commands: `brew trust --formula lernex/tap/lernex` once, then `brew install lernex/tap/lernex`. The tap is
+github.com/lernex/homebrew-tap; its `Formula/lernex.rb` is the one in `packaging/homebrew-tap`.
+
+## Cutting a release
+
+1. Tag `vX.Y.Z` on `main` and push the tag. `release.yml` builds every flavor and drafts the GitHub release
+   with the tarballs, `install.sh` and `SHA256SUMS`.
+2. Check the draft's assets (install each flavor on a clean machine), then publish it. Publishing starts
+   `pypi.yml` (the wheels, through the `pypi` environment) and `docker.yml` (the GHCR image).
+3. Bump the tap: in a checkout of lernex/homebrew-tap, run
+   `<engine checkout>/packaging/homebrew-tap/bump-formula.sh X.Y.Z Formula/lernex.rb`, commit and push. Nothing
+   automates this step: it needs push access to the tap, and a CI deploy key for it is the owner's decision.
+   Copy the bumped formula back into `packaging/homebrew-tap/Formula/lernex.rb` here so the two stay the same.
+4. Check each channel installs the new version: `install.sh`, `brew upgrade lernex`, `pip install -U lernex`,
+   `docker pull ghcr.io/lernex/lernex`, and `lernex update` from the previous release.
 
 ## Build bases
 
