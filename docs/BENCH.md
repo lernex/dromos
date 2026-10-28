@@ -1,9 +1,8 @@
 # Batched serving and prefill: Lernex against vLLM
 
-Status: partial. The vLLM cells and the prefix-cache check are measured. The Logos FP8 cell is in, at a 1024-token context
-and 0.96 GPU memory: 26 of 32 streams resident, and the run ran out of GPU memory before the 64-stream cell. A variant
-with a smaller prefill batch (`--max-num-batched-tokens 2048`) is queued on the GPU lock. The Lernex format sweep
-(every format, the serve view, prefill, spec-check and the profile) waits for final main.
+Status: partial. The vLLM cells, the prefix-cache check and the Logos FP8 runs at a 1024-token context and 0.96 GPU
+memory are measured (the Logos section). The Lernex format sweep (every format, the serve view, prefill, spec-check and
+the profile) waits for final main.
 
 Measured 2026-10-28 on `ssh lernex`. Every GPU run went through the lock (`scripts/remote.sh bench x`).
 
@@ -25,7 +24,8 @@ vLLM is started with the same flags for every format:
       --max-num-batched-tokens 8192 --gpu-memory-utilization 0.90
 
 It runs in a transient systemd user scope with `MemoryMax=20G` and `MAX_JOBS=2`. Extra flags are appended after these,
-so the Logos runs at other settings pass `--max-model-len` and `--gpu-memory-utilization` again.
+so the Logos runs at other settings pass `--max-model-len`, `--gpu-memory-utilization` and, where noted,
+`--max-num-batched-tokens` again. vLLM warns about the repeated keys, and its logged settings are the appended values.
 
 | Format | Folder | Notes |
 |---|---|---|
@@ -122,21 +122,21 @@ Median of three runs, with the min-max range beside it.
 ## vLLM: Logos FP8
 
 Logos FP8's KV cache is what limits vLLM here. At the default settings it admits 17 requests, so the 32- and 64-stream
-cells measure a queue, not a decode rate. Four runs, all on the same checkpoint and driver:
+cells measure a queue, not a decode rate. Each run's cell is the count the server actually held.
 
 | run | context | GPU memory | 32 streams | 64 streams |
 |---|---:|---:|---|---|
 | parent (their harness, `vllm bench serve`) | 4096 | 0.92 | 29 running, 3 waiting, KV 99.5%; peak output 1,102 tok/s, overall 667 tok/s; mean TPOT 28.2 ms | not run |
-| ours, default | 9216 | 0.90 | 17 running, 47 waiting (the peaks), KV 99.2%; both formulas measure the queue | the same queue |
+| ours, default | 9216 | 0.90 | 17 running, 47 waiting (the peaks), KV 99.2%; the cells measure the queue | the same queue |
 | ours, 0.96 at 9216 | 9216 | 0.96 | 26 running, 6 waiting, KV 100%; the third repeat ran out of GPU memory | not reached |
-| ours, 1024 context at 0.96 | 1024 | 0.96 | 26 of 32 resident, 1,023 tok/s (two repeats; the third ran out of GPU memory) | not reached |
-| ours, 1024 context at 0.96, `--max-num-batched-tokens 2048` | 1024 | 0.96 | queued | queued |
+| ours, the requested flags (1024, 0.96) | 1024 | 0.96 | **26 of 32 resident, 1,023 tok/s**; the third repeat ran out of GPU memory | not reached |
+| ours, 1024 at 0.96, `--max-num-batched-tokens 2048` | 1024 | 0.96 | **32 of 32 resident, 1,055.5 tok/s** | **35 of 64 resident, 1,048.7 tok/s** |
 
-**The parent's run.** Their server log peaks at 29 running and 3 waiting, so 29 of the 32 streams were resident.
-Their `vllm bench serve` output is kept as `parent-logos-fp8-ctx4096-u092.vllm-c32.json`, with its log as
-`parent-logos-fp8-ctx4096-u092.vllm.log`. Its
-per-token formula at the nominal 32 streams is 1,135 tok/s (32,000 / 28.19 ms); at the 29 that were resident it is
-1,029 tok/s (29,000 / 28.19 ms).
+**The parent's run.** Their server log peaks at 29 running and 3 waiting, so 29 of the 32 streams were resident. Their
+`vllm bench serve` output is kept as `parent-logos-fp8-ctx4096-u092.vllm-c32.json`, with its log as
+`parent-logos-fp8-ctx4096-u092.vllm.log`. Its per-token formula at the nominal 32 streams is 1,135 tok/s (32,000 /
+28.19 ms); at the 29 that were resident it is 1,029 tok/s (29,000 / 28.19 ms). Their harness is `vllm bench serve`, not
+ours, so the comparison is the definitions, not the client.
 
 **Ours, default (0.90, 9216).** The record, from the first Logos run (its harness did not sample the gauges):
 
@@ -153,21 +153,46 @@ formula 1,268.2 and 1,268.0. The third repeat failed with `torch.OutOfMemoryErro
 125 MiB free on the 15.47 GiB card. The client then reported "the stream carried no usage", because the engine core had
 died. The cause is in the server log (`logos-fp8-u96-9216-oom.vllm.log.gz`), not in the client.
 
-**Ours, 1024 context at 0.96.** The cell, in the form the coordinator set: **26 of 32 streams resident, 1,023 tok/s.**
-N = 26 is the peak running count (the server's stat lines in the same repeats also read 26). X = N x 1000 / mean TPOT,
-over the two repeats that finished:
+**Ours, the requested flags (1024 context, 0.96).** 26 of 32 streams resident, 1,023 tok/s, over the two repeats that
+finished. N = 26 is the peak running count (the server's stat lines in the same repeats also read 26). X = N x 1000 /
+mean TPOT.
 
 | repeat | window tok/s | per-token formula, 32 streams | mean TPOT | 26 resident x 1000 / TPOT | overall output tok/s | peak output tok/s, 1 s |
 |---:|---:|---:|---:|---:|---:|---:|
 | 0 | 453.8 | 1,259.2 | 25.41 ms | 1,023.1 | 644.1 | 962 |
 | 1 | 453.9 | 1,260.2 | 25.39 ms | 1,023.9 | 664.6 | 962 |
 
-The KV budget at 0.96 is 26,770 tokens (2.77 GiB), which holds 26 requests of 1,024 tokens, so 32 streams cannot all be
-resident. The third repeat, at 32 streams, ran out of GPU memory: `torch.OutOfMemoryError`, asking for 248 MiB with 233 MiB
-free. The 64-stream cell was not reached. The raw text is `logos-fp8-ctx1024-u96-0.96-oom.vllm.txt`.
+The KV budget at 0.96 with the default 8192-token prefill batch is 26,770 tokens (2.77 GiB), which holds 26 requests of
+1,024 tokens, so 32 streams cannot all be resident. The third repeat, at 32 streams, ran out of GPU memory:
+`torch.OutOfMemoryError`, asking for 248 MiB with 233 MiB free. The 64-stream cell was not reached. The raw text is
+`logos-fp8-ctx1024-u96-0.96-oom.vllm.txt`.
 
-The parent's cell on the same model, 29 of 32 resident at 4096 context and 0.92, reads 1,029 tok/s (29,000 / 28.19 ms),
-against our 1,023 at 26 resident. The parent's peak one-second output was 1,102 tok/s, and ours was 962.
+**Ours, 1024 context at 0.96 with `--max-num-batched-tokens 2048`.** This is the best-shot run: the same context and GPU
+memory as the requested flags, with a smaller prefill batch. The smaller prefill batch cuts the activation peak that ran
+out of memory, which leaves room for the KV cache to hold all 32 requests. It is a change from the requested flags, and
+the requested-flags run above is kept beside it for that reason.
+
+| streams | repeat | resident (log peak Running) | waiting (log peak Waiting) | window tok/s | per-token formula at resident N | mean TPOT | overall output tok/s | peak output tok/s, 1 s |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 32 | 0 | 32 | 0 | 1,143.1 | 1,056.3 | 30.29 ms | 855.1 | 1,168 |
+| 32 | 1 | 32 | 0 | 1,142.6 | 1,055.5 | 30.32 ms | 892.0 | 1,152 |
+| 32 | 2 | 32 | 0 | 1,142.0 | 1,054.9 | 30.33 ms | 891.4 | 1,152 |
+| 64 | 0 | 35 | 29 | 1,057.4 | 1,048.7 | 33.38 ms | 873.1 | 1,190 |
+| 64 | 1 | 35 | 29 | 1,057.5 | 1,048.7 | 33.38 ms | 873.2 | 1,155 |
+| 64 | 2 | 35 | 29 | 1,057.1 | 1,047.9 | 33.40 ms | 872.7 | 1,165 |
+
+The published cells, medians over the three repeats:
+
+- **32 streams: 32 of 32 streams resident, 1,055.5 tok/s** (X = 32 x 1000 / 30.32 ms). Window 1,142.6 tok/s, overall output
+  891.4 tok/s, peak one-second output 1,152 tok/s.
+- **64 streams: 35 of 64 streams resident, 1,048.7 tok/s** (X = 35 x 1000 / 33.38 ms). Window 1,057.4 tok/s, overall output
+  873.1 tok/s, peak one-second output 1,165 tok/s. The 64-stream per-token formula at the nominal 64, 1,917.5 tok/s, counts
+  the 29 queued requests as decoding, so it is not published.
+
+Against the parent's cell: 29 of 32 resident at 1,029 tok/s, a peak one-second output of 1,102 tok/s and an overall output
+of 667 tok/s. Ours at 32 resident is 1,055.5 tok/s, a peak of 1,152 tok/s and an overall of 891 tok/s, on a 1024 context
+against their 4096. The parent's mean TPOT is faster per stream (28.2 ms against 30.3 ms); the difference is in how many
+streams are resident.
 
 ## Caveats
 
@@ -182,14 +207,15 @@ against our 1,023 at 26 resident. The parent's peak one-second output was 1,102 
   and 253 ms in the other repeats. The medians absorb this; decode is unaffected (235.0 against 234.6 tok/s).
 - **Logos Triton compiles during inference.** The 9216 Logos run logged two Triton JIT compiles while serving
   (`fused_moe_kernel` at 08:54:37, `_causal_conv1d_fwd_kernel` at 08:54:44), during its 8-stream cells. The 1024 run
-  logged the same two at 09:07:25, as its 32-stream cell began. That cell's repeat 0 has TTFT p50 2.03 s, against 1.63 s
-  in repeat 1, while the decode windows match (453.8 and 453.9 tok/s).
-- **Duplicate flags.** vLLM warns "Found duplicate keys --max-model-len, --gpu-memory-utilization" when the appended flags
-  repeat the defaults. Its logged settings are the appended values (`max_seq_len=1024`, GPU memory 0.9600), so the last
-  value wins.
-- **The sampler's waiting count.** At 32 streams the sampler saw 26 running and 15 waiting in one sample, which is 41
-  requests against 32 streams. A preempted request may be counted in both queues. The crash dump's scheduler stats read 17
-  running and 15 waiting (32), so the sampler's waiting peak is not trusted until it is checked.
+  with the requested flags logged the same two at 09:07:25, as its 32-stream cell began; its repeat 0 has TTFT p50 2.03 s,
+  against 1.63 s in repeat 1, while the decode windows match. The variant logged the same two at 09:16:32, one second
+  before its first timed repeat, so they fall in that cell's warm-up, not in the timed repeats.
+- **Duplicate flags.** vLLM warns "Found duplicate keys" for the appended `--max-model-len` and `--gpu-memory-utilization`.
+  Its logged settings are the appended values (`max_seq_len=1024`, GPU memory 0.9600), so the last value wins. The
+  variant also appends `--max-num-batched-tokens`, which is the same case.
+- **The sampler's waiting count is not trusted.** The `/metrics` gauges agree with the server's stat lines on the running
+  count (32 and 35). They do not agree on the waiting count: the sampler reports 27 waiting at 32 streams where the log
+  reports 0, and 59 at 64 where the log reports 29. The cells here use the log's Waiting. The cause is not found.
 - **Shutdown.** The Praxis FP8 server log ends with an `EngineDeadError` during shutdown. It came after the client had
   written its results, and the server was stopped on purpose.
 - **NVFP4.** No vLLM cell. vLLM 0.31.0 does not load the Metis GPTQ NVFP4 folder.
@@ -223,6 +249,7 @@ against our 1,023 at 26 resident. The parent's peak one-second output was 1,102 
     scripts/remote.sh bench x 'bash bench/run_bench.sh serve-vllm /home/aiadmin/kronos-scratch/logos/engines/praxis/fp8 praxis-fp8 65536'
     scripts/remote.sh bench x 'bash bench/run_bench.sh serve-vllm /home/aiadmin/kronos-scratch/logos/hfport/fp8 logos-fp8 65536'
     scripts/remote.sh bench x 'LX_VLLM_STREAMS=32,64 LX_VLLM_PREFILL=512 bash bench/run_bench.sh serve-vllm /home/aiadmin/kronos-scratch/logos/hfport/fp8 logos-fp8-ctx1024-u96 65536 --max-model-len 1024 --gpu-memory-utilization 0.96'
+    scripts/remote.sh bench x 'LX_VLLM_STREAMS=32,64 LX_VLLM_PREFILL=512 bash bench/run_bench.sh serve-vllm /home/aiadmin/kronos-scratch/logos/hfport/fp8 logos-fp8-ctx1024-mbt2048-u96 65536 --max-model-len 1024 --gpu-memory-utilization 0.96 --max-num-batched-tokens 2048'
     scripts/remote.sh bench x 'bash bench/run_bench.sh cachecheck /home/aiadmin/kronos-scratch/logos/engines/praxis/hf praxis-bf16'
     scripts/remote.sh bench x 'bash bench/run_bench.sh cacheoff /home/aiadmin/kronos-scratch/logos/engines/praxis/hf praxis-bf16'
 
