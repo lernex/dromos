@@ -90,6 +90,61 @@ def read_trace(path, total_tasks):
     return entries, heads
 
 
+def op_label(ops, op):
+    info = ops.get(op, {})
+    kind = info.get("kind", "?")
+    shape = f" {info['N']}x{info['K']}" if kind == "gemv" else ""
+    return f"{op} {kind}{shape}"
+
+
+def boundary_report(per_block, ops, names, op_end, top):
+    """Op boundaries ranked by the block time they lose.
+
+    A boundary is a pair (predecessor op, op): on each block, the gap from the predecessor run's end to this run's
+    start, and this run's wait for its dependencies (deps met minus start). A wait is charged to the producer that
+    finished last (the dependency with the largest op_end), which is the one the run was waiting on.
+    """
+    acc = {}
+    for b, runs in per_block.items():
+        prev = None
+        for r in runs:
+            if prev is not None:
+                x = acc.setdefault((prev["op"], r["op"]), {
+                    "gap": 0.0, "wait": 0.0, "runs": 0, "blocks": set(),
+                    "prod": collections.Counter(), "prod_wait": collections.Counter()})
+                gap = max(0, r["start"] - prev["end"])
+                wait = max(0, r["deps"] - r["start"])
+                x["gap"] += gap
+                x["wait"] += wait
+                x["runs"] += 1
+                x["blocks"].add(b)
+                if wait > 0:
+                    prods = [d for d in ops.get(r["op"], {}).get("deps", []) if d in op_end]
+                    if prods:
+                        crit = max(prods, key=lambda d: op_end[d])
+                        x["prod"][crit] += 1
+                        x["prod_wait"][crit] += wait
+            prev = r
+    total = sum(x["gap"] + x["wait"] for x in acc.values())
+    rows = sorted(acc.items(), key=lambda kv: -(kv[1]["gap"] + kv[1]["wait"]))
+    print(f"op boundaries ranked by lost block time (gap between runs + dependency wait, summed over blocks); "
+          f"all boundaries lose {total / 1e3:.1f} us")
+    print(f"  {'#':>2s} {'prev op':>14s} {'op':>14s} {'blk':>4s} {'runs':>5s} {'gap us':>9s} {'wait us':>9s} "
+          f"{'lost us':>9s} {'share':>7s} {'ns/run':>7s}  waits on (critical producer, share of its waits)")
+    for i, ((prev_op, op), x) in enumerate(rows[:top], 1):
+        lost = x["gap"] + x["wait"]
+        waits, prod_names = "-", "-"
+        if x["prod"] and x["wait"]:
+            p, _ = x["prod"].most_common(1)[0]
+            waits = f"{op_label(ops, p)} ({x['prod_wait'][p] / x['wait']:.0%} of this boundary's wait)"
+            prod_names = "; ".join(names.get(p, [])) or "-"
+        print(f"  {i:2d} {op_label(ops, prev_op):>14s} {op_label(ops, op):>14s} {len(x['blocks']):4d} "
+              f"{x['runs']:5d} {x['gap'] / 1e3:9.1f} {x['wait'] / 1e3:9.1f} {lost / 1e3:9.1f} "
+              f"{lost / (total or 1):7.1%} {lost / x['runs']:7.0f}  {waits}")
+        print(f"      consumer: {'; '.join(names.get(op, [])) or '-'} | producer: {prod_names}")
+    print()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("dir")
@@ -98,6 +153,7 @@ def main():
     ap.add_argument("--gbps", type=float, default=896.0)
     ap.add_argument("--bin-us", type=float, default=20.0)
     ap.add_argument("--top", type=int, default=25)
+    ap.add_argument("--boundaries", type=int, default=10, help="how many op boundaries the boundary table lists")
     ap.add_argument("--timeline", type=int, default=None, metavar="BLOCK",
                     help="print one block's runs in order (times in us from the step's first task)")
     ap.add_argument("--from-run", type=int, default=0, help="the first run of --timeline to print")
@@ -313,6 +369,8 @@ def main():
               f"{(info['bytes'] + info['wbytes']) / 1e6:8.2f} {w / 1e3:9.1f} {c / 1e3:9.1f} "
               f"{(w + c) / denom:7.2%} {med:9.0f}  {nm}")
     print()
+
+    boundary_report(per_block, ops, names, op_end, a.boundaries)
 
     # DRAM busy proxy: bytes per window against the bandwidth
     if bytes_windows:
