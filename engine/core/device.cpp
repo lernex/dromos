@@ -133,7 +133,10 @@ std::string DeviceInfo::slug() const {
 }
 
 DeviceInfo query_device(int ordinal) {
-  if (lx_rt_set_device(ordinal) != 0) throw std::runtime_error("no device " + std::to_string(ordinal));
+  // The CUDA error says why (a full card fails here as out of memory), not just that the device is missing.
+  if (const int status = lx_rt_set_device(ordinal); status != 0)
+    throw std::runtime_error("cannot use device " + std::to_string(ordinal) + ": " + lx_rt_error_string(status) +
+                             " (CUDA error " + std::to_string(status) + ")");
   DeviceInfo d;
   d.ordinal = ordinal;
   lx_device_props props{};
