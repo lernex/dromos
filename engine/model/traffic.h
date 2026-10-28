@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -78,7 +79,10 @@ DecodeTraffic count_decode_traffic(const MetisConfig& config, const MatrixLookup
 
 // The same for the folder as the loader would hold it in `target`, with decode's BF16X copies when `bf16x_decode`
 // (the plan's rule: copies of BF16 matrices, every routed expert and the wide dense ones). Nothing is loaded.
-DecodeTraffic config_decode_traffic(const MetisConfig& config, lx_wtype target, bool bf16x_decode, int context);
+// `dropped_copies` names the copy units the plan left out (plan.cpp's names: a projection's checkpoint name,
+// "layers.N.moe.local_experts" for a routed expert pair, "lm_head" for the tied head); those are read in BF16.
+DecodeTraffic config_decode_traffic(const MetisConfig& config, lx_wtype target, bool bf16x_decode, int context,
+                                    const std::set<std::string>* dropped_copies = nullptr);
 
 // The bytes one matrix of [N, K] takes in decode, split into data and scales. Exposed for the model's own accounting.
 struct MatrixBytes {

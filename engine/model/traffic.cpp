@@ -228,7 +228,8 @@ DecodeTraffic count_decode_traffic(const MetisConfig& c, const MatrixLookup& loo
   return t;
 }
 
-DecodeTraffic config_decode_traffic(const MetisConfig& config, lx_wtype target, bool bf16x_decode, int context) {
+DecodeTraffic config_decode_traffic(const MetisConfig& config, lx_wtype target, bool bf16x_decode, int context,
+                                    const std::set<std::string>* dropped_copies) {
   const bool copies = bf16x_decode && target != LX_W_BF16X;  // the lossless target is its own encoding
   return count_decode_traffic(
       config,
@@ -239,7 +240,10 @@ DecodeTraffic config_decode_traffic(const MetisConfig& config, lx_wtype target, 
         d.N = N;
         d.K = K;
         const bool expert = name.find("local_experts.") != std::string::npos;
-        d.copy = copies && d.format == LX_W_BF16 && (expert || bf16x_smaller(K));
+        // The copy unit, as the planner names it: an expert pair is one unit, the tied head is "lm_head".
+        const std::string unit = expert ? name.substr(0, name.rfind('.')) : name == "embedding" ? "lm_head" : name;
+        const bool left_out = dropped_copies && dropped_copies->count(unit);
+        d.copy = copies && !left_out && d.format == LX_W_BF16 && (expert || bf16x_smaller(K));
         return d;
       },
       context);

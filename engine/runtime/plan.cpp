@@ -14,6 +14,7 @@
 
 #include "core/checkpoint.h"
 #include "core/safetensors.h"
+#include "model/traffic.h"
 #include "lx_build_info.h"  // LX_BUILT_ARCHS, written by CMake
 #include "runtime/offload_plan.h"
 
@@ -439,23 +440,9 @@ WeightBytes weight_bytes(const MetisConfig& c, lx_wtype target, bool bf16x_decod
   return wb;
 }
 
-double decode_bytes_per_token(const MetisConfig& c, lx_wtype target, bool bf16x_decode, const std::set<std::string>* dropped) {
-  const bool copies = bf16x_decode && target != LX_W_BF16X;
-  const auto made = [&](const std::string& unit) { return copies && !(dropped && dropped->count(unit)); };
-  const Plain plain = plain_bytes(c);
-  // Per pass: every plain tensor but the gather table (one row of it per token is nothing next to the rest), every
-  // projection as decode reads it, and the routed experts' share a token's top_k choices read.
-  double per_pass = static_cast<double>(plain.plain - plain.gather + plain.derived);
-  double experts = 0;
-  each_projection(c, [&](const std::string& key, Kind kind, int64_t E, int64_t N, int64_t K) {
-    const double bytes = static_cast<double>(held_bytes(target, made(copy_unit(key, kind)), key, kind, E, N, K).decode());
-    (kind == Kind::Experts ? experts : per_pass) += bytes;
-  });
-  per_pass += experts * c.num_experts_per_tok / c.n_routed_experts;
-  // The head once per token: its own copy, or the gather table (or its BF16X copy) when it is BF16.
-  const Held head = held_bytes(target, made("lm_head"), "embedding", Kind::Dense, 1, c.vocab_size, c.hidden_size);
-  const double head_read = static_cast<double>(head.decode());
-  return per_pass * c.num_passes + head_read + 2.0 * static_cast<double>(state_bytes_per_slot(c));
+double decode_bytes_per_token(const MetisConfig& c, lx_wtype target, bool bf16x_decode, int context,
+                             const std::set<std::string>* dropped) {
+  return config_decode_traffic(c, target, bf16x_decode, context, dropped).bytes_per_token();
 }
 
 // The share of the card's bandwidth one stream's decode reaches on each path: the tokens per second the kernels measure
@@ -473,9 +460,9 @@ double decode_efficiency(lx_wtype target, bool bf16x_decode) {
   }
 }
 
-double decode_ceiling_tps(const DeviceInfo& d, const MetisConfig& c, lx_wtype target, bool bf16x_decode,
+double decode_ceiling_tps(const DeviceInfo& d, const MetisConfig& c, lx_wtype target, bool bf16x_decode, int context,
                           const std::set<std::string>* dropped) {
-  const double bytes = decode_bytes_per_token(c, target, bf16x_decode, dropped);
+  const double bytes = decode_bytes_per_token(c, target, bf16x_decode, context, dropped);
   return d.bandwidth_gbs > 0 && bytes > 0 ? d.bandwidth_gbs * 1e9 * decode_efficiency(target, bf16x_decode) / bytes : 0.0;
 }
 
@@ -701,7 +688,7 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
     o.weight_bytes = weight_bytes(c, f).total();
     if (f != LX_W_BF16X && bf16x_kernels) o.bf16x_bytes = weight_bytes(c, f, true).bf16x;
     o.fits = attempt(f, false, useful_slots, kUsefulContext, slot_cap).ok;
-    o.decode_ceiling_tps = decode_ceiling_tps(d, c, f, f != LX_W_BF16X && bf16x_kernels);
+    o.decode_ceiling_tps = decode_ceiling_tps(d, c, f, f != LX_W_BF16X && bf16x_kernels, kUsefulContext);
     o.maths = maths_text(model_formats(f, d, false));
     const std::string fast = maths_text(model_formats(f, d, false, true));
     o.fast_maths = fast == o.maths ? std::string("-") : fast;
@@ -882,7 +869,7 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
     p.prefix_device_bytes = std::min(spare, kPrefixDeviceCap);
     p.prefix_host_bytes = kPrefixHostBytes;
   }
-  const double active = decode_bytes_per_token(c, target, p.bf16x_decode, &p.bf16x_dropped);
+  const double active = decode_bytes_per_token(c, target, p.bf16x_decode, p.kv_capacity, &p.bf16x_dropped);
   if (d.bandwidth_gbs > 0 && active > 0)
     p.decode_ceiling_tps = d.bandwidth_gbs * 1e9 * decode_efficiency(target, p.bf16x_decode) / active;
 

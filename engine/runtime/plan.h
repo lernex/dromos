@@ -196,12 +196,12 @@ WeightBytes weight_bytes(const MetisConfig& config, lx_wtype target, bool bf16x_
 // scales, and for an NVFP4 stack of `stack_experts` experts their per-expert globals. BF16X is the encoding's
 // fixed rows (lx_bf16x_row_bytes; the rare overflow records are not counted), 0 without a backend that has it.
 size_t projection_bytes(lx_wtype format, int64_t rows, int64_t cols, int64_t stack_experts = 0);
-// What one stream reads per decoded token in a target format, and the most tokens per second bandwidth allows:
-// every layer's dense weights and its routed experts' share once per pass, the head once, and the Mamba state.
-double decode_bytes_per_token(const MetisConfig& config, lx_wtype target, bool bf16x_decode,
+// What one stream reads per decoded token in a target format at `context` positions, and the most tokens per second
+// bandwidth allows. The count is the traffic model's (model/traffic.h), the one `lernex bench` checks its roofline against.
+double decode_bytes_per_token(const MetisConfig& config, lx_wtype target, bool bf16x_decode, int context,
                              const std::set<std::string>* dropped = nullptr);
 double decode_ceiling_tps(const DeviceInfo& device, const MetisConfig& config, lx_wtype target, bool bf16x_decode,
-                          const std::set<std::string>* dropped = nullptr);
+                          int context, const std::set<std::string>* dropped = nullptr);
 // Whether the loaded backend has the BF16X kernels (the CUDA one does).
 bool bf16x_available();
 // Persistent state: the Mamba-2 conv and SSM state of one slot, and the attention KV cache of one slot
