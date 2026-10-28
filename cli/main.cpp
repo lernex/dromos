@@ -18,6 +18,7 @@ int cmd_offload(int argc, char** argv);
 int cmd_spec(int argc, char** argv);
 int cmd_spec_check(int argc, char** argv);
 int cmd_spec_cost(int argc, char** argv);
+int cmd_pass1(int argc, char** argv);
 int cmd_features(int argc, char** argv);
 int cmd_block_check(int argc, char** argv);
 int cmd_weights(int argc, char** argv);
@@ -49,6 +50,7 @@ void usage() {
                "  spec MODEL_DIR PROMPTS_JSON [options]     speculative decoding against plain decoding\n"
                "  spec-check MODEL_DIR PROMPTS_JSON [N]     verify steps bit-identical to one-token steps\n"
                "  spec-cost MODEL_DIR [CONTEXT]             milliseconds per plain and per verify step\n"
+               "  pass1 MODEL_DIR PROMPTS_JSON [options]    free drafters from the first pass: acceptance, runs, timing\n"
                "  features MODEL_DIR DATA_JSONL OUT_DIR     hidden-state shards for training draft models\n"
                "  block-check MODEL_DIR HEAD PROMPTS OUT    a block drafter's proposal, for check_block.py\n"
                "  weights MODEL_DIR bf16|int8|fp8|nvfp4|bf16x [--reference DIR] [--bytes-against DIR]\n"
@@ -86,6 +88,7 @@ int main(int argc, char** argv) {
     if (!std::strcmp(cmd, "spec")) return cmd_spec(argc - 1, argv + 1);
     if (!std::strcmp(cmd, "spec-check")) return cmd_spec_check(argc - 1, argv + 1);
     if (!std::strcmp(cmd, "spec-cost")) return cmd_spec_cost(argc - 1, argv + 1);
+    if (!std::strcmp(cmd, "pass1")) return cmd_pass1(argc - 1, argv + 1);
     if (!std::strcmp(cmd, "features")) return cmd_features(argc - 1, argv + 1);
     if (!std::strcmp(cmd, "block-check")) return cmd_block_check(argc - 1, argv + 1);
     if (!std::strcmp(cmd, "weights")) return cmd_weights(argc - 1, argv + 1);

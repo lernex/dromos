@@ -119,6 +119,12 @@ class MetisModel {
   // its sums: Praxis (8 kv heads) 7 tokens, Logos (10) 6.
   int max_verify_tokens() const;
 
+  // Measurement (the early-exit drafter, cli/spec.cpp's pass1): while `logits` is set (a device f32 [V] or [T, V]
+  // the caller owns), every step also reads the first pass's output, the residual streams after pass 0 through the
+  // final norm and the tied head, into it: the logits an exit after one pass would give each row. That is one extra
+  // head read per row, and steps run eagerly (no graphs, no decode program) while it is set. nullptr turns it off.
+  void set_early_logits(float* logits);
+
   // Hidden states for drafters: after set_feature_taps, every step writes, for each of its tokens,
   // the taps' stream means side by side: features() is f32 [T, feature_dim()] on the device, valid
   // until the next step.

@@ -207,6 +207,8 @@ struct MetisModel::Impl {
   // path above, captured in graphs.
   bool use_program = false;
   std::map<std::pair<int, float*>, lx_program*> programs;
+  // set_early_logits: the first pass's readout is written here on every step (metis.h), when set
+  float* early = nullptr;
   // route_projection without its difference columns, for the routing inside a pass (where the
   // difference is zero); the same rows and scales, so it multiplies exactly as the full weight
   Linear route_in;
@@ -1745,6 +1747,8 @@ void MetisModel::forward_spec(const StepBatch& b, float* logits, void* s) {
   }
 }
 
+void MetisModel::set_early_logits(float* logits) { impl_->early = logits; }
+
 void MetisModel::truncate(int slot, int length) {
   if (length < folded_.at(slot) || length > slot_len_[slot])
     throw std::runtime_error("truncate past the slot's pending positions");
@@ -1795,6 +1799,11 @@ void MetisModel::launch(int T, int n_seq, bool all_rows, float* logits, bool spe
   // The L2 carve-out is process-wide: it is on for a decode-sized step and off for the rest (pin.h). Set before the
   // capture, so a graph captures with the window it runs under.
   m.pins.set_on(pin::step_pinned(T));
+  // set_early_logits: eager steps only, so the readout runs on every step (no program, no graph that lacks it)
+  if (m.early) {
+    run(T, n_seq, all_rows, logits, spec, s);
+    return;
+  }
   if (decode_program_covers(m, T, n_seq, spec)) {
     run_program(m, cfg_, T, logits, s);
     return;
@@ -2075,6 +2084,11 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
                                     D, s));
     memory_write(m, c, T, pass, anchor, n_entries, s);
     copy_f32(m.state, D, m.previous, D, T, D, s);
+    // set_early_logits: the first pass's output (previous now holds it) through the final norm and the tied head
+    if (pass == 0 && m.early) {
+      LX_CHECK(lx_rmsnorm(m.previous, LX_F32, m.final_norm, m.out_bf, LX_BF16, T, D, c.rms_norm_eps, s));
+      linear(m, m.head, m.out_bf, LX_BF16, D, m.early, LX_F32, c.vocab_size, T, s);
+    }
   }
 
   // mean over streams, the final norm and the tied LM head

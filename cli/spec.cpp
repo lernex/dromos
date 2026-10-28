@@ -37,6 +37,7 @@
 //   in the folder's format unless --weights names another (cli/common.h, load_weights).
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -44,6 +45,7 @@
 #include <map>
 #include <memory>
 #include <nlohmann/json.hpp>
+#include <numeric>
 #include <random>
 #include <sstream>
 #include <stdexcept>
@@ -553,6 +555,497 @@ int cmd_spec(int argc, char** argv) {
     if (!json_out.empty()) std::ofstream(json_out) << report.dump(1) << "\n";
     if (const int err = lx_rt_last_error())
       throw std::runtime_error(std::string(lx_rt_error_string(err)) + " during the run");
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "error: %s\n", e.what());
+    return 1;
+  }
+  return 0;
+}
+
+// ---- lernex pass1: the free drafters of the pipelined two-pass schedule ----------------------------------------
+//
+//   lernex pass1 MODEL_DIR PROMPTS_JSON [options]
+//     Decodes each prompt one token at a time, as plain decoding does, and at every step records what three free
+//     drafters would have proposed for the next token and whether it held:
+//       early   the argmax of the first pass's readout (metis.h, set_early_logits); under sampling, a draw from it
+//       ngram   prompt lookup: the most recent earlier occurrence of the longest suffix of 3, 2 or 1 tokens, and the
+//               token after it (runtime/speculative.cpp's NgramDrafter, with match lengths 3..1)
+//       comb    ngram when it has a match, else early
+//     Greedy: a draft holds when it equals the target's argmax. Sampled, with p the target's filtered distribution and
+//     q the drafter's (the same filter): the expected acceptance is sum_x min(p, q) (p(g) for a point-mass ngram draft),
+//     and `held` is a simulated accept (draw the draft from q, accept with probability min(1, p / q)). Runs are maximal
+//     stretches of consecutive held steps.
+//     Options (defaults: greedy, 256 tokens):
+//       --tokens N                    tokens per prompt, stopping at an end token
+//       --temp T --top-p P --top-k K --min-p P --rep R --seed S     sampling (temp 0 is greedy)
+//       --json FILE                   every step's numbers and the run-length histograms
+//       --check                       a one-pass model with the same weights runs beside, on the same tokens; its
+//                                     logits must equal this model's first-pass readout bit for bit. Uses two models on
+//                                     the card, so run it with --no-bf16x
+//       --time                        milliseconds per step, medians: plain one-token steps at M = 1 and at M = 2 (two
+//                                     streams), and one-pass sweeps at M = 1 and M = 2 (the pipelined sweep reads the
+//                                     weights once for its two rows). Then the speedup each measured acceptance
+//                                     projects: plain / (sweep at M = 2 + (1 - a) x one-pass step at M = 1).
+//                                     Run it alone, in the production format (no --check, no --no-bf16x)
+namespace {
+
+struct Sampling {
+  double temp = 0.0, top_p = 1.0, min_p = 0.0, rep = 1.0;
+  int top_k = 0;
+  uint64_t seed = 1;
+};
+
+// The sampler's distribution over the vocabulary for one row (kernels.h, lx_sample): repetition penalty on the tokens
+// seen so far, then temperature, top-k, top-p over the top-k distribution, and min-p. Temperature 0 is a point mass on
+// the argmax (ties to the lower index).
+struct Dist {
+  std::vector<double> p;
+  int argmax = 0;
+};
+
+Dist make_dist(const float* logits, int V, const std::vector<char>& seen, const Sampling& sm) {
+  std::vector<double> x(V);
+  for (int i = 0; i < V; ++i) {
+    const double v = logits[i];
+    x[i] = seen[i] && sm.rep != 1.0 ? (v > 0 ? v / sm.rep : v * sm.rep) : v;
+  }
+  Dist d;
+  d.p.assign(V, 0.0);
+  d.argmax = static_cast<int>(std::max_element(x.begin(), x.end()) - x.begin());
+  if (sm.temp <= 0) {
+    d.p[d.argmax] = 1.0;
+    return d;
+  }
+  const int k = sm.top_k > 0 && sm.top_k < V ? sm.top_k : V;
+  std::vector<int> idx(V);
+  std::iota(idx.begin(), idx.end(), 0);
+  std::partial_sort(idx.begin(), idx.begin() + k, idx.end(), [&](int a, int b) {
+    return x[a] > x[b] || (x[a] == x[b] && a < b);
+  });
+  const double s0 = x[idx[0]] / sm.temp;
+  std::vector<double> w(k);
+  double Z = 0.0;
+  for (int j = 0; j < k; ++j) {
+    w[j] = std::exp(x[idx[j]] / sm.temp - s0);
+    Z += w[j];
+  }
+  // top-p: the smallest prefix of the top-k distribution holding top_p of its mass
+  int keep = 0;
+  double cum = 0.0;
+  for (int j = 0; j < k && cum < sm.top_p; ++j) {
+    cum += w[j] / Z;
+    ++keep;
+  }
+  std::vector<int> kept;
+  double mass = 0.0;
+  for (int j = 0; j < keep; ++j) {
+    if (sm.min_p > 0 && x[idx[j]] / sm.temp < s0 + std::log(sm.min_p)) continue;
+    kept.push_back(j);
+    mass += w[j];
+  }
+  for (int j : kept) d.p[idx[j]] = w[j] / mass;
+  return d;
+}
+
+// The token at which a distribution's cumulative mass reaches u (u in [0, 1)).
+int draw(const std::vector<double>& p, double u) {
+  double c = 0.0;
+  int last = 0;
+  for (size_t i = 0; i < p.size(); ++i) {
+    if (p[i] <= 0) continue;
+    c += p[i];
+    last = static_cast<int>(i);
+    if (u < c) return last;
+  }
+  return last;
+}
+
+double overlap(const Dist& p, const Dist& q) {
+  double s = 0.0;
+  for (size_t i = 0; i < p.p.size(); ++i) s += std::min(p.p[i], q.p[i]);
+  return s;
+}
+
+// Prompt lookup (NgramDrafter): the longest suffix of 3, 2 or 1 tokens that occurred before, ending before the last
+// token, and the token after its most recent occurrence. -1 when there is none.
+int ngram_guess(const std::vector<int32_t>& ctx, int max_n, int min_n) {
+  const int L = static_cast<int>(ctx.size());
+  for (int n = max_n; n >= min_n; --n) {
+    if (L - 1 < n) continue;
+    for (int e = L - 2; e >= n - 1; --e) {
+      bool same = true;
+      for (int j = 0; j < n && same; ++j) same = ctx[e - j] == ctx[L - 1 - j];
+      if (same) return ctx[e + 1];
+    }
+  }
+  return -1;
+}
+
+// Lengths of the maximal runs of held steps, as a histogram.
+void add_runs(const std::vector<char>& held, std::map<int, int>& out) {
+  int run = 0;
+  for (char h : held) {
+    if (h) {
+      ++run;
+    } else if (run) {
+      ++out[run];
+      run = 0;
+    }
+  }
+  if (run) ++out[run];
+}
+
+struct Trace {
+  std::vector<int32_t> tokens;  // the emitted tokens (the output after the prompt)
+  std::vector<char> match, agree, held_early, held_ngram, held_comb;
+  std::vector<double> a_early, a_ngram, a_comb;  // expected acceptance per step
+  bool ended = false;                            // stopped at an end token
+  std::vector<int> rank_early;                   // rank of the emitted token under the first-pass logits (0 = top)
+  std::vector<double> lp_p, lp_q;                // log-probability of the emitted token, raw softmax, both readouts
+  std::vector<int> top_early;                    // the first-pass argmax, for the histogram
+  int identical = 0, compared = 0;               // --check: one-pass logits equal to the first-pass readout
+  double worst = 0.0;
+};
+
+// One prompt: prefill all but its last token, then decode the last one and on, with the first pass's readout on every
+// step. `one`, when set, runs beside on the same tokens and its logits are compared with the readout.
+Trace decode_prompt(lx::MetisModel& model, lx::MetisModel* one, const std::vector<int32_t>& prompt, int tokens,
+                    const Sampling& sm, const std::vector<int>& end_ids, float* d_logits, float* d_early, float* d_one,
+                    void* s) {
+  const int V = model.vocab_size();
+  const int L = static_cast<int>(prompt.size());
+  model.set_early_logits(nullptr);
+  model.reset_slot(0);
+  if (one) one->reset_slot(0);
+  for (int off = 0; off + 1 < L; off += 512) {
+    const int c = std::min(512, L - 1 - off);
+    model.forward({{prompt.begin() + off, prompt.begin() + off + c}, {0, c}, {0}}, d_logits, false, s);
+    if (one) one->forward({{prompt.begin() + off, prompt.begin() + off + c}, {0, c}, {0}}, d_one, false, s);
+  }
+  model.set_early_logits(d_early);
+  std::vector<char> seen(V, 0);
+  for (int t : prompt) seen[t] = 1;
+  std::vector<int32_t> ctx(prompt);
+  std::mt19937_64 rng(sm.seed);
+  std::uniform_real_distribution<double> unif(0.0, 1.0);
+  const bool greedy = sm.temp <= 0;
+  std::vector<float> lp(V), lq(V), lo(V);
+  Trace tr;
+  int32_t input = prompt.back();
+  for (int t = 0; t < tokens; ++t) {
+    model.forward({{input}, {0, 1}, {0}}, d_logits, false, s);
+    lx_rt_copy(lp.data(), d_logits, static_cast<int64_t>(sizeof(float)) * V, LX_COPY_D2H, s);
+    lx_rt_copy(lq.data(), d_early, static_cast<int64_t>(sizeof(float)) * V, LX_COPY_D2H, s);
+    if (one) {
+      one->forward({{input}, {0, 1}, {0}}, d_one, false, s);
+      lx_rt_copy(lo.data(), d_one, static_cast<int64_t>(sizeof(float)) * V, LX_COPY_D2H, s);
+    }
+    lx_rt_stream_sync(s);
+    if (one) {
+      ++tr.compared;
+      if (std::memcmp(lq.data(), lo.data(), sizeof(float) * V) == 0) ++tr.identical;
+      for (int v = 0; v < V; ++v) tr.worst = std::max(tr.worst, static_cast<double>(std::abs(lq[v] - lo[v])));
+    }
+    const Dist P = make_dist(lp.data(), V, seen, sm), Q = make_dist(lq.data(), V, seen, sm);
+    const int emitted = greedy ? P.argmax : draw(P.p, unif(rng));
+    {
+      // diagnostics on the raw logits: where the emitted token ranks under the first pass, and its log-probability
+      auto logsoft = [&](const float* x, int i) {
+        double mx = x[0];
+        for (int v = 1; v < V; ++v) mx = std::max(mx, static_cast<double>(x[v]));
+        double z = 0.0;
+        for (int v = 0; v < V; ++v) z += std::exp(static_cast<double>(x[v]) - mx);
+        return static_cast<double>(x[i]) - mx - std::log(z);
+      };
+      int rank = 0;
+      for (int v = 0; v < V; ++v) rank += lq[v] > lq[emitted];
+      tr.rank_early.push_back(rank);
+      tr.lp_p.push_back(logsoft(lp.data(), emitted));
+      tr.lp_q.push_back(logsoft(lq.data(), emitted));
+      tr.top_early.push_back(Q.argmax);
+    }
+
+    // early: the draft from the first pass, its argmax (greedy) or a draw from q
+    const int de = greedy ? Q.argmax : draw(Q.p, unif(rng));
+    const double a_e = greedy ? static_cast<double>(de == P.argmax) : overlap(P, Q);
+    const bool h_e = greedy ? de == emitted : unif(rng) < std::min(1.0, P.p[de] / Q.p[de]);
+
+    // ngram: a point mass, which holds under sampling with probability p(g)
+    const int g = ngram_guess(ctx, 3, 1);
+    const bool match = g >= 0;
+    const double a_n = !match ? 0.0 : greedy ? static_cast<double>(g == P.argmax) : P.p[g];
+    const bool h_n = match && (greedy ? g == emitted : unif(rng) < P.p[g]);
+
+    tr.match.push_back(match);
+    tr.agree.push_back(Q.argmax == P.argmax);
+    tr.a_early.push_back(a_e);
+    tr.held_early.push_back(h_e);
+    tr.a_ngram.push_back(a_n);
+    tr.held_ngram.push_back(h_n);
+    tr.a_comb.push_back(match ? a_n : a_e);
+    tr.held_comb.push_back(match ? h_n : h_e);
+    tr.tokens.push_back(emitted);
+    ctx.push_back(emitted);
+    seen[emitted] = 1;
+    input = emitted;
+    if (std::find(end_ids.begin(), end_ids.end(), emitted) != end_ids.end()) {
+      tr.ended = true;
+      break;
+    }
+  }
+  model.set_early_logits(nullptr);
+  return tr;
+}
+
+// Median milliseconds of `iters` steps (after `warm`) of `n_seq` one-token rows, one row per slot 0 .. n_seq - 1, each
+// synced as a decode loop is.
+double median_step_ms(lx::MetisModel& model, int n_seq, float* logits, void* s, int warm, int iters) {
+  std::vector<int32_t> cu(n_seq + 1), slots(n_seq), toks(n_seq, 1000);
+  for (int i = 0; i <= n_seq; ++i) cu[i] = i;
+  for (int i = 0; i < n_seq; ++i) slots[i] = i;
+  std::vector<double> ms;
+  for (int i = 0; i < warm + iters; ++i) {
+    const auto t0 = std::chrono::steady_clock::now();
+    model.forward({toks, cu, slots}, logits, false, s);
+    lx_rt_stream_sync(s);
+    const auto t1 = std::chrono::steady_clock::now();
+    if (i >= warm) ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+  }
+  std::sort(ms.begin(), ms.end());
+  return ms[ms.size() / 2];
+}
+
+void prefill_slot(lx::MetisModel& model, int slot, const std::vector<int32_t>& ids, float* logits, void* s) {
+  model.reset_slot(slot);
+  for (size_t off = 0; off < ids.size(); off += 512) {
+    const int c = static_cast<int>(std::min<size_t>(512, ids.size() - off));
+    model.forward({{ids.begin() + off, ids.begin() + off + c}, {0, c}, {slot}}, logits, false, s);
+  }
+}
+
+// The projected single-stream speedup of the pipelined schedule at acceptance a (plain = 1 step).
+double projected(double plain, double sweep2, double pass1, double a) { return plain / (sweep2 + (1.0 - a) * pass1); }
+
+}  // namespace
+
+int cmd_pass1(int argc, char** argv) {
+  if (argc < 3) {
+    std::fprintf(stderr,
+                 "usage: lernex pass1 MODEL_DIR PROMPTS_JSON [--tokens N] [--temp T --top-p P --top-k K --min-p P --rep R "
+                 "--seed S] [--json FILE] [--check] [--time] [--weights F] [--no-bf16x]\n");
+    return 2;
+  }
+  try {
+    const std::string dir = argv[1];
+    nlohmann::json prompts;
+    std::ifstream(argv[2]) >> prompts;
+    int tokens = 256;
+    std::string json_out;
+    bool check = false, timing = false;
+    Sampling sm;
+    lx::cli::FormatFlags format;
+    for (int i = 3; i < argc; ++i) {
+      const std::string a = argv[i];
+      auto val = [&]() -> std::string {
+        if (i + 1 >= argc) throw std::runtime_error("missing value for " + a);
+        return argv[++i];
+      };
+      if (lx::cli::parse_format_flag(argc, argv, i, format)) continue;
+      if (a == "--tokens") tokens = std::stoi(val());
+      else if (a == "--temp") sm.temp = std::stod(val());
+      else if (a == "--top-p") sm.top_p = std::stod(val());
+      else if (a == "--top-k") sm.top_k = std::stoi(val());
+      else if (a == "--min-p") sm.min_p = std::stod(val());
+      else if (a == "--rep") sm.rep = std::stod(val());
+      else if (a == "--seed") sm.seed = std::stoull(val());
+      else if (a == "--json") json_out = val();
+      else if (a == "--check") check = true;
+      else if (a == "--time") timing = true;
+      else throw std::runtime_error("unknown option " + a);
+    }
+    if (check && timing) throw std::runtime_error("--check and --time need separate runs (two models do not time cleanly)");
+
+    const lx::MetisConfig config = lx::load_config(dir);
+    lx::cli::LoadedWeights w = lx::cli::load_weights(dir, config, format);
+    std::fprintf(stderr, "%s\n", w.description.c_str());
+    void* s = nullptr;
+    if (lx_rt_stream_create(&s) != 0) throw std::runtime_error("creating a device stream");
+    const int V = config.vocab_size;
+    const std::vector<int> end_ids = config.eos_token_ids;
+    auto alloc = [&](int64_t floats) {
+      void* p = nullptr;
+      if (lx_rt_alloc(&p, static_cast<int64_t>(sizeof(float)) * floats) != 0)
+        throw std::runtime_error("device allocation failed");
+      return static_cast<float*>(p);
+    };
+    float* d_logits = alloc(2 * V);
+    float* d_early = alloc(2 * V);
+    float* d_one = alloc(2 * V);
+
+    // two slots: slot 0 decodes the prompts; slots 0 and 1 are the two streams of --time
+    auto two_pass = std::make_unique<lx::MetisModel>(config, *w.weights, w.formats, 2, 8192, 512, nullptr, true);
+    std::unique_ptr<lx::MetisModel> one;
+    if (check) {
+      lx::MetisConfig c1 = config;
+      c1.num_passes = 1;  // the same weights, read for the first pass alone
+      one = std::make_unique<lx::MetisModel>(c1, *w.weights, w.formats, 2, 8192, 512, nullptr, true);
+    }
+    if (sm.temp <= 0) std::printf("%s, greedy", dir.c_str());
+    else
+      std::printf("%s, sampled: temp %.2f top-p %.2f top-k %d min-p %.2f rep %.2f", dir.c_str(), sm.temp, sm.top_p,
+                  sm.top_k, sm.min_p, sm.rep);
+    std::printf(", %d tokens at most per prompt\n", tokens);
+    std::printf("%-22s %5s %6s | %-19s | %-19s | %-19s\n", "prompt", "steps", "match", "early exp / held",
+                "ngram exp / held", "comb exp / held");
+
+    nlohmann::json report = nlohmann::json::object();
+    report["model"] = dir;
+    report["greedy"] = sm.temp <= 0;
+    report["temperature"] = sm.temp;
+    report["top_p"] = sm.top_p;
+    report["top_k"] = sm.top_k;
+    report["min_p"] = sm.min_p;
+    report["repetition"] = sm.rep;
+    report["seed"] = sm.seed;
+    report["tokens"] = tokens;
+    nlohmann::json per_prompt = nlohmann::json::array();
+
+    std::map<std::string, std::map<int, int>> runs_all;
+    double all_e = 0, all_n = 0, all_c = 0, held_e = 0, held_n = 0, held_c = 0;
+    long long steps_all = 0;
+    int identical = 0, compared = 0;
+    double worst = 0.0;
+    std::vector<int32_t> first_prompt;
+    for (auto& [name, ids_json] : prompts.items()) {
+      const std::vector<int32_t> ids = ids_json.get<std::vector<int32_t>>();
+      if (first_prompt.empty()) first_prompt = ids;
+      Trace tr = decode_prompt(*two_pass, one.get(), ids, tokens, sm, end_ids, d_logits, d_early, d_one, s);
+      const double n = static_cast<double>(tr.tokens.size());
+      auto mean = [&](const std::vector<double>& v) {
+        double acc = 0;
+        for (double x : v) acc += x;
+        return v.empty() ? 0.0 : acc / v.size();
+      };
+      auto rate = [&](const std::vector<char>& v) {
+        double acc = 0;
+        for (char x : v) acc += x;
+        return v.empty() ? 0.0 : acc / v.size();
+      };
+      auto runs = [&](const std::vector<char>& v) {
+        std::map<int, int> h;
+        add_runs(v, h);
+        return h;
+      };
+      auto longest = [&](const std::vector<char>& v) {
+        const auto h = runs(v);
+        return h.empty() ? 0 : h.rbegin()->first;
+      };
+      const double match_rate = rate(tr.match);
+      std::printf("%-22s %5.0f %5.0f%% | %5.1f%% / %5.1f%%    | %5.1f%% / %5.1f%%    | %5.1f%% / %5.1f%%\n",
+                  name.c_str(), n, 100 * match_rate, 100 * mean(tr.a_early), 100 * rate(tr.held_early),
+                  100 * mean(tr.a_ngram), 100 * rate(tr.held_ngram), 100 * mean(tr.a_comb), 100 * rate(tr.held_comb));
+      {
+        int top5 = 0, top1 = 0;
+        for (int r : tr.rank_early) { top5 += r < 5; top1 += r == 0; }
+        std::vector<int> r = tr.rank_early;
+        std::sort(r.begin(), r.end());
+        double lpp = 0, lpq = 0;
+        for (size_t i = 0; i < tr.lp_p.size(); ++i) lpp += tr.lp_p[i], lpq += tr.lp_q[i];
+        const double m = std::max<double>(1.0, static_cast<double>(tr.rank_early.size()));
+        std::printf("%-22s diag: emitted is pass-1 top-1 %.1f%%, top-5 %.1f%%, median rank %d; mean logp(emitted) pass-2 %.3f, pass-1 %.3f\n",
+                    "", 100 * top1 / m, 100 * top5 / m, r.empty() ? -1 : r[r.size() / 2], lpp / m, lpq / m);
+      }
+      std::printf("%-22s longest held run: early %d, ngram %d, comb %d; %s\n", "", longest(tr.held_early),
+                  longest(tr.held_ngram), longest(tr.held_comb),
+                  tr.ended ? "ended at an end token" : "stopped at the token limit");
+      all_e += mean(tr.a_early) * n;
+      all_n += mean(tr.a_ngram) * n;
+      all_c += mean(tr.a_comb) * n;
+      held_e += rate(tr.held_early) * n;
+      held_n += rate(tr.held_ngram) * n;
+      held_c += rate(tr.held_comb) * n;
+      steps_all += static_cast<long long>(n);
+      for (auto& [len, cnt] : runs(tr.held_early)) runs_all["early"][len] += cnt;
+      for (auto& [len, cnt] : runs(tr.held_ngram)) runs_all["ngram"][len] += cnt;
+      for (auto& [len, cnt] : runs(tr.held_comb)) runs_all["comb"][len] += cnt;
+      identical += tr.identical;
+      compared += tr.compared;
+      worst = std::max(worst, tr.worst);
+      per_prompt.push_back(
+          {{"prompt", name},
+           {"steps", tr.tokens.size()},
+           {"ended", tr.ended},
+           {"match", match_rate},
+           {"agree", rate(tr.agree)},
+           {"expected", {{"early", mean(tr.a_early)}, {"ngram", mean(tr.a_ngram)}, {"comb", mean(tr.a_comb)}}},
+           {"held", {{"early", rate(tr.held_early)}, {"ngram", rate(tr.held_ngram)}, {"comb", rate(tr.held_comb)}}},
+           {"runs", {{"early", runs(tr.held_early)}, {"ngram", runs(tr.held_ngram)}, {"comb", runs(tr.held_comb)}}},
+           {"steps_detail",
+            {{"a_early", tr.a_early}, {"held_early", tr.held_early}, {"a_ngram", tr.a_ngram},
+             {"held_ngram", tr.held_ngram}, {"a_comb", tr.a_comb}, {"held_comb", tr.held_comb},
+             {"match", tr.match}, {"tokens", tr.tokens}}}});
+    }
+    const double N = static_cast<double>(std::max<long long>(steps_all, 1));
+    std::printf("%-22s %5lld %5s | %5.1f%% / %5.1f%%    | %5.1f%% / %5.1f%%    | %5.1f%% / %5.1f%%\n", "all prompts",
+                steps_all, "", 100 * all_e / N, 100 * held_e / N, 100 * all_n / N, 100 * held_n / N, 100 * all_c / N,
+                100 * held_c / N);
+    for (const char* d : {"early", "ngram", "comb"}) {
+      std::printf("held runs, %-5s (length:count):", d);
+      int shown = 0;
+      for (auto& [len, cnt] : runs_all[d]) {
+        if (shown++ == 16) break;
+        std::printf(" %d:%d", len, cnt);
+      }
+      std::printf("\n");
+    }
+    report["prompts"] = per_prompt;
+    report["expected_all"] = {{"early", all_e / N}, {"ngram", all_n / N}, {"comb", all_c / N}};
+    report["held_all"] = {{"early", held_e / N}, {"ngram", held_n / N}, {"comb", held_c / N}};
+    if (check) {
+      std::printf("one-pass readout vs first-pass readout, teacher forced: %d of %d steps bit-identical, max |diff| %.3g\n",
+                  identical, compared, worst);
+      report["check"] = {{"identical", identical}, {"compared", compared}, {"max_abs_diff", worst}};
+    }
+
+    if (timing) {
+      if (first_prompt.empty()) throw std::runtime_error("--time needs a prompt for its context");
+      const int ctx_len = static_cast<int>(std::min<size_t>(first_prompt.size(), 1024));
+      const std::vector<int32_t> context(first_prompt.begin(), first_prompt.begin() + ctx_len);
+      const int warm = 30, iters = 200;
+      prefill_slot(*two_pass, 0, context, d_logits, s);
+      prefill_slot(*two_pass, 1, context, d_logits, s);
+      const double plain1 = median_step_ms(*two_pass, 1, d_logits, s, warm, iters);
+      const double plain2 = median_step_ms(*two_pass, 2, d_logits, s, warm, iters);
+      if (!one) {
+        two_pass.reset();  // frees the two-pass model's decode copies before the one-pass model takes its own
+        lx::MetisConfig c1 = config;
+        c1.num_passes = 1;
+        one = std::make_unique<lx::MetisModel>(c1, *w.weights, w.formats, 2, 8192, 512, nullptr, true);
+      }
+      prefill_slot(*one, 0, context, d_logits, s);
+      prefill_slot(*one, 1, context, d_logits, s);
+      const double sweep1 = median_step_ms(*one, 1, d_logits, s, warm, iters);
+      const double sweep2 = median_step_ms(*one, 2, d_logits, s, warm, iters);
+      std::printf("\ntiming at a %d-token context, medians of %d steps (ms per step):\n", ctx_len, iters);
+      std::printf("  plain two-pass step, M = 1           %8.3f   (1.000)\n", plain1);
+      std::printf("  plain two-pass step, M = 2 streams   %8.3f   (%.3f plain steps)\n", plain2, plain2 / plain1);
+      std::printf("  one-pass step, M = 1                 %8.3f   (%.3f plain steps)  pass-1-only sweep\n", sweep1,
+                  sweep1 / plain1);
+      std::printf("  one-pass sweep, M = 2                %8.3f   (%.3f plain steps)  pipelined sweep\n", sweep2,
+                  sweep2 / plain1);
+      std::printf("  pipelined sweep / M = 2 two-pass step  %.3f\n", sweep2 / plain2);
+      std::printf("projected single-stream speedup, plain / (sweep + (1 - a) x pass-1-only), a = mean expected acceptance:\n");
+      const double ae = all_e / N, an = all_n / N, ac = all_c / N;
+      std::printf("  early %.3f -> x%.3f,  ngram %.3f -> x%.3f,  comb %.3f -> x%.3f\n", ae,
+                  projected(plain1, sweep2, sweep1, ae), an, projected(plain1, sweep2, sweep1, an), ac,
+                  projected(plain1, sweep2, sweep1, ac));
+      std::printf("  ceiling at a = 1: x%.3f\n", projected(plain1, sweep2, sweep1, 1.0));
+      report["timing_ms"] = {{"plain_m1", plain1}, {"plain_m2", plain2}, {"one_pass_m1", sweep1}, {"one_pass_m2", sweep2},
+                             {"context", ctx_len}};
+    }
+    if (!json_out.empty()) std::ofstream(json_out) << report.dump(1) << "\n";
+    if (const int err = lx_rt_last_error())
+      throw std::runtime_error(std::string(lx_rt_error_string(err)) + " during pass1");
   } catch (const std::exception& e) {
     std::fprintf(stderr, "error: %s\n", e.what());
     return 1;
