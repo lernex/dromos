@@ -6,6 +6,7 @@
 #   scripts/remote.sh bench x 'bash bench/run_bench.sh serve-engine MODEL TAG [format flags]'
 #   scripts/remote.sh bench x 'bash bench/run_bench.sh serve-vllm MODEL TAG VOCAB [vllm flags]'
 #   scripts/remote.sh bench x 'bash bench/run_bench.sh spec MODEL TAG [format flags]'
+#   scripts/remote.sh bench x 'bash bench/run_bench.sh cachecheck MODEL TAG [format flags]'
 #   scripts/remote.sh bench x 'bash bench/run_bench.sh profile MODEL TAG STREAMS [format flags]'
 #
 # MODEL is a folder. TAG names the outputs. Format flags (--weights, --no-bf16x) go to lernex, as they are.
@@ -60,6 +61,14 @@ case "$cmd" in
       "$LX" prefill "$model" "$PROMPTS" "$T" 5 "$@" > "$OUT/$tag.prefill.T$T.txt" 2>&1
       log "prefill T=$T exit $?"
     done
+    ;;
+
+  cachecheck)
+    # The default lernex bench (prefix cache on) once, to measure what a warm cache does to prefill and TTFT.
+    model=$1; tag=$2; shift 2
+    "$LX" bench "$model" --streams 1,8,32,64 --prompt-tokens 512 --gen-tokens 256 "$@" \
+      > "$OUT/$tag.bench-prefixcache.txt" 2>&1
+    log "cachecheck $tag exit $?"
     ;;
 
   spec)

@@ -150,6 +150,10 @@ def summarize(results: list[dict], prompt_tokens: int, submitted: float, gen_tok
     decode = tokens / window
     mismatches = sum(1 for r in results if len(r["events"]) != r["usage"]["completion_tokens"])
     short = sum(1 for r in results if r["usage"]["completion_tokens"] != gen_tokens)
+    # Mean time per output token after the first, per stream (vllm bench serve's TPOT), and the formula it is
+    # often quoted with: concurrency x 1000 / mean TPOT. Reported beside decode_tps so the two can be compared.
+    tpots = [(r["events"][-1] - r["events"][0]) / max(len(r["events"]) - 1, 1) for r in results]
+    mean_tpot_ms = 1e3 * statistics.fmean(tpots)
     return {
         "streams": n,
         "decode_tps": decode,
@@ -159,6 +163,8 @@ def summarize(results: list[dict], prompt_tokens: int, submitted: float, gen_tok
         "prefill_tps": n * prompt_tokens / max(all_decoding - submitted, 1e-9),
         "window_s": window,
         "tokens_in_window": tokens,
+        "mean_tpot_ms": mean_tpot_ms,
+        "concurrency_over_tpot_tps": n * 1000.0 / mean_tpot_ms,
         "event_vs_usage_mismatch_streams": mismatches,
         "streams_not_at_gen_tokens": short,
         "finish": sorted({r["finish"] for r in results}),
@@ -202,7 +208,8 @@ async def main_async(args) -> dict:
                 print(
                     f"{args.label} streams={n:>3} rep={r} decode={row['decode_tps']:8.1f} tok/s "
                     f"per-stream={row['per_stream_tps']:7.1f} TTFT p50={row['ttft_p50']:.3f}s "
-                    f"prefill={row['prefill_tps']:8.0f} tok/s mismatch={row['event_vs_usage_mismatch_streams']} "
+                    f"prefill={row['prefill_tps']:8.0f} tok/s tpot-formula={row['concurrency_over_tpot_tps']:8.1f} "
+                    f"mismatch={row['event_vs_usage_mismatch_streams']} "
                     f"short={row['streams_not_at_gen_tokens']}",
                     flush=True,
                 )
