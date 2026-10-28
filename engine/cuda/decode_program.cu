@@ -65,6 +65,7 @@ int64_t row_bytes_of(int wtype, int k) {
 
 struct lx_program {
   int M;
+  int variant = 0;  // the kernel copy this program runs: 0 every format, 1 INT8 (and BF16), 2 BF16 (decode_ops.h)
   const int32_t *tokens, *slots, *has_state, *start_pos;
   std::vector<OpDesc> ops;
   std::vector<std::vector<Region>> regions;
@@ -192,6 +193,22 @@ int tile_rows(int N, int row_bytes, int blocks, int factor = 1) {
 }
 
 }  // namespace
+
+// The kernel copy's configure and launch, by the variant the program was built with (decode_ops.h).
+int configure_copy(int variant, size_t smem) {
+  switch (variant) {
+    case 1: return variant_i8::step_configure(smem);
+    case 2: return variant_bf16::step_configure(smem);
+    default: return variant_gen::step_configure(smem);
+  }
+}
+int launch_copy(int variant, const Program& P, int blocks, size_t smem, cudaStream_t stream) {
+  switch (variant) {
+    case 1: return variant_i8::step_launch(P, blocks, smem, stream);
+    case 2: return variant_bf16::step_launch(P, blocks, smem, stream);
+    default: return variant_gen::step_launch(P, blocks, smem, stream);
+  }
+}
 
 extern "C" {
 
@@ -776,8 +793,22 @@ int lx_program_build(lx_program* p) {
   // Shared memory: the fixed slots, then the x buffer the ops need.
   p->x_bytes = round_up(std::max(p->x_need, 1024), 128);
   if (p->x_bytes > p->x_cap) return static_cast<int>(cudaErrorInvalidConfiguration);
-  p->smem = step_smem_bytes(p->x_bytes);
-  if (int e = step_configure(p->smem)) return e;
+  // The copy: the formats every GEMV, expert and entry op reads. The f32 routers and depth head are in every copy. A
+  // program whose quantized formats are INT8 (with BF16 for the entry or experts where they are) runs the INT8 copy; one
+  // of BF16 alone runs the BF16 copy; any other mix runs the generic copy.
+  unsigned fm = 0;
+  for (const OpDesc& d : p->ops) {
+    if (d.kind == kGemv) fm |= 1u << d.gemv.wtype;
+    else if (d.kind == kExpUp) fm |= 1u << d.up.wtype;
+    else if (d.kind == kExpDown) fm |= 1u << d.down.wtype;
+    else if (d.kind == kEntry) fm |= 1u << d.entry.wtype;
+  }
+  const unsigned quant = fm & ~(1u << LX_W_F32);
+  if ((quant & (1u << LX_W_INT8)) && !(quant & ~((1u << LX_W_INT8) | (1u << LX_W_BF16)))) p->variant = 1;
+  else if (quant && !(quant & ~(1u << LX_W_BF16))) p->variant = 2;
+  else p->variant = 0;
+  p->smem = variant_gen::step_smem_bytes(p->x_bytes);
+  if (int e = configure_copy(p->variant, p->smem)) return e;
 
   // Tasks to blocks. The ops of a step mostly wait on each other, so what matters is that each op
   // is even over the blocks: every block gets the same number of its tasks, the remainder going to
@@ -923,7 +954,7 @@ int lx_program_run(const lx_program* p, void* stream) {
   P.x_bytes = p->x_bytes;
   P.bulk = p->bulk ? 1 : 0;
   P.prefetch_bytes = p->prefetch_bytes;
-  return step_launch(P, p->blocks, p->smem, static_cast<cudaStream_t>(stream));
+  return launch_copy(p->variant, P, p->blocks, p->smem, static_cast<cudaStream_t>(stream));
 }
 
 

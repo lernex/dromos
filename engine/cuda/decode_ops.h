@@ -261,8 +261,21 @@ struct Program {
 };
 
 // decode_kernel.cu: the kernel's shared memory for a layout, its attributes, and the launch.
+// The kernel's copies: decode_kernel.cu (every weight format, any program) and decode_kernel_i8.cu and
+// decode_kernel_bf16.cu (one format family each, for the programs that read only it). lx_program_build picks the copy
+// from the formats its program reads (decode_program.cu, variant).
+namespace variant_gen {
 size_t step_smem_bytes(int x_bytes);
 int step_configure(size_t smem);
 int step_launch(const Program& P, int blocks, size_t smem, cudaStream_t stream);
+}  // namespace variant_gen
+namespace variant_i8 {
+int step_configure(size_t smem);
+int step_launch(const Program& P, int blocks, size_t smem, cudaStream_t stream);
+}  // namespace variant_i8
+namespace variant_bf16 {
+int step_configure(size_t smem);
+int step_launch(const Program& P, int blocks, size_t smem, cudaStream_t stream);
+}  // namespace variant_bf16
 
 }  // namespace lx::decode
