@@ -184,8 +184,9 @@ struct MetisModel::Impl {
   // the same way and copies the top n predicted experts that are not in VRAM ahead of the layer.
   int prefetch = 0;
   void* side = nullptr;
-  // Decode steps: the routing features run on route_side, beside the mixer (see run)
-  void *route_side = nullptr, *route_fork = nullptr, *route_join = nullptr;
+  // Decode steps: the routing features run on route_side, beside the mixer (see run). route_read is recorded once the
+  // side has read the streams, and the main stream waits on it before the mixer writes them back.
+  void *route_side = nullptr, *route_fork = nullptr, *route_join = nullptr, *route_read = nullptr;
   // Decode steps: the shared expert's gate-up and activation run on shared_side, beside the routed experts
   void *shared_side = nullptr, *shared_fork = nullptr, *shared_join = nullptr;
   // Decode steps: moe_summary runs beside latent_up, and the memory's value projection beside its key (see run)
@@ -263,6 +264,7 @@ struct MetisModel::Impl {
     if (route_side) lx_rt_stream_destroy(route_side);
     if (route_fork) lx_rt_event_destroy(route_fork);
     if (route_join) lx_rt_event_destroy(route_join);
+    if (route_read) lx_rt_event_destroy(route_read);
     if (shared_side) lx_rt_stream_destroy(shared_side);
     if (shared_fork) lx_rt_event_destroy(shared_fork);
     if (shared_join) lx_rt_event_destroy(shared_join);
@@ -1001,6 +1003,7 @@ MetisModel::MetisModel(const MetisConfig& c, const ModelWeights& weights, const 
   check(lx_rt_event_create(&m.meta_copied), "event create");
   check(lx_rt_stream_create(&m.route_side), "stream create");
   check(lx_rt_event_create(&m.route_fork), "event create");
+  check(lx_rt_event_create(&m.route_read), "event create");
   check(lx_rt_event_create(&m.route_join), "event create");
   check(lx_rt_stream_create(&m.shared_side), "stream create");
   check(lx_rt_event_create(&m.shared_fork), "event create");
@@ -1986,6 +1989,8 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
         check(lx_rt_stream_wait(rs, m.route_fork), "stream wait");
       }
       LX_CHECK(lx_stream_mean(m.streams, m.state, T, S, D, rs));
+      // The side's read of the streams is done: the mixer may now write them (the wait is before lx_mhc_write below).
+      if (beside) check(lx_rt_event_record(m.route_read, rs), "event record");
       routing_features(m, T, rs);
       if (beside) check(lx_rt_event_record(m.route_join, rs), "event record");
 
@@ -2036,6 +2041,8 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
         }
         linear(m, layer.out_proj, m.normed_bf, LX_BF16, m.I, m.update, LX_F32, D, T, s);
       }
+      // The mixer writes the streams, which the routing side reads: order its read first.
+      if (beside) check(lx_rt_stream_wait(s, m.route_read), "stream wait");
       LX_CHECK(lx_mhc_write(m.mixed, mc + S * S + S, m.update, m.streams, T, S, D, s));
 
       // latent mixture of experts
