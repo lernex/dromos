@@ -14,6 +14,13 @@ import torch
 from conftest import BF16, DTYPE, F32, close
 from formats import W_BF16, random_weight
 
+
+@pytest.fixture(autouse=True)
+def _needs_skinny(lx):
+    """Skip on a backend without the skinny GEMM: it is CUDA's alone, and lx_gemm covers these shapes elsewhere."""
+    if not hasattr(lx.lib, "lx_gemm_skinny"):
+        pytest.skip("this backend has no skinny decode GEMM")
+
 # (N, K): the Logos and Praxis decode products the kernel covers (N a multiple of 32, K of 64).
 SHAPES = [
     (10304, 2048),
