@@ -240,6 +240,10 @@ struct MetisModel::Impl {
   // but 0) keeps the three kernels, for A/B.
   bool fused_mamba = false;
   int32_t* mamba_sync = nullptr;
+  // The router of a decode-sized step as one launch (lx_router_route), where the backend has it. router_ticket is the
+  // launch's block counter, kept zero by the kernel.
+  bool fused_router = false;
+  int32_t* router_ticket = nullptr;
 
   // The persisting L2 window of the decode (pin.h): its arena holds the hottest decode weights and, when asked,
   // the Mamba states. Declared last: its destructor clears the window after the graphs that read it are gone.
@@ -800,6 +804,9 @@ MetisModel::MetisModel(const MetisConfig& c, const ModelWeights& weights, const 
                   lx_mamba_decode_step(nullptr, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
                                        nullptr, nullptr, 0.0f, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0, nullptr) == 0;
   if (m.fused_mamba) m.mamba_sync = m.alloc<int32_t>(static_cast<size_t>(max_tokens) * m.G);
+  // lx_router_route's bounds: up to 1024 experts, up to 32 picks among them, and a K of at most eight 256-thread chunks.
+  m.fused_router = lx::dispatch::has("lx_router_route") && m.E <= 1024 && m.K <= 32 && m.K <= m.E && m.Lat + m.R <= 2048;
+  if (m.fused_router) m.router_ticket = m.alloc<int32_t>(1);
 
   size_t unpack_experts = 0;  // the bf16 bytes of an expert layer's BF16X stacks, expanded for prefill
   for (int i = 0; i < m.L_layers; ++i) {
@@ -2058,9 +2065,20 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
       if (beside) check(lx_rt_stream_wait(s, m.route_join), "stream wait");
       // the latent's bf16 copy, and the features into the router's input (one launch)
       LX_CHECK(lx_pack_router(m.router_in, m.latent_bf, m.features, Lat, R, T, s));
-      gemm_f32(m.router_in, Lat + R, layer.router_w, layer.router_b, m.router_logits, E, T, E, Lat + R, s);
-      LX_CHECK(lx_moe_route(m.router_logits, layer.selection_bias, m.route_ids, m.route_w, m.entropy, m.confidence, T,
-                            E, m.K, s));
+      // A single-stream decode step (one token, not speculative). The fused router reads the whole input for every
+      // expert's block, so its extra reads grow with the rows: one stream measured a win against 8969e59 (int8 31
+      // us/token, bf16 19, logos 23), and eight streams lost on an older base, so it stays off there. Larger decode
+      // steps and prefill and verify keep the two calls.
+      if (m.fused_router && !spec && T == n_seq && T == 1) {
+        // the router's GEMV and its routing in one launch: the same logits, ids, weights, entropy and confidence
+        LX_CHECK(lx_router_route(m.router_in, Lat + R, layer.router_w, layer.router_b, m.router_logits,
+                                 layer.selection_bias, m.route_ids, m.route_w, m.entropy, m.confidence, m.router_ticket,
+                                 T, E, Lat + R, m.K, s));
+      } else {
+        gemm_f32(m.router_in, Lat + R, layer.router_w, layer.router_b, m.router_logits, E, T, E, Lat + R, s);
+        LX_CHECK(lx_moe_route(m.router_logits, layer.selection_bias, m.route_ids, m.route_w, m.entropy, m.confidence, T,
+                              E, m.K, s));
+      }
       const bool census_step = m.census && T == n_seq;  // a decode step: one token per stream
       if (m.route_trace || census_step) {
         std::vector<int32_t> ids(static_cast<size_t>(T) * m.K);

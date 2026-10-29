@@ -12,6 +12,7 @@
 // The scratch comes from cudaMallocAsync on the caller's stream: kernels.h has no workspace
 // argument, and stream-ordered allocation keeps the buffer valid under graph capture.
 #include "cuda/common.cuh"
+#include "cuda/route.cuh"
 
 namespace {
 
@@ -20,7 +21,7 @@ using bf16 = __nv_bfloat16;
 constexpr int kThreads = 256;                   // expert kernels: 8 warps per block
 constexpr int kWarps = kThreads / 32;
 constexpr int kRouteWarps = 4;                  // route kernel: one token per warp, 4 per block
-constexpr int kMaxTopK = 32;                    // route keeps one pick per lane of its warp
+constexpr int kMaxTopK = lx::route::kMaxTopK;   // route keeps one pick per lane of its warp
 constexpr size_t kMaxSmem = 48 * 1024;          // default dynamic shared memory limit
 
 // Eight bf16 values in one 16-byte load.
@@ -50,7 +51,8 @@ __device__ __forceinline__ float warp_dot(const bf16* row, const bf16* x, int n,
   return lx::warp_sum(acc);
 }
 
-// Routing: softmax statistics, then the top-k picks, then the weights over the picks.
+// Routing: softmax statistics, then the top-k picks, then the weights over the picks. One warp per token; the per-row
+// arithmetic lives in lx::route (route.cuh), shared with the router's fused epilogue.
 __global__ void moe_route_kernel(const float* __restrict__ logits, const float* __restrict__ bias,
                                  int32_t* __restrict__ ids, float* __restrict__ weights,
                                  float* __restrict__ entropy, float* __restrict__ confidence, int T, int E,
@@ -62,64 +64,74 @@ __global__ void moe_route_kernel(const float* __restrict__ logits, const float* 
   const int t = blockIdx.x * kRouteWarps + warp;
   if (t >= T) return;  // whole warp returns together, so the shuffles below stay full-warp
   const float* row = logits + static_cast<int64_t>(t) * E;
+  lx::route::row_stats(row, E, lane, entropy + t, confidence + t);
+  lx::route::row_picks(row, bias, E, lane, top_k, picked[warp]);
+  lx::route::row_weights(row, picked[warp], top_k, lane, ids + static_cast<int64_t>(t) * top_k,
+                         weights + static_cast<int64_t>(t) * top_k);
+}
 
-  // Three passes over the logits: max, normaliser z, entropy. The largest probability is
-  // exp(0) / z, so confidence is 1 / z with no second pass.
-  float m = -INFINITY;
-  for (int i = lane; i < E; i += 32) m = fmaxf(m, row[i]);
-  m = lx::warp_max(m);
-  float z = 0.0f;
-  for (int i = lane; i < E; i += 32) z += expf(row[i] - m);
-  z = lx::warp_sum(z);
-  float h = 0.0f;
-  for (int i = lane; i < E; i += 32) {
-    const float p = expf(row[i] - m) / z;
-    h -= p * logf(fmaxf(p, 1e-9f));
-  }
-  h = lx::warp_sum(h);
+// The router's GEMV and its routing in one launch (decode-sized steps: M <= 8 rows). Block n computes logit n of every
+// row, with the GEMV's partials and warp reduction as lx_spec_gemv_f32 has them, and writes it to logits [M, E]. The
+// last block to finish (a counter, as the thread-fence reductions elsewhere in the tree) stages the logits in shared
+// memory and routes them with moe_route's arithmetic. For M <= 4 each row has two warps: warp 2r makes the statistics
+// (entropy, confidence) and warp 2r + 1 the picks and weights. Above that one warp routes a row whole.
+constexpr int kRouterThreads = 256;  // the GEMV's block: 8 warps
+constexpr int kRouterRows = 8;       // decode-sized steps, as lx_spec_gemv_f32
+constexpr int kRouterMaxE = 1024;    // the epilogue stages M * E logits in shared memory
+
+template <int J>
+__global__ void __launch_bounds__(kRouterThreads) router_route_kernel(
+    const float* __restrict__ x, int ld_x, const float* __restrict__ w, const float* __restrict__ bias,
+    float* __restrict__ logits, const float* __restrict__ selection_bias, int32_t* __restrict__ ids,
+    float* __restrict__ weights, float* __restrict__ entropy, float* __restrict__ confidence,
+    int32_t* __restrict__ ticket, int M, int K, int top_k) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
+  __shared__ float part[kRouterThreads / 32][kRouterRows];
+  __shared__ float rows[kRouterRows][kRouterMaxE];
+  __shared__ int picked[kRouterRows][kMaxTopK];
+  __shared__ int last;
+  const int E = gridDim.x;
+  const int n = blockIdx.x;
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+
+  float acc[kRouterRows];
+  lx::route::gemv_partials<J, kRouterRows>(x, ld_x, w + static_cast<int64_t>(n) * K, M, K, threadIdx.x, acc);
+#pragma unroll
+  for (int m = 0; m < kRouterRows; ++m) acc[m] = lx::warp_sum(acc[m]);
   if (lane == 0) {
-    entropy[t] = h;
-    confidence[t] = 1.0f / z;
+#pragma unroll
+    for (int m = 0; m < kRouterRows; ++m) part[warp][m] = acc[m];
   }
-
-  // Each round, every lane scans its strided slice for the best expert not yet picked, then the
-  // warp reduces to one winner. The (value, lower index) order makes ties deterministic.
-  int* pick = picked[warp];
-  for (int r = 0; r < top_k; ++r) {
-    float best = -INFINITY;
-    int best_i = E;
-    for (int i = lane; i < E; i += 32) {
-      bool taken = false;
-      for (int j = 0; j < r; ++j) taken |= pick[j] == i;
-      if (taken) continue;
-      const float v = row[i] + (bias ? bias[i] : 0.0f);
-      if (v > best || (v == best && i < best_i)) {
-        best = v;
-        best_i = i;
-      }
-    }
-    for (int o = 16; o > 0; o >>= 1) {
-      const float ov = __shfl_xor_sync(0xffffffffu, best, o);
-      const int oi = __shfl_xor_sync(0xffffffffu, best_i, o);
-      if (ov > best || (ov == best && oi < best_i)) {
-        best = ov;
-        best_i = oi;
-      }
-    }
-    if (lane == 0) pick[r] = best_i;
-    __syncwarp();
+  __syncthreads();
+  if (threadIdx.x < M) {
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kRouterThreads / 32; ++i) sum += part[i][threadIdx.x];
+    if (bias) sum += bias[n];
+    logits[threadIdx.x * E + n] = sum;
   }
+  // Publish this block's logits, then count it. The block that counts the last one routes every row.
+  __threadfence();
+  __syncthreads();
+  if (threadIdx.x == 0) last = atomicAdd(ticket, 1) == E - 1;
+  __syncthreads();
+  if (!last) return;
 
-  // Weights: softmax over the picks of their unbiased logits. Lane j holds pick j.
-  const bool live = lane < top_k;
-  const int id = live ? pick[lane] : 0;
-  const float l = live ? row[id] : -INFINITY;
-  const float lmax = lx::warp_max(l);
-  const float e = live ? expf(l - lmax) : 0.0f;
-  const float esum = lx::warp_sum(e);
-  if (live) {
-    ids[static_cast<int64_t>(t) * top_k + lane] = id;
-    weights[static_cast<int64_t>(t) * top_k + lane] = e / esum;
+  __threadfence();
+  if (threadIdx.x == 0) *ticket = 0;  // the counter is back at zero for the next router
+  for (int i = threadIdx.x; i < M * E; i += kRouterThreads) rows[i / E][i % E] = __ldcg(logits + i);
+  __syncthreads();
+  const bool paired = M <= kRouterRows / 2;
+  const int r = paired ? warp >> 1 : warp;
+  if (r < M) {
+    const float* row = rows[r];
+    if (!paired || (warp & 1) == 0) lx::route::row_stats(row, E, lane, entropy + r, confidence + r);
+    if (!paired || (warp & 1) == 1) {
+      lx::route::row_picks(row, selection_bias, E, lane, top_k, picked[r]);
+      lx::route::row_weights(row, picked[r], top_k, lane, ids + static_cast<int64_t>(r) * top_k,
+                             weights + static_cast<int64_t>(r) * top_k);
+    }
   }
 }
 
@@ -219,6 +231,36 @@ extern "C" int lx_moe_route(const float* logits, const float* selection_bias, in
   if (top_k < 1 || top_k > kMaxTopK || top_k > E) return static_cast<int>(cudaErrorInvalidValue);
   auto s = static_cast<cudaStream_t>(stream);
   lx::launch_pdl(moe_route_kernel, (T + kRouteWarps - 1) / kRouteWarps, kRouteWarps * 32, 0, s, logits, selection_bias, ids, weights, entropy, confidence, T, E, top_k);
+  return lx::launch_status();
+}
+
+namespace {
+template <int J, typename... A>
+void launch_router_route(dim3 grid, cudaStream_t s, A... args) {
+  lx::launch_pdl(router_route_kernel<J>, grid, dim3(kRouterThreads), 0, s, args...);
+}
+}  // namespace
+
+extern "C" int lx_router_route(const float* x, int ld_x, const float* w, const float* bias, float* logits,
+                               const float* selection_bias, int32_t* ids, float* weights, float* entropy,
+                               float* confidence, int32_t* ticket, int M, int E, int K, int top_k, void* stream) {
+  if (M <= 0) return 0;
+  if (M > kRouterRows || E <= 0 || E > kRouterMaxE || K <= 0 || ld_x < K || top_k < 1 || top_k > kMaxTopK ||
+      top_k > E || !x || !w || !logits || !ids || !weights || !entropy || !confidence || !ticket)
+    return static_cast<int>(cudaErrorInvalidValue);
+  const dim3 grid(E);
+  auto s = static_cast<cudaStream_t>(stream);
+  switch ((K + kRouterThreads - 1) / kRouterThreads) {
+    case 1: launch_router_route<1>(grid, s, x, ld_x, w, bias, logits, selection_bias, ids, weights, entropy, confidence, ticket, M, K, top_k); break;
+    case 2: launch_router_route<2>(grid, s, x, ld_x, w, bias, logits, selection_bias, ids, weights, entropy, confidence, ticket, M, K, top_k); break;
+    case 3: launch_router_route<3>(grid, s, x, ld_x, w, bias, logits, selection_bias, ids, weights, entropy, confidence, ticket, M, K, top_k); break;
+    case 4: launch_router_route<4>(grid, s, x, ld_x, w, bias, logits, selection_bias, ids, weights, entropy, confidence, ticket, M, K, top_k); break;
+    case 5: launch_router_route<5>(grid, s, x, ld_x, w, bias, logits, selection_bias, ids, weights, entropy, confidence, ticket, M, K, top_k); break;
+    case 6: launch_router_route<6>(grid, s, x, ld_x, w, bias, logits, selection_bias, ids, weights, entropy, confidence, ticket, M, K, top_k); break;
+    case 7: launch_router_route<7>(grid, s, x, ld_x, w, bias, logits, selection_bias, ids, weights, entropy, confidence, ticket, M, K, top_k); break;
+    case 8: launch_router_route<8>(grid, s, x, ld_x, w, bias, logits, selection_bias, ids, weights, entropy, confidence, ticket, M, K, top_k); break;
+    default: return static_cast<int>(cudaErrorInvalidValue);
+  }
   return lx::launch_status();
 }
 

@@ -36,9 +36,10 @@ inline bool has(const char* symbol) {
 // Whether a backend may leave symbol out without that being a gap: host code checks has() before it calls one of
 // these, and falls back to a path every backend exports. They are CUDA's alone: the persistent decode program
 // (lx_program_*, opt-in with LX_PROGRAM, else the step runs kernel by kernel) and the skinny decode GEMM
-// (lx_gemm_skinny, else lx_gemm). doctor does not list them as missing.
+// (lx_gemm_skinny, else lx_gemm), and the router's fused GEMV and routing (lx_router_route, else lx_spec_gemv_f32 and
+// lx_moe_route). doctor does not list them as missing.
 inline bool optional(const std::string& symbol) {
-  return symbol.rfind("lx_program_", 0) == 0 || symbol == "lx_gemm_skinny";
+  return symbol.rfind("lx_program_", 0) == 0 || symbol == "lx_gemm_skinny" || symbol == "lx_router_route";
 }
 
 // The last message about a missing symbol ("backend CUDA lacks lx_x"), or "" when there was none.

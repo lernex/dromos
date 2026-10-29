@@ -204,6 +204,15 @@ LX_API int lx_attention_varlen(const float* qkv, int ld_qkv, void* k_cache, void
 LX_API int lx_moe_route(const float* logits, const float* selection_bias, int32_t* ids, float* weights,
                         float* entropy, float* confidence, int T, int E, int top_k, void* stream);
 
+// The router of a decode-sized step (M <= 8 rows, E <= 1024 experts, K <= 2048) in one launch: logits[M, E] =
+// x[M, K] @ w[E, K]^T + bias, summed as lx_spec_gemv_f32 sums it, then the routing of lx_moe_route on those logits.
+// Every output (logits, ids, weights, entropy, confidence) is bit-identical to the two calls. ticket is one int32 word,
+// zeroed when the model allocates it; the call leaves it zeroed again. CUDA only: hosts check
+// lx::dispatch::has("lx_router_route") and fall back to the two calls.
+LX_API int lx_router_route(const float* x, int ld_x, const float* w, const float* bias, float* logits,
+                           const float* selection_bias, int32_t* ids, float* weights, float* entropy, float* confidence,
+                           int32_t* ticket, int M, int E, int K, int top_k, void* stream);
+
 // Routed experts on the latent:  out[t, :] = sum_k weights[t, k] * expert(ids[t, k], latent[t, :])
 //   expert(e, x) = down[e] @ (silu(gate_up[e][:I] @ x) * (gate_up[e][I:] @ x))
 // latent bf16 [T, L]; gate_up bf16 [E, 2I, L]; down bf16 [E, L, I]; out f32 [T, L]

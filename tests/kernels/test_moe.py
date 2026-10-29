@@ -12,7 +12,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from conftest import DEVICE, close
+from conftest import BACKEND, DEVICE, close
 
 METIS_E = [128, 192]
 TOP_K = 4
@@ -243,3 +243,43 @@ def test_moe_summary_history_small_odd(lx, T, E, R, top_k):
     lx("moe_summary_history", ids, weights, emb, summary, history, 0.5, 0.5, T, R, top_k)
     assert torch.equal(summary, summary_ref)
     assert torch.equal(history, history_ref)
+
+
+# ---- The router's fused launch ------------------------------------------------------------------
+
+
+def bits(t):
+    """The float32 bit patterns of t, so that equal means identical bits (and -0 is not +0)."""
+    return t.contiguous().view(torch.int32)
+
+
+@pytest.mark.skipif(BACKEND != "cuda", reason="lx_router_route is CUDA's fast path; hosts fall back elsewhere")
+@pytest.mark.parametrize("E,K,top_k", [(128, 1280, 4), (192, 1280, 4), (128, 1000, 4), (64, 300, 8)])
+def test_router_route_is_the_two_calls_bit_for_bit(lx, E, K, top_k):
+    """lx_router_route == lx_spec_gemv_f32 then lx_moe_route, for every row count a decode-sized step has."""
+    torch.manual_seed(1)
+    ld_x = K + 3
+    w = torch.randn(E, K, device=DEVICE) * 0.05
+    bias = torch.randn(E, device=DEVICE)
+    sel = torch.randn(E, device=DEVICE) * 0.3
+    ticket = torch.zeros(1, dtype=torch.int32, device=DEVICE)
+    for M in range(1, 9):
+        x = torch.randn(M, ld_x, device=DEVICE)
+        for b, s in ((bias, sel), (None, None)):
+            logits = torch.full((M, E), float("nan"), device=DEVICE)
+            ids = torch.full((M, top_k), -7, dtype=torch.int32, device=DEVICE)
+            weights = torch.full((M, top_k), float("nan"), device=DEVICE)
+            entropy = torch.full((M,), float("nan"), device=DEVICE)
+            confidence = torch.full((M,), float("nan"), device=DEVICE)
+            lx("router_route", x, ld_x, w, b, logits, s, ids, weights, entropy, confidence, ticket, M, E, K, top_k)
+            assert int(ticket) == 0, "the launch must leave its counter at zero"
+
+            want_logits = torch.full((M, E), float("nan"), device=DEVICE)
+            lx("spec_gemv_f32", x, ld_x, w, b, want_logits, E, M, E, K)
+            want_ids, want_w, want_ent, want_conf = run_route(lx, want_logits, s, top_k)
+            assert torch.equal(bits(logits), bits(want_logits)), f"logits differ, M = {M}"
+            assert torch.equal(ids, want_ids), f"ids differ, M = {M}"
+            assert torch.equal(bits(weights), bits(want_w)), f"weights differ, M = {M}"
+            assert torch.equal(bits(entropy), bits(want_ent)), f"entropy differs, M = {M}"
+            assert torch.equal(bits(confidence), bits(want_conf)), f"confidence differs, M = {M}"
+
