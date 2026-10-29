@@ -88,6 +88,7 @@ int cmd_serve(int argc, char** argv) {
 #endif
 
   for (const std::string& note : plan.notes) std::fprintf(stderr, "%s\n", note.c_str());
+  if (!engine.speculation_note().empty()) std::fprintf(stderr, "%s\n", engine.speculation_note().c_str());
   if (!engine.placement().empty()) std::fprintf(stderr, "%s", engine.placement().c_str());
   std::fprintf(stderr, "Serving %s on http://%s:%d/v1  (Ctrl-C to stop)\n", name.c_str(), host.c_str(), port);
   const bool ok = server.run();

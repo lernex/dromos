@@ -153,6 +153,9 @@ class Engine {
   const Plan& plan() const { return plan_; }
   // Where an offloaded plan's experts live, in lines (empty for a resident plan).
   const std::string& placement() const;
+  // One line for serve to print at startup: why speculation is off, or what it does while on. Empty when there is nothing
+  // to say.
+  const std::string& speculation_note() const;
   // What one decode step moves through memory at `context` cache positions per stream, in this engine's formats
   // (model/traffic.h). The roofline's numerator; an offloaded plan's experts are counted where they are not resident.
   lx::DecodeTraffic decode_traffic(int context) const;

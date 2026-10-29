@@ -153,6 +153,10 @@ struct Engine::Impl {
     }
     if (options.speculate && !plan.offload.enabled && model->max_verify_tokens() > 1)
       spec = std::make_unique<SpecDecoder>(*model);
+    if (!options.speculate) speculation_note = "speculation off: --no-spec";
+    else if (plan.offload.enabled) speculation_note = "speculation off: experts are offloaded";
+    else if (!spec) speculation_note = "speculation off: this model has no verify step";
+    else speculation_note = "speculation on: a lone stream verifies drafts; with several streams decoding, steps are plain";
 #ifdef LX_SLOT_STATE
     if (options.prefix_cache && plan.prefix_device_bytes + plan.prefix_host_bytes > 0)
       cache = std::make_unique<PrefixCache>(plan.prefix_device_bytes, plan.prefix_host_bytes, stream);
@@ -235,6 +239,7 @@ struct Engine::Impl {
   std::unique_ptr<lx::MetisModel> model;                   // declared after both, so it is destroyed first
   std::unique_ptr<SpecDecoder> spec;                       // verify steps of a lone stream; null when speculation is off
   std::string placement;                                   // where the offloaded experts live, or ""
+  std::string speculation_note;                            // why speculation is off, or what it does (speculation_note())
   std::unique_ptr<PrefixCache> cache;  // null when prefix reuse is off or the model lacks slot state
   std::vector<std::string> token_texts;  // every token's text, for the tool grammar's masks
   std::unique_ptr<VocabIndex> vocab_index;  // every token's raw bytes as a trie, for the JSON grammar
@@ -301,6 +306,7 @@ const lx::text::Tokenizer* Engine::tokenizer() const { return impl_->tokenizer.g
 double Engine::now() const { return impl_->now(); }
 
 const std::string& Engine::placement() const { return impl_->placement; }
+const std::string& Engine::speculation_note() const { return impl_->speculation_note; }
 
 lx::DecodeTraffic Engine::decode_traffic(int context) const { return impl_->model->decode_traffic(context); }
 void Engine::set_expert_census(bool on) { impl_->model->set_expert_census(on); }
