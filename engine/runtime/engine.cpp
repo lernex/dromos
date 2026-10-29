@@ -737,7 +737,7 @@ bool Engine::Impl::accept(const std::shared_ptr<Sequence>& s, int32_t token, flo
   return false;
 }
 
-// A decoding sequence may verify drafts: it has its first token, and nothing it asks for needs logprobs or a grammar.
+// A decoding sequence may verify drafts: it has its first token, and nothing it asks for needs a grammar.
 // Its penalties are judged row by row by the verify step, as the plain sampler judges them (SpecDecoder::verify).
 // A constrained row never speculates: a verify step has no grammar mask, so a draft the schema forbids would be
 // accepted or rejected by the target alone. Constrained rows (q.json for response_format, q.grammar for tool calls)
@@ -746,7 +746,7 @@ bool Engine::Impl::spec_eligible(const std::shared_ptr<Sequence>& s) const {
   if (!spec) return false;
   const Sequence& q = *s;
   const SamplingParams& sp = q.request.sampling;
-  return q.has_pending && !q.ended && !q.cancelled && !q.grammar && !q.json && !sp.logprobs &&
+  return q.has_pending && !q.ended && !q.cancelled && !q.grammar && !q.json &&
          q.prompt_fed == static_cast<int>(q.request.prompt.size());
 }
 
@@ -793,7 +793,12 @@ bool Engine::Impl::spec_step(const std::shared_ptr<Sequence>& s) {
                                               : SpecCounts{};
   int accepted = 0;
   int32_t next = 0;
-  spec->verify(q.slot, config, step, draft.q, r.position, counts, accepted, next, stream);
+  // The step's emitted tokens carry the logprobs the plain path would report, when the request asks for them.
+  config.logprobs = sp.logprobs;
+  config.top_logprobs = sp.top_logprobs;
+  SpecLogprobs report;
+  spec->verify(q.slot, config, step, draft.q, r.position, counts, accepted, next, stream,
+               sp.logprobs ? &report : nullptr);
   q.drafter->observe(accepted, next, stream);
   s->spec_steps += 1;
   s->spec_drafted += static_cast<int>(draft.tokens.size());
@@ -806,12 +811,31 @@ bool Engine::Impl::spec_step(const std::shared_ptr<Sequence>& s) {
     stats.spec_drafted += draft.tokens.size();
     stats.spec_accepted += static_cast<uint64_t>(accepted);
   }
-  for (int j = 1; j <= accepted; ++j)
-    if (accept(s, step[static_cast<size_t>(j)], 0.0f, nullptr, nullptr, 0, /*feed=*/false)) {
+  // Emitted token k was predicted by row k: the drafts' rows, then the final token's.
+  auto row_logprob = [&](size_t k, const int32_t** ids, const float** lp) {
+    *ids = nullptr;
+    *lp = nullptr;
+    if (!sp.logprobs) return 0.0f;
+    const size_t top = static_cast<size_t>(report.top_n);
+    if (report.top_n > 0) {
+      *ids = report.top_ids.data() + k * top;
+      *lp = report.top_lp.data() + k * top;
+    }
+    return report.token[k];
+  };
+  for (int j = 1; j <= accepted; ++j) {
+    const int32_t* ids;
+    const float* lp;
+    const float value = row_logprob(static_cast<size_t>(j - 1), &ids, &lp);
+    if (accept(s, step[static_cast<size_t>(j)], value, ids, lp, report.top_n, /*feed=*/false)) {
       retire(s);
       return true;
     }
-  if (accept(s, next, 0.0f, nullptr, nullptr, 0, /*feed=*/true)) retire(s);
+  }
+  const int32_t* ids;
+  const float* lp;
+  const float value = row_logprob(static_cast<size_t>(accepted), &ids, &lp);
+  if (accept(s, next, value, ids, lp, report.top_n, /*feed=*/true)) retire(s);
   return true;
 }
 

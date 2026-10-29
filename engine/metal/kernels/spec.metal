@@ -584,3 +584,41 @@ kernel void spec_block_attention(constant SpecBlockAttnArgs& a [[buffer(0)]], th
     a.out[long(b) * a.ld_out + h * Dh + tid] = sum / z_run;
   }
 }
+
+// lx_spec_logprobs: one threadgroup per verify row, on its raw logits (before the penalties). The steps are sample's
+// step 7 (sampler.metal), so a verify row reports the plain step's numbers at its position.
+kernel void spec_logprobs(constant SpecLogprobsArgs& a [[buffer(0)]], uint r [[threadgroup_position_in_grid]],
+                          uint tid [[thread_index_in_threadgroup]], uint threads [[threads_per_threadgroup]]) {
+  threadgroup SampleShared sh;
+  const int V = a.V;
+  const int token = a.tokens[r];
+  device const float* l = a.logits + long(r) * V;
+  float raw_max = -INFINITY;
+  for (int e = tid; e < V; e += threads) raw_max = max(raw_max, l[e]);
+  raw_max = group_max(raw_max, sh.keep.red, tid, threads);
+  float raw_sum = 0.0f;
+  for (int e = tid; e < V; e += threads) raw_sum += exp(l[e] - raw_max);
+  const float lse = raw_max + log(group_sum(raw_sum, sh.keep.red, tid, threads));
+  if (a.want_token && tid == 0) a.token_lp[r] = l[token] - lse;
+  for (int j = 0; j < a.top_n; ++j) {
+    float best = -INFINITY;
+    int best_i = 0x7fffffff;
+    for (int e = tid; e < V; e += threads) {
+      bool taken = false;
+      for (int c = 0; c < j; ++c) taken |= sh.chosen[c] == e;
+      if (!taken && l[e] > best) {
+        best = l[e];
+        best_i = e;
+      }
+    }
+    float bv;
+    int bi;
+    group_argmax(best, best_i, sh.keep.red, sh.redi, tid, threads, bv, bi);
+    if (tid == 0) {
+      sh.chosen[j] = bi;
+      a.top_tokens[long(r) * a.top_n + j] = bi;
+      a.top_logprobs[long(r) * a.top_n + j] = l[bi] - lse;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+}

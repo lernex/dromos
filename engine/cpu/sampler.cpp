@@ -394,6 +394,23 @@ int lx_mask_logits(float* logits, int V, const int32_t* rows, const uint32_t* bi
   return kOk;
 }
 
+int lx_spec_logprobs(const float* logits, int V, const int32_t* tokens, int rows, int top_n, float* token_lp,
+                     int32_t* top_tokens, float* top_logprobs, void* stream) {
+  LX_PROFILE("spec_logprobs");
+  (void)stream;
+  if (rows < 0 || top_n < 0 || top_n > kMaxTopN || top_n > V) return fail(kInvalid);
+  if (rows == 0) return kOk;
+  if (V <= 0 || V > kMaxVocab || !logits || !tokens) return fail(kInvalid);
+  if (top_n > 0 && (!top_tokens || !top_logprobs)) return fail(kInvalid);
+  // The same scan lx_sample runs for its report (raw_logprobs), one row after another.
+  std::vector<float> scratch(static_cast<size_t>(V));
+  for (int r = 0; r < rows; ++r)
+    raw_logprobs(logits + static_cast<int64_t>(r) * V, V, tokens[r], top_n, scratch.data(),
+                 token_lp ? token_lp + r : nullptr, top_n > 0 ? top_tokens + static_cast<int64_t>(r) * top_n : nullptr,
+                 top_n > 0 ? top_logprobs + static_cast<int64_t>(r) * top_n : nullptr);
+  return kOk;
+}
+
 int lx_spec_penalize(float* logits, int V, lx_spec_penalty pen, const int32_t* tokens, int rows, const int32_t* seen,
                      const int32_t* out_counts, void* stream) {
   LX_PROFILE("spec_penalize");

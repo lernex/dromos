@@ -659,3 +659,26 @@ def test_spec_penalize_rows_are_plain_penalties_after_their_drafts(lx, V, rep, p
               "presence_penalty": pres, "frequency_penalty": freq}],
         )
         assert picked[0] == int(torch.argmax(got[r])), f"row {r}: the plain sampler's pick is not the penalised argmax"
+
+
+@pytest.mark.parametrize("V", [257, 4099])
+def test_spec_logprobs_are_the_plain_report_bit_for_bit(lx, V):
+    """lx_spec_logprobs over verify rows reports what lx_sample reports for the same raw logits: the chosen token's
+    log-probability and the top-n list, bit for bit, since both run the same arithmetic on the same rows."""
+    torch.manual_seed(V)
+    rows = 4
+    logits = (torch.randn(rows, V, device="cuda") * 3).float()
+    sampler = Sampler(lx, V, rows)
+    for s in range(rows):
+        sampler.reset(s)
+    specs = [dict(slot=s, row=s, temperature=0.0) for s in range(rows)]
+    tokens, lp, top_ids, top_lp = sampler.sample(logits, specs, top_n=5)
+    tok = torch.as_tensor(tokens, device="cuda", dtype=torch.int32)
+    got_lp = torch.empty(rows, device="cuda", dtype=torch.float32)
+    got_ids = torch.empty(rows, 5, device="cuda", dtype=torch.int32)
+    got_top = torch.empty(rows, 5, device="cuda", dtype=torch.float32)
+    lx("spec_logprobs", logits, V, tok, rows, 5, got_lp, got_ids, got_top)
+    as_cpu = lambda x: x.cpu() if torch.is_tensor(x) else torch.as_tensor(x)
+    assert as_cpu(top_ids).tolist() == got_ids.cpu().tolist()
+    assert torch.equal(as_cpu(lp).float(), got_lp.cpu())
+    assert torch.equal(as_cpu(top_lp).float(), got_top.cpu())

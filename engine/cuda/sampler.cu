@@ -96,6 +96,55 @@ struct Shared {
   float max_scaled;
 };
 
+// The log-probabilities of the raw logits l: the chosen token's (token_lp) and the top_n most likely, largest first,
+// ties to the lower index (top_tokens, top_logprobs). This is step 7 of sample_kernel, shared with lx_spec_logprobs, so a
+// verify row reports the bits a plain step at its position does. Every thread of the block calls it. token_lp may be
+// null; top_tokens and top_logprobs must be set when top_n > 0.
+__device__ __forceinline__ void raw_logprobs_block(const float* l, int V, int token, int top_n, Shared& sh,
+                                                   float* token_lp, int32_t* top_tokens, float* top_logprobs) {
+  const int tid = threadIdx.x;
+  float raw_max = -INFINITY;
+  for (int e = tid; e < V; e += blockDim.x) raw_max = fmaxf(raw_max, l[e]);
+  raw_max = block_max(raw_max, sh.red);
+  float raw_sum = 0.0f;
+  for (int e = tid; e < V; e += blockDim.x) raw_sum += expf(l[e] - raw_max);
+  const float lse = raw_max + logf(lx::block_sum(raw_sum, sh.red));
+  if (token_lp != nullptr && tid == 0) *token_lp = l[token] - lse;
+
+  for (int j = 0; j < top_n; ++j) {
+    float best = -INFINITY;
+    int best_i = 0x7fffffff;
+    for (int e = tid; e < V; e += blockDim.x) {
+      bool taken = false;
+      for (int c = 0; c < j; ++c) taken |= sh.chosen[c] == e;
+      if (!taken && l[e] > best) best = l[e], best_i = e;
+    }
+    float bv;
+    int bi;
+    block_argmax(best, best_i, sh.red, sh.redi, bv, bi);
+    if (tid == 0) {
+      sh.chosen[j] = bi;
+      top_tokens[j] = bi;
+      top_logprobs[j] = l[bi] - lse;
+    }
+    __syncthreads();
+  }
+}
+
+// lx_spec_logprobs: one block per verify row, on that row's raw logits.
+__global__ void __launch_bounds__(kThreads) spec_logprobs_kernel(const float* __restrict__ logits, int V,
+                                                                 const int32_t* __restrict__ tokens, int top_n,
+                                                                 float* __restrict__ token_lp,
+                                                                 int32_t* __restrict__ top_tokens,
+                                                                 float* __restrict__ top_logprobs) {
+  __shared__ Shared sh;
+  const int r = blockIdx.x;
+  raw_logprobs_block(logits + static_cast<int64_t>(r) * V, V, tokens[r], top_n, sh,
+                     token_lp != nullptr ? token_lp + r : nullptr,
+                     top_n > 0 ? top_tokens + static_cast<int64_t>(r) * top_n : nullptr,
+                     top_n > 0 ? top_logprobs + static_cast<int64_t>(r) * top_n : nullptr);
+}
+
 // One sampling row. The buffers are indexed by the row's sampling index i (work) and by its slot
 // (seen, out_counts); logits by its row.
 __global__ void __launch_bounds__(kThreads) sample_kernel(const float* __restrict__ logits, int V,
@@ -313,32 +362,9 @@ __global__ void __launch_bounds__(kThreads) sample_kernel(const float* __restric
 
   // 7. Log-probabilities of the raw logits, for the chosen token and the top_n most likely.
   if (token_logprob != nullptr || top_n > 0) {
-    float raw_max = -INFINITY;
-    for (int e = tid; e < V; e += blockDim.x) raw_max = fmaxf(raw_max, l[e]);
-    raw_max = block_max(raw_max, sh.red);
-    float raw_sum = 0.0f;
-    for (int e = tid; e < V; e += blockDim.x) raw_sum += expf(l[e] - raw_max);
-    const float lse = raw_max + logf(lx::block_sum(raw_sum, sh.red));
-    if (token_logprob != nullptr && tid == 0) token_logprob[i] = l[token] - lse;
-
-    for (int j = 0; j < top_n; ++j) {
-      float best = -INFINITY;
-      int best_i = 0x7fffffff;
-      for (int e = tid; e < V; e += blockDim.x) {
-        bool taken = false;
-        for (int c = 0; c < j; ++c) taken |= sh.chosen[c] == e;
-        if (!taken && l[e] > best) best = l[e], best_i = e;
-      }
-      float bv;
-      int bi;
-      block_argmax(best, best_i, sh.red, sh.redi, bv, bi);
-      if (tid == 0) {
-        sh.chosen[j] = bi;
-        top_tokens[static_cast<int64_t>(i) * top_n + j] = bi;
-        top_logprobs[static_cast<int64_t>(i) * top_n + j] = l[bi] - lse;
-      }
-      __syncthreads();
-    }
+    raw_logprobs_block(l, V, token, top_n, sh, token_logprob != nullptr ? token_logprob + i : nullptr,
+                       top_n > 0 ? top_tokens + static_cast<int64_t>(i) * top_n : nullptr,
+                       top_n > 0 ? top_logprobs + static_cast<int64_t>(i) * top_n : nullptr);
   }
 
   // 8. The sequence's counts: the chosen token is now part of its output.
@@ -366,6 +392,17 @@ extern "C" int lx_sample(const float* logits, int V, const lx_sampling* rows, in
   auto s = static_cast<cudaStream_t>(stream);
   lx::launch_pdl(sample_kernel, n, kThreads, 0, s, logits, V, rows, seen, out_counts, work, tokens, token_logprob, top_n,
                                        top_tokens, top_logprobs);
+  return lx::launch_status();
+}
+
+extern "C" int lx_spec_logprobs(const float* logits, int V, const int32_t* tokens, int rows, int top_n,
+                                float* token_lp, int32_t* top_tokens, float* top_logprobs, void* stream) {
+  if (rows <= 0) return 0;
+  if (top_n < 0 || top_n > kMaxTopN || V <= 0 || V > (1 << 24) || !logits || !tokens)
+    return static_cast<int>(cudaErrorInvalidValue);
+  if (top_n > 0 && (!top_tokens || !top_logprobs)) return static_cast<int>(cudaErrorInvalidValue);
+  spec_logprobs_kernel<<<rows, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(logits, V, tokens, top_n, token_lp,
+                                                                                  top_tokens, top_logprobs);
   return lx::launch_status();
 }
 

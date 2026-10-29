@@ -147,6 +147,18 @@ struct SpecConfig {
   float repetition_penalty = 1.0f;
   float presence_penalty = 0.0f;
   float frequency_penalty = 0.0f;
+  // Log-probabilities of the emitted tokens (SpecLogprobs), with the top_logprobs most likely at each position.
+  bool logprobs = false;
+  int top_logprobs = 0;
+};
+
+// What a verify step reports for the tokens it emits: entry k is the token emitted at row k (the accepted drafts, then the
+// final token). The numbers are lx_spec_logprobs's over the raw logits, the plain step's own. Empty unless asked for.
+struct SpecLogprobs {
+  int top_n = 0;
+  std::vector<float> token;      // [emitted]
+  std::vector<int32_t> top_ids;  // [emitted, top_n]
+  std::vector<float> top_lp;     // [emitted, top_n]
 };
 
 // The sampler's count tables (kernels.h, lx_sampler_reset), whole: a verify step reads its sequence's slot for the
@@ -189,12 +201,12 @@ class SpecDecoder {
   // Penalties (config) judge each row as a plain step at its position would, from `counts`, which then count the
   // emitted tokens.
   void verify(int slot, const SpecConfig& config, const std::vector<int32_t>& step, const float* q, uint64_t position,
-              SpecCounts counts, int& accepted, int32_t& next, void* stream);
+              SpecCounts counts, int& accepted, int32_t& next, void* stream, SpecLogprobs* logprobs = nullptr);
 
  private:
   // Picks the step's tokens: accepted drafts and the final token. rows = 1 + drafts.
   void accept(const SpecConfig& config, const std::vector<int32_t>& step, const float* q, uint64_t position, int slot,
-              SpecCounts counts, int& accepted, int32_t& next, void* stream);
+              SpecCounts counts, int& accepted, int32_t& next, void* stream, SpecLogprobs* logprobs);
   // Adds tokens to a slot's counts: prompt tokens to seen, output tokens to both (lx_sampler_observe).
   void observe(SpecCounts counts, int slot, const int32_t* tokens, int n, bool is_output, void* stream);
 
@@ -208,6 +220,12 @@ class SpecDecoder {
   int32_t *d_seen_ = nullptr, *d_out_counts_ = nullptr;  // generate's own counts, slot 0
   int32_t* d_observed_ = nullptr;
   int observed_cap_ = 0;
+  // The logprob report (lx_spec_logprobs): the raw rows copied before the penalties, and the report's buffers.
+  float* raw_ = nullptr;
+  int32_t* d_emitted_ = nullptr;
+  float *d_lp_ = nullptr, *d_top_lp_ = nullptr;
+  int32_t* d_top_ids_ = nullptr;
+  int top_capacity_ = 0;
 };
 
 }  // namespace lx::runtime

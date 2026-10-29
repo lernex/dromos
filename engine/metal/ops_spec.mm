@@ -97,6 +97,21 @@ int lx_spec_penalize(float* logits, int V, lx_spec_penalty pen, const int32_t* t
   return k.launch(stream, a, size1(NSUInteger(rows)), size1(kThreads));
 }
 
+int lx_spec_logprobs(const float* logits, int V, const int32_t* tokens, int rows, int top_n, float* token_lp,
+                     int32_t* top_tokens, float* top_logprobs, void* stream) {
+  static Kernel k("spec_logprobs");
+  if (rows <= 0) return kOk;
+  if (V <= 0 || V > (1 << 24) || !logits || !tokens || top_n < 0 || top_n > 20) return kInvalidValue;
+  if (top_n > 0 && (!top_tokens || !top_logprobs)) return kInvalidValue;
+  SpecLogprobsArgs a{addr(stream, logits, size_t(rows) * V * 4),
+                     addr(stream, tokens, size_t(rows) * 4),
+                     token_lp ? addr_w(stream, token_lp, size_t(rows) * 4) : 0,
+                     top_n > 0 ? addr_w(stream, top_tokens, size_t(rows) * top_n * 4) : 0,
+                     top_n > 0 ? addr_w(stream, top_logprobs, size_t(rows) * top_n * 4) : 0,
+                     V, top_n, token_lp != nullptr ? 1 : 0};
+  return k.launch(stream, a, size1(NSUInteger(rows)), size1(kThreads));
+}
+
 int lx_spec_probs(const float* logits, int V, const lx_spec_filter* filters, int rows, float* probs, void* stream) {
   static Kernel k("spec_probs");
   if (rows <= 0) return kOk;

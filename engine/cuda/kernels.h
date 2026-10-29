@@ -832,6 +832,13 @@ typedef struct {
 LX_API int lx_spec_penalize(float* logits, int V, lx_spec_penalty pen, const int32_t* tokens, int rows,
                             const int32_t* seen, const int32_t* out_counts, void* stream);
 
+// The log-probabilities lx_sample reports (sampler.cu, step 7) for the rows of a verify step, read from logits [rows, V]
+// as they stand before the penalties. Row r gets the log-probability of tokens[r] in token_lp[r] (when non-null), and its
+// top_n most likely tokens, largest first, in top_tokens and top_logprobs ([rows, top_n]). The arithmetic is lx_sample's,
+// so a verify row reports the plain step's numbers at its position. Device pointers throughout.
+LX_API int lx_spec_logprobs(const float* logits, int V, const int32_t* tokens, int rows, int top_n, float* token_lp,
+                            int32_t* top_tokens, float* top_logprobs, void* stream);
+
 // Speculative sampling over a verify step. Sequence s fed tokens[cu[s] .. cu[s + 1] - 1]: its pending
 // token, then k_s drafts. Row cu[s] + j of p (from lx_spec_probs on the target's logits) is the
 // target's distribution after the step's first j + 1 tokens; row cu[s] + j of q is the drafter's

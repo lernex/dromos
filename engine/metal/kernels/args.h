@@ -442,6 +442,16 @@ struct SpecPenalizeArgs {
   float frequency_penalty;
   int V;
 };
+struct SpecLogprobsArgs {
+  LX_CPTR(float) logits;     // the rows' raw logits [rows, V], before the penalties
+  LX_CPTR(int) tokens;       // one token per row
+  LX_PTR(float) token_lp;    // [rows]: written when want_token
+  LX_PTR(int) top_tokens;    // [rows, top_n]
+  LX_PTR(float) top_logprobs;
+  int V;
+  int top_n;
+  int want_token;
+};
 struct SpecVerifyArgs {
   LX_CPTR(float) p;
   LX_CPTR(float) q;  // 0: the drafter proposes tokens outright

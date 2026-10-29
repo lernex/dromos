@@ -268,18 +268,27 @@ SpecDecoder::~SpecDecoder() {
   for (void* p : {static_cast<void*>(logits_), static_cast<void*>(probs_), static_cast<void*>(d_tokens_),
                   static_cast<void*>(d_cu_), static_cast<void*>(d_argmax_), static_cast<void*>(d_out_),
                   static_cast<void*>(d_filters_), static_cast<void*>(d_rng_), static_cast<void*>(d_seen_),
-                  static_cast<void*>(d_out_counts_), static_cast<void*>(d_observed_)})
+                  static_cast<void*>(d_out_counts_), static_cast<void*>(d_observed_), static_cast<void*>(raw_),
+                  static_cast<void*>(d_emitted_), static_cast<void*>(d_lp_), static_cast<void*>(d_top_lp_),
+                  static_cast<void*>(d_top_ids_)})
     lx_rt_free(p);
   lx_rt_host_free(h_out_);
 }
 
 void SpecDecoder::accept(const SpecConfig& config, const std::vector<int32_t>& step, const float* q,
-                         uint64_t position, int slot, SpecCounts counts, int& accepted, int32_t& next, void* s) {
+                         uint64_t position, int slot, SpecCounts counts, int& accepted, int32_t& next, void* s,
+                         SpecLogprobs* logprobs) {
   const int rows = static_cast<int>(step.size());
   const int V = target_.vocab_size();
   const int32_t cu[2] = {0, rows};
   LX_CHECK(lx_rt_copy(d_tokens_, step.data(), static_cast<int64_t>(sizeof(int32_t) * rows), LX_COPY_H2D, s));
   LX_CHECK(lx_rt_copy(d_cu_, cu, static_cast<int64_t>(sizeof(cu)), LX_COPY_H2D, s));
+  // The report is over the raw logits, so they are copied before the penalties (and the judgement) change them.
+  const bool report = logprobs != nullptr && config.logprobs;
+  if (report) {
+    if (!raw_) raw_ = device_alloc<float>(max_rows_ * static_cast<size_t>(V));
+    LX_CHECK(lx_rt_copy(raw_, logits_, static_cast<int64_t>(sizeof(float) * rows * V), LX_COPY_D2D, s));
+  }
   if (penalized(config)) {
     if (!counts.seen || !counts.out_counts) throw std::runtime_error("penalties need the sequence's sampler counts");
     // Row j sees the slot's counts plus the drafts before it: the penalised distribution a plain step at its position
@@ -300,6 +309,37 @@ void SpecDecoder::accept(const SpecConfig& config, const std::vector<int32_t>& s
   LX_CHECK(lx_rt_stream_sync(s));
   accepted = h_out_[0];
   next = h_out_[1];
+  if (report) {
+    // Row k of the raw copy predicts the token emitted at k: the accepted drafts, then the final token.
+    std::vector<int32_t> emitted(step.begin() + 1, step.begin() + 1 + accepted);
+    emitted.push_back(next);
+    const int n = static_cast<int>(emitted.size());
+    const int top_n = config.top_logprobs;
+    if (!d_emitted_) {
+      d_emitted_ = device_alloc<int32_t>(max_rows_);
+      d_lp_ = device_alloc<float>(max_rows_);
+    }
+    if (top_n > top_capacity_) {
+      lx_rt_free(d_top_ids_);
+      lx_rt_free(d_top_lp_);
+      d_top_ids_ = top_n > 0 ? device_alloc<int32_t>(max_rows_ * static_cast<size_t>(top_n)) : nullptr;
+      d_top_lp_ = top_n > 0 ? device_alloc<float>(max_rows_ * static_cast<size_t>(top_n)) : nullptr;
+      top_capacity_ = top_n;
+    }
+    LX_CHECK(lx_rt_copy(d_emitted_, emitted.data(), static_cast<int64_t>(sizeof(int32_t) * n), LX_COPY_H2D, s));
+    LX_CHECK(lx_spec_logprobs(raw_, V, d_emitted_, n, top_n, d_lp_, d_top_ids_, d_top_lp_, s));
+    logprobs->top_n = top_n;
+    logprobs->token.resize(static_cast<size_t>(n));
+    logprobs->top_ids.resize(static_cast<size_t>(n) * top_n);
+    logprobs->top_lp.resize(static_cast<size_t>(n) * top_n);
+    LX_CHECK(lx_rt_copy(logprobs->token.data(), d_lp_, static_cast<int64_t>(sizeof(float) * n), LX_COPY_D2H, s));
+    if (top_n > 0) {
+      LX_CHECK(lx_rt_copy(logprobs->top_ids.data(), d_top_ids_,
+                          static_cast<int64_t>(sizeof(int32_t) * n * top_n), LX_COPY_D2H, s));
+      LX_CHECK(lx_rt_copy(logprobs->top_lp.data(), d_top_lp_, static_cast<int64_t>(sizeof(float) * n * top_n), LX_COPY_D2H, s));
+    }
+    LX_CHECK(lx_rt_stream_sync(s));
+  }
   // The emitted tokens, the accepted drafts and the final one, are output: the sampler counts what it draws the
   // same way.
   if (counts.seen) {
@@ -324,7 +364,8 @@ void SpecDecoder::observe(SpecCounts counts, int slot, const int32_t* tokens, in
 }
 
 void SpecDecoder::verify(int slot, const SpecConfig& config, const std::vector<int32_t>& step, const float* q,
-                         uint64_t position, SpecCounts counts, int& accepted, int32_t& next, void* s) {
+                         uint64_t position, SpecCounts counts, int& accepted, int32_t& next, void* s,
+                         SpecLogprobs* logprobs) {
   const int rows = static_cast<int>(step.size());
   if (rows < 1 || rows > max_rows_)
     throw std::runtime_error("a verify step takes 1 to " + std::to_string(max_rows_) + " rows");
@@ -332,7 +373,7 @@ void SpecDecoder::verify(int slot, const SpecConfig& config, const std::vector<i
   const std::vector<lx_spec_filter> filters(rows, config.filter);
   LX_CHECK(lx_rt_copy(d_filters_, filters.data(), static_cast<int64_t>(sizeof(lx_spec_filter) * rows), LX_COPY_H2D, s));
   target_.forward_spec({step, {0, rows}, {slot}}, logits_, s);
-  accept(config, step, q, position, slot, counts, accepted, next, s);
+  accept(config, step, q, position, slot, counts, accepted, next, s, logprobs);
   target_.truncate(slot, before + accepted + 1);
 }
 
@@ -368,7 +409,7 @@ std::vector<int32_t> SpecDecoder::generate(Drafter* drafter, const std::vector<i
   }
   int accepted = 0;
   int32_t next = 0;
-  accept(config, {prompt.back()}, nullptr, 0, 0, counts, accepted, next, s);
+  accept(config, {prompt.back()}, nullptr, 0, 0, counts, accepted, next, s, nullptr);
   stats.prefill_s = std::chrono::duration<double>(Clock::now() - t0).count();
 
   std::vector<int32_t> context = prompt, out;
@@ -402,7 +443,7 @@ std::vector<int32_t> SpecDecoder::generate(Drafter* drafter, const std::vector<i
       target_.forward_spec(b, logits_, s);
     else
       target_.forward(b, logits_, false, s);
-    accept(config, step, draft.q, out.size(), 0, counts, accepted, next, s);
+    accept(config, step, draft.q, out.size(), 0, counts, accepted, next, s, nullptr);
     if (drafter && k > 0) target_.truncate(0, before + accepted + 1);
     if (F) {
       drafter->observe_features(target_.features(), accepted + 1, F, s);
