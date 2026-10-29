@@ -46,7 +46,8 @@ endif()
 #   -DLX_VERSION=X.Y.Z  the version. Without it, git describe --tags --match 'v*': vX.Y.Z is X.Y.Z, commits after a
 #                       tag are X.Y.Z-dev.N+gSHA, and an untagged checkout is 0.0.0-dev+SHA.
 #   -DLX_FLAVOR=NAME    the release flavor this build is packaged as, or source (the default).
-set(LX_FLAVORS source linux-x86_64-cuda12 linux-x86_64-cuda13 linux-x86_64-cpu linux-aarch64-cpu darwin-arm64)
+set(LX_FLAVORS source linux-x86_64-cuda12 linux-x86_64-cuda13 linux-x86_64-cpu linux-aarch64-cpu darwin-arm64
+    windows-x86_64-cpu windows-x86_64-cuda12)
 set(LX_FLAVOR "source" CACHE STRING "The release flavor: one of ${LX_FLAVORS}")
 set_property(CACHE LX_FLAVOR PROPERTY STRINGS ${LX_FLAVORS})
 if(NOT LX_FLAVOR IN_LIST LX_FLAVORS)
@@ -115,6 +116,51 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# Windows (MSVC; the CUDA backend through nvcc -ccbin cl). Sources are UTF-8, __cplusplus tells the truth, and the C
+# runtime keeps quiet about the POSIX names engine/platform/posix.h relies on. The C runtime is linked statically, so a
+# release runs on a Windows that has no Visual C++ redistributable. Every executable and DLL lands in the build
+# directory's top, where dromos.exe looks for its backends, as the install tree's bin\ does.
+if(WIN32)
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+  set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+  add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00 _CRT_SECURE_NO_WARNINGS
+                          _CRT_NONSTDC_NO_WARNINGS _USE_MATH_DEFINES)
+  if(MSVC)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/utf-8> $<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>
+                        $<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor> $<$<COMPILE_LANGUAGE:CXX>:/bigobj>)
+  endif()
+endif()
+
+# The version resource and manifest a Windows binary carries (engine/platform): TARGET's file name, its description,
+# and APP or DLL.
+function(lx_windows_binary target description kind)
+  if(NOT WIN32)
+    return()
+  endif()
+  string(REGEX MATCH "^([0-9]+)\\.([0-9]+)\\.([0-9]+)" _ "${LX_VERSION}")
+  set(LX_RC_VERSION "${CMAKE_MATCH_1},${CMAKE_MATCH_2},${CMAKE_MATCH_3},0")
+  set(LX_RC_DESCRIPTION "${description}")
+  set(LX_RC_NAME "${target}")
+  if(kind STREQUAL "APP")
+    set(LX_RC_FILETYPE "VFT_APP")
+    set(LX_RC_FILE "${target}.exe")
+    target_sources(${target} PRIVATE "${PROJECT_SOURCE_DIR}/engine/platform/dromos.manifest")
+  else()
+    set(LX_RC_FILETYPE "VFT_DLL")
+    set(LX_RC_FILE "${target}.dll")
+  endif()
+  configure_file("${PROJECT_SOURCE_DIR}/engine/platform/version.rc.in" "${CMAKE_BINARY_DIR}/generated/${target}.rc" @ONLY)
+  target_sources(${target} PRIVATE "${CMAKE_BINARY_DIR}/generated/${target}.rc")
+endfunction()
+
+# engine/platform: what differs between Linux, macOS and Windows (platform.h), and on Windows the POSIX calls its C
+# runtime lacks (posix.h, posix_win.cpp). The backends link it on Windows only, for those calls.
+add_library(dromos_platform STATIC engine/platform/platform.cpp)
+if(WIN32)
+  target_sources(dromos_platform PRIVATE engine/platform/posix_win.cpp)
+endif()
+target_include_directories(dromos_platform PUBLIC engine)
+
 # The static runtime for the Linux release builds: libstdc++ and libgcc are part of the binaries, so the release runs
 # on any distribution from the build base's glibc up. The backends hide what they link (their interface is C).
 # Each target gets them from the driver that links it. The CUDA kernels library is linked by the host C++ driver (g++),
@@ -158,7 +204,7 @@ add_custom_command(
 add_library(dromos_dispatch STATIC engine/dispatch/dispatch.cpp "${LX_DISPATCH_GEN}")
 target_include_directories(dromos_dispatch PUBLIC engine)
 target_compile_definitions(dromos_dispatch PRIVATE "LX_INSTALL_LIBDIR=\"${LX_INSTALL_LIBDIR}\"")
-target_link_libraries(dromos_dispatch PUBLIC ${CMAKE_DL_LIBS})
+target_link_libraries(dromos_dispatch PUBLIC dromos_platform ${CMAKE_DL_LIBS})
 
 if(LX_BACKEND_CUDA)
   enable_language(CUDA)
@@ -187,6 +233,14 @@ if(LX_BACKEND_CUDA)
   add_library(dromos_kernels SHARED ${LX_CUDA_SOURCES})
   target_include_directories(dromos_kernels PUBLIC engine)
   target_link_libraries(dromos_kernels PUBLIC CUDA::cudart CUDA::cublasLt)
+  if(WIN32)
+    # dromos_kernels.dll exports the kernels.h ABI (LX_API is dllexport while it builds) and takes the POSIX calls it
+    # makes (the NVML loader) from engine/platform.
+    target_compile_definitions(dromos_kernels PRIVATE LX_BUILDING_BACKEND)
+    target_compile_options(dromos_kernels PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8,/Zc:__cplusplus>)
+    target_link_libraries(dromos_kernels PRIVATE dromos_platform)
+    lx_windows_binary(dromos_kernels "Dromos CUDA backend" DLL)
+  endif()
   if(LX_STATIC_RUNTIME)
     target_link_options(dromos_kernels PRIVATE ${LX_STATIC_RUNTIME})
   endif()
@@ -196,7 +250,31 @@ if(LX_BACKEND_CUDA)
 
   # The release flavors carry the toolkit's runtime libraries in lib/, under the SONAMEs the backend asks for
   # (libcudart.so.13 from libcudart.so.13.2.75): the tarball then needs only the NVIDIA driver.
-  if(LX_BUNDLE_CUDA)
+  if(LX_BUNDLE_CUDA AND WIN32)
+    # Windows: the toolkit's cudart64_N.dll and cublasLt64_N.dll go beside dromos_kernels.dll in bin\, which the
+    # backend loads them from first. Their license goes with them: the toolkit's EULA.txt from NVIDIA's installer, or
+    # the LICENSE of the cudart redistributable archive (scripts/release/cuda-toolkit.ps1), which is the same EULA.
+    foreach(pattern IN ITEMS cudart64_*.dll cublasLt64_*.dll)
+      file(GLOB lib_dll "${CUDAToolkit_BIN_DIR}/${pattern}")
+      list(LENGTH lib_dll lib_count)
+      if(NOT lib_count EQUAL 1)
+        message(FATAL_ERROR "LX_BUNDLE_CUDA: expected one ${pattern} in ${CUDAToolkit_BIN_DIR}, found ${lib_count}")
+      endif()
+      install(FILES ${lib_dll} DESTINATION bin)
+    endforeach()
+    set(LX_CUDA_EULA "")
+    foreach(candidate IN ITEMS "${CUDAToolkit_LIBRARY_ROOT}/EULA.txt" "${CUDAToolkit_BIN_DIR}/../EULA.txt"
+                               "${CUDAToolkit_BIN_DIR}/../licenses/cuda_cudart-LICENSE.txt")
+      if(NOT LX_CUDA_EULA AND EXISTS "${candidate}")
+        set(LX_CUDA_EULA "${candidate}")
+      endif()
+    endforeach()
+    if(NOT LX_CUDA_EULA)
+      message(FATAL_ERROR "LX_BUNDLE_CUDA: the toolkit has no EULA.txt (or redistributable LICENSE) to ship beside "
+                          "its libraries")
+    endif()
+    install(FILES "${LX_CUDA_EULA}" DESTINATION share/dromos/licenses RENAME NVIDIA-CUDA-EULA.txt)
+  elseif(LX_BUNDLE_CUDA)
     foreach(target IN ITEMS CUDA::cudart CUDA::cublasLt)
       get_target_property(lib_path ${target} IMPORTED_LOCATION)
       if(NOT lib_path)
@@ -243,6 +321,10 @@ if(LX_CORE_SOURCES)
   target_include_directories(dromos_core PUBLIC engine third_party third_party/httplib)
   find_package(Threads REQUIRED)
   target_link_libraries(dromos_core PUBLIC dromos_dispatch Threads::Threads)
+  if(WIN32)
+    # The OpenAI server's sockets (cpp-httplib) and the downloads (engine/core/http.cpp, WinHTTP).
+    target_link_libraries(dromos_core PUBLIC ws2_32 winhttp)
+  endif()
   # The architectures this build has code for, for the device report. A header, not a definition: nvcc
   # splits a -D value on its commas.
   file(WRITE "${CMAKE_BINARY_DIR}/generated/lx_build_info.h"
@@ -258,6 +340,7 @@ if(LX_CLI_SOURCES AND TARGET dromos_core)
   target_compile_definitions(dromos PRIVATE "LX_CORPUS_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/tools/rivals/corpus.txt\"")
   target_include_directories(dromos PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(dromos PRIVATE dromos_core)
+  lx_windows_binary(dromos "Dromos" APP)
   if(LX_STATIC_RUNTIME)
     target_link_options(dromos PRIVATE ${LX_STATIC_RUNTIME})
   endif()
@@ -322,7 +405,11 @@ if(TARGET dromos)
   install(TARGETS dromos RUNTIME DESTINATION bin)
 endif()
 foreach(backend dromos_kernels dromos_cpu dromos_metal)
-  if(TARGET ${backend})
+  if(TARGET ${backend} AND WIN32)
+    # Windows: the backend DLLs sit beside dromos.exe in bin\ (where Windows looks for a program's DLLs), and their
+    # import libraries are not part of the install.
+    install(FILES $<TARGET_FILE:${backend}> DESTINATION bin)
+  elseif(TARGET ${backend})
     set_target_properties(${backend} PROPERTIES INSTALL_RPATH "${LX_RPATH_LIB}")
     install(TARGETS ${backend} LIBRARY DESTINATION "${LX_INSTALL_LIBDIR}" RUNTIME DESTINATION "${LX_INSTALL_LIBDIR}")
   endif()

@@ -29,12 +29,15 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#if !defined(_WIN32)
 #include <sys/wait.h>
+#endif
 #include <vector>
 
 #include "cli/common.h"
 #include "cli/roofline.h"
 #include "core/install.h"
+#include "platform/platform.h"
 #include "model/traffic.h"
 #include <fstream>
 #include <sstream>
@@ -251,7 +254,7 @@ int cmd_bench(int argc, char** argv) {
     // Each stream count is a run of its own process, so its plan is the plan a standalone run at that count gets: the
     // engines an earlier count loaded leave device memory in use, which the planner would count as taken. The child
     // prints its plan, its roofline and its row; this process prints the header once and then each child's output.
-    std::printf("%s  (%s)\n", args.model.c_str(), model.dir.c_str());
+    std::printf("%s  (%s)\n", args.model.c_str(), model.dir.string().c_str());
     std::printf("  %d prompt tokens, %d generated tokens per stream, %s\n", args.prompt_tokens, args.gen_tokens,
                 args.sample ? "sampled (temperature 0.6, top-p 0.95, top-k 20)" : "greedy");
     std::printf("  prompts: %s\n", args.random_prompts ? "random ids (--random-prompts)"
@@ -262,6 +265,24 @@ int cmd_bench(int argc, char** argv) {
     std::fflush(stdout);
     bool refused = false;
     for (int streams : args.streams) {
+#if defined(_WIN32)
+      // No shell on Windows: the child gets its arguments as a list, and its output (both streams) comes back here.
+      std::vector<std::string> child_args = {lx::install::executable_path()};
+      for (int i = 0; i < argc; ++i) {  // argv[0] is the subcommand, "bench": the child is run as this one
+        const std::string a = argv[i];
+        if (i > 0 && a == "--streams") {
+          ++i;  // the list is replaced by this count
+          continue;
+        }
+        child_args.push_back(a);
+      }
+      for (const char* a : {"--streams", "", "--one-count"}) child_args.push_back(*a ? a : std::to_string(streams));
+      const int status = lx::platform::run_process(
+          child_args, [](const char* data, size_t size) { std::fwrite(data, 1, size, stdout); }, true);
+      if (status == kRefusedExit) refused = true;
+      else if (status != 0) throw std::runtime_error("bench: the run at " + std::to_string(streams) + " streams failed");
+      std::fflush(stdout);
+#else
       std::string command = shell_quote(lx::install::executable_path());
       for (int i = 0; i < argc; ++i) {  // argv[0] is the subcommand, "bench": the child is run as this one
         const std::string a = argv[i];
@@ -280,6 +301,7 @@ int cmd_bench(int argc, char** argv) {
       if (WIFEXITED(status) && WEXITSTATUS(status) == kRefusedExit) refused = true;
       else if (status != 0) throw std::runtime_error("bench: the run at " + std::to_string(streams) + " streams failed");
       std::fflush(stdout);
+#endif
     }
     return refused ? 1 : 0;
   }

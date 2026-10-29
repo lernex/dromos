@@ -11,6 +11,7 @@
 #include "text/json.h"
 #include "text/jinja_internal.h"
 #include "text/py.h"
+#include "platform/posix.h"
 #include "text/unicode.h"
 #include "text/utf8.h"
 

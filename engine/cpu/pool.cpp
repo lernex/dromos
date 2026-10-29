@@ -24,6 +24,7 @@
 
 #include "cpu/cpu.h"
 #include "cpu/dromos_cpu.h"
+#include "platform/posix.h"
 
 #if defined(__linux__)
 #include <dirent.h>
@@ -36,6 +37,9 @@
 #include <pthread.h>
 #include <sys/qos.h>
 #include <sys/sysctl.h>
+#elif defined(_WIN32)
+#include <windows.h>
+#include <intrin.h>
 #endif
 
 namespace lx::cpu {
@@ -46,8 +50,55 @@ inline void cpu_relax() {
   __builtin_ia32_pause();
 #elif defined(__aarch64__)
   __asm__ volatile("isb" ::: "memory");
+#elif defined(_M_X64)
+  _mm_pause();
+#elif defined(_M_ARM64)
+  __isb(_ARM64_BARRIER_SY);
 #endif
 }
+
+#if defined(_WIN32)
+// Each physical core of processor group 0 as one logical processor (its first), from the system's own topology.
+std::vector<int> windows_cores() {
+  std::vector<int> out;
+  DWORD len = 0;
+  GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+  if (len == 0) return out;
+  std::vector<char> buf(len);
+  auto* info = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data());
+  if (!GetLogicalProcessorInformationEx(RelationProcessorCore, info, &len)) return out;
+  for (DWORD at = 0; at < len;) {
+    const auto* e = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data() + at);
+    const GROUP_AFFINITY& g = e->Processor.GroupMask[0];
+    if (g.Group == 0 && g.Mask) {
+      unsigned long first = 0;
+      _BitScanForward64(&first, static_cast<unsigned long long>(g.Mask));
+      out.push_back(static_cast<int>(first));
+    }
+    at += e->Size;
+  }
+  return out;
+}
+
+// Windows 11 runs a thread it judges to be background work slowly, on efficiency cores at a low clock (EcoQoS). The
+// kernels are the opposite of background work, so their threads opt out, as the macOS pool asks for
+// QOS_CLASS_USER_INITIATED. Systems that predate the setting ignore it.
+void full_speed_thread() {
+  THREAD_POWER_THROTTLING_STATE state{};
+  state.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+  state.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+  state.StateMask = 0;
+  SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &state, sizeof state);
+}
+
+void full_speed_process() {
+  PROCESS_POWER_THROTTLING_STATE state{};
+  state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+  state.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+  state.StateMask = 0;
+  SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state, sizeof state);
+}
+#endif
 
 // Logical CPUs this process may run on, one per physical core (the first sibling), on Linux.
 std::vector<int> core_cpus() {
@@ -73,12 +124,14 @@ std::vector<int> core_cpus() {
     }
     if (seen.insert({pkg, core}).second) out.push_back(cpu);
   }
+#elif defined(_WIN32)
+  out = windows_cores();
 #endif
   return out;
 }
 
 int physical_cores() {
-#if defined(__linux__)
+#if defined(__linux__) || defined(_WIN32)
   const std::vector<int> cpus = core_cpus();
   if (!cpus.empty()) return static_cast<int>(cpus.size());
 #elif defined(__APPLE__)
@@ -104,6 +157,10 @@ class Pool {
     if (n_ < 1) n_ = 1;
     spin_ns_ = static_cast<int64_t>(env_int("LX_SPIN_US", 400)) * 1000;
     const bool pin = env_int("LX_PIN", 0) != 0;
+#if defined(_WIN32)
+    full_speed_process();
+    full_speed_thread();
+#endif
     const std::vector<int> cpus = pin ? core_cpus() : std::vector<int>{};
     for (int i = 1; i < n_; ++i) {
       const int cpu = pin && i < static_cast<int>(cpus.size()) ? cpus[i] : -1;
@@ -166,6 +223,14 @@ class Pool {
 #elif defined(__APPLE__)
     (void)cpu;
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+#elif defined(_WIN32)
+    if (cpu >= 0) {
+      GROUP_AFFINITY affinity{};
+      affinity.Group = 0;
+      affinity.Mask = static_cast<KAFFINITY>(1) << cpu;
+      SetThreadGroupAffinity(GetCurrentThread(), &affinity, nullptr);
+    }
+    full_speed_thread();
 #else
     (void)cpu;
 #endif
@@ -288,7 +353,7 @@ struct Scratch {
   void* p[kSlots] = {};
   size_t cap[kSlots] = {};
   ~Scratch() {
-    for (int i = 0; i < kSlots; ++i) free(p[i]);
+    for (int i = 0; i < kSlots; ++i) lx_aligned_free(p[i]);
   }
 };
 thread_local Scratch t_scratch;
@@ -298,11 +363,10 @@ void* scratch(size_t bytes, int slot) {
   Scratch& s = t_scratch;
   if (bytes < 64) bytes = 64;
   if (s.cap[slot] < bytes) {
-    free(s.p[slot]);
+    lx_aligned_free(s.p[slot]);
     size_t want = 4096;
     while (want < bytes) want *= 2;
-    void* p = nullptr;
-    if (posix_memalign(&p, 64, want) != 0) p = nullptr;
+    void* p = lx_aligned_alloc(64, want);
     s.p[slot] = p;
     s.cap[slot] = p ? want : 0;
   }

@@ -83,6 +83,9 @@ int cmd_serve(int argc, char** argv) {
   g_server = &server;
   std::signal(SIGINT, on_interrupt);
   std::signal(SIGTERM, on_interrupt);
+#if defined(SIGBREAK)
+  std::signal(SIGBREAK, on_interrupt);  // Ctrl-Break in a Windows console stops the server too
+#endif
 
   for (const std::string& note : plan.notes) std::fprintf(stderr, "%s\n", note.c_str());
   if (!engine.placement().empty()) std::fprintf(stderr, "%s", engine.placement().c_str());

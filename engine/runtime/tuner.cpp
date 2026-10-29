@@ -1,6 +1,7 @@
 #include "runtime/tuner.h"
 
 #include "cuda/kernels.h"
+#include "platform/platform.h"
 
 #include <algorithm>
 #include <chrono>
@@ -137,8 +138,11 @@ bool agrees(const std::vector<float>& got, const std::vector<float>& want, doubl
 }
 
 std::string gpu_dir() {
-  const char* home = std::getenv("HOME");
-  return std::string(home ? home : ".") + "/.cache/dromos/tune";
+  try {
+    return (lx::platform::cache_root() / "tune").string();
+  } catch (const std::exception&) {
+    return "./.cache/dromos/tune";
+  }
 }
 
 // The table key of a kernel's problem, as the backend writes it (lx_tune_key), so host and backend agree.

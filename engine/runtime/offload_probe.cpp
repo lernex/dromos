@@ -1,7 +1,4 @@
 // probe_machine: what the machine can move, measured the way the offload runtime moves it.
-#include <dlfcn.h>
-#include <fcntl.h>
-#include <unistd.h>
 #if defined(__x86_64__)
 #include <immintrin.h>
 #endif
@@ -18,6 +15,8 @@
 #include <vector>
 
 #include "runtime/offload.h"
+#include "dispatch/dispatch.h"
+#include "platform/posix.h"
 
 namespace lx::offload {
 namespace {
@@ -28,6 +27,21 @@ void check(int status, const char* what) {
   if (status != 0) throw std::runtime_error(std::string(what) + " failed with error " + std::to_string(status));
 }
 
+// The CPU backend library: LX_CPU_KERNELS, else the one beside the backend this process loaded (engine/dispatch),
+// which is where every release tree keeps it (lib/ on Linux, bin\\ on Windows).
+std::string cpu_backend_path() {
+  if (const char* env = std::getenv("LX_CPU_KERNELS"); env && *env) return env;
+  std::string path = lx::dispatch::info().path;
+#if !defined(_WIN32)
+  if (path.empty()) {  // no backend path: beside the code that holds the offload stubs, as before
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<void*>(&lx_offload_plan), &info) && info.dli_fname) path = info.dli_fname;
+  }
+#endif
+  const size_t slash = path.find_last_of("/\\");
+  return (slash == std::string::npos ? std::string(".") : path.substr(0, slash)) + "/" + lx::dispatch::library_file("cpu");
+}
+
 double since(Clock::time_point t) { return std::chrono::duration<double>(Clock::now() - t).count(); }
 
 // A read-only descriptor that bypasses the page cache: O_DIRECT on Linux, F_NOCACHE where there is no
@@ -35,6 +49,8 @@ double since(Clock::time_point t) { return std::chrono::duration<double>(Clock::
 int open_direct(const char* path) {
 #if defined(O_DIRECT)
   return open(path, O_RDONLY | O_DIRECT);
+#elif defined(_WIN32)
+  return lx_open_unbuffered(path);  // FILE_FLAG_NO_BUFFERING, Windows' O_DIRECT
 #else
   const int fd = open(path, O_RDONLY);
   if (fd >= 0) fcntl(fd, F_NOCACHE, 1);
@@ -107,7 +123,7 @@ double ram_rate(const char* buf, size_t bytes, int threads) {
 }
 
 double nvme_rate(const std::filesystem::path& file, int threads, int64_t request, int64_t total, bool sequential) {
-  const int fd = open_direct(file.c_str());
+  const int fd = open_direct(file.string().c_str());
   if (fd < 0) return 0;
   const int64_t size = lseek(fd, 0, SEEK_END);
   if (size < request * 4) {
@@ -119,7 +135,7 @@ double nvme_rate(const std::filesystem::path& file, int threads, int64_t request
   const auto t0 = Clock::now();
   for (int t = 0; t < threads; ++t)
     pool.emplace_back([&, t] {
-      void* buf = std::aligned_alloc(4096, static_cast<size_t>(request));
+      void* buf = lx_aligned_alloc(4096, static_cast<size_t>(request));
       std::mt19937_64 rng(1234 + t);
       for (;;) {
         const int64_t i = next.fetch_add(1);
@@ -129,7 +145,7 @@ double nvme_rate(const std::filesystem::path& file, int threads, int64_t request
                                        : static_cast<int64_t>(rng() % static_cast<uint64_t>(blocks)) * 4096;
         if (pread(fd, buf, static_cast<size_t>(request), off) <= 0) break;
       }
-      std::free(buf);
+      lx_aligned_free(buf);
     });
   for (auto& th : pool) th.join();
   close(fd);
@@ -170,7 +186,7 @@ double cufile_rate(const std::filesystem::path& file, int64_t request, int64_t t
     note = format("cuFileDriverOpen error %d", e.err);
     return 0;
   }
-  const int fd = open_direct(file.c_str());
+  const int fd = open_direct(file.string().c_str());
   if (fd < 0) return 0;
   CuFileDescr d{};
   d.type = 1;  // CU_FILE_HANDLE_TYPE_OPAQUE_FD
@@ -330,7 +346,7 @@ MachineProfile probe_machine(const ProbeOptions& o) {
   // CPU: RAM bandwidth, then the CPU expert kernel (decode, one token)
   {
     const size_t bytes = 2ull << 30;
-    char* buf = static_cast<char*>(std::aligned_alloc(4096, bytes));
+    char* buf = static_cast<char*>(lx_aligned_alloc(4096, bytes));
     std::memset(buf, 5, bytes);
     p.ram_read_1t_gbs = ram_rate(buf, bytes, 1);
     line("CPU reading RAM (2 GB, AVX2 loads):");
@@ -340,16 +356,10 @@ MachineProfile probe_machine(const ProbeOptions& o) {
       p.ram_read_gbs = std::max(p.ram_read_gbs, r);
       line(format("  %2d threads: %5.1f GB/s", t, r));
     }
-    std::free(buf);
+    lx_aligned_free(buf);
   }
   {
-    std::string path;
-    Dl_info info{};
-    if (dladdr(reinterpret_cast<void*>(&lx_offload_plan), &info) && info.dli_fname) {
-      path = info.dli_fname;
-      path = path.substr(0, path.rfind('/')) + "/libdromos_cpu.so";
-    }
-    if (const char* env = std::getenv("LX_CPU_KERNELS")) path = env;
+    const std::string path = cpu_backend_path();
     void* lib = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
     using Fn = int (*)(const void*, const int32_t*, const float*, const lx_weight*, const lx_weight*, float*, void*, int,
                        int, int, int, void*);
@@ -425,7 +435,7 @@ MachineProfile probe_machine(const ProbeOptions& o) {
       line(format("  together with GPU zero-copy reads: CPU experts %.1f GB/s + GPU %.1f GB/s = %.1f GB/s", c, g, c + g));
       lx_rt_host_free(hh);
     } else {
-      line("CPU expert kernel: libdromos_cpu.so not found");
+      line("CPU expert kernel: " + lx::dispatch::library_file("cpu") + " not found");
     }
   }
 

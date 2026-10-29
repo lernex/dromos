@@ -40,4 +40,8 @@ inline bool optional(const std::string& symbol) {
 // The last message about a missing symbol ("backend CUDA lacks lx_x"), or "" when there was none.
 std::string last_message();
 
+// The file a backend is built as on this platform: "cpu" is libdromos_cpu.so on Linux and macOS and dromos_cpu.dll on
+// Windows; also "cuda", "hip" and "metal". "" for a name that is none of them.
+std::string library_file(const std::string& backend);
+
 }  // namespace lx::dispatch

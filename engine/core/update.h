@@ -16,7 +16,7 @@ int compare(const std::string& a, const std::string& b);
 
 // The version a release page's URL names: .../releases/tag/vX.Y.Z gives X.Y.Z, and anything else gives "".
 std::string version_from_url(const std::string& url);
-// dromos-FLAVOR.tar.gz, the asset a flavor is released as.
+// dromos-FLAVOR.tar.gz (dromos-FLAVOR.zip for a windows- flavor), the asset a flavor is released as.
 std::string asset_name(const std::string& flavor);
 // The SHA-256 (lower-case hex) that a sha256sum-format listing gives for `file`, or "" when it lists none.
 std::string checksum_for(const std::string& sums, const std::string& file);

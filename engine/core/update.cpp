@@ -1,8 +1,5 @@
 #include "core/update.h"
 
-#include <sys/wait.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
@@ -20,6 +17,7 @@
 #include "core/http.h"
 #include "core/install.h"
 #include "lx_version.h"
+#include "platform/platform.h"
 
 namespace lx::update {
 namespace fs = std::filesystem;
@@ -28,57 +26,59 @@ namespace {
 constexpr long long kDay = 24 * 60 * 60;
 const char* kDefaultReleases = "https://github.com/lernex/dromos/releases";
 
-std::string home() {
-  const char* h = std::getenv("HOME");
-  if (!h || !*h) throw std::runtime_error("HOME is not set");
-  return h;
-}
-
-// The dromos directory of this user: ~/.dromos (versions, current, previous).
-fs::path dromos_home() { return fs::path(home()) / ".dromos"; }
+// The dromos directory of this user: ~/.dromos, or %LOCALAPPDATA%\Programs\Dromos on Windows (versions,
+// current, previous; engine/platform).
+fs::path dromos_home() { return lx::platform::install_root(); }
 
 // Runs a program and waits for it. With `captured`, its standard output is collected there. Returns its exit status,
 // or -1 when it did not run to an exit.
 int run_process(const std::vector<std::string>& args, std::string* captured) {
-  int pipefd[2] = {-1, -1};
-  if (captured && pipe(pipefd) != 0) return -1;
-  std::vector<char*> argv;
-  argv.reserve(args.size() + 1);
-  for (const std::string& a : args) argv.push_back(const_cast<char*>(a.c_str()));
-  argv.push_back(nullptr);
-  const pid_t pid = fork();
-  if (pid < 0) {
-    if (captured) {
-      close(pipefd[0]);
-      close(pipefd[1]);
-    }
-    return -1;
+  if (!captured) return lx::platform::run_process(args);
+  return lx::platform::run_process(args, [captured](const char* data, size_t size) { captured->append(data, size); });
+}
+
+// Unpacks a release archive into `dir`: tar -xzf for a tarball, and on Windows the system's own tar.exe (bsdtar, in
+// every Windows since 10 1803), which reads the zip. Its full path, so a GNU tar on PATH (Git's) never gets the zip.
+int unpack(const fs::path& archive, const fs::path& dir) {
+#if defined(_WIN32)
+  const char* root = std::getenv("SystemRoot");
+  const std::string tar = std::string(root && *root ? root : "C:\\Windows") + "\\System32\\tar.exe";
+  return run_process({tar, "-xf", archive.string(), "-C", dir.string()}, nullptr);
+#else
+  return run_process({"tar", "-xzf", archive.string(), "-C", dir.string()}, nullptr);
+#endif
+}
+
+// The release tree's executable: bin/dromos, bin\dromos.exe on Windows.
+fs::path tree_executable(const fs::path& tree) {
+#if defined(_WIN32)
+  return tree / "bin" / "dromos.exe";
+#else
+  return tree / "bin" / "dromos";
+#endif
+}
+
+// Takes an installed version out of the way. On Windows a version may still be running (a `dromos serve` started
+// before the update) and its files cannot be deleted then: the folder is renamed aside first, which keeps it whole
+// if even that is refused (it stays, and a later update retires it), and what cannot be deleted after the rename is
+// left under a dot name that the next update sweeps. Returns false when the version is still there.
+bool retire(const fs::path& dir) {
+  std::error_code ec;
+#if defined(_WIN32)
+  if (dir.filename().string().rfind(".retired-", 0) == 0) {  // already aside: only its remains are left
+    fs::remove_all(dir, ec);
+    return !ec;
   }
-  if (pid == 0) {
-    if (captured) {
-      dup2(pipefd[1], 1);
-      close(pipefd[0]);
-      close(pipefd[1]);
-    }
-    execvp(argv[0], argv.data());
-    _exit(127);
-  }
-  if (captured) {
-    close(pipefd[1]);
-    char buf[4096];
-    ssize_t n;
-    while ((n = read(pipefd[0], buf, sizeof buf)) != 0) {
-      if (n < 0 && errno == EINTR) continue;
-      if (n < 0) break;
-      captured->append(buf, static_cast<size_t>(n));
-    }
-    close(pipefd[0]);
-  }
-  int status = 0;
-  while (waitpid(pid, &status, 0) < 0) {
-    if (errno != EINTR) return -1;
-  }
-  return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+  const fs::path aside = dir.parent_path() / (".retired-" + dir.filename().string() + "-" +
+                                              std::to_string(lx::platform::process_id()));
+  fs::rename(dir, aside, ec);
+  if (ec) return false;
+  fs::remove_all(aside, ec);
+  return true;
+#else
+  fs::remove_all(dir, ec);
+  return !ec;
+#endif
 }
 
 // The body of a GET, as a string. Throws unless the server answers 200.
@@ -105,21 +105,12 @@ std::string download(const std::string& url, const fs::path& file) {
   return hash.hex_digest();
 }
 
-// Points `link` at `target`, replacing what it was, in one step (a rename over the old link).
-void set_link(const fs::path& link, const fs::path& target) {
-  const fs::path tmp = link.parent_path() / (link.filename().string() + ".tmp" + std::to_string(getpid()));
-  std::error_code ec;
-  fs::remove(tmp, ec);
-  fs::create_symlink(target, tmp);
-  fs::rename(tmp, link);
-}
+// Points `link` at `target`, replacing what it was, in one step: a rename over the old symlink, or on Windows a
+// junction retargeted in place (engine/platform).
+void set_link(const fs::path& link, const fs::path& target) { lx::platform::set_link(link, target); }
 
-// What a symlink points at, or "" when `link` is not one.
-fs::path link_target(const fs::path& link) {
-  std::error_code ec;
-  if (!fs::is_symlink(link, ec)) return "";
-  return fs::read_symlink(link, ec);
-}
+// What a link points at, or "" when `link` is not one.
+fs::path link_target(const fs::path& link) { return lx::platform::link_target(link); }
 
 // Installs a verified release tree under ~/.dromos/versions/VERSION and makes it current. The version that was current
 // becomes the previous one, and every other installed version is removed.
@@ -130,7 +121,7 @@ void install_release(const std::string& releases, const std::string& version) {
   const fs::path versions = root / "versions";
   fs::create_directories(versions);
 
-  const fs::path staging = root / ("staging-" + std::to_string(getpid()));
+  const fs::path staging = root / ("staging-" + std::to_string(lx::platform::process_id()));
   std::error_code ec;
   fs::remove_all(staging, ec);
   fs::create_directories(staging);
@@ -153,28 +144,29 @@ void install_release(const std::string& releases, const std::string& version) {
 
   const fs::path tree = staging / "tree";
   fs::create_directories(tree);
-  if (run_process({"tar", "-xzf", tarball.string(), "-C", tree.string()}, nullptr) != 0)
-    throw std::runtime_error("could not unpack " + asset);
+  if (unpack(tarball, tree) != 0) throw std::runtime_error("could not unpack " + asset);
   // The unpacked binary has to be the release it claims, before anything points at it.
   std::string printed;
   const std::string expect = "dromos " + version + " (" + flavor + ",";
-  if (run_process({(tree / "bin" / "dromos").string(), "--version"}, &printed) != 0 ||
-      printed.rfind(expect, 0) != 0)
+  if (run_process({tree_executable(tree).string(), "--version"}, &printed) != 0 || printed.rfind(expect, 0) != 0)
     throw std::runtime_error("the unpacked dromos does not report " + version + " (" + flavor + ")");
 
   const fs::path dest = versions / version;
-  fs::remove_all(dest, ec);
+  if (fs::exists(dest, ec) && !retire(dest))
+    throw std::runtime_error(dest.string() + " is in use (a dromos from it is still running): stop it and update again");
   fs::rename(tree, dest);
 
   const fs::path previous = link_target(root / "current");
   set_link(root / "current", dest);
   if (!previous.empty() && previous != dest) set_link(root / "previous", previous);
   const std::string keep_previous = previous.empty() || previous == dest ? "" : previous.filename().string();
+  std::vector<fs::path> old;
   for (const fs::directory_entry& entry : fs::directory_iterator(versions, ec)) {
     const std::string name = entry.path().filename().string();
     if (name == version || name == keep_previous) continue;
-    fs::remove_all(entry.path(), ec);
+    old.push_back(entry.path());
   }
+  for (const fs::path& dir : old) retire(dir);  // one still running stays until a later update
 
   std::printf("dromos %s is installed and current.", version.c_str());
   if (!keep_previous.empty())
@@ -267,7 +259,9 @@ std::string version_from_url(const std::string& url) {
   return url.substr(start, end == std::string::npos ? std::string::npos : end - start);
 }
 
-std::string asset_name(const std::string& flavor) { return "dromos-" + flavor + ".tar.gz"; }
+std::string asset_name(const std::string& flavor) {
+  return "dromos-" + flavor + (flavor.rfind("windows-", 0) == 0 ? ".zip" : ".tar.gz");
+}
 
 std::string checksum_for(const std::string& sums, const std::string& file) {
   std::istringstream in(sums);
@@ -330,8 +324,11 @@ std::string update_command(const std::string& channel) {
 }
 
 fs::path cache_path() {
-  const char* h = std::getenv("HOME");
-  return fs::path(h && *h ? h : ".") / ".cache" / "dromos" / "update-check";
+  try {
+    return lx::platform::cache_root() / "update-check";
+  } catch (const std::exception&) {
+    return fs::path(".") / ".cache" / "dromos" / "update-check";
+  }
 }
 
 Cache read_cache(const fs::path& file) {
@@ -352,7 +349,7 @@ Cache read_cache(const fs::path& file) {
 void write_cache(const fs::path& file, const Cache& cache) {
   std::error_code ec;
   fs::create_directories(file.parent_path(), ec);
-  const fs::path tmp = file.string() + ".tmp" + std::to_string(getpid());
+  const fs::path tmp = file.string() + ".tmp" + std::to_string(lx::platform::process_id());
   {
     std::ofstream out(tmp);
     if (!out) return;

@@ -1,12 +1,10 @@
 // The runtime half of the backend ABI (kernels.h, "Runtime"), on the CUDA runtime.
 #include <cuda_runtime.h>
 
-#include <dlfcn.h>
-#include <unistd.h>
-
 #include <cstdio>
 
 #include "cuda/kernels.h"
+#include "platform/posix.h"
 
 namespace {
 
@@ -160,7 +158,11 @@ int lx_rt_process_memory(int64_t* bytes) {
   using CountFn = int (*)(unsigned int*);
   using HandleFn = int (*)(unsigned int, void**);
   using ProcsFn = int (*)(void*, unsigned int*, ProcessInfo*);
+#if defined(_WIN32)
+  static void* lib = dlopen("nvml.dll", RTLD_NOW | RTLD_LOCAL);  // the driver installs it in System32
+#else
   static void* lib = dlopen("libnvidia-ml.so.1", RTLD_NOW | RTLD_LOCAL);
+#endif
   if (!lib) return LX_ERR_NOT_SUPPORTED;
   static const bool ready = [] {
     auto init = reinterpret_cast<InitFn>(dlsym(lib, "nvmlInit_v2"));

@@ -14,6 +14,7 @@
 #include "core/digest.h"
 #include "core/http.h"
 #include "nlohmann/json.hpp"
+#include "platform/platform.h"
 
 namespace lx::hub {
 namespace fs = std::filesystem;
@@ -30,9 +31,13 @@ std::string trim(std::string s) {
   return s.substr(first, last - first + 1);
 }
 
-std::string home() {
-  const char* h = std::getenv("HOME");
-  return h ? h : ".";
+// The user's home folder (engine/platform: HOME, or USERPROFILE on Windows), or "." when there is none.
+fs::path home() {
+  try {
+    return lx::platform::home();
+  } catch (const std::exception&) {
+    return ".";
+  }
 }
 
 bool valid_repo(const std::string& repo) {
@@ -184,9 +189,14 @@ std::string alias_repo(const Alias& alias, const std::string& format) {
 }
 
 fs::path cache_root() {
-  // DROMOS_MODELS moves the cache (docs/RELEASE.md); by default it is ~/.cache/dromos/models.
+  // DROMOS_MODELS moves the cache (docs/RELEASE.md); by default it is ~/.cache/dromos/models, and on Windows
+  // %LOCALAPPDATA%\Dromos\models (engine/platform).
   if (const char* env = std::getenv("DROMOS_MODELS"); env && *env) return fs::path(env);
-  return fs::path(home()) / ".cache" / "dromos" / "models";
+  try {
+    return lx::platform::cache_root() / "models";
+  } catch (const std::exception&) {
+    return fs::path(".") / ".cache" / "dromos" / "models";
+  }
 }
 
 fs::path install_dir(const std::string& repo) {
@@ -343,7 +353,7 @@ void pull(const RemoteModel& model, const fs::path& dir, const std::string& toke
               abort_on_status = true;
               return false;
             }
-            out = std::fopen(part_path.c_str(), existing > 0 ? "ab" : "wb");
+            out = std::fopen(part_path.string().c_str(), existing > 0 ? "ab" : "wb");
             if (!out) throw std::runtime_error("cannot write " + part_path.string());
           }
           const size_t wrote = std::fwrite(data, 1, n, out);

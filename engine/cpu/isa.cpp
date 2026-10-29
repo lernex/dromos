@@ -19,7 +19,7 @@
 #include "cpu/dromos_cpu.h"
 
 #if defined(__x86_64__) || defined(_M_X64)
-#include <cpuid.h>
+#include "cpu/cpuid.h"
 #elif defined(__aarch64__)
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
@@ -76,8 +76,7 @@ X86 x86_features() {
   if (!__get_cpuid(1, &a, &b, &c, &d)) return f;
   const bool fma = c & (1u << 12), osxsave = c & (1u << 27), avx = c & (1u << 28), f16c = c & (1u << 29);
   if (!osxsave || !avx) return f;
-  unsigned lo, hi;
-  __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+  const unsigned lo = static_cast<unsigned>(lx_xgetbv0());
   const bool ymm_state = (lo & 0x6u) == 0x6u;
   const bool zmm_state = (lo & 0xe6u) == 0xe6u;
   if (!ymm_state) return f;
@@ -241,8 +240,7 @@ bool amx_present() {
   if (!tile || !(bf16 || int8)) return false;
   __get_cpuid(1, &a, &b, &c, &d);
   if (!(c & (1u << 27))) return false;  // OSXSAVE
-  unsigned lo, hi;
-  __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+  const unsigned lo = static_cast<unsigned>(lx_xgetbv0());
   return (lo & (3u << 17)) == (3u << 17);  // the OS saves the tile state
 #else
   return false;

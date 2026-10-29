@@ -26,6 +26,29 @@
 #define LX_JOIN2(a, b) a##b
 #define LX_JOIN(a, b) LX_JOIN2(a, b)
 
+// The GCC builtins the kernels use, spelled for MSVC (cl), which has none of them. Each is the same operation:
+// rint and fma round as the builtins do, and the prefetch is a read into every cache level.
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <cmath>
+#include <intrin.h>
+#include <limits>
+#define LX_PREFETCH(p) _mm_prefetch(reinterpret_cast<const char*>(p), _MM_HINT_T0)
+#define LX_INFF() (std::numeric_limits<float>::infinity())
+#define LX_LOG1PF(x) (std::log1p(static_cast<float>(x)))
+#if LX_ISA_CODE >= 10 && LX_ISA_CODE < 50
+#define LX_RINTF(x) (_mm_cvtss_f32(_mm_round_ss(_mm_setzero_ps(), _mm_set_ss(x), _MM_FROUND_CUR_DIRECTION)))
+#else
+#define LX_RINTF(x) (std::nearbyint(static_cast<float>(x)))
+#endif
+#define LX_FMAF(a, b, c) (std::fma(static_cast<float>(a), static_cast<float>(b), static_cast<float>(c)))
+#else
+#define LX_PREFETCH(p) __builtin_prefetch((p), 0, 3)
+#define LX_INFF() (__builtin_inff())
+#define LX_LOG1PF(x) (__builtin_log1pf(x))
+#define LX_RINTF(x) (__builtin_rintf(x))
+#define LX_FMAF(a, b, c) (__builtin_fmaf((a), (b), (c)))
+#endif
+
 namespace lx::cpu::LX_ISA {
 
 static inline float bits_f32(uint32_t u) {
@@ -87,7 +110,7 @@ constexpr float kP0 = 1.9875691500e-4f, kP1 = 1.3981999507e-3f, kP2 = 8.33345190
 
 static inline float sexp(float x) {
   x = lmin(lmax(x, kExpLo), kExpHi);
-  const float fx = __builtin_rintf(x * kLog2e);
+  const float fx = LX_RINTF(x * kLog2e);
   float r = x - fx * kC1;
   r = r - fx * kC2;
   float p = kP0;
@@ -449,7 +472,7 @@ static inline float sfma(float a, float b, float c) {
   return _mm_cvtss_f32(_mm_fmadd_ss(_mm_set_ss(a), _mm_set_ss(b), _mm_set_ss(c)));
 }
 #else
-static inline float sfma(float a, float b, float c) { return __builtin_fmaf(a, b, c); }
+static inline float sfma(float a, float b, float c) { return LX_FMAF(a, b, c); }
 #endif
 
 // Double accumulators for the exact dots of the quantized maths (kern/isa.cpp, tile_exact): a vector of W

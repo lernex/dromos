@@ -26,7 +26,7 @@ macro(lx_cpu_level name code)
   if(ok)
     add_library(lx_cpu_${name} OBJECT kern/isa.cpp)
     target_include_directories(lx_cpu_${name} PRIVATE ${PROJECT_SOURCE_DIR}/engine)
-    target_compile_options(lx_cpu_${name} PRIVATE ${flags} -fvisibility=hidden)
+    target_compile_options(lx_cpu_${name} PRIVATE ${flags} $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-fvisibility=hidden>)
     target_compile_definitions(lx_cpu_${name} PRIVATE LX_ISA=${name} LX_ISA_CODE=${code})
     list(APPEND LX_CPU_LEVELS ${name})
   else()
@@ -35,7 +35,18 @@ macro(lx_cpu_level name code)
 endmacro()
 
 lx_cpu_level(generic 1)
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+if(MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+  # cl (Windows): every intrinsic is there whatever /arch says; /arch picks the encoding and what the compiler may emit
+  # on its own (AVX2 brings FMA, F16C and BMI2; AVX512 brings F, BW, VL and DQ). /fp:contract fuses a * b + c, as GCC
+  # does at these levels by default.
+  set(LX_X86 /arch:AVX2 /fp:contract)
+  lx_cpu_level(avx2 10 ${LX_X86})
+  lx_cpu_level(avxvnni 11 ${LX_X86})
+  set(LX_X512 /arch:AVX512 /fp:contract)
+  lx_cpu_level(avx512 20 ${LX_X512})
+  lx_cpu_level(avx512vnni 21 ${LX_X512})
+  lx_cpu_level(avx512bf16 22 ${LX_X512})
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
   set(LX_X86 -mavx2 -mfma -mf16c -mbmi2)
   lx_cpu_level(avx2 10 ${LX_X86})
   lx_cpu_level(avxvnni 11 ${LX_X86} -mavxvnni)
@@ -58,11 +69,18 @@ foreach(level IN LISTS LX_CPU_LEVELS)
 endforeach()
 
 add_library(dromos_cpu SHARED ${LX_CPU_SOURCES} ${LX_CPU_OBJECTS})
-# libdromos_cpu.so on every platform, so the tests and the model find it by one name.
-# Beside libdromos_kernels.so, where the offload runtime looks for its CPU lane.
-set_target_properties(dromos_cpu PROPERTIES SUFFIX ".so" LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+# libdromos_cpu.so on Linux and macOS, so the tests and the model find it by one name, beside libdromos_kernels.so,
+# where the offload runtime looks for its CPU lane. dromos_cpu.dll on Windows, beside dromos_kernels.dll.
+if(WIN32)
+  # Exports the kernels.h ABI (LX_API is dllexport while it builds); the POSIX calls it makes come from engine/platform.
+  target_compile_definitions(dromos_cpu PRIVATE LX_BUILDING_BACKEND)
+  target_link_libraries(dromos_cpu PRIVATE dromos_platform)
+  lx_windows_binary(dromos_cpu "Dromos CPU backend" DLL)
+else()
+  set_target_properties(dromos_cpu PROPERTIES SUFFIX ".so" LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+  target_compile_options(dromos_cpu PRIVATE -fvisibility=hidden)
+endif()
 target_include_directories(dromos_cpu PUBLIC ${PROJECT_SOURCE_DIR}/engine)
-target_compile_options(dromos_cpu PRIVATE -fvisibility=hidden)
 target_compile_definitions(dromos_cpu PRIVATE ${LX_CPU_LEVEL_DEFS})
 find_package(Threads REQUIRED)
 target_link_libraries(dromos_cpu PRIVATE Threads::Threads)

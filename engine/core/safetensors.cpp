@@ -1,10 +1,5 @@
 #include "core/safetensors.h"
 
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
 #include <cerrno>
 #include <cstring>
 #include <fstream>
@@ -13,6 +8,8 @@
 #include <stdexcept>
 
 #include <nlohmann/json.hpp>
+
+#include "platform/posix.h"
 
 namespace lx {
 namespace {
@@ -130,10 +127,18 @@ int64_t TensorInfo::numel() const noexcept {
 }
 
 MappedFile::MappedFile(const std::filesystem::path& path) {
+#if defined(_WIN32)
+  // The UTF-16 path, and the 64-bit size: a checkpoint is larger than the 2 GB plain fstat reports on Windows.
+  const int fd = ::_wopen(path.c_str(), _O_RDONLY | _O_BINARY);
+  if (fd < 0) throw std::runtime_error("cannot open " + path.string() + ": " + std::strerror(errno));
+  struct _stat64 st {};
+  if (::_fstat64(fd, &st) != 0) {
+#else
   const int fd = ::open(path.c_str(), O_RDONLY);
   if (fd < 0) throw std::runtime_error("cannot open " + path.string() + ": " + std::strerror(errno));
   struct stat st {};
   if (::fstat(fd, &st) != 0) {
+#endif
     const int err = errno;
     ::close(fd);
     throw std::runtime_error("cannot stat " + path.string() + ": " + std::strerror(err));

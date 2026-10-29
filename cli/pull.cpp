@@ -7,18 +7,14 @@
 
 #include "cli/common.h"
 #include "core/hub.h"
+#include "platform/platform.h"
 
 namespace cli = lx::cli;
 namespace hub = lx::hub;
 
 namespace {
 
-std::string short_path(const std::filesystem::path& p) {
-  const char* home = std::getenv("HOME");
-  const std::string s = p.string();
-  if (home && s.rfind(home, 0) == 0) return "~" + s.substr(std::string(home).size());
-  return s;
-}
+std::string short_path(const std::filesystem::path& p) { return lx::platform::display(p); }
 
 }  // namespace
 

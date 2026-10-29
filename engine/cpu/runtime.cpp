@@ -10,24 +10,28 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #include <sys/sysctl.h>
 #endif
+#if defined(_WIN32)
+#include <windows.h>
+#include <psapi.h>
+#endif
 #if defined(__x86_64__) || defined(_M_X64)
-#include <cpuid.h>
+#include "cpu/cpuid.h"
 #endif
 
 #include "cpu/cpu.h"
+#include "platform/posix.h"
 
 namespace lx::cpu {
 namespace {
@@ -50,7 +54,12 @@ int alloc(void** ptr, int64_t bytes) {
   const size_t n = static_cast<size_t>(bytes);
   if (n < kMapThreshold) {
     void* p = nullptr;
+#if defined(_WIN32)
+    p = _aligned_malloc(n, 64);
+    if (!p) return fail(kNoMemory);
+#else
     if (posix_memalign(&p, 64, n) != 0 || !p) return fail(kNoMemory);
+#endif
     memset(p, 0, n);
     *ptr = p;
     return kOk;
@@ -82,7 +91,11 @@ int release(void* ptr) {
     }
   }
   if (len) munmap(ptr, len);
+#if defined(_WIN32)
+  else _aligned_free(ptr);
+#else
   else free(ptr);
+#endif
   return kOk;
 }
 
@@ -169,6 +182,22 @@ int64_t cache_bytes(int level) {
     char* unit = nullptr;
     const long v = strtol(size, &unit, 10);
     return static_cast<int64_t>(v) * (unit && *unit == 'M' ? 1 << 20 : unit && *unit == 'K' ? 1 << 10 : 1);
+  }
+  return 0;
+#elif defined(_WIN32)
+  // The first data (or unified) cache of that level the system lists, which is the first core's.
+  DWORD len = 0;
+  GetLogicalProcessorInformationEx(RelationCache, nullptr, &len);
+  if (len == 0) return 0;
+  std::vector<char> buf(len);
+  auto* info = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data());
+  if (!GetLogicalProcessorInformationEx(RelationCache, info, &len)) return 0;
+  for (DWORD at = 0; at < len;) {
+    const auto* e = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data() + at);
+    if (e->Relationship == RelationCache && e->Cache.Level == level &&
+        (e->Cache.Type == CacheData || e->Cache.Type == CacheUnified))
+      return static_cast<int64_t>(e->Cache.CacheSize);
+    at += e->Size;
   }
   return 0;
 #else
@@ -410,6 +439,13 @@ int lx_rt_mem_info(int64_t* free_bytes, int64_t* total_bytes) {
   *free_bytes = static_cast<int64_t>(avail_kb) * 1024;
   *total_bytes = static_cast<int64_t>(total_kb) * 1024;
   return kOk;
+#elif defined(_WIN32)
+  MEMORYSTATUSEX status{};
+  status.dwLength = sizeof status;
+  if (!GlobalMemoryStatusEx(&status)) return fail(kNotSupported);
+  *free_bytes = static_cast<int64_t>(status.ullAvailPhys);
+  *total_bytes = static_cast<int64_t>(status.ullTotalPhys);
+  return kOk;
 #else
   return fail(kNotSupported);
 #endif
@@ -439,7 +475,8 @@ int lx_rt_device_props(int ordinal, lx_device_props* props) {
 }
 
 // Device memory is host memory, so what this process holds is its resident memory: the physical footprint
-// on macOS (what Activity Monitor shows), the resident set on Linux.
+// on macOS (what Activity Monitor shows), the resident set on Linux, the working set on Windows (Task Manager's
+// figure).
 int lx_rt_process_memory(int64_t* bytes) {
   if (!bytes) return fail(kInvalid);
 #if defined(__APPLE__)
@@ -457,6 +494,11 @@ int lx_rt_process_memory(int64_t* bytes) {
   fclose(f);
   if (n != 2) return fail(kNotSupported);
   *bytes = static_cast<int64_t>(resident) * static_cast<int64_t>(sysconf(_SC_PAGESIZE));
+  return kOk;
+#elif defined(_WIN32)
+  PROCESS_MEMORY_COUNTERS counters{};
+  if (!GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof counters)) return fail(kNotSupported);
+  *bytes = static_cast<int64_t>(counters.WorkingSetSize);
   return kOk;
 #else
   return fail(kNotSupported);

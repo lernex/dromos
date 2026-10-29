@@ -6,20 +6,24 @@
 #include <fstream>
 #include <stdexcept>
 
-#include <unistd.h>
-
 #include "core/config.h"
 #include "core/hub.h"
 #include "nlohmann/json.hpp"
+#include "platform/platform.h"
 
 namespace lx::cli {
 namespace fs = std::filesystem;
 
-bool stderr_is_terminal() { return isatty(fileno(stderr)) != 0; }
+bool stderr_is_terminal() { return lx::platform::is_terminal(stderr); }
 
 bool looks_like_path(const std::string& name) {
   if (name.empty()) return false;
   if (name[0] == '/' || name[0] == '.' || name[0] == '~') return true;
+#if defined(_WIN32)
+  // C:\models\praxis, C:/models/praxis and \\server\share\praxis
+  if ((name.size() > 1 && name[1] == ':') || name[0] == '\\') return true;
+  if (name.find('\\') != std::string::npos) return true;
+#endif
   // owner/name is a repository unless a folder of that name exists here
   return name.find('/') != std::string::npos && fs::is_directory(name);
 }
@@ -27,10 +31,7 @@ bool looks_like_path(const std::string& name) {
 Model find_model(const std::string& name, bool download) {
   if (looks_like_path(name)) {
     fs::path dir = name;
-    if (name.rfind("~", 0) == 0) {
-      const char* home = std::getenv("HOME");
-      dir = (home ? std::string(home) : std::string(".")) + name.substr(1);
-    }
+    if (name == "~" || name.rfind("~/", 0) == 0 || name.rfind("~\\", 0) == 0) dir = lx::platform::expand_home(name);
     if (!fs::is_directory(dir)) throw std::runtime_error("there is no model folder at " + dir.string());
     return Model{dir, name, ""};
   }

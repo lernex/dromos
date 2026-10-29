@@ -16,8 +16,9 @@
 #include <thread>
 
 #include "cpu/cpu.h"
+#include "platform/atomics.h"
 
-#if defined(__x86_64__) || defined(__i386__)
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
 
@@ -33,10 +34,12 @@ constexpr uint32_t kProbeMagic = 0x9e3779b9u;
 
 // Pauses a spinning thread for a moment.
 inline void relax() {
-#if defined(__x86_64__) || defined(__i386__)
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64)
   _mm_pause();
 #elif defined(__aarch64__)
   __asm__ __volatile__("yield");
+#elif defined(_M_ARM64)
+  __yield();
 #endif
 }
 
@@ -330,7 +333,7 @@ int plan_layer(const int32_t* ids, const float* weights, const void* latent, int
     const uint32_t seq = *st.job_seq + 1;
     *st.job_seq = seq;
     *st.job_pending = 1;
-    __atomic_store_n(&mb->doorbell, seq, __ATOMIC_RELEASE);
+    lx_store_release(&mb->doorbell, seq);
   } else {
     *st.job_pending = 0;
   }
@@ -565,7 +568,7 @@ int lx_offload_join(lx_offload_state* state, float* out, int T, int L, void* str
   const auto start = std::chrono::steady_clock::now();
   bool ready = false;
   for (uint32_t spins = 0;; ++spins) {
-    if (__atomic_load_n(&state->mailbox->done, __ATOMIC_ACQUIRE) == want) {
+    if (lx_load_acquire(&state->mailbox->done) == want) {
       ready = true;
       break;
     }
@@ -636,7 +639,7 @@ int lx_offload_read_probe(const void* src, int64_t bytes, unsigned long long* si
       acc ^= w[0] ^ w[1] ^ w[2] ^ w[3];
     }
     // Keeps the loads: the sink is only written when the fold lands on the magic value.
-    if (acc == kProbeMagic) __atomic_fetch_add(sink, 1ull, __ATOMIC_RELAXED);
+    if (acc == kProbeMagic) lx_fetch_add_relaxed(sink, 1ull);
   });
   return kOk;
 }

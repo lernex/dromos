@@ -8,7 +8,19 @@
 extern "C" {
 #endif
 
+// Every backend library exports these. A Windows backend is built with LX_BUILDING_BACKEND (dllexport); the
+// engine's own declarations of them, the dispatch stubs, need nothing.
+#ifndef LX_API
+#if defined(_WIN32)
+#if defined(LX_BUILDING_BACKEND)
+#define LX_API __declspec(dllexport)
+#else
+#define LX_API
+#endif
+#else
 #define LX_API __attribute__((visibility("default")))
+#endif
+#endif
 
 // lx_tune_set's rejections: the kernel's order-class rule refuses the variant (see lx::TuneAdmit), or the
 // kernel has no such variant. (LX_ERR_NOT_SUPPORTED is 801, in kernels.h.)

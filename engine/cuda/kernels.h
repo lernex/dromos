@@ -10,7 +10,19 @@
 extern "C" {
 #endif
 
+// Every backend library exports these. A Windows backend is built with LX_BUILDING_BACKEND (dllexport); the
+// engine's own declarations of them, the dispatch stubs, need nothing.
+#ifndef LX_API
+#if defined(_WIN32)
+#if defined(LX_BUILDING_BACKEND)
+#define LX_API __declspec(dllexport)
+#else
+#define LX_API
+#endif
+#else
 #define LX_API __attribute__((visibility("default")))
+#endif
+#endif
 
 typedef enum { LX_F32 = 0, LX_BF16 = 1 } lx_dtype;
 

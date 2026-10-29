@@ -1,13 +1,13 @@
 #include "runtime/offload.h"
 
-#include <dlfcn.h>
-#include <fcntl.h>
-#include <sys/mman.h>
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
 #include <time.h>
-#include <unistd.h>
+
+#include "dispatch/dispatch.h"
+#include "platform/atomics.h"
+#include "platform/posix.h"
 
 #include <algorithm>
 #include <chrono>
@@ -56,6 +56,8 @@ size_t round_up(size_t n, size_t to) { return (n + to - 1) / to * to; }
 int open_direct(const char* path) {
 #if defined(O_DIRECT)
   return open(path, O_RDONLY | O_DIRECT);
+#elif defined(_WIN32)
+  return lx_open_unbuffered(path);  // FILE_FLAG_NO_BUFFERING, Windows' O_DIRECT
 #else
   const int fd = open(path, O_RDONLY);
   if (fd >= 0) fcntl(fd, F_NOCACHE, 1);
@@ -103,19 +105,25 @@ void read_direct(int fd, int64_t offset, int64_t bytes, void* dst, char* bounce)
   std::memcpy(dst, bounce + (offset - start), static_cast<size_t>(bytes));
 }
 
+// The CPU backend library: LX_CPU_KERNELS, else the one beside the backend this process loaded (engine/dispatch),
+// which is where every release tree keeps it (lib/ on Linux, bin\\ on Windows).
+std::string cpu_backend_path() {
+  if (const char* env = std::getenv("LX_CPU_KERNELS"); env && *env) return env;
+  std::string path = lx::dispatch::info().path;
+#if !defined(_WIN32)
+  if (path.empty()) {  // no backend path: beside the code that holds the offload stubs, as before
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<void*>(&lx_offload_plan), &info) && info.dli_fname) path = info.dli_fname;
+  }
+#endif
+  const size_t slash = path.find_last_of("/\\");
+  return (slash == std::string::npos ? std::string(".") : path.substr(0, slash)) + "/" + lx::dispatch::library_file("cpu");
+}
+
 // The CPU backend library beside the GPU kernel library (it exports the same lx_* names, so it is
 // loaded by path, never linked).
 void* open_cpu_backend() {
-  std::string path;
-  if (const char* env = std::getenv("LX_CPU_KERNELS")) path = env;
-  if (path.empty()) {
-    Dl_info info{};
-    if (dladdr(reinterpret_cast<void*>(&lx_offload_plan), &info) && info.dli_fname) {
-      path = info.dli_fname;
-      const size_t slash = path.rfind('/');
-      path = (slash == std::string::npos ? std::string(".") : path.substr(0, slash)) + "/libdromos_cpu.so";
-    }
-  }
+  const std::string path = cpu_backend_path();
   void* lib = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
   if (!lib) throw std::runtime_error("cannot load the CPU backend " + path + ": " + dlerror());
   return lib;
@@ -191,7 +199,7 @@ ExpertOffload::~ExpertOffload() {
   dev_.reset();
   if (mapped_block_) lx_rt_host_free(mapped_block_);
   unpin_region(host_region_, host_region_bytes_);
-  std::free(d_gu_);
+  lx_aligned_free(d_gu_);
   if (cpu_lib_) dlclose(cpu_lib_);
 }
 
@@ -249,7 +257,7 @@ void ExpertOffload::plan_host(const RoutingStats& stats) {
   if (slots < LE) {
     disk_cache_slots_ = static_cast<int>(env_double("LX_DISK_CACHE_SLOTS", 64));
     const size_t total = static_cast<size_t>(disk_cache_slots_) * eb + 4 * 4096;
-    d_gu_ = static_cast<char*>(std::aligned_alloc(4096, round_up(total, 4096)));
+    d_gu_ = static_cast<char*>(lx_aligned_alloc(4096, round_up(total, 4096)));
     d_gus_ = d_gu_ + static_cast<size_t>(disk_cache_slots_) * shape_.gate_up_bytes();
     d_dn_ = d_gus_ + static_cast<size_t>(disk_cache_slots_) * shape_.gate_up_scale_bytes();
     d_dns_ = d_dn_ + static_cast<size_t>(disk_cache_slots_) * shape_.down_bytes();
@@ -402,7 +410,7 @@ void ExpertOffload::finalize(const RoutingStats& stats, int64_t vram_cache_bytes
         const DiskLocation& loc = disk_[id];
         if (fd < 0 || fd_path != loc.file.string()) {
           if (fd >= 0) close(fd);
-          fd = open_direct(loc.file.c_str());
+          fd = open_direct(loc.file.string().c_str());
           fd_path = loc.file.string();
           if (fd < 0) throw std::runtime_error("cannot open " + fd_path);
         }
@@ -767,7 +775,7 @@ void ExpertOffload::prefill(int layer, const int32_t* ids, const float* weights,
 void ExpertOffload::load_disk_expert(int layer, int expert, int cs) {
   const int id = layer * shape_.n_experts + expert;
   const DiskLocation& loc = disk_[id];
-  const int fd = open_direct(loc.file.c_str());
+  const int fd = open_direct(loc.file.string().c_str());
   if (fd < 0) throw std::runtime_error("cannot open " + loc.file.string());
   static thread_local std::vector<char> bounce;
   bounce.resize(static_cast<size_t>(shape_.gate_up_bytes()) + 3 * 8192);
@@ -849,10 +857,10 @@ void ExpertOffload::serve_job() {
 }
 
 void ExpertOffload::cpu_worker() {
-  uint32_t seen = __atomic_load_n(&mailbox_->doorbell, __ATOMIC_ACQUIRE);
+  uint32_t seen = lx_load_acquire(&mailbox_->doorbell);
   auto last = Clock::now();
   while (!stop_.load(std::memory_order_relaxed)) {
-    const uint32_t bell = __atomic_load_n(&mailbox_->doorbell, __ATOMIC_ACQUIRE);
+    const uint32_t bell = lx_load_acquire(&mailbox_->doorbell);
     if (bell != seen) {
       seen = bell;
       try {
@@ -861,13 +869,13 @@ void ExpertOffload::cpu_worker() {
         std::fprintf(stderr, "offload: CPU lane failed: %s\n", e.what());
         return;  // the GPU's join times out and flags the error
       }
-      __atomic_store_n(&mailbox_->done, bell, __ATOMIC_RELEASE);
+      lx_store_release(&mailbox_->done, bell);
       last = Clock::now();
       continue;
     }
     // Spin while the model is generating (a job every ~100 us); after 50 ms idle, nap 20 us at a time.
     if (seconds_since(last) < 0.05) {
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(_M_X64)
       _mm_pause();
 #elif defined(__aarch64__)
       __asm__ __volatile__("yield");

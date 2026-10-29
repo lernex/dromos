@@ -229,7 +229,7 @@ def emit(decls, paths):
         '#include "cuda/tunable.h"',
         '#include "dispatch/dispatch_internal.h"',
         "",
-        "#include <dlfcn.h>",
+        "#include \"platform/posix.h\"",
         "",
         "#include <string>",
         "#include <vector>",

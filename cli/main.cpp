@@ -4,6 +4,7 @@
 #include <exception>
 
 #include "lx_version.h"
+#include "platform/platform.h"
 
 int cmd_inspect(int argc, char** argv);
 int cmd_eval(int argc, char** argv);
@@ -66,6 +67,7 @@ void usage() {
 }  // namespace
 
 int main(int argc, char** argv) {
+  lx::platform::console_init();  // a Windows console: UTF-8 and VT sequences, put back at exit
   if (argc < 2) {
     usage();
     return 2;

@@ -6,9 +6,6 @@
 // An interactive chat in the terminal. Replies stream as they are sampled. The model's reasoning
 // shows dimmed while it thinks, then folds into one line when the answer starts (/expand reads it
 // again). Ctrl-C stops a reply and keeps the chat; Ctrl-D or /quit leaves.
-#include <sys/ioctl.h>
-#include <unistd.h>
-
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -24,6 +21,7 @@
 
 #include "cli/common.h"
 #include "core/update.h"
+#include "platform/platform.h"
 #include "runtime/engine.h"
 #include "text/tokenizer.h"
 
@@ -33,14 +31,20 @@ namespace {
 
 std::atomic<bool> g_interrupted{false};
 
-void on_interrupt(int) { g_interrupted.store(true); }
+void on_interrupt(int sig) {
+  g_interrupted.store(true);
+#if defined(_WIN32)
+  std::signal(sig, on_interrupt);  // Windows resets a handler to the default before it runs: the next Ctrl-C needs it
+#else
+  (void)sig;
+#endif
+}
 
-bool stdout_is_terminal() { return isatty(STDOUT_FILENO) != 0; }
+bool stdout_is_terminal() { return lx::platform::is_terminal(stdout); }
 
 int terminal_width() {
-  winsize ws{};
-  if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) return ws.ws_col;
-  return 80;
+  const int columns = lx::platform::terminal_columns(stdout);
+  return columns > 0 ? columns : 80;
 }
 
 // Counts the rows a dimmed block takes on screen, so it can be erased when it folds.
@@ -89,9 +93,9 @@ class Chat {
       g_interrupted.store(false);
       std::fputs(prompt().c_str(), stdout);
       std::fflush(stdout);
-      if (!std::getline(std::cin, line)) {
-        if (std::cin.eof()) break;
-        std::cin.clear();  // Ctrl-C at the prompt clears the line and asks again
+      const int got = lx::platform::read_line(line);
+      if (got == 0) break;
+      if (got < 0) {  // Ctrl-C at the prompt clears the line and asks again
         std::fputs("\n", stdout);
         continue;
       }
@@ -129,7 +133,7 @@ class Chat {
       std::string more;
       std::fputs("... ", stdout);
       std::fflush(stdout);
-      if (!std::getline(std::cin, more)) break;
+      if (lx::platform::read_line(more) != 1) break;
       text += "\n" + more;
     }
     return text;
@@ -137,7 +141,7 @@ class Chat {
 
   std::string multiline() {
     std::string out, line;
-    while (std::getline(std::cin, line)) {
+    while (lx::platform::read_line(line) == 1) {
       if (line == "\"\"\"") break;
       if (!out.empty()) out += "\n";
       out += line;
@@ -341,7 +345,9 @@ int cmd_run(int argc, char** argv) {
   if (!engine.tokenizer()) throw std::runtime_error("the model folder has no tokenizer");
 
   std::signal(SIGINT, on_interrupt);
+#if defined(SIGPIPE)
   std::signal(SIGPIPE, SIG_IGN);
+#endif
   Chat chat(engine, model, thinking);
   chat.run();
   return 0;

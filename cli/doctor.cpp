@@ -151,7 +151,7 @@ void print_device(const lx::runtime::DeviceInfo& d) {
     std::printf("backend    none: %s\n", backend.error.c_str());
     std::printf("missing    not checked, no backend loaded\n");
   } else {
-    const std::size_t slash = backend.path.rfind('/');
+    const std::size_t slash = backend.path.find_last_of("/\\");
     const std::string file = slash == std::string::npos ? backend.path : backend.path.substr(slash + 1);
     std::printf("backend    %s, %s (%s)\n", backend.backend.c_str(), file.c_str(), backend.path.c_str());
     // CUDA-only fast paths (lx::dispatch::optional) have a fallback everywhere else, so their absence is no gap.

@@ -1,39 +1,23 @@
 #include "core/install.h"
 
-#include <unistd.h>
-
-#include <cstdint>
 #include <fstream>
 #include <string>
 
-#if defined(__APPLE__)
-#include <climits>
-#include <cstdlib>
-#include <mach-o/dyld.h>
-#endif
+#include "platform/platform.h"
 
 namespace lx::install {
 
-// The executable's path with symlinks resolved, or "".
-std::string executable_path() {
-  char buf[4096];
-#if defined(__APPLE__)
-  uint32_t size = sizeof buf;
-  if (_NSGetExecutablePath(buf, &size) != 0) return "";
-  char resolved[PATH_MAX];
-  if (!realpath(buf, resolved)) return "";
-  return resolved;
-#else
-  const ssize_t n = readlink("/proc/self/exe", buf, sizeof buf - 1);
-  if (n <= 0) return "";
-  return std::string(buf, static_cast<size_t>(n));
-#endif
-}
+// The executable's path with symlinks resolved, or "" (engine/platform).
+std::string executable_path() { return lx::platform::executable_path().string(); }
 
 std::string executable_dir() {
   const std::string exe = executable_path();
   if (exe.empty()) return "";
+#if defined(_WIN32)
+  const size_t slash = exe.find_last_of("/\\");
+#else
   const size_t slash = exe.rfind('/');
+#endif
   if (slash == std::string::npos) return "";
   return slash == 0 ? "/" : exe.substr(0, slash);
 }

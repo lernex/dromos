@@ -1,5 +1,6 @@
 #include "runtime/json_grammar.h"
 
+#include <bit>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -149,7 +150,7 @@ uint64_t range_bits(const Node& nd, uint32_t n) {
   const size_t count = nd.keys.size();
   if (n >= count) return 0;
   const uint64_t rest = nd.required & ~low_bits(n);
-  const size_t last = rest ? static_cast<size_t>(__builtin_ctzll(rest)) : count - 1;
+  const size_t last = rest ? static_cast<size_t>(std::countr_zero(rest)) : count - 1;
   return low_bits(last + 1) & ~low_bits(n);
 }
 
@@ -332,7 +333,7 @@ class Machine {
           Stack ns = s;
           Frame& g = ns.back();
           g.phase = kOKeyEnd;
-          g.n = static_cast<uint16_t>(__builtin_ctzll(sel) + 1);
+          g.n = static_cast<uint16_t>(std::countr_zero(sel) + 1);
           g.aux = 0;
           g.mask = 0;
           out.push_back(std::move(ns));
@@ -1297,7 +1298,7 @@ bool JsonGrammar::finished(const std::vector<int32_t>& stops) {
   if (!may_end()) return false;
   const std::vector<uint32_t>& bits = mask(stops);
   size_t allowed = 0;
-  for (uint32_t w : bits) allowed += static_cast<size_t>(__builtin_popcount(w));
+  for (uint32_t w : bits) allowed += static_cast<size_t>(std::popcount(w));
   std::set<int32_t> counted;
   size_t stop_allowed = 0;
   for (int32_t id : stops) {

@@ -1,5 +1,6 @@
 #include "runtime/engine.h"
 
+#include <bit>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -592,7 +593,7 @@ void Engine::Impl::sample(const std::vector<int>& rows, const std::vector<std::s
     if (json) {
       json_rows += 1;
       size_t allowed = 0;
-      for (uint32_t w : bits) allowed += static_cast<size_t>(__builtin_popcount(w));
+      for (uint32_t w : bits) allowed += static_cast<size_t>(std::popcount(w));
       for (int32_t id : s.stop_ids)
         if (id >= 0 && id < V && (bits[static_cast<size_t>(id) / 32] >> (static_cast<size_t>(id) % 32) & 1u)) allowed -= 1;
       if (allowed == 1) json_sole += 1;

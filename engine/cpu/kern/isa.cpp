@@ -226,7 +226,7 @@ inline void tile(const float* x, int64_t ld_x, const Row<F>* rows, int64_t K, fl
   auto pf_to = [&](int64_t step_bytes) {
     if (!pf) return;
     const int64_t goal = lmin<int64_t>(pf_bytes, pulled + step_bytes);
-    for (; pulled < goal; pulled += 64) __builtin_prefetch(pf + pulled, 0, 3);
+    for (; pulled < goal; pulled += 64) LX_PREFETCH(pf + pulled);
   };
   if constexpr (SV > 1 && (MR <= 2 || F == kW_BF16X)) {
     for (; k + Row<F>::kSpan <= K; k += Row<F>::kSpan) {
@@ -988,7 +988,7 @@ void attention(const AttnItem& a) {
     }
     float mx[kMaxG], sum[kMaxG];
     for (int g = 0; g < G; ++g) {
-      mx[g] = -__builtin_inff();
+      mx[g] = -LX_INFF();
       sum[g] = 0.0f;
     }
     const int L = a.start + j + 1;
@@ -1003,7 +1003,7 @@ void attention(const AttnItem& a) {
         float bm = s[g][0];
         for (int p = 1; p < n; ++p) bm = lmax(bm, s[g][p]);
         const float nm = lmax(mx[g], bm);
-        const float corr = mx[g] == -__builtin_inff() ? 0.0f : sexp(mx[g] - nm);
+        const float corr = mx[g] == -LX_INFF() ? 0.0f : sexp(mx[g] - nm);
         for (int p = 0; p < n; ++p) s[g][p] -= nm;
         exp_f32(s[g], s[g], n);
         float bs = 0.0f;
@@ -1033,7 +1033,7 @@ void attention(const AttnItem& a) {
 
 // ---- Selective scan --------------------------------------------------------------------------------------
 
-inline float softplus_f(float v) { return v > 20.0f ? v : __builtin_log1pf(sexp(v)); }
+inline float softplus_f(float v) { return v > 20.0f ? v : LX_LOG1PF(sexp(v)); }
 
 void scan(const ScanItem& a) {
   const int P = a.P, N = a.N;

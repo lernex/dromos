@@ -6,9 +6,6 @@
 
 #include "dispatch/dispatch_internal.h"
 
-#include <dlfcn.h>
-#include <unistd.h>
-
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
@@ -19,9 +16,8 @@
 #include <string>
 #include <vector>
 
-#if defined(__APPLE__)
-#include <mach-o/dyld.h>
-#endif
+#include "platform/platform.h"
+#include "platform/posix.h"
 
 #ifndef LX_INSTALL_LIBDIR
 #define LX_INSTALL_LIBDIR "lib"
@@ -30,22 +26,29 @@
 namespace lx::dispatch {
 namespace {
 
+// A backend's file: libdromos_NAME.so on Linux and macOS, dromos_NAME.dll on Windows.
+#if defined(_WIN32)
+#define LX_BACKEND_LIB(name) name ".dll"
+#else
+#define LX_BACKEND_LIB(name) "lib" name ".so"
+#endif
+
 // The backends LX_BACKEND can name, and the file each one is.
 struct BackendFile {
   const char* name;  // lower case, as LX_BACKEND is compared
   const char* file;
 };
 const BackendFile kBackendFiles[] = {
-    {"cuda", "libdromos_kernels.so"},
-    {"hip", "libdromos_hip.so"},
+    {"cuda", LX_BACKEND_LIB("dromos_kernels")},
+    {"hip", LX_BACKEND_LIB("dromos_hip")},
     {"metal", "libdromos_metal.dylib"},
-    {"cpu", "libdromos_cpu.so"},
+    {"cpu", LX_BACKEND_LIB("dromos_cpu")},
 };
 
 // The probe's order. The CPU library comes last and qualifies as soon as it loads: it is the fallback.
-const char* const kProbeOrder[] = {"libdromos_kernels.so", "libdromos_hip.so", "libdromos_metal.dylib",
-                                   "libdromos_cpu.so"};
-const char* const kCpuFile = "libdromos_cpu.so";
+const char* const kProbeOrder[] = {LX_BACKEND_LIB("dromos_kernels"), LX_BACKEND_LIB("dromos_hip"),
+                                   "libdromos_metal.dylib", LX_BACKEND_LIB("dromos_cpu")};
+const char* const kCpuFile = LX_BACKEND_LIB("dromos_cpu");
 
 // The names of the backends by the id lx_rt_backend returns.
 const char* const kBackendNames[] = {"CUDA", "HIP", "Metal", "CPU"};
@@ -79,23 +82,18 @@ std::string canonical(const std::string& path) {
 }
 
 std::string dir_of(const std::string& path) {
+#if defined(_WIN32)
+  const std::size_t slash = path.find_last_of("/\\");
+#else
   const std::size_t slash = path.rfind('/');
+#endif
   if (slash == std::string::npos) return ".";
   return slash == 0 ? "/" : path.substr(0, slash);
 }
 
-// The directory of the running executable, read from /proc/self/exe on Linux and from _NSGetExecutablePath
-// on macOS. The current directory when neither works.
+// The directory of the running executable (engine/platform), or the current directory when it cannot be found.
 std::string executable_dir() {
-  char buf[4096];
-  std::string exe;
-#if defined(__APPLE__)
-  uint32_t size = sizeof buf;
-  if (_NSGetExecutablePath(buf, &size) == 0) exe = buf;
-#else
-  const ssize_t n = readlink("/proc/self/exe", buf, sizeof buf - 1);
-  if (n > 0) exe.assign(buf, static_cast<std::size_t>(n));
-#endif
+  const std::string exe = lx::platform::executable_path().string();
   if (!exe.empty()) return dir_of(canonical(exe));
   char cwd[4096];
   return getcwd(cwd, sizeof cwd) ? cwd : ".";
@@ -226,6 +224,12 @@ void ensure() { std::call_once(g_once, load); }
 const Info& info() {
   detail::ensure();
   return g_info;
+}
+
+std::string library_file(const std::string& backend) {
+  for (const BackendFile& b : kBackendFiles)
+    if (backend == b.name) return b.file;
+  return "";
 }
 
 std::string last_message() {
