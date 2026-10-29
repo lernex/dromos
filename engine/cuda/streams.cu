@@ -42,6 +42,8 @@ inline int slice_width(int dim) { return (dim + kCluster - 1) / kCluster; }
 // streams[t, s, :] = table[ids[t], :] + stream_emb[s, :]
 __global__ void embed_kernel(const __nv_bfloat16* table, const int32_t* ids, const __nv_bfloat16* stream_emb,
                              float* streams, int S, int D) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   const int t = blockIdx.x;
   const __nv_bfloat16* row = table + static_cast<int64_t>(ids[t]) * D;
   float* out = streams + static_cast<int64_t>(t) * S * D;
@@ -53,6 +55,8 @@ __global__ void embed_kernel(const __nv_bfloat16* table, const int32_t* ids, con
 
 // mean[t, d] = (1 / S) sum_s streams[t, s, d]. One thread per output; tokens go over blockIdx.y.
 __global__ void stream_mean_kernel(const float* streams, float* mean, int T, int S, int D) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   const int d = blockIdx.x * blockDim.x + threadIdx.x;
   if (d >= D) return;
   for (int t = blockIdx.y; t < T; t += gridDim.y) {
@@ -69,6 +73,8 @@ __global__ void stream_mean_kernel(const float* streams, float* mean, int T, int
 __global__ void mhc_read_kernel(const float* streams, const float* matrix, const float* read_weights,
                                 const __nv_bfloat16* norm_w, float eps, float* mixed, __nv_bfloat16* h,
                                 int S, int D) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   extern __shared__ float smem[];
   float* sm_matrix = smem;             // [S, S]
   float* sm_read = sm_matrix + S * S;  // [S]
@@ -120,6 +126,8 @@ __global__ void __launch_bounds__(kClusterThreads) LX_CLUSTER_DIMS(kCluster)
 mhc_read_cluster_kernel(const float* streams, const float* matrix, const float* read_weights,
                         const __nv_bfloat16* norm_w, float eps, float* mixed, __nv_bfloat16* h, int S, int D,
                         int W) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   __shared__ float sm_matrix[kMaxStreams * kMaxStreams];
   __shared__ float sm_read[kMaxStreams];
   __shared__ float parts[kCluster];    // the cluster's sums of squares, by rank, filled by the peers
@@ -179,6 +187,8 @@ mhc_read_cluster_kernel(const float* streams, const float* matrix, const float* 
 // buffer: each element is read by the thread that then writes it, so no other thread sees a change.
 __global__ void mhc_write_kernel(const float* mixed, const float* write_weights, const float* update,
                                  float* streams, int S, int D) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   const int t = blockIdx.x;
   const int64_t base = static_cast<int64_t>(t) * S * D;
   const float* up = update + static_cast<int64_t>(t) * D;
@@ -192,6 +202,8 @@ __global__ void mhc_write_kernel(const float* mixed, const float* write_weights,
 // covers many SMs. Each element is still read and written by the same thread, so aliasing holds.
 __global__ void mhc_write_columns_kernel(const float* mixed, const float* write_weights, const float* update,
                                          float* streams, int S, int D) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   const int t = blockIdx.y;
   const int d = blockIdx.x * blockDim.x + threadIdx.x;
   if (d >= D) return;
@@ -205,8 +217,7 @@ __global__ void mhc_write_columns_kernel(const float* mixed, const float* write_
 extern "C" int lx_embed_streams(const void* table, const int32_t* ids, const void* stream_emb, float* streams,
                                 int T, int S, int D, void* stream) {
   if (T <= 0 || S <= 0 || D <= 0) return 0;
-  embed_kernel<<<T, row_threads(D), 0, static_cast<cudaStream_t>(stream)>>>(
-      static_cast<const __nv_bfloat16*>(table), ids, static_cast<const __nv_bfloat16*>(stream_emb), streams,
+  lx::launch_pdl(embed_kernel, T, row_threads(D), 0, static_cast<cudaStream_t>(stream), static_cast<const __nv_bfloat16*>(table), ids, static_cast<const __nv_bfloat16*>(stream_emb), streams,
       S, D);
   return lx::launch_status();
 }
@@ -214,7 +225,7 @@ extern "C" int lx_embed_streams(const void* table, const int32_t* ids, const voi
 extern "C" int lx_stream_mean(const float* streams, float* mean, int T, int S, int D, void* stream) {
   if (T <= 0 || S <= 0 || D <= 0) return 0;
   const dim3 grid(static_cast<unsigned>((D + 255) / 256), static_cast<unsigned>(std::min(T, 65535)));
-  stream_mean_kernel<<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(streams, mean, T, S, D);
+  lx::launch_pdl(stream_mean_kernel, grid, 256, 0, static_cast<cudaStream_t>(stream), streams, mean, T, S, D);
   return lx::launch_status();
 }
 
@@ -234,7 +245,7 @@ int launch_mhc_read(bool cluster, const float* streams, const float* matrix, con
   if (cluster) {
     const int W = slice_width(D);
     const int threads = (W + 31) / 32 * 32;  // one thread per owned column
-    mhc_read_cluster_kernel<<<T * kCluster, threads, 0, s>>>(streams, matrix, read,
+    lx::launch_pdl(mhc_read_cluster_kernel, T * kCluster, threads, 0, s, streams, matrix, read,
                                                              static_cast<const __nv_bfloat16*>(norm_w), eps, mixed,
                                                              static_cast<__nv_bfloat16*>(h), S, D, W);
     return lx::launch_status();
@@ -243,7 +254,7 @@ int launch_mhc_read(bool cluster, const float* streams, const float* matrix, con
   // 48 KB per block for every width this engine uses (Praxis 2048, Logos 2560).
   const size_t smem = (static_cast<size_t>(S) * S + S + D) * sizeof(float);
   if (smem > 48 * 1024) return static_cast<int>(cudaErrorInvalidValue);
-  mhc_read_kernel<<<T, row_threads(D), smem, s>>>(streams, matrix, read,
+  lx::launch_pdl(mhc_read_kernel, T, row_threads(D), smem, s, streams, matrix, read,
                                                   static_cast<const __nv_bfloat16*>(norm_w), eps, mixed,
                                                   static_cast<__nv_bfloat16*>(h), S, D);
   return lx::launch_status();
@@ -323,11 +334,9 @@ extern "C" int lx_mhc_write(const float* mixed, const float* write, const float*
   if (T <= 0 || S <= 0 || D <= 0) return 0;
   if (T <= kMhcSpreadTokens) {
     const dim3 grid(static_cast<unsigned>((D + 255) / 256), static_cast<unsigned>(T));
-    mhc_write_columns_kernel<<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(
-        mixed, write, update, streams, S, D);
+    lx::launch_pdl(mhc_write_columns_kernel, grid, 256, 0, static_cast<cudaStream_t>(stream), mixed, write, update, streams, S, D);
     return lx::launch_status();
   }
-  mhc_write_kernel<<<T, row_threads(D), 0, static_cast<cudaStream_t>(stream)>>>(
-      mixed, write, update, streams, S, D);
+  lx::launch_pdl(mhc_write_kernel, T, row_threads(D), 0, static_cast<cudaStream_t>(stream), mixed, write, update, streams, S, D);
   return lx::launch_status();
 }

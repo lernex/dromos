@@ -185,6 +185,8 @@ __global__ void __launch_bounds__(kRows * 32) quantize_act_kernel(const TX* __re
                                                                   float* __restrict__ scale,
                                                                   uint8_t* __restrict__ block_scale, int ld_bs, int M,
                                                                   int K, bool vec) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   constexpr int kTPR = 32 * W;  // threads per row
   __shared__ float red[kRows];
   const int warp = threadIdx.x >> 5;
@@ -259,8 +261,7 @@ int launch(const void* x, int ld_x, void* q, int ld_q, float* scale, void* block
   const bool vec = (align & 15) == 0 && K % 16 == 0;
   constexpr int kWarpK = sizeof(TX) == 4 ? 2048 : 4096;  // longest row a warp holds (64 registers of chunks)
   auto run = [&](auto kernel, int rows_per_block) {
-    kernel<<<(M + rows_per_block - 1) / rows_per_block, kRows * 32, 0, s>>>(
-        static_cast<const TX*>(x), ld_x, static_cast<uint8_t*>(q), ld_q, scale, static_cast<uint8_t*>(block_scale),
+    lx::launch_pdl(kernel, (M + rows_per_block - 1) / rows_per_block, kRows * 32, 0, s, static_cast<const TX*>(x), ld_x, static_cast<uint8_t*>(q), ld_q, scale, static_cast<uint8_t*>(block_scale),
         ld_bs, M, K, vec);
   };
   if (!vec) run(quantize_act_kernel<TX, kMath, 1, 0>, kRows);

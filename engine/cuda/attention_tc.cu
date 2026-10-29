@@ -66,6 +66,8 @@ __global__ void __launch_bounds__(kThreads, 1)
                         const bf16* __restrict__ v_cache, const int32_t* __restrict__ slot_ids,
                         const int32_t* __restrict__ start_pos, const int32_t* __restrict__ cu, int n_seq,
                         int capacity, bf16* __restrict__ out, int H, int KVH, float scale_log2) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   constexpr int kKS = Dh / 16;  // k16 steps over the head dimension
   constexpr int kND = Dh / 8;   // n8 tiles of the output
   constexpr int kChunks = Dh / 8;
@@ -259,7 +261,7 @@ int launch(const float* qkv, int ld_qkv, const bf16* k_cache, const bf16* v_cach
         cudaFuncSetAttribute(attention_tc_kernel<Dh>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     if (attr != cudaSuccess) return static_cast<int>(attr);
   }
-  attention_tc_kernel<Dh><<<grid, kThreads, smem, s>>>(qkv, ld_qkv, k_cache, v_cache, slot_ids, start_pos, cu, n_seq,
+  lx::launch_pdl(attention_tc_kernel<Dh>, grid, kThreads, smem, s, qkv, ld_qkv, k_cache, v_cache, slot_ids, start_pos, cu, n_seq,
                                                        capacity, out, H, KVH, scale * 1.4426950408889634f);
   return lx::launch_status();
 }

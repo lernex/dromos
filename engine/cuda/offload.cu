@@ -143,6 +143,8 @@ template <int F>
 __global__ void __launch_bounds__(kThreads) ox_gate_up(const bf16* __restrict__ latent, const lx_expert_ref* src,
                                                        const lx_expert_ref* fill, bf16* __restrict__ inter, int L,
                                                        int I, int top_k, int rows) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   const int p = blockIdx.x / rows;
   const lx_expert_ref s = src[p];
   if (!s.gate_up) return;
@@ -224,6 +226,8 @@ template <int F>
 __global__ void __launch_bounds__(kThreads) ox_down(const bf16* __restrict__ inter, const float* __restrict__ weights,
                                                     const lx_expert_ref* src, const lx_expert_ref* fill,
                                                     float* __restrict__ out, int L, int I, int top_k, int rows) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   extern __shared__ uint4 smem[];
   const int t = blockIdx.x / rows;
   const int l = (blockIdx.x % rows) * kWarps + (threadIdx.x >> 5);
@@ -297,6 +301,8 @@ __global__ void __launch_bounds__(kThreads) ox_gate_up_grouped(const bf16* __res
                                                                const int32_t* __restrict__ pairs,
                                                                bf16* __restrict__ inter, int L, int I, int top_k,
                                                                int rows) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   const int g = blockIdx.x / rows;
   const int begin = offsets[g], end = offsets[g + 1];
   if (begin == end) return;
@@ -356,6 +362,8 @@ __global__ void __launch_bounds__(kThreads) ox_down_grouped(const bf16* __restri
                                                             const int32_t* __restrict__ offsets,
                                                             const int32_t* __restrict__ pairs,
                                                             float* __restrict__ partial, int L, int I, int rows) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   const int g = blockIdx.x / rows;
   const int begin = offsets[g], end = offsets[g + 1];
   if (begin == end) return;
@@ -401,6 +409,8 @@ __global__ void __launch_bounds__(kThreads) ox_down_grouped(const bf16* __restri
 
 // Stage 3: out[t, l] = sum over k of partial[t * top_k + k, l], in k order.
 __global__ void ox_sum_pairs(const float* __restrict__ partial, float* __restrict__ out, int T, int L, int top_k) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   const int64_t n = static_cast<int64_t>(T) * L;
   for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
        i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
@@ -432,6 +442,8 @@ __device__ __forceinline__ void copy_bytes(const void* src, void* dst, int64_t b
 
 __global__ void ox_copy(const lx_expert_ref* src, const lx_expert_ref* dst, const int32_t* count, int64_t gu_bytes,
                         int64_t gus_bytes, int64_t dn_bytes, int64_t dns_bytes) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   const int j = blockIdx.y;
   if (j >= *count) return;
   const lx_expert_ref s = src[j], d = dst[j];
@@ -508,6 +520,8 @@ __device__ __forceinline__ uint32_t load_acquire_sys(const volatile uint32_t* p)
 __global__ void ox_plan(const int32_t* __restrict__ ids, const float* __restrict__ weights,
                         const bf16* __restrict__ latent, int layer, lx_offload_state* sp, lx_expert_ref* src,
                         lx_expert_ref* fill, int T) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   __shared__ int miss_expert[LX_OFFLOAD_MAX_PAIRS], miss_lane[LX_OFFLOAD_MAX_PAIRS], miss_slot[LX_OFFLOAD_MAX_PAIRS];
   __shared__ int pair_miss[LX_OFFLOAD_MAX_PAIRS];  // index into the miss list, -1 for a hit
   const lx_offload_state st = *sp;
@@ -662,6 +676,8 @@ __global__ void ox_plan(const int32_t* __restrict__ ids, const float* __restrict
 }
 
 __global__ void ox_join(lx_offload_state* sp, float* __restrict__ out, int T, int L) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   __shared__ int ready;
   if (threadIdx.x == 0) {
     ready = 0;
@@ -689,6 +705,8 @@ __global__ void ox_join(lx_offload_state* sp, float* __restrict__ out, int T, in
 
 __global__ void ox_prefetch(const int32_t* __restrict__ predicted, int n, int layer, lx_offload_state* sp,
                             lx_expert_ref* src, lx_expert_ref* dst, int32_t* count) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   const lx_offload_state st = *sp;
   const int lane = threadIdx.x;
   const int base = layer * st.n_experts;
@@ -725,6 +743,8 @@ __global__ void ox_prefetch(const int32_t* __restrict__ predicted, int n, int la
 }
 
 __global__ void ox_read_probe(const uint4* __restrict__ src, int64_t n, unsigned long long* sink) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   uint32_t acc = 0;
   const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
   int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -745,10 +765,10 @@ int launch_decode(const void* latent, const float* weights, const lx_expert_ref*
   bf16* inter = static_cast<bf16*>(workspace);
   const int P = T * top_k;
   const int rows1 = (I + kWarps - 1) / kWarps;
-  ox_gate_up<F><<<P * rows1, kThreads, 0, s>>>(static_cast<const bf16*>(latent), src, fill, inter, L, I, top_k, rows1);
+  lx::launch_pdl(ox_gate_up<F>, P * rows1, kThreads, 0, s, static_cast<const bf16*>(latent), src, fill, inter, L, I, top_k, rows1);
   const int rows2 = (L + kWarps - 1) / kWarps;
   const size_t smem = static_cast<size_t>(top_k) * I * sizeof(bf16);
-  ox_down<F><<<T * rows2, kThreads, smem, s>>>(inter, weights, src, fill, out, L, I, top_k, rows2);
+  lx::launch_pdl(ox_down<F>, T * rows2, kThreads, smem, s, inter, weights, src, fill, out, L, I, top_k, rows2);
   return lx::launch_status();
 }
 
@@ -760,10 +780,10 @@ int launch_grouped(const void* latent, const float* weights, const lx_expert_ref
   bf16* inter = static_cast<bf16*>(workspace);
   float* partial = reinterpret_cast<float*>(static_cast<char*>(workspace) + (static_cast<int64_t>(P) * I * 2 + 15) / 16 * 16);
   const int rows1 = (I + kWarps - 1) / kWarps;
-  ox_gate_up_grouped<F><<<G * rows1, kThreads, 0, s>>>(static_cast<const bf16*>(latent), groups, offsets, pairs, inter,
+  lx::launch_pdl(ox_gate_up_grouped<F>, G * rows1, kThreads, 0, s, static_cast<const bf16*>(latent), groups, offsets, pairs, inter,
                                                        L, I, top_k, rows1);
   const int rows2 = (L + kWarps - 1) / kWarps;
-  ox_down_grouped<F><<<G * rows2, kThreads, 0, s>>>(inter, weights, groups, offsets, pairs, partial, L, I, rows2);
+  lx::launch_pdl(ox_down_grouped<F>, G * rows2, kThreads, 0, s, inter, weights, groups, offsets, pairs, partial, L, I, rows2);
   return lx::launch_status();
 }
 
@@ -844,7 +864,7 @@ int lx_offload_experts_grouped(const void* latent, const float* weights, const l
   if (flags & LX_OG_END) {
     const int64_t n = static_cast<int64_t>(T) * L;
     const int blocks = static_cast<int>(std::min<int64_t>((n + 255) / 256, 4096));
-    ox_sum_pairs<<<blocks, 256, 0, s>>>(partial, out, T, L, top_k);
+    lx::launch_pdl(ox_sum_pairs, blocks, 256, 0, s, partial, out, T, L, top_k);
   }
   return lx::launch_status();
 }
@@ -860,7 +880,7 @@ int lx_offload_copy(const lx_expert_ref* src, const lx_expert_ref* dst, const in
   // 24 blocks per expert keep ~400 KB in flight, enough to cover PCIe latency, while leaving most
   // of the SMs to the work it overlaps.
   dim3 grid(24, max_count);
-  ox_copy<<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(src, dst, count, gu, scaled ? 2ll * I * 4 : 0, dn,
+  lx::launch_pdl(ox_copy, grid, 256, 0, static_cast<cudaStream_t>(stream), src, dst, count, gu, scaled ? 2ll * I * 4 : 0, dn,
                                                                 scaled ? static_cast<int64_t>(L) * 4 : 0);
   return lx::launch_status();
 }
@@ -868,25 +888,25 @@ int lx_offload_copy(const lx_expert_ref* src, const lx_expert_ref* dst, const in
 int lx_offload_plan(const int32_t* ids, const float* weights, const void* latent, int layer, lx_offload_state* state,
                     lx_expert_ref* src, lx_expert_ref* fill, int T, void* stream) {
   if (T <= 0) return 0;
-  ox_plan<<<1, 32, 0, static_cast<cudaStream_t>(stream)>>>(ids, weights, static_cast<const bf16*>(latent), layer, state,
+  lx::launch_pdl(ox_plan, 1, 32, 0, static_cast<cudaStream_t>(stream), ids, weights, static_cast<const bf16*>(latent), layer, state,
                                                            src, fill, T);
   return lx::launch_status();
 }
 
 int lx_offload_join(lx_offload_state* state, float* out, int T, int L, void* stream) {
   if (T <= 0) return 0;
-  ox_join<<<1, 1024, 0, static_cast<cudaStream_t>(stream)>>>(state, out, T, L);
+  lx::launch_pdl(ox_join, 1, 1024, 0, static_cast<cudaStream_t>(stream), state, out, T, L);
   return lx::launch_status();
 }
 
 int lx_offload_prefetch(const int32_t* predicted, int n, int layer, lx_offload_state* state, lx_expert_ref* src,
                         lx_expert_ref* dst, int32_t* count, void* stream) {
-  ox_prefetch<<<1, 32, 0, static_cast<cudaStream_t>(stream)>>>(predicted, n, layer, state, src, dst, count);
+  lx::launch_pdl(ox_prefetch, 1, 32, 0, static_cast<cudaStream_t>(stream), predicted, n, layer, state, src, dst, count);
   return lx::launch_status();
 }
 
 int lx_offload_read_probe(const void* src, int64_t bytes, unsigned long long* sink, int blocks, void* stream) {
-  ox_read_probe<<<blocks, 256, 0, static_cast<cudaStream_t>(stream)>>>(static_cast<const uint4*>(src), bytes / 16, sink);
+  lx::launch_pdl(ox_read_probe, blocks, 256, 0, static_cast<cudaStream_t>(stream), static_cast<const uint4*>(src), bytes / 16, sink);
   return lx::launch_status();
 }
 

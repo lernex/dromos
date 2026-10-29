@@ -46,6 +46,8 @@ __device__ __forceinline__ uint32_t e2m1_encode(float x) {
 // FP8 scale = absmax / 448 (1 for an all-zero row), q = e4m3(w / scale), saturating.
 __global__ void quantize_fp8_kernel(const bf16* __restrict__ w, uint8_t* __restrict__ q, float* __restrict__ scale,
                                     int64_t rows, int cols) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   const int64_t row = static_cast<int64_t>(blockIdx.x) * kWarps + (threadIdx.x >> 5);
   if (row >= rows) return;
   const int lane = threadIdx.x & 31;
@@ -65,6 +67,8 @@ __global__ void quantize_fp8_kernel(const bf16* __restrict__ w, uint8_t* __restr
 
 // Absolute maximum of the whole matrix. |w| is non-negative, so its bit pattern orders like the value.
 __global__ void absmax_kernel(const bf16* __restrict__ w, int64_t n, unsigned int* __restrict__ out) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   unsigned int local = 0;
   for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
        i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
@@ -85,6 +89,8 @@ __global__ void absmax_kernel(const bf16* __restrict__ w, int64_t n, unsigned in
 // The effective scale is the e4m3 block scale times the global, the same product the kernel uses.
 __global__ void quantize_nvfp4_kernel(const bf16* __restrict__ w, uint8_t* __restrict__ q, uint8_t* __restrict__ scale,
                                       float global, int64_t rows, int cols) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   const int64_t blocks_per_row = cols / 16;
   const int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (t >= rows * blocks_per_row) return;
@@ -120,6 +126,8 @@ __global__ void quantize_nvfp4_kernel(const bf16* __restrict__ w, uint8_t* __res
 // thread per element.
 template <int F>
 __global__ void dequantize_kernel(const lx_weight w, bf16* __restrict__ out, int64_t rows, int cols) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= rows * cols) return;
   const int64_t n = i / cols, k = i % cols;
@@ -150,8 +158,7 @@ extern "C" int lx_quantize_weight(const void* w, lx_weight* out, int64_t rows, i
     case LX_W_FP8: {
       if (!out->data || !out->scale) return static_cast<int>(cudaErrorInvalidValue);
       const int64_t blocks = (rows + kWarps - 1) / kWarps;
-      quantize_fp8_kernel<<<static_cast<unsigned int>(blocks), kThreads, 0, s>>>(
-          static_cast<const bf16*>(w), static_cast<uint8_t*>(const_cast<void*>(out->data)),
+      lx::launch_pdl(quantize_fp8_kernel, static_cast<unsigned int>(blocks), kThreads, 0, s, static_cast<const bf16*>(w), static_cast<uint8_t*>(const_cast<void*>(out->data)),
           static_cast<float*>(const_cast<void*>(out->scale)), rows, cols);
       return lx::launch_status();
     }
@@ -163,7 +170,7 @@ extern "C" int lx_quantize_weight(const void* w, lx_weight* out, int64_t rows, i
       if (cudaMalloc(&amax_dev, sizeof(unsigned int)) != cudaSuccess) return static_cast<int>(cudaErrorMemoryAllocation);
       cudaMemsetAsync(amax_dev, 0, sizeof(unsigned int), s);
       const unsigned int grid = static_cast<unsigned int>(std::min<int64_t>((n + kThreads - 1) / kThreads, 1024));
-      absmax_kernel<<<grid, kThreads, 0, s>>>(static_cast<const bf16*>(w), n, amax_dev);
+      lx::launch_pdl(absmax_kernel, grid, kThreads, 0, s, static_cast<const bf16*>(w), n, amax_dev);
       unsigned int amax_bits = 0;
       cudaMemcpyAsync(&amax_bits, amax_dev, sizeof(amax_bits), cudaMemcpyDeviceToHost, s);
       const cudaError_t sync = cudaStreamSynchronize(s);
@@ -175,7 +182,7 @@ extern "C" int lx_quantize_weight(const void* w, lx_weight* out, int64_t rows, i
       out->global = global;
       const int64_t t = rows * (cols / 16);
       const unsigned int blocks = static_cast<unsigned int>((t + kThreads - 1) / kThreads);
-      quantize_nvfp4_kernel<<<blocks, kThreads, 0, s>>>(static_cast<const bf16*>(w),
+      lx::launch_pdl(quantize_nvfp4_kernel, blocks, kThreads, 0, s, static_cast<const bf16*>(w),
                                                          static_cast<uint8_t*>(const_cast<void*>(out->data)),
                                                          static_cast<uint8_t*>(const_cast<void*>(out->scale)), global,
                                                          rows, cols);
@@ -207,9 +214,9 @@ extern "C" int lx_dequantize_weight(const lx_weight* w, void* out, int64_t rows,
   auto s = static_cast<cudaStream_t>(stream);
   auto* o = static_cast<bf16*>(out);
   switch (w->type) {
-    case LX_W_INT8: dequantize_kernel<LX_W_INT8><<<blocks, kThreads, 0, s>>>(*w, o, rows, cols); break;
-    case LX_W_FP8: dequantize_kernel<LX_W_FP8><<<blocks, kThreads, 0, s>>>(*w, o, rows, cols); break;
-    default: dequantize_kernel<LX_W_NVFP4><<<blocks, kThreads, 0, s>>>(*w, o, rows, cols); break;
+    case LX_W_INT8: lx::launch_pdl(dequantize_kernel<LX_W_INT8>, blocks, kThreads, 0, s, *w, o, rows, cols); break;
+    case LX_W_FP8: lx::launch_pdl(dequantize_kernel<LX_W_FP8>, blocks, kThreads, 0, s, *w, o, rows, cols); break;
+    default: lx::launch_pdl(dequantize_kernel<LX_W_NVFP4>, blocks, kThreads, 0, s, *w, o, rows, cols); break;
   }
   return lx::launch_status();
 }

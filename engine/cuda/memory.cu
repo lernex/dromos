@@ -42,6 +42,8 @@ __device__ __forceinline__ float sigmoid(float v) { return 1.0f / (1.0f + expf(-
 // Entries past n_entries are never read, so a bank can hold stale or NaN slots there.
 __global__ void memory_attend_kernel(const float* q, const float* bank_k, const float* bank_v, int n_entries,
                                      int max_entries, __nv_bfloat16* out, int rows, int S, int M) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   const int row = blockIdx.x * kWarpsPerBlock + (threadIdx.x >> 5);
   if (row >= rows) return;  // the whole warp shares the row, so it leaves together
   const int lane = threadIdx.x & 31;
@@ -91,6 +93,8 @@ __global__ void memory_attend_kernel(const float* q, const float* bank_k, const 
 // independent warp reductions that overlap. Needs M % 4 == 0 for the vector loads to stay aligned.
 __global__ void memory_attend_vec_kernel(const float* q, const float* bank_k, const float* bank_v, int n_entries,
                                          int max_entries, __nv_bfloat16* out, int rows, int S, int M) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   const int row = blockIdx.x;
   if (row >= rows) return;
   const int lane = threadIdx.x & 31;
@@ -173,6 +177,8 @@ __global__ void memory_attend_vec_kernel(const float* q, const float* bank_k, co
 // with its own block reduction. The summary reads only projected, so it runs last.
 __global__ void memory_fuse_kernel(float* streams, const float* projected, const __nv_bfloat16* gate,
                                    const __nv_bfloat16* gate_bias, float* summary, int S, int D) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   __shared__ float scratch[32];
   const int t = blockIdx.x;
   const float inv_sqrt_d = rsqrtf(static_cast<float>(D));
@@ -203,6 +209,8 @@ __global__ void memory_fuse_kernel(float* streams, const float* projected, const
 __global__ void __launch_bounds__(kClusterThreads) LX_CLUSTER_DIMS(kCluster)
 memory_fuse_cluster_kernel(float* streams, const float* projected, const __nv_bfloat16* gate,
                            const __nv_bfloat16* gate_bias, float* summary, int S, int D, int W) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   __shared__ float warp_dots[32][kMaxStreams];
   __shared__ float parts[kCluster][kMaxStreams];  // the cluster's shares, [rank][stream]
 
@@ -277,6 +285,8 @@ memory_fuse_cluster_kernel(float* streams, const float* projected, const __nv_bf
 // Thread 0 writes the result, so the sigmoid runs once per token.
 __global__ void continuation_kernel(const float* logit, const float* state, const float* difference, float limit,
                                     float* out, int D) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   __shared__ float scratch[32];
   const int t = blockIdx.x;
   const float* st = state + static_cast<int64_t>(t) * D;
@@ -306,13 +316,10 @@ extern "C" int lx_memory_attend(const float* q, const float* bank_k, const float
   if (T <= 0 || S <= 0 || M <= 0) return 0;
   const int rows = T * S;
   if (T <= kDecodeTokens && M % 4 == 0 && M <= 4 * 32 * kLaneVecs) {
-    memory_attend_vec_kernel<<<rows, 32, 0, static_cast<cudaStream_t>(stream)>>>(
-        q, bank_k, bank_v, n_entries, max_entries, static_cast<__nv_bfloat16*>(out), rows, S, M);
+    lx::launch_pdl(memory_attend_vec_kernel, rows, 32, 0, static_cast<cudaStream_t>(stream), q, bank_k, bank_v, n_entries, max_entries, static_cast<__nv_bfloat16*>(out), rows, S, M);
     return lx::launch_status();
   }
-  memory_attend_kernel<<<(rows + kWarpsPerBlock - 1) / kWarpsPerBlock, 32 * kWarpsPerBlock, 0,
-                         static_cast<cudaStream_t>(stream)>>>(
-      q, bank_k, bank_v, n_entries, max_entries, static_cast<__nv_bfloat16*>(out), rows, S, M);
+  lx::launch_pdl(memory_attend_kernel, (rows + kWarpsPerBlock - 1) / kWarpsPerBlock, 32 * kWarpsPerBlock, 0, static_cast<cudaStream_t>(stream), q, bank_k, bank_v, n_entries, max_entries, static_cast<__nv_bfloat16*>(out), rows, S, M);
   return lx::launch_status();
 }
 
@@ -330,13 +337,13 @@ int launch_memory_fuse(bool cluster, float* streams, const float* projected, con
   if (cluster) {
     const int W = slice_width(D);
     const int threads = (W + 31) / 32 * 32;  // one thread per owned column
-    memory_fuse_cluster_kernel<<<T * kCluster, threads, 0, s>>>(streams, projected,
+    lx::launch_pdl(memory_fuse_cluster_kernel, T * kCluster, threads, 0, s, streams, projected,
                                                                 static_cast<const __nv_bfloat16*>(gate),
                                                                 static_cast<const __nv_bfloat16*>(gate_bias), summary,
                                                                 S, D, W);
     return lx::launch_status();
   }
-  memory_fuse_kernel<<<T, row_threads(D), 0, s>>>(streams, projected, static_cast<const __nv_bfloat16*>(gate),
+  lx::launch_pdl(memory_fuse_kernel, T, row_threads(D), 0, s, streams, projected, static_cast<const __nv_bfloat16*>(gate),
                                                   static_cast<const __nv_bfloat16*>(gate_bias), summary, S, D);
   return lx::launch_status();
 }
@@ -402,7 +409,6 @@ extern "C" int lx_memory_fuse(float* streams, const float* projected, const void
 extern "C" int lx_continuation_finish(const float* logit, const float* state, const float* difference, float limit,
                                       float* out, int T, int D, void* stream) {
   if (T <= 0 || D <= 0) return 0;
-  continuation_kernel<<<T, row_threads(D), 0, static_cast<cudaStream_t>(stream)>>>(
-      logit, state, difference, limit, out, D);
+  lx::launch_pdl(continuation_kernel, T, row_threads(D), 0, static_cast<cudaStream_t>(stream), logit, state, difference, limit, out, D);
   return lx::launch_status();
 }

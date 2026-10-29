@@ -189,6 +189,8 @@ cudaError_t ensure_scratch(DeviceState& s, size_t bytes) {
 // out[i] = alpha * bias[i], rounded to TOut.
 template <typename TIn, typename TOut>
 __global__ void scale_bias_kernel(const TIn* __restrict__ bias, float alpha, TOut* __restrict__ out, int n) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) out[i] = lx::from_f32<TOut>(alpha * lx::to_f32(bias[i]));
 }
@@ -196,7 +198,7 @@ __global__ void scale_bias_kernel(const TIn* __restrict__ bias, float alpha, TOu
 template <typename TIn, typename TOut>
 void launch_scale_bias(const void* bias, float alpha, void* out, int n, cudaStream_t stream) {
   const int blocks = (n + 255) / 256;
-  scale_bias_kernel<TIn, TOut><<<blocks, 256, 0, stream>>>(static_cast<const TIn*>(bias), alpha,
+  lx::launch_pdl(scale_bias_kernel<TIn, TOut>, blocks, 256, 0, stream, static_cast<const TIn*>(bias), alpha,
                                                             static_cast<TOut*>(out), n);
 }
 

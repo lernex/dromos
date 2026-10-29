@@ -28,6 +28,7 @@
 #include "cuda/moe_grouped.cuh"
 #include "cuda/tunable.h"
 
+#include "cuda/common.cuh"
 namespace {
 
 using namespace lx::tc;
@@ -108,6 +109,8 @@ Layout layout(int T, int L, int I, int E, int top_k, lx_math math, bool ordered)
 
 __global__ void __launch_bounds__(kRouteThreads) route_count(const int32_t* __restrict__ ids, int P, int E, int chunk,
                                                              int32_t* __restrict__ counts) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   extern __shared__ int hist[];
   for (int e = threadIdx.x; e < E; e += blockDim.x) hist[e] = 0;
   __syncthreads();
@@ -154,6 +157,8 @@ struct TablesOut {
 // end, so a stale workspace never leaks into the GEMMs).
 __global__ void __launch_bounds__(1024) route_scan(int32_t* __restrict__ counts, int chunks, int E,
                                                    int32_t* __restrict__ offsets, TablesOut out) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   __shared__ int warp_sums[32];
   __shared__ int off[kMaxE + 1];
   __shared__ int ts[kMaxE + 1];
@@ -207,6 +212,8 @@ __global__ void __launch_bounds__(kRouteThreads) route_scatter(const int32_t* __
                                                                int chunk, const int32_t* __restrict__ counts,
                                                                const int32_t* __restrict__ offsets,
                                                                int32_t* __restrict__ sorted) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   constexpr int kWarps = kRouteThreads / 32;
   extern __shared__ int sh[];
   int* base = sh;                // [E]
@@ -261,6 +268,8 @@ __device__ __forceinline__ void add_to(V& s, const V& v) {
 }
 template <class V>
 __global__ void ordered_sum_kernel(const V* __restrict__ sums, int top_k, int Lv, int64_t n, V* __restrict__ out) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   for (int64_t i = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x; i < n;
        i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
     const int64_t t = i / Lv, c = i % Lv;
@@ -407,7 +416,7 @@ extern "C" int lx_moe_experts_grouped(const void* latent, const int32_t* ids, co
   auto* pairs = reinterpret_cast<int32_t*>(ws + l.pairs);
 
   // 1. route
-  route_count<<<l.chunks, kRouteThreads, sizeof(int) * E, s>>>(ids, P, E, l.chunk, counts);
+  lx::launch_pdl(route_count, l.chunks, kRouteThreads, sizeof(int) * E, s, ids, P, E, l.chunk, counts);
   TablesOut to{};
   TileTables tt{};
   for (int b = 0; b < kTileBMs; ++b) {
@@ -416,8 +425,8 @@ extern "C" int lx_moe_experts_grouped(const void* latent, const int32_t* ids, co
     tt.table[b] = to.table[b];
     tt.capacity[b] = l.capacity[b];
   }
-  route_scan<<<1, 1024, 0, s>>>(counts, l.chunks, E, offsets, to);
-  route_scatter<<<l.chunks, kRouteThreads, sizeof(int) * E * (1 + kRouteThreads / 32), s>>>(ids, P, E, l.chunk, counts,
+  lx::launch_pdl(route_scan, 1, 1024, 0, s, counts, l.chunks, E, offsets, to);
+  lx::launch_pdl(route_scatter, l.chunks, kRouteThreads, sizeof(int) * E * (1 + kRouteThreads / 32), s, ids, P, E, l.chunk, counts,
                                                                                           offsets, pairs);
   if (int e = lx::launch_status()) return e;
 
@@ -498,10 +507,10 @@ extern "C" int lx_moe_experts_grouped(const void* latent, const int32_t* ids, co
     const int64_t n = static_cast<int64_t>(T) * Lv;
     const int blocks = static_cast<int>(std::min<int64_t>((n + 255) / 256, 4096));
     if (v4)
-      ordered_sum_kernel<float4><<<blocks, 256, 0, s>>>(reinterpret_cast<const float4*>(ws + l.sums), top_k, Lv, n,
+      lx::launch_pdl(ordered_sum_kernel<float4>, blocks, 256, 0, s, reinterpret_cast<const float4*>(ws + l.sums), top_k, Lv, n,
                                                         reinterpret_cast<float4*>(out));
     else
-      ordered_sum_kernel<float><<<blocks, 256, 0, s>>>(reinterpret_cast<const float*>(ws + l.sums), top_k, Lv, n, out);
+      lx::launch_pdl(ordered_sum_kernel<float>, blocks, 256, 0, s, reinterpret_cast<const float*>(ws + l.sums), top_k, Lv, n, out);
     if (int e = lx::launch_status()) return e;
   }
   return 0;

@@ -118,6 +118,8 @@ struct DenseEpi {
 template <int kKind, int kArch, int BM, int BN, int WM, int WN, int ST, int RB, int kSplit>
 __global__ void __launch_bounds__(WM * WN * 32, (lx::tc::Config<kKind, kArch, BM, BN, WM, WN, ST, RB>::kMinBlocks))
     dense_kernel(const DenseProb::Params pp, const DenseEpi::Params ep) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   extern __shared__ __align__(128) uint8_t smem[];
   lx::tc::gemm_body<kKind, kArch, BM, BN, WM, WN, ST, RB, DenseProb, DenseEpi, kSplit>(pp, ep, smem);
 }
@@ -141,7 +143,7 @@ inline int launch_dense(DenseProb::Params pp, const DenseEpi::Params& ep, cudaSt
   pp.group = std::min(pp.tiles_m, 8);
   const unsigned grid = static_cast<unsigned>(pp.tiles_m * pp.tiles_n * kSplit);
   if constexpr (kSplit == 1) {
-    kernel<<<grid, C::kThreads, C::kSmem, s>>>(pp, ep);
+    lx::launch_pdl(kernel, grid, C::kThreads, C::kSmem, s, pp, ep);
     return lx::launch_status();
   } else {
     cudaLaunchConfig_t cfg{};

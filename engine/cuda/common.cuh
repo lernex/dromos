@@ -6,6 +6,10 @@
 
 #include <cooperative_groups.h>
 
+#include <cstdio>
+#include <cstdlib>
+#include <utility>
+
 #include "cuda/kernels.h"
 #include "cuda/tunable.h"
 
@@ -48,6 +52,45 @@ __device__ __forceinline__ void pdl_wait() {}
 
 // Whether a launch may use a programmatic dependent launch on this device (host code).
 inline bool pdl_available() { return lx_arch() >= kClusterArch; }
+
+// Whether launches carry the programmatic-stream-serialization attribute: a device that supports it, and LX_PDL is not 0
+// (LX_PDL=0 gives the plain launches, for an A/B in one binary).
+inline bool pdl_env_off(const char* name) {
+  const char* v = std::getenv(name);
+  return v && v[0] == '0';
+}
+inline bool pdl_on() {
+  static const bool on = pdl_available() && !pdl_env_off("LX_PDL");
+  return on;
+}
+// The two sets of sites separately, for the race hunt: the four launches that predate the rollout, and launch_pdl.
+inline bool pdl_old_on() {
+  static const bool on = pdl_on() && !pdl_env_off("LX_PDL_OLD");
+  return on;
+}
+inline bool pdl_new_on() {
+  static const bool on = pdl_on() && !pdl_env_off("LX_PDL_NEW");
+  return on;
+}
+
+// A launch that may start while the previous kernel in its stream still runs (when pdl_on()). The kernel waits in
+// lx::pdl_wait() before its first read of what that kernel wrote, see the kernels of the decode path.
+template <typename... ExpT, typename... ActT>
+inline void launch_pdl(void (*kernel)(ExpT...), dim3 grid, dim3 block, size_t smem, cudaStream_t stream,
+                       ActT&&... args) {
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = grid;
+  cfg.blockDim = block;
+  cfg.dynamicSmemBytes = smem;
+  cfg.stream = stream;
+  cudaLaunchAttribute attr = {};
+  attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr.val.programmaticStreamSerializationAllowed = 1;
+  cfg.attrs = &attr;
+  cfg.numAttrs = pdl_new_on() ? 1 : 0;
+  const cudaError_t e = cudaLaunchKernelEx(&cfg, kernel, std::forward<ActT>(args)...);
+  if (e != cudaSuccess) std::fprintf(stderr, "lx::launch_pdl: launch failed: %s\n", cudaGetErrorString(e));
+}
 
 __device__ __forceinline__ float to_f32(float v) { return v; }
 __device__ __forceinline__ float to_f32(__nv_bfloat16 v) { return __bfloat162float(v); }

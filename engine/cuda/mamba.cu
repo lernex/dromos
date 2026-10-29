@@ -19,6 +19,8 @@ __global__ void conv1d_kernel(const float* __restrict__ x, int ld_x, const __nv_
                               const __nv_bfloat16* __restrict__ bias, float* __restrict__ state,
                               const int32_t* __restrict__ slot_ids, const int32_t* __restrict__ has_state,
                               const int32_t* __restrict__ cu, float* __restrict__ out, int C, int W) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   __shared__ float old[kConvMaxW - 1][kConvCh];  // the old state rows of this block's channels (0 when none)
   const int tx = threadIdx.x, ty = threadIdx.y;
   const int s = blockIdx.y;
@@ -119,6 +121,8 @@ __device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wai
 // synchronization.
 template <int NI>
 __global__ void __launch_bounds__(256) ssm_scan_kernel(const ScanArgs a) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   constexpr int BW = 16 * NI;  // B and C row width, padded so every lane's four-column load is in range
   __shared__ __align__(16) float stage[2][kChunk * kRowMax];
   __shared__ float dts[2][kChunk], decays[2][kChunk];
@@ -235,7 +239,7 @@ __global__ void __launch_bounds__(256) ssm_scan_kernel(const ScanArgs a) {
 
 template <int NI>
 int launch_scan(const ScanArgs& args, int n_seq, int threads, cudaStream_t s) {
-  ssm_scan_kernel<NI><<<dim3(args.H, n_seq), threads, 0, s>>>(args);
+  lx::launch_pdl(ssm_scan_kernel<NI>, dim3(args.H, n_seq), threads, 0, s, args);
   return lx::launch_status();
 }
 
@@ -245,6 +249,8 @@ int launch_scan(const ScanArgs& args, int n_seq, int threads, cudaStream_t s) {
 __global__ void gated_rmsnorm_kernel(const float* __restrict__ y, const float* __restrict__ z, int ld_z,
                                      const __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ out,
                                      int I, int groups, float eps) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   __shared__ float scratch[32];
   const int K = I / groups;
   const int t = blockIdx.x / groups, g = blockIdx.x % groups;
@@ -301,6 +307,8 @@ struct DecodeArgs {
 
 template <int NI>
 __global__ void __launch_bounds__(kDecodeThreads) mamba_decode_kernel(const DecodeArgs a) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   __shared__ float xs[kDecodeMaxP];                  // the head's x conv outputs
   __shared__ __align__(16) float Bs[kDecodeMaxN];    // the group's B conv outputs, zero past N
   __shared__ __align__(16) float Cs[kDecodeMaxN];    // the group's C conv outputs, zero past N
@@ -465,7 +473,7 @@ __global__ void __launch_bounds__(kDecodeThreads) mamba_decode_kernel(const Deco
 
 template <int NI>
 int launch_decode(const DecodeArgs& args, int n_seq, int H, cudaStream_t s) {
-  mamba_decode_kernel<NI><<<dim3(H, n_seq), kDecodeThreads, 0, s>>>(args);
+  lx::launch_pdl(mamba_decode_kernel<NI>, dim3(H, n_seq), kDecodeThreads, 0, s, args);
   return lx::launch_status();
 }
 
@@ -477,8 +485,7 @@ extern "C" int lx_conv1d_varlen(const float* x, int ld_x, const void* w, const v
   if (n_seq <= 0) return 0;
   if (C <= 0 || W < 1 || W > 8 || ld_x < C || n_seq > 65535) return static_cast<int>(cudaErrorInvalidValue);
   auto s = static_cast<cudaStream_t>(stream);
-  conv1d_kernel<<<dim3((C + kConvCh - 1) / kConvCh, n_seq), dim3(kConvCh, 8), 0, s>>>(
-      x, ld_x, static_cast<const __nv_bfloat16*>(w), static_cast<const __nv_bfloat16*>(bias), conv_state, slot_ids,
+  lx::launch_pdl(conv1d_kernel, dim3((C + kConvCh - 1) / kConvCh, n_seq), dim3(kConvCh, 8), 0, s, x, ld_x, static_cast<const __nv_bfloat16*>(w), static_cast<const __nv_bfloat16*>(bias), conv_state, slot_ids,
       has_state, cu_seqlens, out, C, W);
   return lx::launch_status();
 }
@@ -514,7 +521,7 @@ extern "C" int lx_gated_rmsnorm(const float* y, const float* z, int ld_z, const 
   const int K = I / groups;
   const int threads = K >= 256 ? 256 : ((K + 31) / 32) * 32;
   auto s = static_cast<cudaStream_t>(stream);
-  gated_rmsnorm_kernel<<<T * groups, threads, 0, s>>>(y, z, ld_z, static_cast<const __nv_bfloat16*>(w),
+  lx::launch_pdl(gated_rmsnorm_kernel, T * groups, threads, 0, s, y, z, ld_z, static_cast<const __nv_bfloat16*>(w),
                                                       static_cast<__nv_bfloat16*>(out), I, groups, eps);
   return lx::launch_status();
 }

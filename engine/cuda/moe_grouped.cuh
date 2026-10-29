@@ -200,6 +200,8 @@ struct DownEpi {
 template <int kKind, int kArch, int BM, int BN, int WM, int WN, int ST, int RB, class Prob, class Epi>
 __global__ void __launch_bounds__(WM * WN * 32, (lx::tc::Config<kKind, kArch, BM, BN, WM, WN, ST, RB>::kMinBlocks))
     grouped_kernel(const GroupedParams pp, const typename Epi::Params ep) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   extern __shared__ __align__(128) uint8_t smem[];
   lx::tc::gemm_body<kKind, kArch, BM, BN, WM, WN, ST, RB, Prob, Epi>(pp, ep, smem);
 }
@@ -218,7 +220,7 @@ inline int launch_grouped(GroupedParams pp, const typename Epi::Params& ep, cons
   pp.tiles = tt.table[bm_slot(BM)];
   pp.tiles_n = (pp.N + BN - 1) / BN;
   const int64_t grid = static_cast<int64_t>(tt.capacity[bm_slot(BM)]) * pp.tiles_n;
-  kernel<<<static_cast<unsigned>(grid), C::kThreads, C::kSmem, s>>>(pp, ep);
+  lx::launch_pdl(kernel, static_cast<unsigned>(grid), C::kThreads, C::kSmem, s, pp, ep);
   return lx::launch_status();
 }
 

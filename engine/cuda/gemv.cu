@@ -634,6 +634,8 @@ __global__ void gemv_small_kernel(const TX* __restrict__ x, int ld_x, const lx_w
 // divides the same way.
 __global__ void quantize_w8_kernel(const bf16* __restrict__ w, int8_t* __restrict__ q, float* __restrict__ scale,
                                    int64_t rows, int cols) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   const int64_t row = static_cast<int64_t>(blockIdx.x) * kWarps + (threadIdx.x >> 5);
   if (row >= rows) return;
   const int lane = threadIdx.x & 31;
@@ -680,7 +682,7 @@ cudaLaunchConfig_t pdl_config(unsigned blocks, int threads, cudaStream_t stream,
   attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attr.val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = &attr;
-  cfg.numAttrs = lx::pdl_available() ? 1 : 0;  // below sm_90 the launch is an ordinary one, in stream order
+  cfg.numAttrs = lx::pdl_old_on() ? 1 : 0;  // below sm_90 the launch is an ordinary one, in stream order
   return cfg;
 }
 
@@ -1174,7 +1176,6 @@ extern "C" int lx_quantize_w8(const void* w, int8_t* q, float* scale, int64_t ro
   if (rows <= 0) return 0;
   if (cols <= 0 || !w || !q || !scale) return static_cast<int>(cudaErrorInvalidValue);
   const int64_t blocks = (rows + kWarps - 1) / kWarps;
-  quantize_w8_kernel<<<static_cast<unsigned int>(blocks), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
-      static_cast<const bf16*>(w), q, scale, rows, cols);
+  lx::launch_pdl(quantize_w8_kernel, static_cast<unsigned int>(blocks), kThreads, 0, static_cast<cudaStream_t>(stream), static_cast<const bf16*>(w), q, scale, rows, cols);
   return lx::launch_status();
 }

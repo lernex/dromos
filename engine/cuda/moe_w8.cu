@@ -158,6 +158,8 @@ __global__ void __launch_bounds__(kThreads) w8_gate_up_pair_scalar(const bf16* _
 // which is P int32s, so the pass costs a few microseconds and the stage 1 blocks never scan.
 __global__ void __launch_bounds__(kThreads) w8_pair_links(const int32_t* __restrict__ ids, int P,
                                                           int32_t* __restrict__ next, int32_t* __restrict__ lead) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   const int p = blockIdx.x * blockDim.x + threadIdx.x;
   if (p >= P) return;
   const int e = ids[p];
@@ -368,7 +370,7 @@ cudaError_t launch_kernel(void (*kernel)(Params...), unsigned int grid, size_t s
   cfg.dynamicSmemBytes = smem;
   cfg.stream = s;
   cfg.attrs = &attr;
-  cfg.numAttrs = dependent && lx::pdl_available() ? 1 : 0;  // below sm_90 an ordinary launch: stream order holds
+  cfg.numAttrs = dependent && lx::pdl_old_on() ? 1 : 0;  // below sm_90 an ordinary launch: stream order holds
   return cudaLaunchKernelEx(&cfg, kernel, args...);
 }
 

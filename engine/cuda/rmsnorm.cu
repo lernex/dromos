@@ -6,6 +6,8 @@ namespace {
 template <typename TIn, typename TOut>
 __global__ void rmsnorm_kernel(const TIn* __restrict__ x, const __nv_bfloat16* __restrict__ w,
                                TOut* __restrict__ y, int dim, float eps) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   __shared__ float scratch[32];
   const TIn* row = x + static_cast<int64_t>(blockIdx.x) * dim;
   TOut* out = y + static_cast<int64_t>(blockIdx.x) * dim;
@@ -27,7 +29,6 @@ extern "C" int lx_rmsnorm(const void* x, lx_dtype x_dtype, const void* w, void* 
   const int threads = dim >= 1024 ? 1024 : ((dim + 31) / 32) * 32;
   auto s = static_cast<cudaStream_t>(stream);
   LX_DISPATCH_DTYPE(x_dtype, TIn, LX_DISPATCH_DTYPE(y_dtype, TOut,
-    rmsnorm_kernel<TIn, TOut><<<rows, threads, 0, s>>>(
-        static_cast<const TIn*>(x), static_cast<const __nv_bfloat16*>(w), static_cast<TOut*>(y), dim, eps)))
+    lx::launch_pdl(rmsnorm_kernel<TIn, TOut>, rows, threads, 0, s, static_cast<const TIn*>(x), static_cast<const __nv_bfloat16*>(w), static_cast<TOut*>(y), dim, eps)))
   return lx::launch_status();
 }

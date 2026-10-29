@@ -76,6 +76,8 @@ __global__ void write_kv_kernel(const float* __restrict__ qkv, int ld_qkv,
                                 const int32_t* __restrict__ slot_ids, const int32_t* __restrict__ start_pos,
                                 const int32_t* __restrict__ cu_seqlens, int n_seq, int capacity, int H,
                                 int KVH, int Dh) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   const int T = cu_seqlens[n_seq];
   const int width = KVH * Dh;
   for (int t = blockIdx.x; t < T; t += gridDim.x) {
@@ -99,6 +101,8 @@ __global__ void LX_CLUSTER_DIMS(kSplit) __launch_bounds__(kThreads) attention_ke
     const __nv_bfloat16* __restrict__ v_cache, const int32_t* __restrict__ slot_ids,
     const int32_t* __restrict__ start_pos, const int32_t* __restrict__ cu_seqlens, int n_seq, int capacity,
     __nv_bfloat16* __restrict__ out, int H, int KVH, int Dh, float scale, int clusters, int tc_min) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   extern __shared__ __align__(16) unsigned char smem_raw[];
   __nv_bfloat16* sK = reinterpret_cast<__nv_bfloat16*>(smem_raw);  // [stage][kBlockN][Dh]
   __nv_bfloat16* sV = sK + kStages * kBlockN * Dh;                 // [stage][kBlockN][Dh]
@@ -364,7 +368,7 @@ extern "C" int lx_attention_varlen(const float* qkv, int ld_qkv, void* k_cache, 
   auto kc = static_cast<__nv_bfloat16*>(k_cache);
   auto vc = static_cast<__nv_bfloat16*>(v_cache);
   auto o = static_cast<__nv_bfloat16*>(out);
-  write_kv_kernel<<<kWriteBlocks, kThreads, 0, s>>>(qkv, ld_qkv, kc, vc, slot_ids, start_pos, cu_seqlens,
+  lx::launch_pdl(write_kv_kernel, kWriteBlocks, kThreads, 0, s, qkv, ld_qkv, kc, vc, slot_ids, start_pos, cu_seqlens,
                                                     n_seq, capacity, H, KVH, Dh);
   const int tc_min = lx::attention_tc_min_tokens(H, KVH, Dh);
   if (int e = lx::attention_tc(qkv, ld_qkv, kc, vc, slot_ids, start_pos, cu_seqlens, n_seq, capacity, o, H, KVH, Dh,
@@ -374,12 +378,12 @@ extern "C" int lx_attention_varlen(const float* qkv, int ld_qkv, void* k_cache, 
   const int smem = kStages * 2 * kBlockN * Dh * static_cast<int>(sizeof(__nv_bfloat16));
   if (Dh <= 64) {
     cudaFuncSetAttribute(attention_kernel<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    attention_kernel<1><<<kAttnBlocks, kThreads, smem, s>>>(qkv, ld_qkv, kc, vc, slot_ids, start_pos,
+    lx::launch_pdl(attention_kernel<1>, kAttnBlocks, kThreads, smem, s, qkv, ld_qkv, kc, vc, slot_ids, start_pos,
                                                             cu_seqlens, n_seq, capacity, o, H, KVH, Dh, scale,
                                                             clusters, tc_min);
   } else {
     cudaFuncSetAttribute(attention_kernel<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    attention_kernel<2><<<kAttnBlocks, kThreads, smem, s>>>(qkv, ld_qkv, kc, vc, slot_ids, start_pos,
+    lx::launch_pdl(attention_kernel<2>, kAttnBlocks, kThreads, smem, s, qkv, ld_qkv, kc, vc, slot_ids, start_pos,
                                                             cu_seqlens, n_seq, capacity, o, H, KVH, Dh, scale,
                                                             clusters, tc_min);
   }

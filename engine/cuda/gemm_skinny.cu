@@ -24,6 +24,7 @@
 #include "cuda/kernels.h"
 #include "cuda/mma.cuh"
 
+#include "cuda/common.cuh"
 namespace cg = cooperative_groups;
 
 namespace {
@@ -63,6 +64,8 @@ __global__ void __launch_bounds__(128) skinny_bf16_kernel(const __nv_bfloat16* _
                                                           const __nv_bfloat16* __restrict__ w, const void* bias,
                                                           bool bias_f32, void* y, bool y_bf16, int ld_y, int M, int K,
                                                           float alpha, float beta) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   extern __shared__ __align__(16) uint8_t smem[];
   constexpr int kMT = BM / 16;                       // row tiles
   constexpr int kNTG = BN / 8 < 2 ? BN / 8 : 2;      // warp groups splitting the n8 tiles

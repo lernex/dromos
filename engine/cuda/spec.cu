@@ -47,6 +47,8 @@ __global__ void spec_conv_out_kernel(const float* __restrict__ x, int ld_x, cons
                                      const int32_t* __restrict__ fold,
                                      const int32_t* __restrict__ keep, const int32_t* __restrict__ cu,
                                      float* __restrict__ out, int C, int W) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   const int s = blockIdx.y;
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= C) return;
@@ -89,6 +91,8 @@ __global__ void spec_conv_state_kernel(const float* __restrict__ x, int ld_x, fl
                                        const int32_t* __restrict__ fold,
                                        const int32_t* __restrict__ keep, const int32_t* __restrict__ cu, int C,
                                        int W) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   const int s = blockIdx.y;
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= C) return;
@@ -170,6 +174,8 @@ struct SpecScanArgs {
 
 template <int NI>
 __global__ void __launch_bounds__(256) spec_scan_kernel(const SpecScanArgs a) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   constexpr int BW = 16 * NI;
   __shared__ __align__(16) float stage[2][kChunk * kRowMax];
   __shared__ float dts[2][kChunk], decays[2][kChunk];
@@ -323,7 +329,7 @@ __global__ void __launch_bounds__(256) spec_scan_kernel(const SpecScanArgs a) {
 
 template <int NI>
 int launch_spec_scan(const SpecScanArgs& args, int n_seq, int threads, cudaStream_t s) {
-  spec_scan_kernel<NI><<<dim3(args.H, n_seq), threads, 0, s>>>(args);
+  lx::launch_pdl(spec_scan_kernel<NI>, dim3(args.H, n_seq), threads, 0, s, args);
   return lx::launch_status();
 }
 
@@ -338,6 +344,8 @@ __global__ void __launch_bounds__(kGemvThreads) gemv_f32_kernel(const float* __r
                                                                const float* __restrict__ w,
                                                                const float* __restrict__ bias, float* __restrict__ y,
                                                                int ld_y, int M, int K) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   __shared__ float part[kGemvThreads / 32][kGemvRows];
   const int n = blockIdx.x;
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -603,6 +611,8 @@ __device__ void filter_row(const float* __restrict__ l, float* __restrict__ w, i
 __global__ void __launch_bounds__(kThreads) probs_kernel(const float* __restrict__ logits, int V,
                                                          const lx_spec_filter* __restrict__ filters,
                                                          float* __restrict__ probs) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   __shared__ FilterShared sh;
   const int r = blockIdx.x;
   const int tid = threadIdx.x;
@@ -641,6 +651,8 @@ __global__ void __launch_bounds__(kThreads) verify_kernel(const float* __restric
                                                           const int32_t* __restrict__ cu,
                                                           const lx_spec_rng* __restrict__ rng,
                                                           int32_t* __restrict__ accepted, int32_t* __restrict__ next) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   __shared__ float red[32];
   __shared__ int redi[32];
   __shared__ int s_j;
@@ -700,6 +712,8 @@ __global__ void __launch_bounds__(kThreads) verify_kernel(const float* __restric
 // One block per row: argmax with ties to the lower index.
 __global__ void __launch_bounds__(kThreads) argmax_kernel(const float* __restrict__ logits, int V,
                                                           int32_t* __restrict__ out) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   __shared__ float red[32];
   __shared__ int redi[32];
   const float* l = logits + static_cast<int64_t>(blockIdx.x) * V;
@@ -717,6 +731,8 @@ __global__ void __launch_bounds__(kThreads) argmax_kernel(const float* __restric
 __global__ void greedy_accept_kernel(const int32_t* __restrict__ amax, const int32_t* __restrict__ tokens,
                                      const int32_t* __restrict__ cu, int n_seq, int32_t* __restrict__ accepted,
                                      int32_t* __restrict__ next) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   const int s = blockIdx.x * blockDim.x + threadIdx.x;
   if (s >= n_seq) return;
   const int start = cu[s], k = cu[s + 1] - start - 1;
@@ -731,6 +747,8 @@ __global__ void __launch_bounds__(kThreads) sample_kernel(const float* __restric
                                                           const int32_t* __restrict__ rows,
                                                           const lx_spec_rng* __restrict__ rng, uint32_t domain,
                                                           int32_t* __restrict__ tokens) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   __shared__ float red[32];
   __shared__ int redi[32];
   const int i = blockIdx.x;
@@ -764,6 +782,8 @@ struct RopeFreqs {
 // this card, and made this the drafter's slowest small kernel.)
 __global__ void head_norm_rope_kernel(float* __restrict__ x, int ld_x, int rows, int heads, int Dh,
                                       const __nv_bfloat16* __restrict__ w, float eps, int64_t pos0, RopeFreqs f) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   const int warp = static_cast<int>((static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) >> 5);
   const int lane = threadIdx.x & 31;
   if (warp >= rows * heads) return;
@@ -804,6 +824,8 @@ __global__ void __launch_bounds__(kAttnThreads) block_attention_kernel(
     const float* __restrict__ q, int ld_q, const float* __restrict__ k_ctx, const float* __restrict__ v_ctx, int n_ctx,
     const float* __restrict__ k_blk, const float* __restrict__ v_blk, int ld_blk, float* __restrict__ out, int ld_out,
     int B, int H, int KVH, int Dh, float scale) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   extern __shared__ float sm[];  // query [Dh], partial sums [kAttnThreads], scores [n_ctx + B]
   __shared__ float red[32];
   const int h = blockIdx.x, b = blockIdx.y, kv = h / (H / KVH), n = n_ctx + B, tid = threadIdx.x;
@@ -865,11 +887,11 @@ extern "C" int lx_spec_conv1d(const float* x, int ld_x, const void* w, const voi
   if (n_seq <= 0) return 0;
   if (C <= 0 || W < 1 || W > 8 || ld_x < C || n_seq > 65535) return static_cast<int>(cudaErrorInvalidValue);
   auto s = static_cast<cudaStream_t>(stream);
-  spec_conv_out_kernel<<<dim3((C + 31) / 32, n_seq), dim3(32, 8), 0, s>>>(
-      x, ld_x, static_cast<const __nv_bfloat16*>(w), static_cast<const __nv_bfloat16*>(bias), conv_state, conv_hist,
-      slot_ids, hist_ids, has_state, fold, keep, cu_seqlens, out, C, W);
-  spec_conv_state_kernel<<<dim3((C + 127) / 128, n_seq), 128, 0, s>>>(x, ld_x, conv_state, conv_hist, slot_ids,
-                                                                      hist_ids, has_state, fold, keep, cu_seqlens, C, W);
+  lx::launch_pdl(spec_conv_out_kernel, dim3((C + 31) / 32, n_seq), dim3(32, 8), 0, s,
+                 x, ld_x, static_cast<const __nv_bfloat16*>(w), static_cast<const __nv_bfloat16*>(bias), conv_state,
+                 conv_hist, slot_ids, hist_ids, has_state, fold, keep, cu_seqlens, out, C, W);
+  lx::launch_pdl(spec_conv_state_kernel, dim3((C + 127) / 128, n_seq), 128, 0, s, x, ld_x, conv_state, conv_hist,
+                 slot_ids, hist_ids, has_state, fold, keep, cu_seqlens, C, W);
   return lx::launch_status();
 }
 
@@ -900,7 +922,7 @@ extern "C" int lx_spec_gemv_f32(const float* x, int ld_x, const float* w, const 
   if (M == 0 || N == 0) return 0;
   if (M < 0 || M > kGemvRows || K <= 0 || ld_x < K || ld_y < N || !x || !w || !y)
     return static_cast<int>(cudaErrorInvalidValue);
-  gemv_f32_kernel<<<N, kGemvThreads, 0, static_cast<cudaStream_t>(stream)>>>(x, ld_x, w, bias, y, ld_y, M, K);
+  lx::launch_pdl(gemv_f32_kernel, N, kGemvThreads, 0, static_cast<cudaStream_t>(stream), x, ld_x, w, bias, y, ld_y, M, K);
   return lx::launch_status();
 }
 
@@ -908,7 +930,7 @@ extern "C" int lx_spec_probs(const float* logits, int V, const lx_spec_filter* f
                              void* stream) {
   if (rows <= 0) return 0;
   if (V <= 0 || V > (1 << 24) || !logits || !filters || !probs) return static_cast<int>(cudaErrorInvalidValue);
-  probs_kernel<<<rows, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(logits, V, filters, probs);
+  lx::launch_pdl(probs_kernel, rows, kThreads, 0, static_cast<cudaStream_t>(stream), logits, V, filters, probs);
   return lx::launch_status();
 }
 
@@ -917,7 +939,7 @@ extern "C" int lx_spec_verify(const float* p, const float* q, int V, const int32
   if (n_seq <= 0) return 0;
   if (V <= 0 || V > (1 << 24) || !p || !tokens || !cu_seqlens || !rng || !accepted || !next)
     return static_cast<int>(cudaErrorInvalidValue);
-  verify_kernel<<<n_seq, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(p, q, V, tokens, cu_seqlens, rng, accepted,
+  lx::launch_pdl(verify_kernel, n_seq, kThreads, 0, static_cast<cudaStream_t>(stream), p, q, V, tokens, cu_seqlens, rng, accepted,
                                                                            next);
   return lx::launch_status();
 }
@@ -929,8 +951,8 @@ extern "C" int lx_spec_verify_greedy(const float* logits, int V, const int32_t* 
   if (V <= 0 || !logits || !tokens || !cu_seqlens || !argmax || !accepted || !next)
     return static_cast<int>(cudaErrorInvalidValue);
   auto s = static_cast<cudaStream_t>(stream);
-  argmax_kernel<<<rows, kThreads, 0, s>>>(logits, V, argmax);
-  greedy_accept_kernel<<<(n_seq + 127) / 128, 128, 0, s>>>(argmax, tokens, cu_seqlens, n_seq, accepted, next);
+  lx::launch_pdl(argmax_kernel, rows, kThreads, 0, s, logits, V, argmax);
+  lx::launch_pdl(greedy_accept_kernel, (n_seq + 127) / 128, 128, 0, s, argmax, tokens, cu_seqlens, n_seq, accepted, next);
   return lx::launch_status();
 }
 
@@ -938,7 +960,7 @@ extern "C" int lx_spec_sample(const float* probs, int V, const int32_t* rows, co
                               int n, int32_t* tokens, void* stream) {
   if (n <= 0) return 0;
   if (V <= 0 || V > (1 << 24) || !probs || !rng || !tokens) return static_cast<int>(cudaErrorInvalidValue);
-  sample_kernel<<<n, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(probs, V, rows, rng, domain, tokens);
+  lx::launch_pdl(sample_kernel, n, kThreads, 0, static_cast<cudaStream_t>(stream), probs, V, rows, rng, domain, tokens);
   return lx::launch_status();
 }
 
@@ -950,8 +972,7 @@ extern "C" int lx_spec_head_norm_rope(float* x, int ld_x, int rows, int heads, i
   RopeFreqs f;
   for (int i = 0; i < head_dim / 2; ++i) f.inv[i] = std::pow(theta, -2.0 * i / head_dim);
   const int64_t threads = static_cast<int64_t>(rows) * heads * 32;
-  head_norm_rope_kernel<<<static_cast<unsigned>((threads + 255) / 256), 256, 0, static_cast<cudaStream_t>(stream)>>>(
-      x, ld_x, rows, heads, head_dim, static_cast<const __nv_bfloat16*>(norm_w), eps, pos0, f);
+  lx::launch_pdl(head_norm_rope_kernel, static_cast<unsigned>((threads + 255) / 256), 256, 0, static_cast<cudaStream_t>(stream), x, ld_x, rows, heads, head_dim, static_cast<const __nv_bfloat16*>(norm_w), eps, pos0, f);
   return lx::launch_status();
 }
 
@@ -968,7 +989,6 @@ extern "C" int lx_spec_block_attention(const float* q, int ld_q, const float* k_
     return static_cast<int>(cudaErrorInvalidValue);
   const size_t smem = sizeof(float) * (static_cast<size_t>(head_dim) + kAttnThreads + n_ctx + B);
   if (smem > 48 * 1024) return static_cast<int>(cudaErrorInvalidValue);
-  block_attention_kernel<<<dim3(H, B), kAttnThreads, smem, static_cast<cudaStream_t>(stream)>>>(
-      q, ld_q, k_ctx, v_ctx, n_ctx, k_blk, v_blk, ld_blk, out, ld_out, B, H, KVH, head_dim, scale);
+  lx::launch_pdl(block_attention_kernel, dim3(H, B), kAttnThreads, smem, static_cast<cudaStream_t>(stream), q, ld_q, k_ctx, v_ctx, n_ctx, k_blk, v_blk, ld_blk, out, ld_out, B, H, KVH, head_dim, scale);
   return lx::launch_status();
 }

@@ -105,7 +105,7 @@ cudaLaunchConfig_t pdl_config(unsigned blocks, int threads, cudaStream_t stream,
   attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attr.val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = &attr;
-  cfg.numAttrs = lx::pdl_available() ? 1 : 0;  // programmatic launch exists on sm_90 and up
+  cfg.numAttrs = lx::pdl_old_on() ? 1 : 0;  // programmatic launch exists on sm_90 and up
   return cfg;
 }
 
@@ -117,6 +117,8 @@ __device__ __forceinline__ uint32_t exponent_of(uint32_t u) { return (u >> 7) & 
 
 __global__ void __launch_bounds__(kThreads) encode_bases(const uint16_t* __restrict__ w, int64_t rows, int K,
                                                          uint8_t* __restrict__ out, uint32_t* __restrict__ counts) {
+  lx::pdl_wait();
+  lx::pdl_trigger();
   const int64_t r = static_cast<int64_t>(blockIdx.x) * kWarps + (threadIdx.x >> 5);
   if (r >= rows) return;
   const int lane = threadIdx.x & 31;
@@ -149,6 +151,8 @@ __host__ __device__ inline int64_t overflow_bytes(uint32_t count, int slots) {
 // Exclusive prefix of the overflow record sizes over rows, in one block; total[0] is the sum.
 __global__ void __launch_bounds__(1024) encode_offsets(const uint32_t* __restrict__ counts, int64_t rows, int slots,
                                                        int64_t* __restrict__ offsets, int64_t* __restrict__ total) {
+  lx::pdl_wait();
+  lx::pdl_trigger();
   using Scan = cub::BlockScan<int64_t, 1024>;
   __shared__ typename Scan::TempStorage tmp;
   const int64_t per = (rows + 1023) / 1024;
@@ -167,6 +171,8 @@ __global__ void __launch_bounds__(1024) encode_offsets(const uint32_t* __restric
 __global__ void __launch_bounds__(kThreads) encode_rows(const uint16_t* __restrict__ w, int64_t rows, int K,
                                                         uint8_t* __restrict__ out, const uint32_t* __restrict__ counts,
                                                         const int64_t* __restrict__ offsets) {
+  lx::pdl_wait();
+  lx::pdl_trigger();
   const int64_t r = static_cast<int64_t>(blockIdx.x) * kWarps + (threadIdx.x >> 5);
   if (r >= rows) return;
   const int lane = threadIdx.x & 31;
@@ -244,6 +250,8 @@ __global__ void __launch_bounds__(kThreads) encode_rows(const uint16_t* __restri
 // the products use.
 __global__ void __launch_bounds__(kThreads) decode_rows(const uint8_t* __restrict__ data, int64_t rows, int K,
                                                         uint16_t* __restrict__ w) {
+  lx::pdl_wait();
+  lx::pdl_trigger();
   const int64_t r = static_cast<int64_t>(blockIdx.x) * kWarps + (threadIdx.x >> 5);
   if (r >= rows) return;
   const int lane = threadIdx.x & 31;
@@ -1154,8 +1162,8 @@ __global__ void __launch_bounds__(kThreads) experts_down_scalar(const bf16* __re
                                                                 const uint8_t* __restrict__ down,
                                                                 float* __restrict__ out, int L, int I, int top_k,
                                                                 int row_blocks) {
-  lx::pdl_trigger();
   lx::pdl_wait();
+  lx::pdl_trigger();
   const int64_t t = blockIdx.x / row_blocks;
   const int l = (blockIdx.x % row_blocks) * kWarps + (threadIdx.x >> 5);
   if (l >= L) return;
@@ -1220,8 +1228,8 @@ extern "C" int64_t lx_bf16x_bytes(const void* w, int64_t rows, int K, void* stre
   if (err == cudaSuccess) err = cudaMallocAsync(reinterpret_cast<void**>(&scratch), (rows + 1) * sizeof(int64_t), s);
   if (err != cudaSuccess) return -static_cast<int64_t>(err);
   const auto grid = static_cast<unsigned>((rows + kWarps - 1) / kWarps);
-  encode_bases<<<grid, kThreads, 0, s>>>(static_cast<const uint16_t*>(w), rows, K, nullptr, counts);
-  encode_offsets<<<1, 1024, 0, s>>>(counts, rows, fx::patch_slots(K), scratch, scratch + rows);
+  lx::launch_pdl(encode_bases, grid, kThreads, 0, s, static_cast<const uint16_t*>(w), rows, K, nullptr, counts);
+  lx::launch_pdl(encode_offsets, 1, 1024, 0, s, counts, rows, fx::patch_slots(K), scratch, scratch + rows);
   int64_t overflow = 0;
   cudaMemcpyAsync(&overflow, scratch + rows, sizeof(int64_t), cudaMemcpyDeviceToHost, s);
   cudaFreeAsync(counts, s);
@@ -1246,14 +1254,14 @@ extern "C" int lx_bf16x_encode(const void* w, int64_t rows, int K, void* out, in
   const auto grid = static_cast<unsigned>((rows + kWarps - 1) / kWarps);
   auto* o = static_cast<uint8_t*>(out);
   const auto* src = static_cast<const uint16_t*>(w);
-  encode_bases<<<grid, kThreads, 0, s>>>(src, rows, K, o, counts);
-  encode_offsets<<<1, 1024, 0, s>>>(counts, rows, fx::patch_slots(K), offsets, offsets + rows);
+  lx::launch_pdl(encode_bases, grid, kThreads, 0, s, src, rows, K, o, counts);
+  lx::launch_pdl(encode_offsets, 1, 1024, 0, s, counts, rows, fx::patch_slots(K), offsets, offsets + rows);
   int64_t overflow = 0;
   cudaMemcpyAsync(&overflow, offsets + rows, sizeof(int64_t), cudaMemcpyDeviceToHost, s);
   err = cudaStreamSynchronize(s);
   if (err == cudaSuccess && (rows * fx::row_bytes(K) + 7) / 8 * 8 + overflow > out_bytes) err = cudaErrorInvalidValue;
   if (err == cudaSuccess) {
-    encode_rows<<<grid, kThreads, 0, s>>>(src, rows, K, o, counts, offsets);
+    lx::launch_pdl(encode_rows, grid, kThreads, 0, s, src, rows, K, o, counts, offsets);
     err = cudaGetLastError();
   }
   cudaFreeAsync(counts, s);
@@ -1265,7 +1273,7 @@ extern "C" int lx_bf16x_decode(const void* data, int64_t rows, int K, void* w, v
   if (rows <= 0) return 0;
   if (K <= 0 || K >= fx::kMaxK || !data || !w) return static_cast<int>(cudaErrorInvalidValue);
   const auto grid = static_cast<unsigned>((rows + kWarps - 1) / kWarps);
-  decode_rows<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(static_cast<const uint8_t*>(data), rows, K,
+  lx::launch_pdl(decode_rows, grid, kThreads, 0, static_cast<cudaStream_t>(stream), static_cast<const uint8_t*>(data), rows, K,
                                                                          static_cast<uint16_t*>(w));
   return lx::launch_status();
 }

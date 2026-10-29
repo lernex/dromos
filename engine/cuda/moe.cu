@@ -55,6 +55,8 @@ __global__ void moe_route_kernel(const float* __restrict__ logits, const float* 
                                  int32_t* __restrict__ ids, float* __restrict__ weights,
                                  float* __restrict__ entropy, float* __restrict__ confidence, int T, int E,
                                  int top_k) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   __shared__ int picked[kRouteWarps][kMaxTopK];
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int t = blockIdx.x * kRouteWarps + warp;
@@ -127,6 +129,8 @@ __global__ void moe_route_kernel(const float* __restrict__ logits, const float* 
 __global__ void moe_intermediate_kernel(const bf16* __restrict__ latent, const int32_t* __restrict__ ids,
                                         const bf16* __restrict__ gate_up, bf16* __restrict__ inter, int L,
                                         int I, int top_k, int row_blocks) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   extern __shared__ __align__(16) bf16 x[];
   const int64_t p = static_cast<int64_t>(blockIdx.x) / row_blocks;
   const int i = static_cast<int>(blockIdx.x % row_blocks) * kWarps + (threadIdx.x >> 5);
@@ -149,6 +153,8 @@ __global__ void moe_intermediate_kernel(const bf16* __restrict__ latent, const i
 __global__ void moe_down_kernel(const bf16* __restrict__ inter, const int32_t* __restrict__ ids,
                                 const float* __restrict__ weights, const bf16* __restrict__ down,
                                 float* __restrict__ out, int L, int I, int top_k, int row_blocks) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   extern __shared__ __align__(16) bf16 h[];
   const int64_t t = static_cast<int64_t>(blockIdx.x) / row_blocks;
   const int l = static_cast<int>(blockIdx.x % row_blocks) * kWarps + (threadIdx.x >> 5);
@@ -172,6 +178,8 @@ __global__ void moe_down_kernel(const bf16* __restrict__ inter, const int32_t* _
 __global__ void moe_summary_kernel(const int32_t* __restrict__ ids, const float* __restrict__ weights,
                                    const bf16* __restrict__ emb, float* __restrict__ summary, int64_t n, int R,
                                    int top_k) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
   const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (idx >= n) return;
   const int64_t t = idx / R;
@@ -210,8 +218,7 @@ extern "C" int lx_moe_route(const float* logits, const float* selection_bias, in
   if (T <= 0) return 0;
   if (top_k < 1 || top_k > kMaxTopK || top_k > E) return static_cast<int>(cudaErrorInvalidValue);
   auto s = static_cast<cudaStream_t>(stream);
-  moe_route_kernel<<<(T + kRouteWarps - 1) / kRouteWarps, kRouteWarps * 32, 0, s>>>(
-      logits, selection_bias, ids, weights, entropy, confidence, T, E, top_k);
+  lx::launch_pdl(moe_route_kernel, (T + kRouteWarps - 1) / kRouteWarps, kRouteWarps * 32, 0, s, logits, selection_bias, ids, weights, entropy, confidence, T, E, top_k);
   return lx::launch_status();
 }
 
@@ -230,12 +237,10 @@ extern "C" int lx_moe_experts(const void* latent, const int32_t* ids, const floa
   if (err != cudaSuccess) return static_cast<int>(err);
 
   const int row_blocks_a = (I + kWarps - 1) / kWarps;
-  moe_intermediate_kernel<<<static_cast<unsigned int>(row_blocks_a * pairs), kThreads, smem_latent, s>>>(
-      static_cast<const bf16*>(latent), ids, static_cast<const bf16*>(gate_up), inter, L, I, top_k, row_blocks_a);
+  lx::launch_pdl(moe_intermediate_kernel, static_cast<unsigned int>(row_blocks_a * pairs), kThreads, smem_latent, s, static_cast<const bf16*>(latent), ids, static_cast<const bf16*>(gate_up), inter, L, I, top_k, row_blocks_a);
 
   const int row_blocks_b = (L + kWarps - 1) / kWarps;
-  moe_down_kernel<<<static_cast<unsigned int>(T * row_blocks_b), kThreads, smem_inter, s>>>(
-      inter, ids, weights, static_cast<const bf16*>(down), out, L, I, top_k, row_blocks_b);
+  lx::launch_pdl(moe_down_kernel, static_cast<unsigned int>(T * row_blocks_b), kThreads, smem_inter, s, inter, ids, weights, static_cast<const bf16*>(down), out, L, I, top_k, row_blocks_b);
 
   cudaFreeAsync(inter, s);
   return lx::launch_status();
@@ -246,8 +251,7 @@ extern "C" int lx_moe_summary(const int32_t* ids, const float* weights, const vo
   if (T <= 0 || R <= 0) return 0;
   const int64_t n = static_cast<int64_t>(T) * R;
   auto s = static_cast<cudaStream_t>(stream);
-  moe_summary_kernel<<<static_cast<unsigned int>((n + kThreads - 1) / kThreads), kThreads, 0, s>>>(
-      ids, weights, static_cast<const bf16*>(expert_emb), summary, n, R, top_k);
+  lx::launch_pdl(moe_summary_kernel, static_cast<unsigned int>((n + kThreads - 1) / kThreads), kThreads, 0, s, ids, weights, static_cast<const bf16*>(expert_emb), summary, n, R, top_k);
   return lx::launch_status();
 }
 

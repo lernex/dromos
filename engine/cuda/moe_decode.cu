@@ -133,7 +133,9 @@ __global__ void __launch_bounds__(kThreads) moe_gate_up_kernel(const bf16* __res
                                                               int L, int I, int top_k, int rows_per_pair) {
   constexpr int kV = kVal<F>;
   constexpr int D = kDepth<F>;
-  // The down stage may start its prologue now: it reads only ids and weights before it waits for this stage.
+  // The down stage may start its prologue now: it reads only ids and weights before it waits for this stage. Both
+  // come from the routing kernel before this one, so this stage waits for it first.
+  lx::pdl_wait();
   lx::pdl_trigger();
   const int p = blockIdx.x / rows_per_pair;
   const int i = (blockIdx.x % rows_per_pair) * kWarps + (threadIdx.x >> 5);
@@ -292,7 +294,7 @@ cudaError_t launch_down(const bf16* inter, const int32_t* ids, const float* weig
   cfg.dynamicSmemBytes = 0;
   cfg.stream = s;
   cfg.attrs = &attr;
-  cfg.numAttrs = lx::pdl_available() ? 1 : 0;
+  cfg.numAttrs = lx::pdl_old_on() ? 1 : 0;
   cudaLaunchKernelEx(&cfg, moe_down_kernel<F>, inter, ids, weights, w, out, T, L, I, top_k);
   return cudaGetLastError();
 }
@@ -302,7 +304,7 @@ template <int F>
 cudaError_t launch_gate_up(const bf16* latent, const int32_t* ids, const lx_weight& w, bf16* inter, int L, int I,
                            int top_k, int P, cudaStream_t s) {
   const int rows_per_pair = (I + kWarps - 1) / kWarps;
-  moe_gate_up_kernel<F><<<static_cast<unsigned int>(P * rows_per_pair), kThreads, 0, s>>>(latent, ids, w, inter, L,
+  lx::launch_pdl(moe_gate_up_kernel<F>, static_cast<unsigned int>(P * rows_per_pair), kThreads, 0, s, latent, ids, w, inter, L,
                                                                                          I, top_k, rows_per_pair);
   return cudaGetLastError();
 }
