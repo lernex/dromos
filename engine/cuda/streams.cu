@@ -127,7 +127,6 @@ mhc_read_cluster_kernel(const float* streams, const float* matrix, const float* 
                         const __nv_bfloat16* norm_w, float eps, float* mixed, __nv_bfloat16* h, int S, int D,
                         int W) {
   lx::pdl_trigger();
-  lx::pdl_wait();
   __shared__ float sm_matrix[kMaxStreams * kMaxStreams];
   __shared__ float sm_read[kMaxStreams];
   __shared__ float parts[kCluster];    // the cluster's sums of squares, by rank, filled by the peers
@@ -140,15 +139,18 @@ mhc_read_cluster_kernel(const float* streams, const float* matrix, const float* 
   const float* in = streams + static_cast<int64_t>(t) * S * D;
   float* mix = mixed + static_cast<int64_t>(t) * S * D;
 
-  // The column loads go out first; the per-pass constants are staged in shared memory while they fly.
-  // Padding threads read a valid column (dc) and never write it.
+  // The per-pass constants and the norm weight are model parameters no kernel writes, so they load before the
+  // predecessor finishes; the column loads depend on it and go after the wait. Padding threads read a valid column
+  // (dc) and never write it.
+  for (int k = threadIdx.x; k < S * S; k += blockDim.x) sm_matrix[k] = matrix[k];
+  for (int k = threadIdx.x; k < S; k += blockDim.x) sm_read[k] = read_weights[k];
+  const float nw = own ? __bfloat162float(norm_w[d]) : 0.0f;
   const int dc = min(d, D - 1);
+  __syncthreads();
+  lx::pdl_wait();
   float x[kMaxStreams];
 #pragma unroll
   for (int i = 0; i < kMaxStreams; ++i) x[i] = (i < S) ? in[i * D + dc] : 0.0f;
-  for (int k = threadIdx.x; k < S * S; k += blockDim.x) sm_matrix[k] = matrix[k];
-  for (int k = threadIdx.x; k < S; k += blockDim.x) sm_read[k] = read_weights[k];
-  __syncthreads();
 
   float src = 0.0f;
 #pragma unroll
@@ -179,7 +181,7 @@ mhc_read_cluster_kernel(const float* streams, const float* matrix, const float* 
   if (own) {
     const float scale = rsqrtf(total / D + eps);
     h[static_cast<int64_t>(t) * D + d] =
-        lx::from_f32<__nv_bfloat16>(src * scale * __bfloat162float(norm_w[d]));
+        lx::from_f32<__nv_bfloat16>(src * scale * nw);
   }
 }
 
@@ -193,7 +195,6 @@ mhc_write_read_cluster_kernel(float* mixed, const float* write_weights, const fl
                               const float* matrix, const float* read_weights, const __nv_bfloat16* norm_w, float eps,
                               __nv_bfloat16* h, int S, int D, int W) {
   lx::pdl_trigger();
-  lx::pdl_wait();
   __shared__ float sm_matrix[kMaxStreams * kMaxStreams];
   __shared__ float sm_read[kMaxStreams];
   __shared__ float sm_write[kMaxStreams];
@@ -208,16 +209,21 @@ mhc_write_read_cluster_kernel(float* mixed, const float* write_weights, const fl
   const int64_t base = static_cast<int64_t>(t) * S * D;
   float* mix = mixed + base;
 
-  float old[kMaxStreams];
-#pragma unroll
-  for (int i = 0; i < kMaxStreams; ++i) old[i] = (i < S) ? mix[i * D + dc] : 0.0f;
-  const float u = update[static_cast<int64_t>(t) * D + dc];
+  // The matrix, the weights and the norm weight are model parameters no kernel writes, so they load before the
+  // predecessor finishes; mixed and update depend on it and go after the wait.
   for (int k = threadIdx.x; k < S * S; k += blockDim.x) sm_matrix[k] = matrix[k];
   for (int k = threadIdx.x; k < S; k += blockDim.x) {
     sm_read[k] = read_weights[k];
     sm_write[k] = write_weights[k];
   }
+  const float nw = own ? __bfloat162float(norm_w[d]) : 0.0f;
   __syncthreads();
+  lx::pdl_wait();
+
+  float old[kMaxStreams];
+#pragma unroll
+  for (int i = 0; i < kMaxStreams; ++i) old[i] = (i < S) ? mix[i * D + dc] : 0.0f;
+  const float u = update[static_cast<int64_t>(t) * D + dc];
 
   // The write, as mhc_write_columns_kernel: streams[s, d] = mixed[s, d] + write[s] * update[d].
   float x[kMaxStreams];
@@ -255,7 +261,7 @@ mhc_write_read_cluster_kernel(float* mixed, const float* write_weights, const fl
   for (int k = 0; k < kCluster; ++k) total += parts[k];
   if (own) {
     const float scale = rsqrtf(total / D + eps);
-    h[static_cast<int64_t>(t) * D + d] = lx::from_f32<__nv_bfloat16>(src * scale * __bfloat162float(norm_w[d]));
+    h[static_cast<int64_t>(t) * D + d] = lx::from_f32<__nv_bfloat16>(src * scale * nw);
   }
 }
 

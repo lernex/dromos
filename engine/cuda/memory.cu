@@ -210,7 +210,6 @@ __global__ void __launch_bounds__(kClusterThreads) LX_CLUSTER_DIMS(kCluster)
 memory_fuse_cluster_kernel(float* streams, const float* projected, const __nv_bfloat16* gate,
                            const __nv_bfloat16* gate_bias, float* summary, int S, int D, int W) {
   lx::pdl_trigger();
-  lx::pdl_wait();
   __shared__ float warp_dots[32][kMaxStreams];
   __shared__ float parts[kCluster][kMaxStreams];  // the cluster's shares, [rank][stream]
 
@@ -222,15 +221,22 @@ memory_fuse_cluster_kernel(float* streams, const float* projected, const __nv_bf
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
 
-  // Padding threads read a valid column (dc) and never write it; streams past S are never loaded.
+  // Padding threads read a valid column (dc) and never write it; streams past S are never loaded. The gate and its
+  // bias are model parameters no kernel writes, so they load before the predecessor finishes.
   const int dc = min(d, D - 1);
-  float x[kMaxStreams], p[kMaxStreams], g_in[kMaxStreams];
+  float g_in[kMaxStreams], gb[kMaxStreams];
+#pragma unroll
+  for (int s = 0; s < kMaxStreams; ++s) {
+    g_in[s] = (s < S) ? lx::to_f32(gate[s * D + dc]) : 0.0f;
+    gb[s] = (s < S) ? lx::to_f32(gate_bias[s]) : 0.0f;
+  }
+  lx::pdl_wait();
+  float x[kMaxStreams], p[kMaxStreams];
 #pragma unroll
   for (int s = 0; s < kMaxStreams; ++s) {
     const int64_t at = base + static_cast<int64_t>(s) * D + dc;
     x[s] = (s < S) ? streams[at] : 0.0f;
     p[s] = (s < S) ? projected[at] : 0.0f;
-    g_in[s] = (s < S) ? lx::to_f32(gate[s * D + dc]) : 0.0f;
   }
   float dot[kMaxStreams];
 #pragma unroll
@@ -272,7 +278,7 @@ memory_fuse_cluster_kernel(float* streams, const float* projected, const __nv_bf
 #pragma unroll
     for (int s = 0; s < kMaxStreams; ++s) {
       if (s < S) {
-        const float g = sigmoid(total[s] * inv_sqrt_d + lx::to_f32(gate_bias[s]));
+        const float g = sigmoid(total[s] * inv_sqrt_d + gb[s]);
         streams[base + static_cast<int64_t>(s) * D + d] = x[s] + g * p[s];
         acc += p[s];
       }
