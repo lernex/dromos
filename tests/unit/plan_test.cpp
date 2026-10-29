@@ -610,6 +610,19 @@ TEST_CASE("a CPU with the model's RAM free: resident in RAM, no expert offload, 
   CHECK_THROWS_AS(make_offload_plan(d, praxis(), bf16_checkpoint(), plain), std::runtime_error);
 }
 
+TEST_CASE("a CPU with the model's size in RAM but less of it free: resident, with a note that the system pages") {
+  // The 8.5 GB Windows VM that ran Praxis BF16 at 12 tok/s: 6.47 GB free at startup against 6.21 GB needed.
+  DeviceInfo d = simulated_cpu("Windows VM CPU", 8.5);
+  d.free_bytes = static_cast<size_t>(6.47 * 1e9);
+  PlanRequest plain;
+  plain.bf16x = false;
+  const Plan p = make_plan(d, praxis(), bf16_checkpoint(), plain);
+  CHECK(p.weights == LX_W_BF16);
+  CHECK_FALSE(p.offload.enabled);
+  CHECK(has_note(p, "pages other programs out"));
+  CHECK(names_no_gpu(p));
+}
+
 TEST_CASE("a CPU with less RAM free than the model: says so in RAM terms, no VRAM or offload") {
   const DeviceInfo d = simulated_cpu("Windows VM CPU", 3);
   PlanRequest plain;
@@ -624,7 +637,7 @@ TEST_CASE("a CPU with less RAM free than the model: says so in RAM terms, no VRA
   }
   CHECK(threw);
   CHECK(why.find("this machine") != std::string::npos);
-  CHECK(why.find("of RAM is free") != std::string::npos);
+  CHECK(why.find("of RAM can hold the model") != std::string::npos);
   CHECK(why.find("VRAM") == std::string::npos);
   CHECK(why.find("GPU") == std::string::npos);
   CHECK(why.find("CUDA") == std::string::npos);

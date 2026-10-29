@@ -584,10 +584,21 @@ namespace {
 
 // The budget a resident plan may fill: the request's share of the free memory, no more than the VRAM budget
 // (which counts this process's CUDA context too), less what the plan keeps back.
+// A CPU's model lives in RAM the OS manages, which pages other programs out to make room: what is free at startup is
+// not the limit there. The budget is the machine's RAM less a reserve for the system (an eighth, at least 1.5 GiB), no
+// more than LX_RAM_BUDGET_GB when that is set.
+size_t cpu_budget(const DeviceInfo& d, const PlanRequest& req) {
+  const size_t total = std::max(d.total_bytes, d.free_bytes);
+  const size_t reserve = std::max<size_t>(1536 * kMiB, total / 8);
+  size_t budget = total > reserve ? total - reserve : 0;
+  if (req.ram_budget > 0) budget = std::min(budget, req.ram_budget);
+  return budget;
+}
+
 size_t resident_budget(const DeviceInfo& d, const PlanRequest& req) {
+  if (d.cpu) return cpu_budget(d, req);
   size_t free_budget = static_cast<size_t>(static_cast<double>(d.free_bytes) * req.memory_fraction);
-  // A CPU has no VRAM: its host memory is the device's, and the one fit check is against that RAM.
-  if (req.vram_budget > 0 && !d.cpu)
+  if (req.vram_budget > 0)
     free_budget = std::min(free_budget, req.vram_budget > kCudaContextBytes ? req.vram_budget - kCudaContextBytes : 0);
   return free_budget > kReserveBytes ? free_budget - kReserveBytes : 0;
 }
@@ -795,7 +806,9 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
   if (!chosen.ok) {
     std::string why = "\n  " + format_name(target) + " needs " + gb(chosen.need) + " for one sequence of " +
                       std::to_string(kLimitedContext) + " tokens; " +
-                      (d.cpu ? gb(d.free_bytes) + " of RAM is free" : gb(budget) + " is free for the model");
+                      (d.cpu ? gb(budget) + " of this machine's " + gb(std::max(d.total_bytes, d.free_bytes)) +
+                                   " of RAM can hold the model, less what the system keeps"
+                             : gb(budget) + " is free for the model");
     if (!offload_why.empty()) why += "\n  and offloading the experts does not help: " + offload_why;
     for (const FormatOption& o : options)
       if (o.fits && o.format != target)
@@ -950,8 +963,11 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
     n.push_back("--weights " + weights_flag(o->format) +
                 " would decode at about " + tps(o->decode_ceiling_tps) + " tok/s against " +
                 tps(p.decode_ceiling_tps) + " here (" + o->load + ").");
-  n.push_back("Memory: " + gb(p.weight_bytes + p.state_bytes + p.kv_bytes + p.scratch_bytes) + " planned of " +
-              gb(budget) + " available.");
+  const size_t planned = p.weight_bytes + p.state_bytes + p.kv_bytes + p.scratch_bytes;
+  n.push_back("Memory: " + gb(planned) + " planned of " + gb(budget) + " available.");
+  if (d.cpu && planned > d.free_bytes)
+    n.push_back("Only " + gb(d.free_bytes) + " of RAM is free now, so the system pages other programs out to make room "
+                "as the model loads; the first tokens may be slow.");
   return p;
 }
 
