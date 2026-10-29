@@ -60,8 +60,10 @@
 #include "model/metis.h"
 #include "runtime/block_drafter.h"
 #include "runtime/engine.h"
+#include "runtime/json_grammar.h"
 #include "runtime/offload_model.h"
 #include "runtime/speculative.h"
+#include "text/tokenizer.h"
 
 namespace {
 
@@ -1122,7 +1124,8 @@ void check_rc(int rc, const char* what) {
 
 int run_exactness(const std::string& dir, const std::string& prompts_path, const std::string& name, int draws,
                   const lx::cli::FormatFlags& format, double rep, double presence, double frequency, int output_top,
-                  double temp, double top_p, int top_k, double min_p) {
+                  double temp, double top_p, int top_k, double min_p, const std::string& json_schema,
+                  const std::string& json_prefix) {
   nlohmann::json prompts;
   std::ifstream(prompts_path) >> prompts;
   if (!prompts.contains(name)) throw std::runtime_error("no prompt named " + name + " in " + prompts_path);
@@ -1161,6 +1164,41 @@ int run_exactness(const std::string& dir, const std::string& prompts_path, const
   std::vector<float> base(static_cast<size_t>(V));
   check_rc(lx_rt_copy(base.data(), d_logits, static_cast<int64_t>(sizeof(float)) * V, LX_COPY_D2H, s), "copy of logits");
   check_rc(lx_rt_stream_sync(s), "stream sync");
+
+  // Constrained decoding (--json-schema): the grammar, advanced over --json-prefix, masks the base row the way the engine
+  // masks a plain step's logits before sampling (lx_mask_logits sets them to -inf). The reference, the plain draws and
+  // the verify rows all read this masked row.
+  const int words = (V + 31) / 32;
+  std::unique_ptr<lx::text::Tokenizer> tokenizer;
+  std::unique_ptr<lx::runtime::VocabIndex> vocab;
+  std::shared_ptr<lx::runtime::JsonProgram> program;
+  std::unique_ptr<lx::runtime::JsonGrammar> grammar;
+  std::vector<uint32_t> mask0;  // the base row's mask, one bit per token
+  if (!json_schema.empty()) {
+    tokenizer = lx::text::Tokenizer::load(dir);
+    if (!tokenizer) throw std::runtime_error("no tokenizer in " + dir + ": the grammar needs the vocabulary's bytes");
+    std::vector<std::string> bytes(static_cast<size_t>(V));
+    for (int i = 0; i < V; ++i) bytes[static_cast<size_t>(i)] = tokenizer->token_bytes(i);
+    vocab = std::make_unique<lx::runtime::VocabIndex>(bytes);
+    lx::runtime::JsonFormat jf;
+    jf.schema = json_schema;
+    program = lx::runtime::compile_json(jf);
+    grammar = std::make_unique<lx::runtime::JsonGrammar>(program, *vocab);
+    if (!json_prefix.empty() && !grammar->accept(json_prefix))
+      throw std::runtime_error("the --json-prefix is not a start of a reply the schema allows");
+    mask0 = grammar->mask({});
+    double mass_all = 0.0, mass_kept = 0.0, top = -INFINITY;
+    for (int t = 0; t < V; ++t) top = std::max(top, static_cast<double>(base[static_cast<size_t>(t)]));
+    for (int t = 0; t < V; ++t) {
+      const double e = std::exp(static_cast<double>(base[static_cast<size_t>(t)]) - top);
+      mass_all += e;
+      if ((mask0[static_cast<size_t>(t) / 32] >> (t % 32)) & 1u) mass_kept += e;
+    }
+    for (int t = 0; t < V; ++t)
+      if (!((mask0[static_cast<size_t>(t) / 32] >> (t % 32)) & 1u)) base[static_cast<size_t>(t)] = -INFINITY;
+    std::printf("grammar: the schema allows %.4f of the unconstrained next-token mass (%d of %d tokens)\n",
+                mass_kept / mass_all, [&] { int n = 0; for (int t = 0; t < V; ++t) n += (mask0[static_cast<size_t>(t) / 32] >> (t % 32)) & 1u; return n; }(), V);
+  }
   // --output-top N: the N most likely tokens also count as output, so presence and frequency act on them. The context's
   // own tail is too unlikely to hold the candidates, so this is the state the presence and frequency checks need. Both
   // paths read the same counts.
@@ -1249,6 +1287,18 @@ int run_exactness(const std::string& dir, const std::string& prompts_path, const
   config.frequency_penalty = static_cast<float>(frequency);
   auto spec_draws = [&](int draft, long& accepted_total) {
     std::vector<long> counts(static_cast<size_t>(V), 0);
+    // Row 0 is the base row's mask; row 1 is the grammar after the draft, on a copy that leaves the grammar as it is.
+    std::vector<uint32_t> row_masks;
+    if (grammar) {
+      std::unique_ptr<lx::runtime::JsonGrammar> after = grammar->clone();
+      if (!after->accept(vocab->bytes(static_cast<int32_t>(draft))))
+        throw std::runtime_error("the forced draft is not allowed by the grammar");
+      row_masks = mask0;
+      const std::vector<uint32_t>& row1 = after->mask({});
+      row_masks.insert(row_masks.end(), row1.begin(), row1.end());
+      config.row_masks = row_masks.data();
+      config.mask_words = words;
+    }
     prefill();
     const int before = model.slot_length(0);
     for (int i = 0; i < draws; ++i) {
@@ -1276,7 +1326,7 @@ int run_exactness(const std::string& dir, const std::string& prompts_path, const
   const int high = kept.size() > 1 ? kept[1] : kept[0];
   const int low = kept.back();
 
-  const std::vector<long> plain_a = plain_draws(1);
+  const std::vector<long> plain_a = plain_draws(1);  // (the base row is masked: so are the plain draws)
   const std::vector<long> plain_b = plain_draws(2);
   long acc_high = 0, acc_low = 0;
   const std::vector<long> spec_high = spec_draws(high, acc_high);
@@ -1352,6 +1402,7 @@ int cmd_spec_exactness(int argc, char** argv) {
     int output_top = 0;
     double temp = 0.8, top_p = 0.95, min_p = 0.0;  // the think setting
     int top_k = 20;
+    std::string json_schema, json_prefix;  // a grammar: the schema's JSON text, and the output already written
     std::vector<char*> pos;
     for (size_t i = 0; i < args.size(); ++i) {
       const std::string a = args[i];
@@ -1367,19 +1418,21 @@ int cmd_spec_exactness(int argc, char** argv) {
       else if (a == "--top-p") top_p = std::stod(val());
       else if (a == "--top-k") top_k = std::stoi(val());
       else if (a == "--min-p") min_p = std::stod(val());
+      else if (a == "--json-schema") json_schema = val();
+      else if (a == "--json-prefix") json_prefix = val();
       else pos.push_back(args[i]);
     }
     const int n = static_cast<int>(pos.size());
     if (n != 4 && n != 5) {
       std::fprintf(stderr,
                    "usage: dromos spec-exactness MODEL_DIR PROMPTS_JSON PROMPT [DRAWS] [--rep R] [--presence P] "
-                   "[--frequency F] [--temp T] [--top-p P] [--top-k K] [--min-p M] %s\n",
+                   "[--frequency F] [--temp T] [--top-p P] [--top-k K] [--min-p M] [--json-schema JSON] [--json-prefix TEXT] %s\n",
                    lx::cli::kFormatUsage);
       return 2;
     }
     const int draws = n == 5 ? std::stoi(pos[4]) : 2000;
     return run_exactness(pos[1], pos[2], pos[3], draws, format, rep, presence, frequency, output_top, temp, top_p, top_k,
-                         min_p);
+                         min_p, json_schema, json_prefix);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "error: %s\n", e.what());
     return 1;

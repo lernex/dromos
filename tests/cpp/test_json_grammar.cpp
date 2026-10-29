@@ -348,3 +348,17 @@ TEST_CASE("a rejected token leaves the grammar unchanged") {
   REQUIRE(g.accept(R"(,"year":1,"tags":[]})"));
   CHECK(g.may_end());
 }
+
+TEST_CASE("a clone is in the same state and advances on its own") {
+  auto p = program(R"({"type":"object","properties":{"title":{"type":"string"}},"required":["title"]})");
+  JsonGrammar g(p, vocab());
+  REQUIRE(g.accept("{\""));
+  auto copy = g.clone();
+  CHECK(copy->mask(stops()) == g.mask(stops()));
+  // The copy takes the rest of a value; the original is where it was.
+  REQUIRE(copy->accept("title\":\"ab\"}"));
+  CHECK(copy->may_end());
+  CHECK_FALSE(g.may_end());
+  CHECK(g.accept("title"));
+  CHECK(copy->mask(stops()) != g.mask(stops()));
+}

@@ -270,7 +270,7 @@ SpecDecoder::~SpecDecoder() {
                   static_cast<void*>(d_filters_), static_cast<void*>(d_rng_), static_cast<void*>(d_seen_),
                   static_cast<void*>(d_out_counts_), static_cast<void*>(d_observed_), static_cast<void*>(raw_),
                   static_cast<void*>(d_emitted_), static_cast<void*>(d_lp_), static_cast<void*>(d_top_lp_),
-                  static_cast<void*>(d_top_ids_)})
+                  static_cast<void*>(d_top_ids_), static_cast<void*>(d_mask_bits_), static_cast<void*>(d_mask_rows_)})
     lx_rt_free(p);
   lx_rt_host_free(h_out_);
 }
@@ -369,10 +369,30 @@ void SpecDecoder::verify(int slot, const SpecConfig& config, const std::vector<i
   const int rows = static_cast<int>(step.size());
   if (rows < 1 || rows > max_rows_)
     throw std::runtime_error("a verify step takes 1 to " + std::to_string(max_rows_) + " rows");
+  const int V = target_.vocab_size();
   const int before = target_.slot_length(slot);
   const std::vector<lx_spec_filter> filters(rows, config.filter);
   LX_CHECK(lx_rt_copy(d_filters_, filters.data(), static_cast<int64_t>(sizeof(lx_spec_filter) * rows), LX_COPY_H2D, s));
   target_.forward_spec({step, {0, rows}, {slot}}, logits_, s);
+  if (config.row_masks) {
+    // The masks go on before anything reads the rows: a plain step masks its logits before sampling, and before the
+    // log-probabilities are taken, so a verify row's numbers are the masked distribution's too.
+    const int words = config.mask_words;
+    if (words <= 0) throw std::runtime_error("constrained verify rows need the token mask's word count");
+    if (words > mask_cap_) {
+      lx_rt_free(d_mask_bits_);
+      d_mask_bits_ = device_alloc<uint32_t>(max_rows_ * static_cast<size_t>(words));
+      if (!d_mask_rows_) d_mask_rows_ = device_alloc<int32_t>(max_rows_);
+      mask_cap_ = words;
+    }
+    std::vector<int32_t> row_index(static_cast<size_t>(rows));
+    for (int j = 0; j < rows; ++j) row_index[static_cast<size_t>(j)] = j;
+    LX_CHECK(lx_rt_copy(d_mask_rows_, row_index.data(), static_cast<int64_t>(sizeof(int32_t) * rows), LX_COPY_H2D, s));
+    LX_CHECK(lx_rt_copy(d_mask_bits_, config.row_masks, static_cast<int64_t>(sizeof(uint32_t) * rows * words),
+                        LX_COPY_H2D, s));
+    LX_CHECK(lx_rt_stream_sync(s));  // the host copies are the caller's: they must be read before it returns
+    LX_CHECK(lx_mask_logits(logits_, V, d_mask_rows_, d_mask_bits_, rows, s));
+  }
   accept(config, step, q, position, slot, counts, accepted, next, s, logprobs);
   target_.truncate(slot, before + accepted + 1);
 }

@@ -73,6 +73,9 @@ class JsonGrammar {
   ~JsonGrammar();
   JsonGrammar(const JsonGrammar&) = delete;
   JsonGrammar& operator=(const JsonGrammar&) = delete;
+  // An independent copy in the same state: a verify step advances it along the drafts to mask their rows, and leaves
+  // this one where it is.
+  std::unique_ptr<JsonGrammar> clone() const;
 
   // Consumes the bytes of one token. False, with no change, when they cannot come next.
   bool accept(std::string_view bytes);

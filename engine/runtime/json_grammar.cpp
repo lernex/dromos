@@ -1222,6 +1222,14 @@ int entry_for(JsonProgram& p, const VocabIndex& v, const jx::Machine& m, const j
 
 }  // namespace
 
+std::unique_ptr<JsonGrammar> JsonGrammar::clone() const {
+  auto copy = std::unique_ptr<JsonGrammar>(new JsonGrammar(impl_->program, *impl_->vocab));
+  copy->impl_->configs = impl_->configs;
+  copy->impl_->cached = impl_->cached;
+  copy->impl_->cache = impl_->cache;
+  return copy;
+}
+
 JsonGrammar::JsonGrammar(std::shared_ptr<JsonProgram> program, const VocabIndex& vocab)
     : impl_(std::make_unique<Impl>()) {
   impl_->program = std::move(program);

@@ -150,6 +150,11 @@ struct SpecConfig {
   // Log-probabilities of the emitted tokens (SpecLogprobs), with the top_logprobs most likely at each position.
   bool logprobs = false;
   int top_logprobs = 0;
+  // Constrained decoding: one token mask per verify row (row j: the grammar after the step's first j tokens), mask_words
+  // 32-bit words each. They are applied to the rows' logits as a plain step applies its mask, before anything reads
+  // them. Null when the sequence is unconstrained.
+  const uint32_t* row_masks = nullptr;
+  int mask_words = 0;
 };
 
 // What a verify step reports for the tokens it emits: entry k is the token emitted at row k (the accepted drafts, then the
@@ -226,6 +231,10 @@ class SpecDecoder {
   float *d_lp_ = nullptr, *d_top_lp_ = nullptr;
   int32_t* d_top_ids_ = nullptr;
   int top_capacity_ = 0;
+  // The constrained rows' masks on the device, and their row indices.
+  uint32_t* d_mask_bits_ = nullptr;
+  int32_t* d_mask_rows_ = nullptr;
+  int mask_cap_ = 0;  // words per row the mask buffer holds
 };
 
 }  // namespace lx::runtime

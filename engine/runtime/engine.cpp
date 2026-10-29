@@ -737,7 +737,8 @@ bool Engine::Impl::accept(const std::shared_ptr<Sequence>& s, int32_t token, flo
   return false;
 }
 
-// A decoding sequence may verify drafts: it has its first token, and nothing it asks for needs a grammar.
+// A decoding sequence may verify drafts: it has its first token and its prompt is in. Constrained sequences draft under
+// their grammar's masks (spec_step).
 // Its penalties are judged row by row by the verify step, as the plain sampler judges them (SpecDecoder::verify).
 // A constrained row never speculates: a verify step has no grammar mask, so a draft the schema forbids would be
 // accepted or rejected by the target alone. Constrained rows (q.json for response_format, q.grammar for tool calls)
@@ -746,8 +747,7 @@ bool Engine::Impl::spec_eligible(const std::shared_ptr<Sequence>& s) const {
   if (!spec) return false;
   const Sequence& q = *s;
   const SamplingParams& sp = q.request.sampling;
-  return q.has_pending && !q.ended && !q.cancelled && !q.grammar && !q.json &&
-         q.prompt_fed == static_cast<int>(q.request.prompt.size());
+  return q.has_pending && !q.ended && !q.cancelled && q.prompt_fed == static_cast<int>(q.request.prompt.size());
 }
 
 // The lone stream's step as a verify step: its pending token and the drafts prompt lookup proposes from its history run
@@ -777,10 +777,59 @@ bool Engine::Impl::spec_step(const std::shared_ptr<Sequence>& s) {
     return false;
   }
 
+  // A constrained sequence drafts under its grammar. Row j of the step is masked to the tokens the grammar allows after
+  // the step's first j tokens, found on copies of the grammar advanced along the drafts. The drafts stop before the first
+  // one the grammar rules out, before a stop token (the reply ends there, and the row samples it), and before a state
+  // with no token left (the plain step decides that one). Greedy and sampled verify both draw from the masked rows, so
+  // an accepted draft is one the plain constrained step could have drawn.
+  std::vector<uint32_t> row_masks;  // row j at j * spec_mask_words
+  const int spec_mask_words = (V + 31) / 32;
+  if (q.grammar || q.json) {
+    std::unique_ptr<JsonGrammar> json_copy = q.json ? q.json->clone() : nullptr;
+    std::unique_ptr<ToolGrammar> tool_copy = q.grammar ? std::make_unique<ToolGrammar>(*q.grammar) : nullptr;
+    auto allowed_now = [&]() -> const std::vector<uint32_t>& {
+      return json_copy ? json_copy->mask(q.stop_ids) : tool_copy->mask(token_texts, q.stop_ids);
+    };
+    auto advance = [&](int32_t t) {
+      return json_copy ? json_copy->accept(vocab_index->bytes(t)) : tool_copy->accept(token_texts[static_cast<size_t>(t)]);
+    };
+    auto bit = [](const uint32_t* bits, int32_t t) { return (bits[t / 32] >> (t % 32)) & 1u; };
+    auto any = [](const uint32_t* bits, int words) {
+      for (int w = 0; w < words; ++w)
+        if (bits[w]) return true;
+      return false;
+    };
+    const std::vector<uint32_t>& first = allowed_now();
+    if (!any(first.data(), spec_mask_words)) {
+      q.drafter->observe(0, 0, stream);  // no token is allowed: the plain step is the one that ends or refuses the reply
+      return false;
+    }
+    row_masks.assign(first.begin(), first.end());
+    size_t kept = 0;
+    while (kept < draft.tokens.size()) {
+      const int32_t t = draft.tokens[kept];
+      const uint32_t* row = row_masks.data() + kept * static_cast<size_t>(spec_mask_words);
+      if (t < 0 || t >= V || bit(row, t) == 0) break;
+      if (std::find(q.stop_ids.begin(), q.stop_ids.end(), t) != q.stop_ids.end()) break;
+      if (!advance(t)) break;
+      const std::vector<uint32_t>& next_row = allowed_now();
+      if (!any(next_row.data(), spec_mask_words)) break;
+      row_masks.insert(row_masks.end(), next_row.begin(), next_row.end());
+      kept += 1;
+    }
+    draft.tokens.resize(kept);
+    if (kept == 0) {
+      q.drafter->observe(0, 0, stream);
+      return false;
+    }
+  }
+
   std::vector<int32_t> step{q.pending};
   step.insert(step.end(), draft.tokens.begin(), draft.tokens.end());
   q.has_pending = false;
   SpecConfig config;
+  config.row_masks = (q.grammar || q.json) ? row_masks.data() : nullptr;
+  config.mask_words = spec_mask_words;
   config.filter = lx_spec_filter{sp.temperature, sp.top_p, sp.top_k, sp.min_p};
   config.seed = sp.seed;
   config.stop_ids = q.stop_ids;
