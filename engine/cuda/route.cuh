@@ -108,4 +108,100 @@ __device__ __forceinline__ void gemv_partials(const float* __restrict__ x, int l
   }
 }
 
+// The picks of a row in one pass, for the fused launch. Each lane keeps the best TK of its own experts; a butterfly then
+// merges the lists. The best TK of two sorted lists is the elementwise better of one list and the other reversed, which
+// is bitonic, and a bitonic sort (half-cleaners) puts it in order. Every lane ends with the row's best TK in row_picks'
+// order: value descending, ties to the lower index. A NaN bias is never picked, as in row_picks. row_picks runs top_k
+// rounds of scan, shuffle reduction and shared-memory write; this gives the same picks in one pass.
+template <int TK>
+struct TopList {
+  float v[TK];
+  int i[TK];
+};
+
+__device__ __forceinline__ bool beats(float va, int ia, float vb, int ib) { return va > vb || (va == vb && ia < ib); }
+
+// Insert (v, i) into a list kept best first.
+template <int TK>
+__device__ __forceinline__ void top_insert(TopList<TK>& t, float v, int i) {
+  if (!beats(v, i, t.v[TK - 1], t.i[TK - 1])) return;
+  t.v[TK - 1] = v;
+  t.i[TK - 1] = i;
+#pragma unroll
+  for (int k = TK - 1; k > 0; --k) {
+    if (beats(t.v[k], t.i[k], t.v[k - 1], t.i[k - 1])) {
+      const float tv = t.v[k - 1];
+      const int ti = t.i[k - 1];
+      t.v[k - 1] = t.v[k];
+      t.i[k - 1] = t.i[k];
+      t.v[k] = tv;
+      t.i[k] = ti;
+    }
+  }
+}
+
+// The best TK of two best-first lists (TK a power of two), kept best first.
+template <int TK>
+__device__ __forceinline__ void top_merge(TopList<TK>& a, const TopList<TK>& b) {
+  TopList<TK> c;
+#pragma unroll
+  for (int k = 0; k < TK; ++k) {
+    const int j = TK - 1 - k;
+    const bool take_a = beats(a.v[k], a.i[k], b.v[j], b.i[j]);
+    c.v[k] = take_a ? a.v[k] : b.v[j];
+    c.i[k] = take_a ? a.i[k] : b.i[j];
+  }
+#pragma unroll
+  for (int d = TK / 2; d >= 1; d /= 2) {
+#pragma unroll
+    for (int k = 0; k < TK; ++k) {
+      if ((k & d) == 0) {
+        const int j = k + d;
+        if (beats(c.v[j], c.i[j], c.v[k], c.i[k])) {
+          const float tv = c.v[k];
+          const int ti = c.i[k];
+          c.v[k] = c.v[j];
+          c.i[k] = c.i[j];
+          c.v[j] = tv;
+          c.i[j] = ti;
+        }
+      }
+    }
+  }
+  a = c;
+}
+
+// Every lane of the warp ends holding the warp's best TK.
+template <int TK>
+__device__ __forceinline__ void top_warp(TopList<TK>& t) {
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) {
+    TopList<TK> p;
+#pragma unroll
+    for (int k = 0; k < TK; ++k) {
+      p.v[k] = __shfl_xor_sync(0xffffffffu, t.v[k], o);
+      p.i[k] = __shfl_xor_sync(0xffffffffu, t.i[k], o);
+    }
+    top_merge(t, p);
+  }
+}
+
+// The picks of one row, the same as row_picks writes them for top_k <= TK. Lane j scans experts j, j + 32, ... The full
+// warp runs it, and the picks are visible to the warp on return.
+template <int TK>
+__device__ __forceinline__ void top_picks(const float* row, const float* bias, int E, int lane, int top_k, int* pick) {
+  TopList<TK> t;
+#pragma unroll
+  for (int k = 0; k < TK; ++k) {
+    t.v[k] = -INFINITY;
+    t.i[k] = E;
+  }
+  for (int i = lane; i < E; i += 32) top_insert(t, row[i] + (bias ? bias[i] : 0.0f), i);
+  top_warp(t);
+#pragma unroll
+  for (int k = 0; k < TK; ++k)
+    if (lane == 0 && k < top_k) pick[k] = t.i[k];
+  __syncwarp();
+}
+
 }  // namespace lx::route

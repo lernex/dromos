@@ -283,3 +283,40 @@ def test_router_route_is_the_two_calls_bit_for_bit(lx, E, K, top_k):
             assert torch.equal(bits(entropy), bits(want_ent)), f"entropy differs, M = {M}"
             assert torch.equal(bits(confidence), bits(want_conf)), f"confidence differs, M = {M}"
 
+
+@pytest.mark.skipif(BACKEND != "cuda", reason="lx_router_route is CUDA's fast path; hosts fall back elsewhere")
+def test_router_route_breaks_ties_and_skips_nan_like_the_two_calls(lx):
+    """Experts with identical logits and biases tie, and the picks go to the lower index as lx_moe_route's do. A NaN
+    selection bias is never picked."""
+    torch.manual_seed(2)
+    E, K, top_k = 128, 1280, 4
+    ld_x = K + 3
+    dup = torch.arange(16, E, device=DEVICE) % 16
+    w = torch.randn(E, K, device=DEVICE) * 0.05
+    w[16:] = w[dup]
+    bias = torch.randn(E, device=DEVICE)
+    bias[16:] = bias[dup]
+    sel = torch.randn(E, device=DEVICE) * 0.3
+    sel[16:] = sel[dup]
+    sel[5] = float("nan")
+    ticket = torch.zeros(1, dtype=torch.int32, device=DEVICE)
+    for M in range(1, 9):
+        x = torch.randn(M, ld_x, device=DEVICE)
+        logits = torch.full((M, E), float("nan"), device=DEVICE)
+        ids = torch.full((M, top_k), -7, dtype=torch.int32, device=DEVICE)
+        weights = torch.full((M, top_k), float("nan"), device=DEVICE)
+        entropy = torch.full((M,), float("nan"), device=DEVICE)
+        confidence = torch.full((M,), float("nan"), device=DEVICE)
+        lx("router_route", x, ld_x, w, bias, logits, sel, ids, weights, entropy, confidence, ticket, M, E, K, top_k)
+        assert int(ticket) == 0, "the launch must leave its counter at zero"
+
+        want_logits = torch.full((M, E), float("nan"), device=DEVICE)
+        lx("spec_gemv_f32", x, ld_x, w, bias, want_logits, E, M, E, K)
+        want_ids, want_w, want_ent, want_conf = run_route(lx, want_logits, sel, top_k)
+        assert torch.equal(bits(logits), bits(want_logits)), f"logits differ, M = {M}"
+        assert torch.equal(ids, want_ids), f"ids differ, M = {M}"
+        assert torch.equal(bits(weights), bits(want_w)), f"weights differ, M = {M}"
+        assert torch.equal(bits(entropy), bits(want_ent)), f"entropy differs, M = {M}"
+        assert torch.equal(bits(confidence), bits(want_conf)), f"confidence differs, M = {M}"
+        assert not bool((ids == 5).any()), "a NaN selection bias was picked"
+

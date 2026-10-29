@@ -89,16 +89,20 @@ __global__ void __launch_bounds__(kRouterThreads) router_route_kernel(
   lx::pdl_wait();
   __shared__ float part[kRouterThreads / 32][kRouterRows];
   __shared__ float rows[kRouterRows][kRouterMaxE];
+  __shared__ float bsm[kRouterMaxE];  // the selection bias, staged once per block for the picks
   __shared__ int picked[kRouterRows][kMaxTopK];
   __shared__ int last;
   const int E = gridDim.x;
   const int n = blockIdx.x;
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
 
+  if (selection_bias)
+    for (int i = threadIdx.x; i < E; i += kRouterThreads) bsm[i] = selection_bias[i];
   float acc[kRouterRows];
   lx::route::gemv_partials<J, kRouterRows>(x, ld_x, w + static_cast<int64_t>(n) * K, M, K, threadIdx.x, acc);
 #pragma unroll
-  for (int m = 0; m < kRouterRows; ++m) acc[m] = lx::warp_sum(acc[m]);
+  for (int m = 0; m < kRouterRows; ++m)
+    if (m < M) acc[m] = lx::warp_sum(acc[m]);  // rows past M are never read
   if (lane == 0) {
 #pragma unroll
     for (int m = 0; m < kRouterRows; ++m) part[warp][m] = acc[m];
@@ -128,7 +132,8 @@ __global__ void __launch_bounds__(kRouterThreads) router_route_kernel(
     const float* row = rows[r];
     if (!paired || (warp & 1) == 0) lx::route::row_stats(row, E, lane, entropy + r, confidence + r);
     if (!paired || (warp & 1) == 1) {
-      lx::route::row_picks(row, selection_bias, E, lane, top_k, picked[r]);
+      if (top_k == 4) lx::route::top_picks<4>(row, selection_bias ? bsm : nullptr, E, lane, top_k, picked[r]);
+      else lx::route::row_picks(row, selection_bias, E, lane, top_k, picked[r]);
       lx::route::row_weights(row, picked[r], top_k, lane, ids + static_cast<int64_t>(r) * top_k,
                              weights + static_cast<int64_t>(r) * top_k);
     }
