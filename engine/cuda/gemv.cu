@@ -1109,14 +1109,16 @@ cudaError_t dispatch_vec_bf16(const Args& a, const VecConfig& c) {
   return cudaErrorInvalidValue;
 }
 
-// f32 x: one row per warp and a ring of 4; the split follows the variant.
+// f32 x: one row per warp and a ring of 4; the split follows the variant. At split 8 each warp holds one
+// step, so every row's block re-reads all of x from L2: eight rows a block share each x load. RG moves loads,
+// not sums, so each row keeps its split-8 order and its bits. MT = 8 keeps RG = 1 (64 accumulators a warp).
 template <int F, int MT>
 cudaError_t dispatch_vec_f32(const Args& a, const VecConfig& c) {
   switch (c.S) {
     case 1: return run_vec<F, float, MT, 1, 1, 4, 0>(a);
     case 2: return run_vec<F, float, MT, 1, 2, 4, 0>(a);
     case 4: return run_vec<F, float, MT, 1, 4, 4, 0>(a);
-    default: return run_vec<F, float, MT, 1, 8, 4, 0>(a);
+    default: return run_vec<F, float, MT, MT <= 4 ? 8 : 1, 8, 4, 0>(a);
   }
 }
 
