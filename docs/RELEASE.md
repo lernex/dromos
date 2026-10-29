@@ -55,12 +55,12 @@ The Windows zip is the same tree with the backends beside the engine, where Wind
     bin\cudart64_12.dll  cublasLt64_12.dll          (CUDA flavor only, the toolkit's own)
     share\dromos\...  LICENSE  NOTICE              as above
 
-`bin/dromos` finds its backends in `../lib` (already done by engine/dispatch), and the backends find
-the bundled CUDA libraries through an `$ORIGIN` rpath. On Windows the engine loads each backend with its own
-folder searched first for what it links (`LoadLibraryExW`, engine/platform/posix_win.cpp), so the CUDA backend finds
-the DLLs beside it, then `PATH` (where pip's NVIDIA wheels are put). Tuning tables are read from `../share/dromos/tuning`
-next to the real executable, then the source tree they were built from. Nothing reads a path baked in at
-build time unless it exists.
+`bin/dromos` finds its backends in `../lib` (already done by engine/dispatch), and the backends find the bundled
+CUDA libraries through an `$ORIGIN` rpath. On Windows the engine loads each backend with its own folder searched
+first for what it links (`LoadLibraryExW`, engine/platform/posix_win.cpp), so the CUDA backend finds the DLLs beside
+it, then `PATH` (where pip's NVIDIA wheels are put). Tuning tables are read from `../share/dromos/tuning` next to
+the real executable, then the source tree they were built from. Nothing reads a path baked in at build time unless
+it exists.
 
 `share/dromos/channel` says who installed it, so `dromos update` and the daily notice name the right
 command: `dromos update` for `tarball`, `brew upgrade dromos`, `pip install -U dromos`,
@@ -130,8 +130,8 @@ github.com/lernex/homebrew-tap; its `Formula/dromos.rb` is the one in `packaging
    `<engine checkout>/packaging/homebrew-tap/bump-formula.sh X.Y.Z Formula/dromos.rb`, commit and push. Nothing
    automates this step: it needs push access to the tap, and a CI deploy key for it is the owner's decision.
    Copy the bumped formula back into `packaging/homebrew-tap/Formula/dromos.rb` here so the two stay the same.
-4. Check each channel installs the new version: `install.sh`, `install.ps1`, `brew upgrade dromos`, `pip install -U dromos`,
-   `docker pull ghcr.io/lernex/dromos`, and `dromos update` from the previous release.
+4. Check each channel installs the new version: `install.sh`, `install.ps1`, `brew upgrade dromos`,
+   `pip install -U dromos`, `docker pull ghcr.io/lernex/dromos`, and `dromos update` from the previous release.
 
 ## Build bases
 
