@@ -1,13 +1,184 @@
 # Install tests
 
 What `scripts/install.sh`, the Docker image, `dromos update` and the install paths were run on, with the result of
-each run. Every row names the machine, the release build it installed and what happened. There have been two rounds:
-the release candidate v0.1.0-rc1 (round 2, first below) and the 0.1.0 test builds before it (round 1). A row marked
-"not run" was not run in its round; the Open items say what is left.
+each run. Every row names the machine, the release build it installed and what happened. There have been three
+rounds: Windows (round 3, first below), the release candidate v0.1.0-rc1 (round 2) and the 0.1.0 test builds before it
+(round 1). A row marked "not run" was not run in its round; the Open items say what is left.
 
 The engine was renamed Dromos on 2026-10-29, after both rounds. They ran under the old name, so their commands and
 output say `lernex`. In today's names: the command is `dromos`, `LERNEX_*` is `DROMOS_*`, `~/.lernex` is `~/.dromos`,
 the assets are `dromos-*.tar.gz`, and the backends are `libdromos_*`.
+
+## Round 3: Windows x64 (2026-10-28)
+
+The first Windows builds, from `main` at `c3101ba` (Dromos names) with `LX_ALLOW_DIRTY=1`, in the x64 Windows 11 VM on
+the GPU server: QEMU/KVM with `-cpu host` on an i5-14500 (AVX2 and AVX-VNNI, no AVX-512), 6 vCPUs, 8.5 GB, no GPU.
+Visual Studio Build Tools 17.14 (MSVC 14.44) with its own CMake and Ninja, Python 3.14.8, and CUDA 12.8 from
+`scripts/release/cuda-toolkit.ps1` (nvcc 12.8.93, cudart 12.8.90, cuBLAS 12.8.5.5). Every zip came from
+`scripts/release/build.ps1`, the script `release.yml`'s Windows jobs run, and every install from `install.ps1` under
+Windows PowerShell 5.1 (`irm | iex`), against two release hosts on the server shaped like GitHub's: `/latest` and
+`/latest/download/NAME` answer 302, each asset redirects once more as GitHub's do to its object store, and every
+asset is `application/octet-stream` (`relhost-gh.py` in `~/installer-win`, reached from the VM as 10.0.2.2). One
+says the latest release is 0.1.1, the other 0.1.2; the three CPU zips 0.1.0, 0.1.1 and 0.1.2 differ only in
+`LX_VERSION`.
+
+| # | What | Where | Result |
+|---|------|-------|--------|
+| 16 | `build.ps1 windows-x86_64-cpu`, clean: tree check, `dumpbin /dependents`, the tree's `--version`, the zip | the VM | pass (16a) |
+| 17 | `build.ps1 windows-x86_64-cuda12`: nvcc 12.8 with `cl` as host compiler, `LX_ARCHS=all`; then on a PC without an NVIDIA driver: `--version`, `doctor`, one prompt, `install.ps1` choosing and forcing it, its CUDA DLLs missing, the cuda12 wheel with NVIDIA's wheels | the VM | pass, as far as a PC without a GPU goes (17a) |
+| 18 | `install.ps1` pinned to 0.1.0: the flavor it picks, the user `PATH` in a new terminal, `doctor`, `doctor praxis`, one prompt on the CPU, a prompt outside ASCII, `serve` and one curl, the daily notice | the VM | pass (18a) |
+| 19 | `dromos update` end to end: `--check`, update while the old version serves, a running version retired, `--rollback`, the sweep; `install.ps1` re-run, already current, failing under iex and as a file | the VM, both hosts | pass (18a) |
+| 20 | HTTPS through WinHTTP: `update --check` against github.com, a 404 refused cleanly, `pull` of a public model from the Hugging Face hub | the VM, the internet | pass (18a) |
+| 21 | A real console (ConPTY, over `ssh -tt`): UTF-8 in and out, Ctrl-C during a reply and at the prompt, Ctrl-Z to quit | the VM | pass (21a) |
+| 22 | The `win_amd64` wheel: `build_wheel.py` from the CPU zip, `pip install` in a fresh venv, the launcher | the VM, Python 3.14.8 | pass (22a) |
+| 23 | `install.ps1`'s choices and refusals: flavor from a stub `nvidia-smi` (driver and compute capability boundaries), a corrupt zip, a bad `DROMOS_FLAVOR`, a missing release, an unreachable host, a running version | the VM, fake builds | pass, under the old names (23a) |
+| 24 | `install.ps1` under PowerShell 7: `irm` on an asset served as `application/octet-stream`, pinned and latest installs, `update` and `--rollback` from that install, a failure under iex and as a file, the user `PATH` | the VM, PowerShell 7.6.9 | pass (24a) |
+
+The test binaries ran in the VM too: `dromos_tests` 34 of 34 cases, `lx_cpu_isa_check` 664 of 664 checks of the CPU
+kernels at every level the VM has (generic, AVX2, AVX-VNNI), `lx_text_tests` 12 of 12, and `dromos_unit` 51 of 55:
+the four that fail ask the CUDA device for its architecture and the `memory_fuse` kernel, and need the GPU server.
+
+### 16a. The CPU zip
+
+```
+build.ps1: dromos.exe links WS2_32.dll, WINHTTP.dll, KERNEL32.dll
+build.ps1: dromos_cpu.dll links KERNEL32.dll
+build.ps1: dromos 0.1.0 (windows-x86_64-cpu, c3101ba)
+build.ps1: C:\lxw\rel-0.1.0\dromos-windows-x86_64-cpu.zip 1.7 MB (2 files in bin\)
+```
+
+Nothing links the Visual C++ runtime, so a clean Windows runs it. Two runs of `pack_zip.py` over one tree give the
+same bytes.
+
+### 17a. The CUDA 12 zip, on a PC without a GPU
+
+```
+build.ps1: dromos_kernels.dll links cudart64_12.dll, cublasLt64_12.dll, KERNEL32.dll
+build.ps1: dromos 0.1.2 (windows-x86_64-cuda12, c3101ba)
+build.ps1: C:\lxw\rel-cuda\dromos-windows-x86_64-cuda12.zip 514.3 MB (5 files in bin\)
+```
+
+`bin\` holds `dromos.exe` (2.8 MB), `dromos_cpu.dll` (1.7 MB), `dromos_kernels.dll` (139 MB, real code for sm_80, 86,
+89, 90a, 100a and 120a), `cudart64_12.dll` (0.6 MB) and `cublasLt64_12.dll` (675 MB), with NVIDIA's EULA in
+`share\dromos\licenses`. The build needs `95e43a2` on `main`: before it, `gemm_skinny.cu` called the cluster API
+unguarded, and every `LX_ARCHS=all` build failed on sm_80, 86 and 89, on Linux too.
+
+The VM has no NVIDIA driver, so the CUDA library loads and finds no device:
+
+```
+--version                 dromos 0.1.2 (windows-x86_64-cuda12, c3101ba)
+doctor                    backend    CPU, dromos_cpu.dll (C:\lxw\cuda-tree\bin\dromos_cpu.dll)
+                          skipped    CUDA, dromos_kernels.dll: found no NVIDIA GPU (there is none, or its driver is
+                                     missing or too old)
+                          missing    none
+run praxis --think off    "What is 17 times 3?" 51, on the CPU
+install.ps1               cpu build, no NVIDIA driver found, so no CUDA (the release lists both zips)
+DROMOS_FLAVOR=cuda12      cuda12 build, DROMOS_FLAVOR asks for it
+                          WARNING: cuda12 needs an NVIDIA driver of 527.41 or newer, and this PC has none: the
+                          engine may not start
+                          installed dromos 0.1.2 in %LOCALAPPDATA%\Programs\Dromos\versions\0.1.2; doctor as above
+cudart64_12.dll away      skipped    CUDA, dromos_kernels.dll: did not load: cudart64_12.dll, which it needs, is not
+                                     beside it, in System32 or on PATH (error 126)
+LX_BACKEND=cuda           error: cannot use device 0: CUDA driver version is insufficient for CUDA runtime version
+                          (CUDA error 35)
+the wheel                 build_wheel.py leaves cudart64_12.dll, cublasLt64_12.dll and the EULA to NVIDIA's wheels:
+                          55.9 MB. pip resolves nvidia-cuda-runtime-cu12 12.9.79, nvidia-cublas-cu12 12.9.2.10 and the
+                          nvidia-cuda-nvrtc-cu12 12.9.86 that cuBLAS 12.9 requires, 111 s in all
+  through the launcher    skipped    CUDA, dromos_kernels.dll: found no NVIDIA GPU (...), loaded from NVIDIA's DLLs
+  the engine directly     skipped    CUDA, dromos_kernels.dll: did not load: cudart64_12.dll and cublasLt64_12.dll,
+                                     which it needs, are not beside it, in System32 or on PATH (error 126)
+```
+
+The `skipped` row is new in this round, on every platform. Before it, a cuda12 build without a GPU printed the same
+`doctor` as the CPU build, with no word on why, and a CUDA library that did not load on Windows said only "The
+specified module could not be found" about a file that was there. A CPU build, a Mac and a machine whose GPU the
+CUDA library takes print no `skipped` row. The rows above ran a `dromos.exe` built with it, in the c3101ba tree.
+
+The wheel names NVIDIA's wheels as floors below the next major (`>=12.8.90,<13`), so pip takes 12.9: CUDA 12's
+minor-version compatibility runs a 12.8 build on them, and the zip carries real code only, no PTX to JIT. A
+dependency DLL is also found on `PATH` when it is not beside the library (dlopen's fallback, there for those wheels),
+so a cuda12 install's `current\bin` on the user `PATH` lends its cudart to any other copy; the missing-DLL rows above
+ran with that entry taken off `PATH`.
+
+### 18a. Install, run, serve, update (Windows PowerShell 5.1, `irm | iex`)
+
+```
+install 0.1.0 pinned        dromos: Windows x64: cpu build, no NVIDIA driver found, so no CUDA
+                            dromos: installed dromos 0.1.0 in %LOCALAPPDATA%\Programs\Dromos\versions\0.1.0
+                            dromos: added %LOCALAPPDATA%\Programs\Dromos\current\bin to your user PATH: open a new terminal to use dromos
+new terminal                C:\Users\lernex\AppData\Local\Programs\Dromos\current\bin\dromos.exe, dromos 0.1.0 (windows-x86_64-cpu, c3101ba)
+doctor                      backend CPU, dromos_cpu.dll (...\Dromos\versions\0.1.0\bin\dromos_cpu.dll), missing none
+run praxis --think off      "What is 17 times 3?" 51, 12 tok/s, 18 s with the load (BF16 Praxis, 6.2 GB)
+run, outside ASCII          "Wie heißt die Hauptstadt von Österreich?" Wien., stdout valid UTF-8; the daily notice on
+                            stderr: dromos 0.1.1 is out (you have 0.1.0). Run `dromos update` to install it.
+serve praxis + curl         up in 2 s; "Name the largest planet" Jupiter in 2 s; /v1/models lists praxis
+update --check              dromos 0.1.1 is available (you have 0.1.0).
+update (0.1.0 serving)      dromos 0.1.1 is installed and current. dromos 0.1.0 is kept
+update (host says 0.1.2)    dromos 0.1.2 is installed and current. dromos 0.1.1 is kept
+                            versions: .retired-0.1.0-10072 0.1.1 0.1.2 (0.1.0 renamed aside, its serve still answering /health)
+update --rollback           dromos switched back to 0.1.1. The next run uses it.
+update again                versions: 0.1.1 0.1.2 (the leftover swept once the serve stopped)
+install.ps1 (latest)        installed dromos 0.1.2; your user PATH already has ...\current\bin
+install.ps1 again           dromos 0.1.2 is already installed and current
+user PATH                   one entry, %LOCALAPPDATA%\Programs\Dromos\current\bin, REG_EXPAND_SZ
+DROMOS_VERSION=9.9.9        under iex: dromos: there is no release 9.9.9 at ... (check DROMOS_VERSION), the session stays;
+                            powershell -File install.ps1: the same line, exit 1
+github.com/cli/cli          update --check: dromos 2.103.3 is available (TLS, the /latest redirect); update: GET
+                            .../SHA256SUMS answered HTTP 404, exit 1, nothing changed
+pull HuggingFaceTB/SmolLM2-135M   269 MB over HTTPS with the hub's CDN redirects, 85 s, dromos.json written
+```
+
+`current` and `previous` are junctions, and `dromos update` retargets `current` in place. Windows lets the folder
+of a running program be renamed, so the version a serve was running from moved aside whole and kept serving;
+`install.ps1` asks the process list instead and keeps such a version until it stops.
+
+### 21a. A real console
+
+`dromos run praxis --think off` in a ConPTY over `ssh -tt`, typed input:
+
+```
+> Translate 'thank you' into Japanese. Reply with only the Japanese words.
+ありがとう (arigatou)
+> Write a 600-word story about a lighthouse keeper.
+The beam of light swept across ... the wind’s mournful song ... preferring to dwell in [stopped]
+153 tokens, 21 tok/s
+> half-typed line        (Ctrl-C at the prompt: the line is dropped and the prompt asks again)
+> Was ist 2 plus 2? Antworte mit einem Wort auf Deutsch.
+> ^Z                     (Ctrl-Z, Enter: the session ends)
+```
+
+### 22a. The wheel
+
+`build_wheel.py --plat win_amd64` from the 0.1.2 CPU zip ("2 Windows images are PE32+ AMD64"), then in a fresh venv:
+`pip install` ok, `dromos --version` and `python -m dromos --version` print `dromos 0.1.2 (windows-x86_64-cpu,
+c3101ba)`, `doctor` loads `dromos_cpu.dll` from site-packages, the channel is `pip` and `dromos update` says `pip
+install -U dromos`, and an unknown command exits 2 through the launcher. NVIDIA's `win_amd64` wheels at the floors the
+wheel names carry `nvidia/cuda_runtime/bin/cudart64_12.dll` and `nvidia/cublas/bin/cublasLt64_12.dll` (read from their
+zip directories on PyPI), the folders the launcher puts on `PATH`.
+
+### 23a. `install.ps1`'s own matrix
+
+Run before the rename with fake `lernex.exe` builds, a stub `nvidia-smi` and a local server: RTX 4070 on driver
+560.94 gets cuda12; 516.94 (below 527.41) gets cpu, as do a GTX 1650 (sm_75), no `nvidia-smi`, an unreadable
+compute capability and a release without a cuda12 zip; 527.41 and sm_80 exactly get cuda12. A zip cut in half fails
+the checksum and changes nothing; a bad flavor, a missing version and an unreachable host each print one line. A
+version running from `versions\X` is never replaced: Windows allowed the rename that was meant to catch it, so the
+installer checks the process list first. ARM64 and builds below 17763 are refused (simulated).
+
+### 24a. PowerShell 7
+
+PowerShell 7.6.9, portable from PowerShell's own release (its SHA-256 matched the digest GitHub lists for the
+asset), against the same GitHub-shaped host in the VM with 0.1.1 and 0.1.2:
+
+```
+irm .../install.ps1       System.String, 21014 chars (PowerShell 7 decodes an octet-stream body as text, as 5.1 does)
+DROMOS_VERSION=0.1.1      installed dromos 0.1.1 ... (was 0.1.2): the cuda12 0.1.2 from 17a, now previous
+latest                    installed dromos 0.1.2 ... (was 0.1.1): the cpu zip in place of the cuda12 one, same version
+update --rollback         dromos switched back to 0.1.1
+update                    dromos 0.1.2 is installed and current. dromos 0.1.1 is kept
+DROMOS_VERSION=9.9.9      under iex: there is no release 9.9.9 ..., and the session goes on; pwsh -File: exit 1
+user PATH                 one entry, %LOCALAPPDATA%\Programs\Dromos\current\bin, ExpandString
+```
 
 ## Round 2: v0.1.0-rc1 (2026-10-28)
 
@@ -401,6 +572,17 @@ gets the same run once it is built from the RC tarball.
 
 ## Findings
 
+- Windows lets a running program's folder be renamed. `dromos update` uses that: a version still serving is moved
+  aside whole and keeps running, and the next update deletes what is left (18a). `install.ps1` instead asks the
+  process list before it replaces or removes a version, since a rename cannot tell it one is running (23a).
+- `stdout` redirected to a file on Windows ends lines with CRLF (the C runtime's text mode), as Windows programs do.
+  The console and the server are unaffected.
+- The CUDA toolkit's network installer exits 0xE0E00019 when it runs without a desktop session, as it would on a
+  runner. `cuda-toolkit.ps1` takes NVIDIA's redistributable archives instead, checked against NVIDIA's manifest.
+- The Windows binaries are not signed. `install.ps1` downloads with `Invoke-WebRequest` and unpacks with `tar.exe`,
+  which leave no Mark of the Web, so nothing warns. A zip downloaded in a browser carries the mark, and SmartScreen
+  warns on the first run of its unsigned `dromos.exe`, as Gatekeeper does for the darwin tarball (below).
+
 - Resolved in rc1: `doctor` listed the 15 `lx_program_*` symbols as missing on the CPU and Metal backends. The decode
   program is CUDA's alone and opt-in, so `doctor` leaves those names out, and rc1 prints `missing none` on all three
   backends (rows 4, 10 to 12).
@@ -459,3 +641,15 @@ gets the same run once it is built from the RC tarball.
   does.
 - udocker's R1 mode is not pursued: the GPU server keeps `kernel.apparmor_restrict_unprivileged_userns = 1` on
   purpose, and Docker with the NVIDIA runtime replaces udocker there (14b, and round 2's row 14).
+- Windows needs an NVIDIA PC for what the VM cannot run (round 3): the cuda12 flavor loading `dromos_kernels.dll`
+  against a real driver, its kernels, cuBLASLt and NVML (`nvml.dll`) on Windows, and its speed against Linux;
+  `install.ps1` choosing cuda12 from a real `nvidia-smi`; the `win_amd64` wheel with NVIDIA's wheels on a GPU. A GPU
+  that drives a display is under Windows's TDR: a kernel running over 2 seconds is reset. Decode steps are far
+  shorter; the longest prefill chunk is the one to time there.
+- `release.yml`'s Windows jobs have not run on GitHub (Actions is held until November 1). Round 3 ran their script,
+  `build.ps1`, by hand in the VM. `install.ps1` ran under Windows PowerShell 5.1 and PowerShell 7.6.9 (row 24).
+- On the CPU backend, a model larger than the free RAM is planned as a GPU's would be: Praxis BF16 (5.89 GB) on the
+  8.5 GB VM offloads its experts "cached in 5.85 GB of VRAM, all of them in pinned RAM", in `run` and `doctor` alike,
+  on every platform. Both are the same RAM there. With the engine session (`plan.cpp`, `offload_plan.cpp`).
+- Windows on Arm has no build, and `install.ps1` refuses it. The x64 CPU zip under Windows's x64 emulation is
+  untested.
