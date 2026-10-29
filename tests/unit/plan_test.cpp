@@ -11,12 +11,14 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "core/checkpoint.h"
 #include "core/config.h"
 #include "core/safetensors.h"
 #include "model/traffic.h"
 #include "doctest.h"
+#include "runtime/offload_plan.h"
 #include "runtime/plan.h"
 
 using namespace lx;
@@ -45,6 +47,31 @@ DeviceInfo simulated(const std::string& name, int cc, double gib, double bandwid
   d.clusters = cc >= 90;
   d.built = true;
   return d;
+}
+
+// A CPU backend's device: host memory is the device's, so the free figure is the RAM the plan may fill, with no VRAM.
+DeviceInfo simulated_cpu(const std::string& name, double free_gib) {
+  DeviceInfo d;
+  d.name = name;
+  d.cpu = true;
+  d.isa = "AVX2";
+  d.total_bytes = static_cast<size_t>(free_gib * kGiB);
+  d.free_bytes = d.total_bytes;
+  d.bandwidth_gbs = 40;
+  d.bandwidth_measured = true;
+  d.built = true;
+  return d;
+}
+
+// Every line a CPU plan says, its reason included, is free of the GPU's words: no VRAM, card, CUDA, graph or offload.
+bool names_no_gpu(const Plan& p) {
+  std::vector<std::string> lines = p.notes;
+  lines.push_back(p.reason);
+  lines.push_back(p.bf16x_reason);
+  for (const std::string& line : lines)
+    for (const char* word : {"VRAM", "GPU", "CUDA", "card", "offload", "Graph"})
+      if (line.find(word) != std::string::npos) return false;
+  return true;
 }
 
 MetisConfig praxis() {
@@ -568,3 +595,41 @@ TEST_CASE("the plan for each simulated GPU and model, written to LX_PLAN_REPORT 
   }
   std::fclose(out);
 }
+
+TEST_CASE("a CPU with the model's RAM free: resident in RAM, no expert offload, no GPU wording") {
+  const DeviceInfo d = simulated_cpu("Windows VM CPU", 64);
+  PlanRequest plain;
+  plain.bf16x = false;
+  const Plan p = make_plan(d, praxis(), bf16_checkpoint(), plain);
+  CHECK(p.weights == LX_W_BF16);
+  CHECK_FALSE(p.offload.enabled);
+  CHECK(p.max_slots >= kUsefulSlots);
+  CHECK(has_note(p, "Memory: "));
+  CHECK(names_no_gpu(p));
+  // The offload planner refuses a CPU outright: the experts are in RAM already.
+  CHECK_THROWS_AS(make_offload_plan(d, praxis(), bf16_checkpoint(), plain), std::runtime_error);
+}
+
+TEST_CASE("a CPU with less RAM free than the model: says so in RAM terms, no VRAM or offload") {
+  const DeviceInfo d = simulated_cpu("Windows VM CPU", 3);
+  PlanRequest plain;
+  plain.bf16x = false;
+  std::string why;
+  bool threw = false;
+  try {
+    make_plan(d, praxis(), bf16_checkpoint(), plain);
+  } catch (const std::runtime_error& e) {
+    threw = true;
+    why = e.what();
+  }
+  CHECK(threw);
+  CHECK(why.find("this machine") != std::string::npos);
+  CHECK(why.find("of RAM is free") != std::string::npos);
+  CHECK(why.find("VRAM") == std::string::npos);
+  CHECK(why.find("GPU") == std::string::npos);
+  CHECK(why.find("CUDA") == std::string::npos);
+  CHECK(why.find("offload") == std::string::npos);
+  // A narrower format that fits is named, as on a GPU: never taken for the user.
+  CHECK((why.find("--weights") == std::string::npos || why.find("fits") != std::string::npos));
+}
+

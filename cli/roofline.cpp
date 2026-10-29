@@ -63,7 +63,8 @@ Bandwidth measure_bandwidth(double fallback_gbs) {
     b.note = "this backend has no probe: its own reading";
   } else {
     b.measured_gbs = fallback_gbs;
-    b.note = "the probe failed (CUDA error " + std::to_string(status) + "): the clock's peak stands in";
+    b.note = std::string("the probe failed (") + (lx_rt_backend() == LX_BACKEND_CUDA ? "CUDA " : "") + "error " +
+             std::to_string(status) + "): the clock's peak stands in";
   }
   return b;
 }

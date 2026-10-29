@@ -166,7 +166,7 @@ void print_device(const lx::runtime::DeviceInfo& d) {
 }
 
 // The plan for a model folder, as dromos doctor prints it.
-void print_plan(const lx::runtime::Plan& plan) {
+void print_plan(const lx::runtime::Plan& plan, bool cpu) {
   using namespace lx::runtime;
   std::printf("\nformats    %-6s %-4s %10s %12s %-14s %-18s %s\n", "", "fits", "weights", "decode est.", "maths",
               "with --fast-math", "loads");
@@ -197,8 +197,8 @@ void print_plan(const lx::runtime::Plan& plan) {
   else if (first)
     std::printf("           * decoding from the BF16X copies of the BF16 tensors, which add %s\n", copies.c_str());
   std::printf("           fits: resident with room for %d sequences of %d tokens; decode est.: one stream, the "
-              "measured share of the card's bandwidth over the bytes a token reads\n",
-              kUsefulSlots, kUsefulContext);
+              "measured share of %s bandwidth over the bytes a token reads\n",
+              kUsefulSlots, kUsefulContext, cpu ? "this machine's" : "the card's");
 
   std::printf("\nstored     %s\n", format_name(plan.stored).c_str());
   std::printf("chosen     %s, %s\n", format_name(plan.weights).c_str(), plan.reason.c_str());
@@ -207,6 +207,9 @@ void print_plan(const lx::runtime::Plan& plan) {
                 100.0 * plan.offload.resident_fraction, format_name(plan.recipe.experts).c_str(),
                 static_cast<double>(plan.offload.expert_cache_bytes) / 1e9,
                 plan.offload.disk_expert_bytes ? "pinned RAM and on NVMe" : "pinned RAM");
+  } else if (cpu) {
+    std::printf("offload    no: every expert stays in RAM (%d sequence%s of %d tokens)\n", plan.max_slots,
+                plan.max_slots == 1 ? "" : "s", plan.kv_capacity);
   } else {
     std::printf("offload    no: the model is resident (%d sequence%s of %d tokens)\n", plan.max_slots,
                 plan.max_slots == 1 ? "" : "s", plan.kv_capacity);
@@ -217,9 +220,11 @@ void print_plan(const lx::runtime::Plan& plan) {
     std::printf("BF16X      off: no BF16 tensors to copy in %s\n",
                 format_name(plan.weights).c_str());
   if (plan.decode_ceiling_tps > 0)
-    std::printf("decode     about %.0f tokens per second for one stream (the measured share of the card's bandwidth "
+    std::printf("decode     about %.0f tokens per second for one stream (the measured share of %s bandwidth "
                 "over the bytes a token reads)\n",
-                plan.decode_ceiling_tps);
+                plan.decode_ceiling_tps, cpu ? "this machine's" : "the card's");
+  else if (cpu)
+    std::printf("decode     set by what a run measures on this machine\n");
   else
     std::printf("decode     set by the experts that miss the VRAM cache, which only a run measures\n");
   if (plan.offload.enabled)
@@ -255,12 +260,15 @@ void print_roofline(const lx::MetisConfig& config, lx_wtype target, bool bf16x_d
   const std::string spec = bw.spec_gbs > 0 ? std::to_string(static_cast<long>(bw.spec_gbs + 0.5)) + " GB/s" : "n/a";
   const std::string measured = bw.measured_gbs > 0 ? std::to_string(static_cast<long>(bw.measured_gbs + 0.5)) + " GB/s" : "n/a";
 
-  std::printf("\nroofline   a decode step's memory traffic against the card (one stream unless said; passes included)\n");
+  std::printf("\nroofline   a decode step's memory traffic against %s (one stream unless said; passes included)\n",
+              device.cpu ? "this machine" : "the card");
   std::printf("bandwidth  %s spec, %s measured%s%s\n", spec.c_str(), measured.c_str(),
               bw.measured ? " (1 GiB read, best of 5)" : "", bw.note.empty() ? "" : (" (" + bw.note + ")").c_str());
   if (peak.known)
     std::printf("compute    %.1f TFLOPS BF16 tensor, dense with FP32 accumulate (%s, sm_%d; %s)\n", peak.bf16_tflops,
                 peak.card.c_str(), device.cc(), peak.source.c_str());
+  else if (device.cpu)
+    std::printf("compute    no peak in the table for this CPU: the compute ceiling is not shown\n");
   else
     std::printf("compute    no tensor peak in the table for this device: the compute ceiling is not shown\n");
 
@@ -384,7 +392,7 @@ int cmd_doctor(int argc, char** argv) {
         if (const char* v = std::getenv("LX_VRAM_BUDGET_GB")) req.vram_budget = static_cast<size_t>(std::atof(v) * 1073741824.0);
         if (const char* v = std::getenv("LX_RAM_BUDGET_GB")) req.ram_budget = static_cast<size_t>(std::atof(v) * 1073741824.0);
         const Plan plan = make_plan(device, config, checkpoint, req);
-        print_plan(plan);
+        print_plan(plan, device.cpu);
         print_roofline(config, plan.weights, plan.bf16x_decode, device, &plan.options, &plan.bf16x_dropped);
       }
     }

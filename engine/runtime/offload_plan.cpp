@@ -21,6 +21,8 @@ std::string name_of(lx_wtype t) { return format_name(t); }
 
 Plan make_offload_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& ck, const PlanRequest& req,
                        const offload::MachineProfile* machine) {
+  // A CPU's experts are in RAM already: there is nothing to offload to, and no VRAM to cache them in.
+  if (d.cpu) throw std::runtime_error("a CPU keeps every expert in RAM: there is no expert offload");
   // The format: the file's own, or the one the request names, as make_plan takes it.
   const lx_wtype format = req.weights >= 0 ? static_cast<lx_wtype>(req.weights) : ck.stored;
   if (format != LX_W_BF16 && format != LX_W_INT8 && format != LX_W_FP8)

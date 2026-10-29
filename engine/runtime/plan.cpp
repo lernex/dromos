@@ -586,7 +586,8 @@ namespace {
 // (which counts this process's CUDA context too), less what the plan keeps back.
 size_t resident_budget(const DeviceInfo& d, const PlanRequest& req) {
   size_t free_budget = static_cast<size_t>(static_cast<double>(d.free_bytes) * req.memory_fraction);
-  if (req.vram_budget > 0)
+  // A CPU has no VRAM: its host memory is the device's, and the one fit check is against that RAM.
+  if (req.vram_budget > 0 && !d.cpu)
     free_budget = std::min(free_budget, req.vram_budget > kCudaContextBytes ? req.vram_budget - kCudaContextBytes : 0);
   return free_budget > kReserveBytes ? free_budget - kReserveBytes : 0;
 }
@@ -742,8 +743,10 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
   }
 
   // Not resident usefully: offload the routed experts in the same format before anything narrower is considered.
+  // A CPU keeps every expert in RAM, which is where an offload would keep them too: no offload applies, and a model that
+  // does not fit RAM is said to need that much and no more.
   std::string offload_why;
-  if (!chosen.ok) {
+  if (!chosen.ok && !d.cpu) {
     if (target == LX_W_BF16 || target == LX_W_INT8 || target == LX_W_FP8) {
       try {
         PlanRequest same = req;
@@ -791,7 +794,8 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
   }
   if (!chosen.ok) {
     std::string why = "\n  " + format_name(target) + " needs " + gb(chosen.need) + " for one sequence of " +
-                      std::to_string(kLimitedContext) + " tokens; " + gb(budget) + " is free for the model";
+                      std::to_string(kLimitedContext) + " tokens; " +
+                      (d.cpu ? gb(d.free_bytes) + " of RAM is free" : gb(budget) + " is free for the model");
     if (!offload_why.empty()) why += "\n  and offloading the experts does not help: " + offload_why;
     for (const FormatOption& o : options)
       if (o.fits && o.format != target)
@@ -835,19 +839,20 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
     }
   }
   if (copies > 0) {
+    const std::string decode = d.cpu ? "Decode" : "Graph decode";
     const std::string kept =
         target == LX_W_BF16 ? "the BF16 weights" : "the BF16 tensors " + format_name(target) + " keeps wide";
     const std::string seqs = std::to_string(slots) + (slots == 1 ? " sequence" : " sequences");
     // The graph decode reads the copies. The opt-in decode program reads the same tensors as stored, which holds the
     // same bits, since a BF16X copy decodes to exactly the bf16 values it was made from.
-    const std::string program = " The opt-in decode program reads " + kept + " as stored, to the same bits.";
+    const std::string program = d.cpu ? "" : " The opt-in decode program reads " + kept + " as stored, to the same bits.";
     if (!bf16x_off.empty()) bf16x_reason = bf16x_off;
     else if (dropped.empty())
-      bf16x_reason = "Graph decode reads lossless BF16X copies of " + kept + " (" + gb(copy_bytes) +
+      bf16x_reason = decode + " reads lossless BF16X copies of " + kept + " (" + gb(copy_bytes) +
                      " more): the same logits to the bit from about 1.3x fewer bytes." + program +
                      " Prefill reads the BF16 copy.";
     else if (kept_units > 0)
-      bf16x_reason = "Graph decode reads lossless BF16X copies of " + std::to_string(kept_units) + " of " +
+      bf16x_reason = decode + " reads lossless BF16X copies of " + std::to_string(kept_units) + " of " +
                      std::to_string(units.size()) + " projections of " + kept + " (" + gb(copy_bytes) +
                      " more); the rest (" + gb(dropped_bytes) + ") read the BF16 weights, as their copies do not fit beside the " +
                      seqs + "." + program;
