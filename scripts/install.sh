@@ -1,7 +1,7 @@
 #!/bin/sh
 # Installs Dromos, the inference engine for Praxis and Logos, from its release:
 #
-#   curl -fsSL https://github.com/dromos/dromos/releases/latest/download/install.sh | sh
+#   curl -fsSL https://github.com/lernex/dromos/releases/latest/download/install.sh | sh
 #
 # It picks the build this machine can run (CUDA when an NVIDIA driver is new enough, else CPU; Metal on a
 # Mac), checks it against SHA256SUMS, unpacks it to ~/.dromos/versions/X.Y.Z, points ~/.dromos/current at it
@@ -23,7 +23,7 @@ CUDA13_MIN_SM=80
 CUDA12_MIN_DRIVER=525
 CUDA12_MIN_SM=80
 
-DEFAULT_RELEASES=https://github.com/dromos/dromos/releases
+DEFAULT_RELEASES=https://github.com/lernex/dromos/releases
 MACOS_MIN_MAJOR=14
 
 say() { printf 'dromos: %s\n' "$*"; }

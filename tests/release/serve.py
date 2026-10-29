@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# A release host for `dromos update` tests, answering the way github.com/dromos/dromos/releases does.
+# A release host for `dromos update` tests, answering the way github.com/lernex/dromos/releases does.
 #
 #   tests/release/serve.py DIR PORT
 #

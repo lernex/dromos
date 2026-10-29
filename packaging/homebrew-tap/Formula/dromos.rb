@@ -5,8 +5,8 @@
 # packaging/homebrew-tap/bump-formula.sh moves version, url and sha256 to a release.
 class Dromos < Formula
   desc "Metis inference engine on the Metal GPU of an Apple silicon Mac"
-  homepage "https://github.com/dromos/dromos"
-  url "https://github.com/dromos/dromos/releases/download/v0.1.0/dromos-darwin-arm64.tar.gz"
+  homepage "https://github.com/lernex/dromos"
+  url "https://github.com/lernex/dromos/releases/download/v0.1.0/dromos-darwin-arm64.tar.gz"
   version "0.1.0"
   sha256 "cdd136284cdea38b7a8773ef5a5dbfa7f6064e0744829ad7fc081ff7138b7662"
   license "Apache-2.0"

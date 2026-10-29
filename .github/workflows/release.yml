@@ -20,6 +20,21 @@ env:
   LX_JOBS: '4'
 
 jobs:
+  release-address:
+    # install.sh, `dromos update` and the image download releases from this address, built in. A rename or transfer that
+    # misses one of them ships an engine that cannot find its own releases, so a release from anywhere else stops here.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: The built-in release address is this repository's
+        run: |
+          want="https://github.com/$GITHUB_REPOSITORY/releases"
+          ok=1
+          grep -qxF "DEFAULT_RELEASES=$want" scripts/install.sh || { echo "::error file=scripts/install.sh::DEFAULT_RELEASES is not $want"; ok=0; }
+          grep -qF "kDefaultReleases = \"$want\";" engine/core/update.cpp || { echo "::error file=engine/core/update.cpp::kDefaultReleases is not $want"; ok=0; }
+          grep -qxF "ARG DROMOS_RELEASES=$want" docker/Dockerfile || { echo "::error file=docker/Dockerfile::DROMOS_RELEASES is not $want"; ok=0; }
+          [ "$ok" = 1 ]
+
   linux-x86_64-cpu:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -108,7 +123,7 @@ jobs:
   publish:
     # Only a tag publishes. A dispatch run stops at the artifacts above.
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [linux-x86_64-cpu, linux-aarch64-cpu, darwin-arm64, linux-x86_64-cuda12]
+    needs: [release-address, linux-x86_64-cpu, linux-aarch64-cpu, darwin-arm64, linux-x86_64-cuda12]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

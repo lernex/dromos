@@ -58,11 +58,11 @@ TEST_CASE("versions compare by their numbers, then a release beats its pre-relea
 
 TEST_CASE("a release page's URL names its version") {
   using lx::update::version_from_url;
-  CHECK(version_from_url("https://github.com/dromos/dromos/releases/tag/v0.1.1") == "0.1.1");
+  CHECK(version_from_url("https://github.com/lernex/dromos/releases/tag/v0.1.1") == "0.1.1");
   CHECK(version_from_url("http://127.0.0.1:8000/tag/v0.1.1?expanded=true") == "0.1.1");
   CHECK(version_from_url("http://127.0.0.1:8000/tag/v0.2.0-rc1#top") == "0.2.0-rc1");
-  CHECK(version_from_url("https://github.com/dromos/dromos/releases/latest") == "");
-  CHECK(version_from_url("https://github.com/dromos/dromos/releases/download/v0.1.1/x.tar.gz") == "");
+  CHECK(version_from_url("https://github.com/lernex/dromos/releases/latest") == "");
+  CHECK(version_from_url("https://github.com/lernex/dromos/releases/download/v0.1.1/x.tar.gz") == "");
 }
 
 TEST_CASE("the asset is named for its flavor") {

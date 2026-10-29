@@ -18,7 +18,7 @@
 
 ARG DROMOS_VERSION
 ARG DROMOS_FLAVOR=cuda12
-ARG DROMOS_RELEASES=https://github.com/dromos/dromos/releases
+ARG DROMOS_RELEASES=https://github.com/lernex/dromos/releases
 ARG CUDA_BASE=nvidia/cuda:12.8.1-base-ubuntu24.04
 
 # Fetch and check the tree on a plain Ubuntu: the runtime image gets the tree, not the download tooling.
@@ -46,7 +46,7 @@ FROM ${CUDA_BASE}
 ARG DROMOS_VERSION
 LABEL org.opencontainers.image.title="Dromos" \
       org.opencontainers.image.description="Dromos, Lernex's inference engine for Praxis and Logos, serving the OpenAI API on port 8080" \
-      org.opencontainers.image.source="https://github.com/dromos/dromos" \
+      org.opencontainers.image.source="https://github.com/lernex/dromos" \
       org.opencontainers.image.version="${DROMOS_VERSION}" \
       org.opencontainers.image.licenses="Apache-2.0"
 # The NVIDIA runtime hooks need these to hand the GPU to the container. curl brings the libcurl.so.4 the engine

@@ -13,7 +13,7 @@ version in: CMake takes `-DLX_VERSION=X.Y.Z`, and without it reads `git describe
 
 ## Release assets
 
-Names carry no version, so `https://github.com/dromos/dromos/releases/latest/download/NAME`
+Names carry no version, so `https://github.com/lernex/dromos/releases/latest/download/NAME`
 is a stable link:
 
 | Asset | Contents |
@@ -65,7 +65,7 @@ command: `dromos update` for `tarball`, `brew upgrade dromos`, `pip install -U d
 | `~/.cache/dromos/update-check` | the daily check's cache |
 
 Environment: `DROMOS_NO_UPDATE_CHECK=1` turns the daily check off. `DROMOS_RELEASES` (default
-`https://github.com/dromos/dromos/releases`) points install.sh and `dromos update` at another
+`https://github.com/lernex/dromos/releases`) points install.sh and `dromos update` at another
 release host, for tests.
 
 ## Updates
@@ -78,7 +78,7 @@ release host, for tests.
 
 ## Install paths
 
-    curl -fsSL https://github.com/dromos/dromos/releases/latest/download/install.sh | sh
+    curl -fsSL https://github.com/lernex/dromos/releases/latest/download/install.sh | sh
     brew trust --formula lernex/tap/dromos && brew install lernex/tap/dromos
     pip install dromos
     docker run --gpus all -p 8080:8080 -v dromos:/root/.cache/dromos ghcr.io/lernex/dromos praxis

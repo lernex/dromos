@@ -26,7 +26,7 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr long long kDay = 24 * 60 * 60;
-const char* kDefaultReleases = "https://github.com/dromos/dromos/releases";
+const char* kDefaultReleases = "https://github.com/lernex/dromos/releases";
 
 std::string home() {
   const char* h = std::getenv("HOME");

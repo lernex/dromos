@@ -23,7 +23,7 @@ while [ $# -gt 0 ]; do
     *) usage ;;
   esac
 done
-releases=${DROMOS_RELEASES:-https://github.com/dromos/dromos/releases}
+releases=${DROMOS_RELEASES:-https://github.com/lernex/dromos/releases}
 asset=dromos-darwin-arm64.tar.gz
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT

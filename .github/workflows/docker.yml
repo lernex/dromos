@@ -50,7 +50,7 @@ jobs:
         env:
           V: ${{ steps.v.outputs.version }}
         run: |
-          url="https://github.com/dromos/dromos/releases/download/v$V/SHA256SUMS"
+          url="https://github.com/lernex/dromos/releases/download/v$V/SHA256SUMS"
           for _ in $(seq 1 60); do
             if curl -fsSL -o /dev/null "$url"; then exit 0; fi
             sleep 30
