@@ -155,6 +155,25 @@ int lx_add_row_bf16(float* y, const void* row, int rows, int cols, void* stream)
   return kOk;
 }
 
+// Two adds in one pass over y: each element gets row_a then row_b, the bits of the two calls.
+int lx_add_two_rows_bf16(float* y, const void* row_a, const void* row_b, int rows, int cols, void* stream) {
+  LX_PROFILE("add_two_rows_bf16");
+  (void)stream;
+  if (rows <= 0 || cols <= 0) return kOk;
+  if (!y || !row_a || !row_b) return fail(kInvalid);
+  const uint16_t* ra = static_cast<const uint16_t*>(row_a);
+  const uint16_t* rb = static_cast<const uint16_t*>(row_b);
+  parallel_for(rows, row_grain(rows, cols), [&](int64_t r0, int64_t r1) {
+    for (int64_t r = r0; r < r1; ++r)
+      for (int c = 0; c < cols; ++c) {
+        float& v = y[r * cols + c];
+        const float t = v + bf16_to_f32(ra[c]);
+        v = t + bf16_to_f32(rb[c]);
+      }
+  });
+  return kOk;
+}
+
 // ---- Embedding and the residual streams ---------------------------------------------------------------
 
 int lx_embed_streams(const void* table, const int32_t* ids, const void* stream_emb, float* streams, int T, int S, int D,

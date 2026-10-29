@@ -58,6 +58,8 @@ LX_API int lx_silu_mul(const float* x, int ld_x, void* out, lx_dtype out_dtype, 
 
 // y[r, c] += row[c] (f32 y [rows, cols], row: [cols] bf16). Adds a bias or an embedding row.
 LX_API int lx_add_row_bf16(float* y, const void* row, int rows, int cols, void* stream);
+// lx_add_row_bf16 with row_a, then with row_b, in one launch (the same bits as the two calls).
+LX_API int lx_add_two_rows_bf16(float* y, const void* row_a, const void* row_b, int rows, int cols, void* stream);
 
 // ---- Dense GEMM (gemm.cu, cuBLASLt) ---------------------------------------------------------
 

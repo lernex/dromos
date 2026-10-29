@@ -74,6 +74,12 @@ int lx_add_row_bf16(float* y, const void* row, int rows, int cols, void* stream)
   return k.launch(stream, a, size2(ceil_div(cols, kThreads), std::min(rows, 65535)), size1(kThreads));
 }
 
+// The two adds as two launches here (the CUDA build fuses them): the same bits.
+int lx_add_two_rows_bf16(float* y, const void* row_a, const void* row_b, int rows, int cols, void* stream) {
+  if (int e = lx_add_row_bf16(y, row_a, rows, cols, stream)) return e;
+  return lx_add_row_bf16(y, row_b, rows, cols, stream);
+}
+
 int lx_axpby_f32(float* y, const float* x, float alpha, float beta, int64_t n, void* stream) {
   static Kernel k("axpby");
   if (n <= 0) return kOk;

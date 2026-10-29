@@ -71,6 +71,21 @@ __global__ void add_row_kernel(float* y, const __nv_bfloat16* row, int rows, int
   for (int r = blockIdx.y; r < rows; r += gridDim.y) y[static_cast<int64_t>(r) * cols + c] += add;
 }
 
+// y[r, c] = (y[r, c] + a[c]) + b[c]: add_row_kernel twice, in one launch. Each add rounds to f32 as it would in
+// its own launch, and in the same order, so the bits are the same.
+__global__ void add_two_rows_kernel(float* y, const __nv_bfloat16* a, const __nv_bfloat16* b, int rows, int cols) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= cols) return;
+  const float add_a = lx::to_f32(a[c]), add_b = lx::to_f32(b[c]);
+  for (int r = blockIdx.y; r < rows; r += gridDim.y) {
+    float& v = y[static_cast<int64_t>(r) * cols + c];
+    const float t = v + add_a;
+    v = t + add_b;
+  }
+}
+
 }  // namespace
 
 extern "C" int lx_copy2d(const void* src, lx_dtype src_dtype, int ld_src, void* dst, lx_dtype dst_dtype,
@@ -111,5 +126,12 @@ extern "C" int lx_silu_mul(const float* x, int ld_x, void* out, lx_dtype out_dty
 extern "C" int lx_add_row_bf16(float* y, const void* row, int rows, int cols, void* stream) {
   if (rows <= 0 || cols <= 0) return 0;
   lx::launch_pdl(add_row_kernel, grid2d(rows, cols), kThreads, 0, static_cast<cudaStream_t>(stream), y, static_cast<const __nv_bfloat16*>(row), rows, cols);
+  return lx::launch_status();
+}
+
+extern "C" int lx_add_two_rows_bf16(float* y, const void* row_a, const void* row_b, int rows, int cols, void* stream) {
+  if (rows <= 0 || cols <= 0) return 0;
+  lx::launch_pdl(add_two_rows_kernel, grid2d(rows, cols), kThreads, 0, static_cast<cudaStream_t>(stream), y,
+                 static_cast<const __nv_bfloat16*>(row_a), static_cast<const __nv_bfloat16*>(row_b), rows, cols);
   return lx::launch_status();
 }

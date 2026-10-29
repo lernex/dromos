@@ -110,3 +110,9 @@ extern "C" int lx_add_row_bf16(float* y, const void* row, int rows, int cols, vo
       y, static_cast<const __hip_bfloat16*>(row), rows, cols);
   return lx::launch_status();
 }
+
+// The two adds as two launches here (the CUDA build fuses them): the same bits.
+extern "C" int lx_add_two_rows_bf16(float* y, const void* row_a, const void* row_b, int rows, int cols, void* stream) {
+  if (int e = lx_add_row_bf16(y, row_a, rows, cols, stream)) return e;
+  return lx_add_row_bf16(y, row_b, rows, cols, stream);
+}

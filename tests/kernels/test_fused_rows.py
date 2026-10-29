@@ -50,3 +50,18 @@ def test_meta_entry_is_the_summary_copy_and_the_scalars(lx, T, R):
     lx("copy2d", summary, DTYPE[torch.float32], R, old, DTYPE[torch.bfloat16], R + 4, T, R)
     lx("meta_scalars", entropy, confidence, continuation, mean_k, inv_log_e, old, R + 4, R, T)
     close(fused, old, atol=0.0)
+
+
+@pytest.mark.parametrize("rows,cols", [(1, 512), (3, 37), (300, 64)])
+def test_add_two_rows_is_two_add_rows(lx, rows, cols):
+    """y += row_a, then y += row_b, in one launch: the bits of the two add_row calls memory_write used to make."""
+    torch.manual_seed(3)
+    y0 = torch.randn(rows, cols, device=DEVICE)
+    a, b = (torch.randn(cols, device=DEVICE).to(torch.bfloat16) for _ in range(2))
+    fused, old = y0.clone(), y0.clone()
+
+    lx("add_two_rows_bf16", fused, a, b, rows, cols)
+
+    lx("add_row_bf16", old, a, rows, cols)
+    lx("add_row_bf16", old, b, rows, cols)
+    close(fused, old, atol=0.0)

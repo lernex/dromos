@@ -1358,8 +1358,9 @@ void memory_write(Impl& m, const MetisConfig& c, int T, int pass, int anchor, in
   // the summary's bf16 copy and the four scalars, in one launch
   LX_CHECK(lx_meta_entry(m.summary, m.entropy, m.confidence, m.continuation, mean_k, inv_log_e, m.meta_bf, R, T, s));
   linear(m, m.m_meta, m.meta_bf, LX_BF16, R + 4, m.entry, LX_F32, Mm, T, s, 1.0f, 1.0f);
-  LX_CHECK(lx_add_row_bf16(m.entry, static_cast<const uint16_t*>(m.m_pass_emb) + pass * Mm, T, Mm, s));
-  LX_CHECK(lx_add_row_bf16(m.entry, static_cast<const uint16_t*>(m.m_anchor_emb) + anchor * Mm, T, Mm, s));
+  // the pass and anchor embeddings, added in turn, in one launch
+  LX_CHECK(lx_add_two_rows_bf16(m.entry, static_cast<const uint16_t*>(m.m_pass_emb) + pass * Mm,
+                                static_cast<const uint16_t*>(m.m_anchor_emb) + anchor * Mm, T, Mm, s));
   const int ld_bank = m.Emax * Mm;
   // The key and the value read the same entry and write their own banks. On a decode-sized step the value runs
   // on value_side beside the key, and the key joins it before the function returns.
