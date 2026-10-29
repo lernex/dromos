@@ -37,6 +37,12 @@ jobs:
           grep -qxF "ARG DROMOS_RELEASES=$want" docker/Dockerfile || { echo "::error file=docker/Dockerfile::DROMOS_RELEASES is not $want"; ok=0; }
           grep -qxF "\$DromosDefaultReleases = '$want'" scripts/install.ps1 || { echo "::error file=scripts/install.ps1::DromosDefaultReleases is not $want"; ok=0; }
           [ "$ok" = 1 ]
+      - name: No path from a development machine in what ships
+        # A home folder in the engine, the CLI or the installer is a path no user has: it would be printed to them, or read.
+        run: |
+          if grep -rnE '/home/|kronos-scratch' engine cli scripts/install.sh scripts/install.ps1; then
+            echo "::error::a development machine's path is in the shipped sources (above)"; exit 1
+          fi
 
   linux-x86_64-cpu:
     runs-on: ubuntu-24.04

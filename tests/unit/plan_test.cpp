@@ -275,7 +275,7 @@ TEST_CASE("what each file loads into: never wider, NVFP4 only from the GPTQ fold
   CHECK(how.find("wider") != std::string::npos);
   CHECK_FALSE(can_load(LX_W_FP8, LX_W_NVFP4, c));
   CHECK_FALSE(can_load(LX_W_NVFP4, LX_W_BF16, c, &how));
-  CHECK(how.find("GPTQ NVFP4 checkpoint") != std::string::npos);
+  CHECK(how == "from its own checkpoint: dromos run Lernex/Metis-1.6-Praxis-NVFP4");
   CHECK(can_load(LX_W_NVFP4, LX_W_NVFP4, c));
   CHECK_FALSE(can_load(LX_W_BF16X, LX_W_FP8, c));
   // the plan refuses the same
@@ -621,6 +621,28 @@ TEST_CASE("a CPU with the model's size in RAM but less of it free: resident, wit
   CHECK_FALSE(p.offload.enabled);
   CHECK(has_note(p, "pages other programs out"));
   CHECK(names_no_gpu(p));
+}
+
+TEST_CASE("a refusal lists what runs from this checkpoint, and NVFP4 with the command that loads it") {
+  // The 8.5 GB Windows VM, with the budget held down so BF16 is refused and the narrower formats fit.
+  DeviceInfo d = simulated_cpu("Windows VM CPU", 8.5);
+  d.free_bytes = static_cast<size_t>(6.5 * 1e9);
+  PlanRequest req = weights(LX_W_BF16);
+  req.ram_budget = static_cast<size_t>(5.6 * kGiB);
+  std::string why;
+  try {
+    make_plan(d, praxis(), bf16_checkpoint(), req);
+  } catch (const std::runtime_error& e) {
+    why = e.what();
+  }
+  INFO(why);
+  REQUIRE_FALSE(why.empty());
+  CHECK(why.find("BF16X fits") != std::string::npos);
+  CHECK(why.find("INT8 fits") != std::string::npos);
+  CHECK(why.find("NVFP4 would fit") != std::string::npos);
+  CHECK(why.find("dromos run Lernex/Metis-1.6-Praxis-NVFP4") != std::string::npos);
+  CHECK(why.find("NVFP4 fits") == std::string::npos);
+  CHECK(why.find("/home/") == std::string::npos);
 }
 
 TEST_CASE("a CPU with less RAM free than the model: says so in RAM terms, no VRAM or offload") {

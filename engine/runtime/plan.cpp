@@ -378,7 +378,11 @@ bool can_load(lx_wtype target, lx_wtype stored, const MetisConfig& config, std::
   if (target == stored) {
     why = "as stored";
   } else if (target == LX_W_NVFP4) {
-    why = nvfp4_unavailable(stored, config);
+    // NVFP4 comes from its own checkpoint, never from conversion: the note names the command that loads it.
+    const std::string repo = nvfp4_checkpoint(config);
+    const std::string who = config.family.empty() ? std::string("this model") : config.family;
+    why = repo.empty() ? "but no NVFP4 checkpoint of " + who + " is published yet"
+                       : "from its own checkpoint: dromos run " + repo;
     ok = false;
   } else if (target == LX_W_BF16X) {
     if (stored != LX_W_BF16) {
@@ -810,10 +814,16 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
                                    " of RAM can hold the model, less what the system keeps"
                              : gb(budget) + " is free for the model");
     if (!offload_why.empty()) why += "\n  and offloading the experts does not help: " + offload_why;
-    for (const FormatOption& o : options)
-      if (o.fits && o.format != target)
-        why += "\n  " + format_name(o.format) + " fits (" + gb(o.weight_bytes) + "): " +
-               (o.loadable ? "--weights " + weights_flag(o.format) + ", " + o.load : o.load);
+    // "Fits" names only what runs from this checkpoint; NVFP4, which loads from its own, says how to run it.
+    for (const FormatOption& o : options) {
+      if (!o.fits || o.format == target) continue;
+      if (o.loadable)
+        why += "\n  " + format_name(o.format) + " fits (" + gb(o.weight_bytes) + "): --weights " + weights_flag(o.format) +
+               ", " + o.load;
+      else if (o.format == LX_W_NVFP4)
+        why += "\n  " + format_name(o.format) + " would fit (" + gb(o.weight_bytes) + ")" +
+               (o.load.rfind("from ", 0) == 0 ? " " : ", ") + o.load;
+    }
     throw std::runtime_error("the model does not run on " + std::string(this_device(d)) + " as " + format_name(target) + ":" + why);
   }
 

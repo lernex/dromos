@@ -180,7 +180,7 @@ TEST_CASE("checkpoint: the GPTQ NVFP4 folder loads as NVFP4, its tensors unconve
   report("NVFP4 target from the GPTQ folder", m);
 }
 
-TEST_CASE("checkpoint: NVFP4 from a BF16 or FP8 folder is refused, naming the GPTQ checkpoint") {
+TEST_CASE("checkpoint: NVFP4 from a BF16 or FP8 folder is refused, naming the published NVFP4 checkpoint") {
   const char* bf16 = folder("LX_CKPT_BF16_DIR");
   const char* fp8 = folder("LX_CKPT_FP8_DIR");
   LoadOptions options;
@@ -202,9 +202,8 @@ TEST_CASE("checkpoint: NVFP4 from a BF16 or FP8 folder is refused, naming the GP
     }
     CHECK(threw);
     const std::string expected = std::string("NVFP4 from ") + c.stored +
-                                 " checkpoint is refused: round-to-nearest conversion fails its KL. Use the GPTQ "
-                                 "NVFP4 checkpoint at /home/aiadmin/kronos-scratch/logos/engines/praxis/nvfp4 "
-                                 "instead.";
+                                 " checkpoint is refused: round-to-nearest conversion fails its KL. NVFP4 loads from "
+                                 "its own checkpoint: dromos run Lernex/Metis-1.6-Praxis-NVFP4";
     CHECK(config.family == "praxis");
     CHECK(what == expected);
     if (what != expected) std::printf("  got: %s\n", what.c_str());

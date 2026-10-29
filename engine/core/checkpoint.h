@@ -36,6 +36,9 @@ lx_wtype projection_format(lx_wtype target, std::string_view projection);
 // Why NVFP4 cannot load from a folder stored as `stored`: the text ModelWeights::load throws, naming the
 // model's GPTQ NVFP4 checkpoint when there is one.
 std::string nvfp4_unavailable(lx_wtype stored, const MetisConfig& config);
+// The Hugging Face repository NVFP4 of this model loads from ("Lernex/Metis-1.6-Praxis-NVFP4"), or "" when none is
+// published.
+std::string nvfp4_checkpoint(const MetisConfig& config);
 
 class ModelWeights {
  public:

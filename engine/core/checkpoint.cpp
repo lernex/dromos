@@ -165,26 +165,35 @@ lx_wtype recipe(lx_wtype target, std::string_view key) {
   }
 }
 
-// The GPTQ NVFP4 checkpoint of each model family: the one NVFP4 is loaded from, since round-to-nearest
-// conversion is refused. A family with none is named as such in the refusal.
-struct GptqCheckpoint {
+// The published NVFP4 checkpoint of each model family, by its Hugging Face name: NVFP4 loads from it, since
+// round-to-nearest conversion is refused. A family with none is said to have none published.
+struct Nvfp4Checkpoint {
   std::string_view family;
-  std::string_view path;
+  std::string_view repo;
 };
-constexpr GptqCheckpoint kGptqNvfp4[] = {
-    {"praxis", "/home/aiadmin/kronos-scratch/logos/engines/praxis/nvfp4"},
-    {"logos", "/home/aiadmin/kronos-scratch/logos/engines/logos-nvfp4"},
+constexpr Nvfp4Checkpoint kNvfp4[] = {
+    {"praxis", "Lernex/Metis-1.6-Praxis-NVFP4"},
+    {"logos", "Lernex/Metis-1.6-Logos-NVFP4"},
 };
+
+std::string nvfp4_repo(const MetisConfig& config) {
+  for (const Nvfp4Checkpoint& g : kNvfp4)
+    if (config.family == g.family) return std::string(g.repo);
+  return {};
+}
+
+// Where NVFP4 of this model loads from, as a command, or that none is published.
+std::string nvfp4_source(const MetisConfig& config) {
+  const std::string repo = nvfp4_repo(config);
+  if (!repo.empty()) return "NVFP4 loads from its own checkpoint: dromos run " + repo;
+  const std::string who = config.family.empty() ? std::string("this model") : config.family;
+  return "No NVFP4 checkpoint of " + who + " is published yet.";
+}
 
 // The refusal of a conversion to NVFP4 from a folder that is not NVFP4 (ModelWeights::load).
 std::string nvfp4_refusal(lx_wtype stored, const MetisConfig& config) {
-  std::string message = std::string("NVFP4 from ") + (stored == LX_W_FP8 ? "an FP8" : "a BF16") +
-                        " checkpoint is refused: round-to-nearest conversion fails its KL. ";
-  for (const GptqCheckpoint& g : kGptqNvfp4)
-    if (config.family == g.family)
-      return message + "Use the GPTQ NVFP4 checkpoint at " + std::string(g.path) + " instead.";
-  const std::string who = config.family.empty() ? std::string("this model") : config.family;
-  return message + "No GPTQ NVFP4 checkpoint of " + who + " exists yet.";
+  return std::string("NVFP4 from ") + (stored == LX_W_FP8 ? "an FP8" : "a BF16") +
+         " checkpoint is refused: round-to-nearest conversion fails its KL. " + nvfp4_source(config);
 }
 
 // The format a folder holds, from its tensors: see ModelWeights::stored_format.
@@ -202,6 +211,8 @@ lx_wtype stored_format_of(const SafetensorsSet& set) {
 lx_wtype projection_format(lx_wtype target, std::string_view projection) { return recipe(target, projection); }
 
 std::string nvfp4_unavailable(lx_wtype stored, const MetisConfig& config) { return nvfp4_refusal(stored, config); }
+
+std::string nvfp4_checkpoint(const MetisConfig& config) { return nvfp4_repo(config); }
 
 // One projection of the folder: its tensors, the format the file holds it in, and the format it loads in.
 struct Projection {
