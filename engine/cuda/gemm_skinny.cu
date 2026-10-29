@@ -13,7 +13,6 @@
 //
 // Warps. Each CTA has four warps. With BN = 32 the warps split the four n8 tiles two ways and the row tiles two ways, so
 // no warp reads the whole activation tile; with BN = 16 or 8 the same rule gives one n8 tile per warp group.
-#include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -25,7 +24,6 @@
 #include "cuda/mma.cuh"
 
 #include "cuda/common.cuh"
-namespace cg = cooperative_groups;
 
 namespace {
 
@@ -37,8 +35,14 @@ constexpr int kMaxSplit = 8;  // the largest cluster the card's portable launche
 // The cluster barrier, as PTX states it. Arrive publishes this thread's shared-memory writes (release) and wait takes the
 // peers' writes (acquire). The memory clobber keeps the compiler from moving the partial stores or the peer reads across
 // the barrier; cooperative groups' sync() does not promise that for the partial exchange.
+// Below sm_90 there are no clusters and the host never launches S > 1, so both are empty there.
+#if LX_SM90_DEVICE
 __device__ __forceinline__ void cluster_arrive() { asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory"); }
 __device__ __forceinline__ void cluster_wait() { asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory"); }
+#else
+__device__ __forceinline__ void cluster_arrive() {}
+__device__ __forceinline__ void cluster_wait() {}
+#endif
 
 
 __device__ __forceinline__ void epilogue_store(float v, int row, int col, const void* bias, bool bias_f32, void* y,
@@ -77,7 +81,7 @@ __global__ void __launch_bounds__(128) skinny_bf16_kernel(const __nv_bfloat16* _
   const int g = lane >> 2, t = lane & 3;
   const int ng = warp % kNTG, mg = warp / kNTG;
   const int KT = K / kKC;
-  const int rank = S > 1 ? static_cast<int>(cg::this_cluster().block_rank()) : 0;
+  const int rank = S > 1 ? static_cast<int>(lx::cluster_block_rank()) : 0;
   const int n0 = (S > 1 ? static_cast<int>(blockIdx.x) / S : static_cast<int>(blockIdx.x)) * BN;
   const int kt0 = rank * KT / S;                     // this CTA's K slice: tiles kt0 .. kt0 + KTr - 1
   const int KTr = (rank + 1) * KT / S - kt0;
@@ -182,7 +186,6 @@ __global__ void __launch_bounds__(128) skinny_bf16_kernel(const __nv_bfloat16* _
     // owns (i = rank + S * m, so the CTAs of a cluster split the tile by residue) into registers. A second barrier
     // then ends every peer read, so the CTA may write its outputs and exit. No global access sits between the DSMEM
     // reads and the barrier.
-    cg::cluster_group cluster = cg::this_cluster();
     cluster_arrive();
     cluster_wait();
     constexpr int kOwn = (BM * BN + S * 128 - 1) / (S * 128);  // outputs per thread, rounded up
@@ -194,7 +197,7 @@ __global__ void __launch_bounds__(128) skinny_bf16_kernel(const __nv_bfloat16* _
       if (i < BM * BN) {
 #pragma unroll
         for (int q = 0; q < S; ++q) {
-          const float v = cluster.map_shared_rank(part, q)[i];
+          const float v = lx::cluster_peer(part, static_cast<unsigned>(q))[i];
           sum = q == 0 ? v : sum + v;
         }
       }
