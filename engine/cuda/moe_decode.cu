@@ -144,6 +144,9 @@ __global__ void __launch_bounds__(kThreads) moe_gate_up_kernel(const bf16* __res
   const int e = ids[p];
   // gate_up[e] is [2I, L]: row i the gate and row I + i the up projection.
   const lx_weight w = lx::expert_slice(gate_up, e, 2 * I, L);
+  // The row factors go out with the weights: loaded after the reduction, they add a memory round trip at the end.
+  const float sg = lx::WordFormat<F>::row_factor(w, i);
+  const float su = lx::WordFormat<F>::row_factor(w, static_cast<int64_t>(I) + i);
   const bf16* x = latent + static_cast<int64_t>(p / top_k) * L;
 
   // This lane's steps: k0 = lane_k + s * stride, for every s with k0 < L.
@@ -169,8 +172,6 @@ __global__ void __launch_bounds__(kThreads) moe_gate_up_kernel(const bf16* __res
   g = lx::warp_sum(g);
   u = lx::warp_sum(u);
   if (lane == 0) {
-    const float sg = lx::WordFormat<F>::row_factor(w, i);
-    const float su = lx::WordFormat<F>::row_factor(w, static_cast<int64_t>(I) + i);
     inter[static_cast<int64_t>(p) * I + i] = lx::from_f32<bf16>(lx::silu(sg * g) * (su * u));
   }
 }
