@@ -14,8 +14,9 @@ readme = { text = """Dromos, Lernex's inference engine for the Metis models, run
     dromos run praxis       chat in the terminal
     dromos serve logos      the OpenAI API on this machine
 
-The engine picks its backend when it starts: CUDA on an NVIDIA GPU (Linux x86_64; the CUDA runtime comes from
-NVIDIA's own wheels, which this package installs), Metal on Apple silicon (macOS 14 or later), and the CPU otherwise.
+The engine picks its backend when it starts: CUDA on an NVIDIA GPU (Linux x86_64 and Windows x64; the CUDA runtime
+comes from NVIDIA's own wheels, which this package installs), Metal on Apple silicon (macOS 14 or later), and the CPU
+otherwise.
 """, content-type = "text/plain" }
 license = "Apache-2.0"
 # The engine's LICENSE and NOTICE, and the third-party licenses beside them (scripts/release/build.sh): build_wheel.py
@@ -25,6 +26,7 @@ requires-python = ">=3.9"
 classifiers = [
   "Environment :: GPU :: NVIDIA CUDA",
   "Operating System :: MacOS :: MacOS X",
+  "Operating System :: Microsoft :: Windows",
   "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
