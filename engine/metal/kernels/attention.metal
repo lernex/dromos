@@ -7,9 +7,11 @@
 // (rows padded so the lanes hit distinct banks), the simdgroup keeps an online softmax, and lane l
 // accumulates output dims l, l + 32, ...
 //
-// Few items (decode): each item is split over `splits` threadgroups, part r taking tiles r, r +
-// splits, ...; parts write their softmax state (max, sum, accumulator) to a scratch buffer and
-// attn_combine merges them. Many items (prefill): whole items, written directly. T is device data (the
+// Every item reduces in `splits` parts, part r taking tiles r, r + splits, ..., and the parts are merged in
+// attn_combine's order. Few items (decode): the parts run in separate threadgroups, which write their softmax
+// state (max, sum, accumulator) to a scratch buffer, and attn_combine merges them. Many items (prefill): one
+// threadgroup runs the parts in turn and merges them in place, with the same arithmetic, so a token's bits do
+// not depend on how many items run beside it. T is device data (the
 // ABI passes cu_seqlens, not a count), so both kernels read T = cu[n_seq] and grid-stride over the
 // work, and every threadgroup makes the same choice. On GPUs with neural accelerators, prefill items
 // go to the flash kernel in nax/attention.metal instead (attn_flash_takes).
@@ -17,6 +19,7 @@
 constant constexpr int kAttnTile = 32;
 constant constexpr int kAttnHeads = 4;  // query heads per pass: one per simdgroup
 constant constexpr int kSplitBelow = 64;
+constant constexpr int kAttnSplitMax = 16;  // the most parts an item takes (the host's kAttnSplits)
 
 // Whether the whole items go to the flash kernel on the neural accelerators (nax/attention.metal, which
 // makes the same choice): the host allows it, the items are not split, and the sequences carry enough
@@ -67,8 +70,10 @@ kernel void attention(constant AttnArgs& a [[buffer(0)]], threadgroup uchar* sme
   threadgroup float* sQ = (threadgroup float*)(sV + kAttnTile * RS);
   const int T = a.cu[a.n_seq];
   if (attn_flash_takes(a, T)) return;
+  // Few items run their parts in parallel; otherwise a threadgroup runs its item's parts in turn. The parts
+  // are the architecture's (S = splits), so the reduction is the same either way.
   const bool split = a.splits > 1 && T * KVH < kSplitBelow;
-  const int S = split ? a.splits : 1;
+  const int S = a.splits;
   const int part = split ? int(g) % S : 0;
   const int first = split ? int(g) / S : int(g);
   const int stride = split ? int(groups) / S : int(groups);
@@ -90,55 +95,66 @@ kernel void attention(constant AttnArgs& a [[buffer(0)]], threadgroup uchar* sme
         const int hh = i / Dh, d = i % Dh;
         sQ[i] = (h0 + hh < G) ? q_row[(kvh * G + h0 + hh) * Dh + d] * a.scale : 0.0f;
       }
-      float m = -INFINITY, l = 0.0f;
-      float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};  // dims lane + 32 j, Dh <= 128
+      // The item's parts, each reduced from a softmax state of its own: one part here in split mode, all S in turn
+      // otherwise. The merge at the end is attn_combine's, in the same order.
+      const int pr_lo = split ? part : 0;
+      const int pr_hi = split ? part + 1 : S;
+      float pm[kAttnSplitMax], pl[kAttnSplitMax];
+      float pacc[kAttnSplitMax][4];
+      for (int pr = pr_lo; pr < pr_hi; ++pr) {
+        float m = -INFINITY, l = 0.0f;
+        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};  // dims lane + 32 j, Dh <= 128
 
-      for (int tile = part; tile < n_tiles; tile += S) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int c = tid; c < kAttnTile * NCH; c += 128) {
-          const int r = c / NCH, ch = c % NCH;
-          const int p = tile * kAttnTile + r;
-          uint4 kv = uint4(0), vv = uint4(0);
+        for (int tile = pr; tile < n_tiles; tile += S) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          for (int c = tid; c < kAttnTile * NCH; c += 128) {
+            const int r = c / NCH, ch = c % NCH;
+            const int p = tile * kAttnTile + r;
+            uint4 kv = uint4(0), vv = uint4(0);
+            if (p < L) {
+              const long src = ((slot * a.capacity + p) * KVH + kvh) * Dh + ch * 8;
+              kv = *(const device uint4*)(a.k_cache + src);
+              vv = *(const device uint4*)(a.v_cache + src);
+            }
+            threadgroup uint* dk = (threadgroup uint*)(sK + r * RS + ch * 8);
+            threadgroup uint* dv = (threadgroup uint*)(sV + r * RS + ch * 8);
+            dk[0] = kv.x; dk[1] = kv.y; dk[2] = kv.z; dk[3] = kv.w;
+            dv[0] = vv.x; dv[1] = vv.y; dv[2] = vv.z; dv[3] = vv.w;
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (!live) continue;
+          const int p = tile * kAttnTile + int(lane);
+          float score = -INFINITY;
           if (p < L) {
-            const long src = ((slot * a.capacity + p) * KVH + kvh) * Dh + ch * 8;
-            kv = *(const device uint4*)(a.k_cache + src);
-            vv = *(const device uint4*)(a.v_cache + src);
+            const threadgroup ushort* kr = sK + lane * RS;
+            const threadgroup float* qr = sQ + sg * Dh;
+            float dot = 0.0f;
+            for (int d = 0; d < Dh; d += 2) {
+              const uint w = *(const threadgroup uint*)(kr + d);
+              dot = fma(qr[d], bf_lo(w), dot);
+              dot = fma(qr[d + 1], bf_hi(w), dot);
+            }
+            score = dot;
           }
-          threadgroup uint* dk = (threadgroup uint*)(sK + r * RS + ch * 8);
-          threadgroup uint* dv = (threadgroup uint*)(sV + r * RS + ch * 8);
-          dk[0] = kv.x; dk[1] = kv.y; dk[2] = kv.z; dk[3] = kv.w;
-          dv[0] = vv.x; dv[1] = vv.y; dv[2] = vv.z; dv[3] = vv.w;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (!live) continue;
-        const int p = tile * kAttnTile + int(lane);
-        float score = -INFINITY;
-        if (p < L) {
-          const threadgroup ushort* kr = sK + lane * RS;
-          const threadgroup float* qr = sQ + sg * Dh;
-          float dot = 0.0f;
-          for (int d = 0; d < Dh; d += 2) {
-            const uint w = *(const threadgroup uint*)(kr + d);
-            dot = fma(qr[d], bf_lo(w), dot);
-            dot = fma(qr[d + 1], bf_hi(w), dot);
+          const float mn = max(m, simd_max(score));
+          if (mn == -INFINITY) continue;  // no visible key in this tile (only possible for a tail split)
+          const float corr = fast::exp(m - mn);
+          const float pj = p < L ? fast::exp(score - mn) : 0.0f;
+          l = l * corr + simd_sum(pj);
+          for (int j = 0; j < 4; ++j) acc[j] *= corr;
+          for (int j = 0; j < kAttnTile; ++j) {
+            const float w = simd_shuffle(pj, ushort(j));
+            const threadgroup ushort* vr = sV + j * RS;
+            for (int k = 0; k < 4; ++k) {
+              const int d = int(lane) + 32 * k;
+              if (d < Dh) acc[k] = fma(w, bf(vr[d]), acc[k]);
+            }
           }
-          score = dot;
+          m = mn;
         }
-        const float mn = max(m, simd_max(score));
-        if (mn == -INFINITY) continue;  // no visible key in this tile (only possible for a tail split)
-        const float corr = fast::exp(m - mn);
-        const float pj = p < L ? fast::exp(score - mn) : 0.0f;
-        l = l * corr + simd_sum(pj);
-        for (int j = 0; j < 4; ++j) acc[j] *= corr;
-        for (int j = 0; j < kAttnTile; ++j) {
-          const float w = simd_shuffle(pj, ushort(j));
-          const threadgroup ushort* vr = sV + j * RS;
-          for (int k = 0; k < 4; ++k) {
-            const int d = int(lane) + 32 * k;
-            if (d < Dh) acc[k] = fma(w, bf(vr[d]), acc[k]);
-          }
-        }
-        m = mn;
+        pm[pr] = m;
+        pl[pr] = l;
+        for (int k = 0; k < 4; ++k) pacc[pr][k] = acc[k];
       }
 
       if (live) {
@@ -147,18 +163,36 @@ kernel void attention(constant AttnArgs& a [[buffer(0)]], threadgroup uchar* sme
           device float* ps = a.partial + ((long(item) * S + part) * G + (h0 + sg)) * (Dh + 2);
           for (int k = 0; k < 4; ++k) {
             const int d = int(lane) + 32 * k;
-            if (d < Dh) ps[d] = acc[k];
+            if (d < Dh) ps[d] = pacc[part][k];
           }
           if (lane == 0) {
-            ps[Dh] = m;
-            ps[Dh + 1] = l;
+            ps[Dh] = pm[part];
+            ps[Dh + 1] = pl[part];
           }
         } else {
           device ushort* o = a.out + long(t) * H * Dh + long(hq) * Dh;
-          const float inv = 1.0f / l;
-          for (int k = 0; k < 4; ++k) {
-            const int d = int(lane) + 32 * k;
-            if (d < Dh) o[d] = to_bf(acc[k] * inv);
+          if (S == 1) {
+            const float inv = 1.0f / pl[0];
+            for (int k = 0; k < 4; ++k) {
+              const int d = int(lane) + 32 * k;
+              if (d < Dh) o[d] = to_bf(pacc[0][k] * inv);
+            }
+          } else {
+            // attn_combine's merge of the parts: the same order and arithmetic, so the bits match a split item.
+            float M = -INFINITY;
+            for (int r = 0; r < S; ++r) M = max(M, pm[r]);
+            float Z = 0.0f;
+            float A[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            for (int r = 0; r < S; ++r) {
+              if (pm[r] == -INFINITY) continue;
+              const float w = fast::exp(pm[r] - M);
+              Z += pl[r] * w;
+              for (int k = 0; k < 4; ++k) A[k] += pacc[r][k] * w;
+            }
+            for (int k = 0; k < 4; ++k) {
+              const int d = int(lane) + 32 * k;
+              if (d < Dh) o[d] = to_bf(A[k] / Z);
+            }
           }
         }
       }
@@ -166,7 +200,7 @@ kernel void attention(constant AttnArgs& a [[buffer(0)]], threadgroup uchar* sme
   }
 }
 
-// Merges the split parts of each item (only in split mode; otherwise the items were written whole).
+// Merges the split parts of each item (only in split mode; a whole item is merged in the attention kernel).
 kernel void attn_combine(constant AttnArgs& a [[buffer(0)]], uint g [[threadgroup_position_in_grid]],
                          uint groups [[threadgroups_per_grid]], uint tid [[thread_index_in_threadgroup]],
                          uint threads [[threads_per_threadgroup]]) {
