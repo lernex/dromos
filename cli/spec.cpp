@@ -1121,7 +1121,8 @@ void check_rc(int rc, const char* what) {
 }
 
 int run_exactness(const std::string& dir, const std::string& prompts_path, const std::string& name, int draws,
-                  const lx::cli::FormatFlags& format, double rep, double presence, double frequency, int output_top) {
+                  const lx::cli::FormatFlags& format, double rep, double presence, double frequency, int output_top,
+                  double temp, double top_p, int top_k, double min_p) {
   nlohmann::json prompts;
   std::ifstream(prompts_path) >> prompts;
   if (!prompts.contains(name)) throw std::runtime_error("no prompt named " + name + " in " + prompts_path);
@@ -1130,7 +1131,7 @@ int run_exactness(const std::string& dir, const std::string& prompts_path, const
   const std::vector<int32_t> prefix(ids.begin(), ids.end() - 1);
   const int32_t last = ids.back();
   const int N = static_cast<int>(prefix.size());
-  Sampling sm{0.8, 0.95, 0.0, rep, 20, 0};  // temp, top_p, min_p, rep, top_k, seed (unused: the seeds below)
+  Sampling sm{temp, top_p, min_p, rep, top_k, 0};  // temp, top_p, min_p, rep, top_k, seed (unused: the seeds below)
   sm.presence = presence;
   sm.frequency = frequency;
   // The context is seen (repetition), and its last 16 tokens are output (presence and frequency), as after a
@@ -1222,7 +1223,7 @@ int run_exactness(const std::string& dir, const std::string& prompts_path, const
       sp.temperature = static_cast<float>(sm.temp);
       sp.top_p = static_cast<float>(sm.top_p);
       sp.top_k = sm.top_k;
-      sp.min_p = 0.0f;
+      sp.min_p = static_cast<float>(sm.min_p);
       sp.repetition_penalty = static_cast<float>(rep);
       sp.presence_penalty = static_cast<float>(presence);
       sp.frequency_penalty = static_cast<float>(frequency);
@@ -1282,8 +1283,8 @@ int run_exactness(const std::string& dir, const std::string& prompts_path, const
   const std::vector<long> spec_low = spec_draws(low, acc_low);
   if (const int err = lx_rt_last_error()) throw std::runtime_error(std::string(lx_rt_error_string(err)) + " during the check");
 
-  std::printf("%s: %d prefix tokens, the next token drawn %d times at temperature %.1f, top-p %.2f, top-k %d\n",
-              name.c_str(), N, draws, sm.temp, sm.top_p, sm.top_k);
+  std::printf("%s: %d prefix tokens, the next token drawn %d times at temperature %.2f, top-p %.2f, top-k %d, min-p %.3f\n",
+              name.c_str(), N, draws, sm.temp, sm.top_p, sm.top_k, sm.min_p);
   // How far the penalties move this distribution: a check is only informative when they change it.
   double moved = 0.0;
   {
@@ -1297,6 +1298,15 @@ int run_exactness(const std::string& dir, const std::string& prompts_path, const
   }
   std::printf("penalties (rep %.3f, presence %.3f, frequency %.3f) move the reference by total variation %.4f\n", rep,
               presence, frequency, moved);
+  if (sm.min_p > 0 || sm.top_k > 0) {  // the same check for the truncations: min-p and top-k must change the distribution
+    Sampling untruncated = sm;
+    untruncated.min_p = 0.0;
+    untruncated.top_k = 0;
+    const Dist open_ref = make_dist(base.data(), V, seen_mask, untruncated, nullptr);
+    double cut = 0.0;
+    for (int t = 0; t < V; ++t) cut += std::abs(ref.p[static_cast<size_t>(t)] - open_ref.p[static_cast<size_t>(t)]);
+    std::printf("min-p %.3f and top-k %d move the reference by total variation %.4f\n", sm.min_p, sm.top_k, 0.5 * cut);
+  }
   if (output_top > 0)
     std::printf("the %d most likely tokens count as output too (--output-top)\n", output_top);
   std::printf("reference: %zu tokens kept, most likely %d (p %.3f)\n", kept.size(), kept[0],
@@ -1340,6 +1350,8 @@ int cmd_spec_exactness(int argc, char** argv) {
     std::vector<char*> args = without_format_flags(argc, argv, format);
     double rep = 1.0, presence = 0.0, frequency = 0.0;
     int output_top = 0;
+    double temp = 0.8, top_p = 0.95, min_p = 0.0;  // the think setting
+    int top_k = 20;
     std::vector<char*> pos;
     for (size_t i = 0; i < args.size(); ++i) {
       const std::string a = args[i];
@@ -1351,18 +1363,23 @@ int cmd_spec_exactness(int argc, char** argv) {
       else if (a == "--presence") presence = std::stod(val());
       else if (a == "--frequency") frequency = std::stod(val());
       else if (a == "--output-top") output_top = std::stoi(val());
+      else if (a == "--temp") temp = std::stod(val());
+      else if (a == "--top-p") top_p = std::stod(val());
+      else if (a == "--top-k") top_k = std::stoi(val());
+      else if (a == "--min-p") min_p = std::stod(val());
       else pos.push_back(args[i]);
     }
     const int n = static_cast<int>(pos.size());
     if (n != 4 && n != 5) {
       std::fprintf(stderr,
                    "usage: dromos spec-exactness MODEL_DIR PROMPTS_JSON PROMPT [DRAWS] [--rep R] [--presence P] "
-                   "[--frequency F] %s\n",
+                   "[--frequency F] [--temp T] [--top-p P] [--top-k K] [--min-p M] %s\n",
                    lx::cli::kFormatUsage);
       return 2;
     }
     const int draws = n == 5 ? std::stoi(pos[4]) : 2000;
-    return run_exactness(pos[1], pos[2], pos[3], draws, format, rep, presence, frequency, output_top);
+    return run_exactness(pos[1], pos[2], pos[3], draws, format, rep, presence, frequency, output_top, temp, top_p, top_k,
+                         min_p);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "error: %s\n", e.what());
     return 1;
