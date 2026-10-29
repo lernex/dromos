@@ -6,7 +6,9 @@
 // One algorithm serves every prefill row count of a shape (pinned_algo): it is chosen at kPinRows without split-K and
 // reused, so a prefill row's bits never depend on how many rows share its step. Decode steps (M <= kDecodeMaxRows) of
 // plain bf16 shapes may run a faster algorithm from the same candidates, listed in kDecodePins: the prefill algorithm
-// has too few tiles at decode row counts (one 128x128 tile column at M = 32, 94 us against a 20 us floor).
+// has too few tiles at decode row counts (one 128x128 tile column at M = 32, 94 us against a 20 us floor). A decode pin
+// keeps K unsplit, but a different tile can still sum in a different order, so each entry is one that was measured to
+// match the prefill pin bit for bit, and it applies only on the architecture and cuBLASLt it was measured on.
 //
 // The bias goes through cuBLASLt's bias epilogue, which adds after alpha and beta, so the bias
 // has to be alpha * bias. cuBLASLt also wants the bias in the output's dtype. Those two rules mean
@@ -41,6 +43,10 @@ constexpr size_t kMaxPlans = 2048;
 constexpr int kPinRows = 512;
 // Decode steps of plain bf16 shapes (up to kDecodeMaxRows rows) may take a faster candidate than the prefill pin.
 constexpr int kDecodeMaxRows = 64;
+// kDecodePins was measured bit-identical on compute capability 12.0 with cuBLASLt 13.8. Another architecture or
+// cuBLASLt release can offer a different kernel under the same tile and stage IDs, so it keeps the prefill pin.
+constexpr int kDecodePinsCC = 120;
+constexpr size_t kDecodePinsCublas = 1308;  // cublasLtGetVersion() / 100
 
 cudaError_t to_cuda(cublasStatus_t status) {
   switch (status) {
@@ -103,6 +109,7 @@ struct DeviceState {
   size_t bias_scratch_bytes = 0;
   std::map<PlanKey, Plan> plans;
   std::map<AlgoKey, cublasLtMatmulAlgo_t> algos;  // never flushed: one entry per shape
+  bool decode_pins = false;  // kDecodePins applies here (the architecture and cuBLASLt it was measured on)
 };
 
 // Created on first use, on the device that is current then. Never destroyed: tearing handles down
@@ -112,11 +119,15 @@ DeviceState* device_state() {
   if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= kMaxDevices) return nullptr;
   static std::array<DeviceState, kMaxDevices> states;
   DeviceState& s = states[device];
-  std::call_once(s.ready, [&s] {
+  std::call_once(s.ready, [&s, device] {
     if (cublasLtCreate(&s.handle) != CUBLAS_STATUS_SUCCESS) {
       s.init_error = cudaErrorUnknown;
       return;
     }
+    int major = 0, minor = 0;
+    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) == cudaSuccess &&
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) == cudaSuccess)
+      s.decode_pins = major * 10 + minor == kDecodePinsCC && cublasLtGetVersion() / 100 == kDecodePinsCublas;
     s.init_error = cudaMalloc(&s.workspace, kWorkspaceBytes);
   });
   return &s;
@@ -211,8 +222,8 @@ uint32_t algo_attr(const cublasLtMatmulAlgo_t& algo, cublasLtMatmulAlgoConfigAtt
 }
 
 // The algorithm this shape runs at its row class. Both classes choose from the same candidates: the heuristic's order at
-// kPinRows, without split-K (checked in the algorithm's own config as well). The prefill pin is the first of them. Without
-// split-K nothing reorders a row's reduction over K, so a decode pin changes speed, not bits (kDecodePins).
+// kPinRows, without split-K (checked in the algorithm's own config as well). The prefill pin is the first of them. A decode
+// pin changes speed, not bits, because each kDecodePins entry was measured to match the prefill pin (s.decode_pins).
 cublasStatus_t pinned_algo(DeviceState& s, const PlanKey& key, cudaDataType bias_type, cublasLtMatmulAlgo_t& out) {
   const AlgoKey ak = algo_key(key);
   if (auto it = s.algos.find(ak); it != s.algos.end()) {
@@ -254,7 +265,7 @@ cublasStatus_t pinned_algo(DeviceState& s, const PlanKey& key, cudaDataType bias
   if (count == 0) return CUBLAS_STATUS_NOT_SUPPORTED;
 
   out = passing[0];  // the prefill pin
-  if (ak.decode) {
+  if (ak.decode && s.decode_pins) {
     for (const DecodePin& pin : kDecodePins) {
       if (pin.N != ak.N || pin.K != ak.K) continue;
       for (int j = 0; j < count; ++j) {
