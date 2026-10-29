@@ -1,5 +1,8 @@
 // Mamba-2 mixer kernels: the causal conv that carries its state between steps, the selective scan
 // (the SSD recurrence) with f32 state per slot, and the gated RMSNorm that follows the scan.
+#include <cooperative_groups.h>
+#include <cstdlib>
+
 #include "cuda/common.cuh"
 
 namespace {
@@ -305,8 +308,22 @@ struct DecodeArgs {
   int H, P, G, N, W;
 };
 
-template <int NI>
-__global__ void __launch_bounds__(kDecodeThreads) mamba_decode_kernel(const DecodeArgs a) {
+// One chunk of a block's new state: four columns from one thread, as one float4 when the row is whole float4s.
+__device__ __forceinline__ void store_state_chunk(float* st, int N, bool vec, int n0, const float* v) {
+  if (vec) {
+    if (n0 < N) __stcg(reinterpret_cast<float4*>(st + n0), make_float4(v[0], v[1], v[2], v[3]));
+  } else {
+#pragma unroll
+    for (int e = 0; e < 4; ++e)
+      if (n0 + e < N) __stcg(st + n0 + e, v[e]);
+  }
+}
+
+// One body for both launches. kCluster = false: the head blocks of a group count arrivals on a global counter and the
+// last one to arrive finishes the group. kCluster = true (sm_90 and up): the group's head blocks are one cluster, and
+// they share y through distributed shared memory, so there is no counter, no fence and no read-back from L2.
+template <int NI, bool kCluster>
+__device__ __forceinline__ void mamba_decode_body(const DecodeArgs& a) {
   lx::pdl_trigger();
   lx::pdl_wait();
   __shared__ float xs[kDecodeMaxP];                  // the head's x conv outputs
@@ -315,6 +332,7 @@ __global__ void __launch_bounds__(kDecodeThreads) mamba_decode_kernel(const Deco
   __shared__ float nst[7][kDecodeMaxP];             // the head's x channels' new conv state rows
   __shared__ float red[32];
   __shared__ int last;
+  __shared__ float ysh[kDecodeMaxP];  // the head's y, read by the cluster's blocks (kCluster only)
 
   const int tid = threadIdx.x, q = tid & 3, p = tid >> 2;
   const int h = blockIdx.x, s = blockIdx.y;
@@ -413,21 +431,17 @@ __global__ void __launch_bounds__(kDecodeThreads) mamba_decode_kernel(const Deco
     }
     // This chunk's new state goes out as soon as it is computed, so its stores drain while the later chunks' state
     // loads are still in flight. The stores are the same values in the same places, whatever order they go out in.
-    const int n0 = 4 * (q + 4 * i);
-    if (valid) {
-      if (vec) {
-        if (n0 < N) __stcg(reinterpret_cast<float4*>(st + n0), make_float4(S[i][0], S[i][1], S[i][2], S[i][3]));
-      } else {
-#pragma unroll
-        for (int e = 0; e < 4; ++e)
-          if (n0 + e < N) __stcg(st + n0 + e, S[i][e]);
-      }
-    }
+    // (The cluster's last chunk goes out behind its barrier arrival instead, below.)
+    if (valid && !(kCluster && i == NI - 1)) store_state_chunk(st, N, vec, 4 * (q + 4 * i), S[i]);
   }
   float y = (acc[0] + acc[1]) + (acc[2] + acc[3]);
 #pragma unroll
   for (int o = 1; o < 4; o <<= 1) y += __shfl_xor_sync(0xffffffffu, y, o);
-  if (valid && q == 0) a.y[static_cast<int64_t>(s) * I + h * P + p] = y + Dh * xp;
+  const float yo = y + Dh * xp;
+  if (valid && q == 0) {
+    a.y[static_cast<int64_t>(s) * I + h * P + p] = yo;
+    if (kCluster) ysh[p] = yo;
+  }
 
   // The group's B and C conv state, read now, behind the arrival: only the last block moves it on, and nothing writes
   // it before that block does, so every block may read it. The last block then has it in registers, a round trip
@@ -445,6 +459,51 @@ __global__ void __launch_bounds__(kDecodeThreads) mamba_decode_kernel(const Deco
         bc_old[r][k] = (k < W - 1 && has) ? __ldcg(cst + static_cast<int64_t>(k) * conv_dim + c) : 0.0f;
     }
   }
+
+  // The cluster path: the group's head blocks are one cluster, consecutive in x, so the rank is the head's place in its
+  // group. Each block reads the group's B and C state before the barrier, and rank 0 moves it on after it, so no block
+  // writes state another still reads. The norm sums the group's K channels in the order the last block did (thread t
+  // takes channels t, t + 256, ...), reading each channel's y from the head block that owns it, so the bits are the same.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  if constexpr (kCluster) {
+    const cooperative_groups::cluster_group cluster = cooperative_groups::this_cluster();
+    const int hpg = H / G, rank = h - g * hpg;
+    // The arrival orders this block's y and B and C reads before the barrier; the last chunk of state goes out behind it,
+    // so the barrier waits only for the stores that were issued before the last chunk.
+    __cluster_barrier_arrive();
+    if (valid) store_state_chunk(st, N, vec, 4 * (q + 4 * (NI - 1)), S[NI - 1]);
+    __cluster_barrier_wait();
+    if (rank == 0 && W >= 2) {
+#pragma unroll
+      for (int r = 0; r < 2; ++r) {
+        const int j = tid + r * kDecodeThreads;
+        if (j < 2 * N) {
+          const int c = I + (j < N ? g * N + j : GN + g * N + (j - N));
+#pragma unroll
+          for (int k = 0; k < 6; ++k)
+            if (k < W - 2) cst[static_cast<int64_t>(k) * conv_dim + c] = bc_old[r][k + 1];
+          cst[static_cast<int64_t>(W - 2) * conv_dim + c] = bc_xn[r];
+        }
+      }
+    }
+    const int K = hpg * P, base = g * K;
+    const float* zr = zrow + base;
+    float sum = 0.0f;
+    for (int i = tid; i < K; i += kDecodeThreads) {
+      const float v = cluster.map_shared_rank(ysh, i / P)[i % P] * lx::silu(zr[i]);
+      sum += v * v;
+    }
+    const float scale = rsqrtf(lx::block_sum(sum, red) / K + a.eps);
+    for (int j = tid; j < P; j += kDecodeThreads) {
+      const int i = rank * P + j;
+      const float v = ysh[j] * lx::silu(zr[i]);
+      a.out[static_cast<int64_t>(s) * I + base + i] =
+          lx::from_f32<__nv_bfloat16>(v * scale * __bfloat162float(a.norm_w[base + i]));
+    }
+    cluster.sync();  // no block leaves while another still reads its shared memory
+    return;
+  }
+#endif
 
   // Arrival: the group's last block to finish takes over. Every thread's writes are fenced before the count.
   __threadfence();
@@ -486,7 +545,56 @@ __global__ void __launch_bounds__(kDecodeThreads) mamba_decode_kernel(const Deco
 }
 
 template <int NI>
+__global__ void __launch_bounds__(kDecodeThreads) mamba_decode_kernel(const DecodeArgs a) {
+  mamba_decode_body<NI, false>(a);
+}
+
+template <int NI>
+__global__ void __launch_bounds__(kDecodeThreads) mamba_decode_cluster_kernel(const DecodeArgs a) {
+  mamba_decode_body<NI, true>(a);
+}
+
+// Whether the group norm runs on clusters: the device launches them (sm_90 and up). LX_MAMBA_ATOMIC=1 takes the counter
+// path on any device, so the suite can check both.
+inline bool cluster_on() {
+  static const bool forced_atomic = std::getenv("LX_MAMBA_ATOMIC") != nullptr;
+  if (forced_atomic) return false;
+  int dev = 0, v = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&v, cudaDevAttrClusterLaunch, dev) != cudaSuccess)
+    return false;
+  return v != 0;
+}
+
+// One cluster per group: its hpg head blocks, consecutive in x. A cluster is at most 8 blocks, the portable size.
+template <int NI>
+int launch_decode_cluster(const DecodeArgs& args, int n_seq, int H, int hpg, cudaStream_t s) {
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3(H, n_seq);
+  cfg.blockDim = dim3(kDecodeThreads);
+  cfg.dynamicSmemBytes = 0;
+  cfg.stream = s;
+  cudaLaunchAttribute attrs[2] = {};
+  int na = 0;
+  attrs[na].id = cudaLaunchAttributeClusterDimension;
+  attrs[na].val.clusterDim.x = hpg;
+  attrs[na].val.clusterDim.y = 1;
+  attrs[na].val.clusterDim.z = 1;
+  ++na;
+  if (lx::pdl_new_on()) {
+    attrs[na].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[na].val.programmaticStreamSerializationAllowed = 1;
+    ++na;
+  }
+  cfg.attrs = attrs;
+  cfg.numAttrs = na;
+  cudaLaunchKernelEx(&cfg, mamba_decode_cluster_kernel<NI>, args);
+  return lx::launch_status();
+}
+
+template <int NI>
 int launch_decode(const DecodeArgs& args, int n_seq, int H, cudaStream_t s) {
+  const int hpg = args.H / args.G;  // the head blocks of one group
+  if (hpg <= 8 && cluster_on()) return launch_decode_cluster<NI>(args, n_seq, H, hpg, s);
   lx::launch_pdl(mamba_decode_kernel<NI>, dim3(H, n_seq), kDecodeThreads, 0, s, args);
   return lx::launch_status();
 }
