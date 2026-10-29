@@ -45,3 +45,10 @@ All three need the decode-program port in item 1 before AMD compiles.
 The regenerated tree is commit 0ed6172 on the logos worker's clone, kept as a patch
 (`parked/0001` in that worker's scratch). Re-run `python3 engine/hip/translate.py
 generate` after the patches are re-ported, then `check`.
+
+## Hand-written HIP compositions to carry over
+
+Folds A, B and C (the add_two_rows, concat4_f32 and stream_concat4 compositions in engine/hip/src/glue.cu and
+engine/hip/src/elementwise.cu, with their kernels.h declarations) and the mhc write_read fusion (lx_mhc_write_read in
+engine/hip/src/streams.cu, composed from lx_mhc_write and lx_mhc_read) are written by hand in src/ with no patches, so
+`translate.py generate` would overwrite them. Port each into a patch when the backend is regenerated.
