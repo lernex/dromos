@@ -2043,11 +2043,11 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
       }
       // The mixer writes the streams, which the routing side reads: order its read first.
       if (beside) check(lx_rt_stream_wait(s, m.route_read), "stream wait");
-      LX_CHECK(lx_mhc_write(m.mixed, mc + S * S + S, m.update, m.streams, T, S, D, s));
-
-      // latent mixture of experts
+      // latent mixture of experts. The mixer's write and the MoE's read of the same streams are one call: one kernel
+      // where clusters run, bit-identical to the two. The wait above precedes it.
       const float* ec = layer.moe_conn.params + pass * params;
-      LX_CHECK(lx_mhc_read(m.streams, ec, ec + S * S, layer.moe_conn.norm, c.rms_norm_eps, m.mixed, m.h_bf, T, S, D, s));
+      LX_CHECK(lx_mhc_write_read(m.mixed, mc + S * S + S, m.update, m.streams, ec, ec + S * S, layer.moe_conn.norm,
+                                 c.rms_norm_eps, m.h_bf, T, S, D, s));
       // the latent lands in the router's input: [latent | features], one row of Lat + R per token
       linear(m, layer.latent_down, m.h_bf, LX_BF16, D, m.router_in, LX_F32, Lat + R, T, s);
       if (beside) check(lx_rt_stream_wait(s, m.route_join), "stream wait");

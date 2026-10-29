@@ -329,3 +329,12 @@ extern "C" int lx_mhc_write(const float* mixed, const float* write, const float*
       mixed, write, update, streams, S, D);
   return lx::launch_status();
 }
+
+// Composite on HIP: the write and the read as two launches (the fused kernel is CUDA's).
+extern "C" int lx_mhc_write_read(float* mixed, const float* write, const float* update, float* streams,
+                                 const float* matrix, const float* read, const void* norm_w, float eps, void* h, int T,
+                                 int S, int D, void* stream) {
+  const int status = lx_mhc_write(mixed, write, update, streams, T, S, D, stream);
+  if (status != 0) return status;
+  return lx_mhc_read(streams, matrix, read, norm_w, eps, mixed, h, T, S, D, stream);
+}

@@ -183,6 +183,82 @@ mhc_read_cluster_kernel(const float* streams, const float* matrix, const float* 
   }
 }
 
+// The decode mhc_write and the read that follows it, in one cluster. The write is column-local (streams[s, d] takes
+// mixed[s, d] and update[d]), and so are the read's mix and source, so a block forms its own columns of the streams,
+// stores them, and takes the read from those registers. Only the RMSNorm sum crosses blocks, through the exchange
+// mhc_read_cluster_kernel uses. Each element is read by the thread that then writes it, so mixed is updated in place:
+// its old value is the write's input and its new value is the read's mix.
+__global__ void __launch_bounds__(kClusterThreads) LX_CLUSTER_DIMS(kCluster)
+mhc_write_read_cluster_kernel(float* mixed, const float* write_weights, const float* update, float* streams,
+                              const float* matrix, const float* read_weights, const __nv_bfloat16* norm_w, float eps,
+                              __nv_bfloat16* h, int S, int D, int W) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
+  __shared__ float sm_matrix[kMaxStreams * kMaxStreams];
+  __shared__ float sm_read[kMaxStreams];
+  __shared__ float sm_write[kMaxStreams];
+  __shared__ float parts[kCluster];
+  __shared__ float scratch[32];
+
+  const int rank = static_cast<int>(lx::cluster_block_rank());
+  const int t = blockIdx.x / kCluster;
+  const int d = rank * W + threadIdx.x;
+  const bool own = threadIdx.x < W && d < D;
+  const int dc = min(d, D - 1);  // padding threads read a valid column and never store
+  const int64_t base = static_cast<int64_t>(t) * S * D;
+  float* mix = mixed + base;
+
+  float old[kMaxStreams];
+#pragma unroll
+  for (int i = 0; i < kMaxStreams; ++i) old[i] = (i < S) ? mix[i * D + dc] : 0.0f;
+  const float u = update[static_cast<int64_t>(t) * D + dc];
+  for (int k = threadIdx.x; k < S * S; k += blockDim.x) sm_matrix[k] = matrix[k];
+  for (int k = threadIdx.x; k < S; k += blockDim.x) {
+    sm_read[k] = read_weights[k];
+    sm_write[k] = write_weights[k];
+  }
+  __syncthreads();
+
+  // The write, as mhc_write_columns_kernel: streams[s, d] = mixed[s, d] + write[s] * update[d].
+  float x[kMaxStreams];
+#pragma unroll
+  for (int i = 0; i < kMaxStreams; ++i) x[i] = (i < S) ? old[i] + sm_write[i] * u : 0.0f;
+  if (own) {
+#pragma unroll
+    for (int i = 0; i < kMaxStreams; ++i)
+      if (i < S) streams[base + i * D + d] = x[i];
+  }
+
+  // The read, as mhc_read_cluster_kernel, from the values just written.
+  float src = 0.0f;
+#pragma unroll
+  for (int i = 0; i < kMaxStreams; ++i)
+    if (i < S) src += sm_read[i] * x[i];
+  if (own) {
+#pragma unroll
+    for (int o = 0; o < kMaxStreams; ++o) {
+      if (o < S) {
+        float acc = 0.0f;
+#pragma unroll
+        for (int i = 0; i < kMaxStreams; ++i)
+          if (i < S) acc += sm_matrix[o * S + i] * x[i];
+        mix[o * D + d] = acc;
+      }
+    }
+  }
+
+  const float block_sq = lx::block_sum(own ? src * src : 0.0f, scratch);
+  if (threadIdx.x < kCluster) *lx::cluster_peer(&parts[rank], threadIdx.x) = block_sq;
+  lx::cluster_sync();
+
+  float total = 0.0f;
+  for (int k = 0; k < kCluster; ++k) total += parts[k];
+  if (own) {
+    const float scale = rsqrtf(total / D + eps);
+    h[static_cast<int64_t>(t) * D + d] = lx::from_f32<__nv_bfloat16>(src * scale * __bfloat162float(norm_w[d]));
+  }
+}
+
 // streams[t, s, :] = mixed[t, s, :] + write[s] * update[t, :]. mixed and streams may be the same
 // buffer: each element is read by the thread that then writes it, so no other thread sees a change.
 __global__ void mhc_write_kernel(const float* mixed, const float* write_weights, const float* update,
@@ -339,4 +415,34 @@ extern "C" int lx_mhc_write(const float* mixed, const float* write, const float*
   }
   lx::launch_pdl(mhc_write_kernel, T, row_threads(D), 0, static_cast<cudaStream_t>(stream), mixed, write, update, streams, S, D);
   return lx::launch_status();
+}
+
+namespace {
+
+int launch_mhc_write_read(float* mixed, const float* write, const float* update, float* streams, const float* matrix,
+                          const float* read, const void* norm_w, float eps, void* h, int T, int S, int D,
+                          cudaStream_t s) {
+  const int W = slice_width(D);
+  const int threads = (W + 31) / 32 * 32;  // one thread per owned column
+  lx::launch_pdl(mhc_write_read_cluster_kernel, T * kCluster, threads, 0, s, mixed, write, update, streams, matrix,
+                 read, static_cast<const __nv_bfloat16*>(norm_w), eps, static_cast<__nv_bfloat16*>(h), S, D, W);
+  return lx::launch_status();
+}
+
+}  // namespace
+
+// mhc_write then mhc_read on the same streams, as one kernel where clusters run. Bit-identical to the two calls: the same
+// arithmetic in the same order, with the streams that the write stores held in registers for the read.
+extern "C" int lx_mhc_write_read(float* mixed, const float* write, const float* update, float* streams,
+                                 const float* matrix, const float* read, const void* norm_w, float eps, void* h, int T,
+                                 int S, int D, void* stream) {
+  if (T <= 0 || S <= 0 || D <= 0) return 0;
+  if (S > kMaxStreams) return static_cast<int>(cudaErrorInvalidValue);
+  const int tuned = lx_tune_get("mhc_read", T, D, S);
+  if (mhc_cluster_ok(T, D) && (tuned < 0 || tuned == kMhcCluster))
+    return launch_mhc_write_read(mixed, write, update, streams, matrix, read, norm_w, eps, h, T, S, D,
+                                 static_cast<cudaStream_t>(stream));
+  const int status = lx_mhc_write(mixed, write, update, streams, T, S, D, stream);
+  if (status != 0) return status;
+  return lx_mhc_read(streams, matrix, read, norm_w, eps, mixed, h, T, S, D, stream);
 }

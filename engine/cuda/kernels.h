@@ -95,6 +95,13 @@ LX_API int lx_mhc_read(const float* streams, const float* matrix, const float* r
 LX_API int lx_mhc_write(const float* mixed, const float* write, const float* update, float* streams,
                         int T, int S, int D, void* stream);
 
+// The write above and the read below, back to back on the same streams (the mixer's write and the MoE's read): one
+// kernel where clusters run. mixed is updated in place, as the write's input and then the read's mix; h is the read's
+// output. Bit-identical to lx_mhc_write followed by lx_mhc_read.
+LX_API int lx_mhc_write_read(float* mixed, const float* write, const float* update, float* streams,
+                             const float* matrix, const float* read, const void* norm_w, float eps, void* h,
+                             int T, int S, int D, void* stream);
+
 // ---- Depth memory (memory.cu) ---------------------------------------------------------------
 // Each token keeps a bank of up to E entries; for each entry its key and value projections
 // (f32 [T, E, M]) are stored when the entry is written, so a read only attends.

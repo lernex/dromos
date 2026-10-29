@@ -80,6 +80,9 @@ LX_API int lx_mhc_read(const float* streams, const float* matrix, const float* r
 
 // Hyper-connection write: streams[t, s, :] = mixed[t, s, :] + write[s] * update[t, :].
 // mixed, streams f32 [T, S, D] (may alias); write f32 [S]; update f32 [T, D].
+LX_API int lx_mhc_write_read(float* mixed, const float* write, const float* update, float* streams,
+                             const float* matrix, const float* read, const void* norm_w, float eps, void* h,
+                             int T, int S, int D, void* stream);
 LX_API int lx_mhc_write(const float* mixed, const float* write, const float* update, float* streams,
                         int T, int S, int D, void* stream);
 

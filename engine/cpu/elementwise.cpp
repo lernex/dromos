@@ -252,4 +252,11 @@ int lx_mhc_write(const float* mixed, const float* write, const float* update, fl
   return kOk;
 }
 
+int lx_mhc_write_read(float* mixed, const float* write, const float* update, float* streams, const float* matrix,
+                      const float* read, const void* norm_w, float eps, void* h, int T, int S, int D, void* stream) {
+  const int status = lx_mhc_write(mixed, write, update, streams, T, S, D, stream);
+  if (status != kOk) return status;
+  return lx_mhc_read(streams, matrix, read, norm_w, eps, mixed, h, T, S, D, stream);
+}
+
 }  // extern "C"

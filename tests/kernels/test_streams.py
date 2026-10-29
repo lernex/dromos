@@ -94,6 +94,32 @@ def test_mhc_write(lx, T, S, D, alias):
     close(streams, want, atol=1e-6, rtol=1e-5)
 
 
+@pytest.mark.parametrize("T,S,D", [(1, 4, 2048), (8, 4, 2560), (3, 8, 37), (300, 4, 2048)])
+def test_mhc_write_read_matches_write_then_read(lx, T, S, D):
+    """The fused write-then-read is the two calls, bit for bit: streams, the in-place mixed and h."""
+    torch.manual_seed(0)
+    eps = 1e-6
+    mixed0 = torch.randn(T, S, D, device=DEVICE)
+    write = torch.randn(S, device=DEVICE)
+    update = torch.randn(T, D, device=DEVICE)
+    matrix = torch.randn(S, S, device=DEVICE)
+    read = torch.randn(S, device=DEVICE)
+    norm_w = (torch.rand(D, device=DEVICE) + 0.5).to(torch.bfloat16)
+
+    streams_a, mixed_a = torch.empty(T, S, D, device=DEVICE), mixed0.clone()
+    h_a = torch.empty(T, D, device=DEVICE, dtype=torch.bfloat16)
+    lx("mhc_write", mixed_a, write, update, streams_a, T, S, D)
+    lx("mhc_read", streams_a, matrix, read, norm_w, eps, mixed_a, h_a, T, S, D)
+
+    streams_b, mixed_b = torch.empty(T, S, D, device=DEVICE), mixed0.clone()
+    h_b = torch.empty(T, D, device=DEVICE, dtype=torch.bfloat16)
+    lx("mhc_write_read", mixed_b, write, update, streams_b, matrix, read, norm_w, eps, h_b, T, S, D)
+
+    assert torch.equal(streams_b, streams_a), "streams differ from write-then-read"
+    assert torch.equal(mixed_b, mixed_a), "mixed differs from write-then-read"
+    assert torch.equal(h_b, h_a), "h differs from write-then-read"
+
+
 @pytest.mark.parametrize("T,S,D", [(1, 4, 2048), (8, 4, 2560), (3, 8, 37)])
 def test_decode_is_repeatable(lx, T, S, D):
     """The decode path reduces across a cluster. Same inputs must give the same bits every run."""

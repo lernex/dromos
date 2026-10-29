@@ -91,6 +91,14 @@ int lx_mhc_write(const float* mixed, const float* write, const float* update, fl
   return k.launch(stream, a, size2(ceil_div(D, 256), std::min(T, 65535)), size1(256));
 }
 
+// The mixer's write and the MoE's read as two launches (Metal has no fused kernel for them yet).
+int lx_mhc_write_read(float* mixed, const float* write, const float* update, float* streams, const float* matrix,
+                      const float* read, const void* norm_w, float eps, void* h, int T, int S, int D, void* stream) {
+  const int status = lx_mhc_write(mixed, write, update, streams, T, S, D, stream);
+  if (status != kOk) return status;
+  return lx_mhc_read(streams, matrix, read, norm_w, eps, mixed, h, T, S, D, stream);
+}
+
 int lx_memory_attend(const float* q, const float* bank_k, const float* bank_v, int n_entries, int max_entries, void* out,
                      int T, int S, int M, void* stream) {
   static Kernel k("memory_attend");
