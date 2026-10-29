@@ -219,12 +219,14 @@ def test_qkv_column_slice_of_wider_buffer(lx):
                col=7, pad=21)
 
 
+@pytest.mark.parametrize("H,KVH,Dh", [(32, 8, 64), (40, 10, 64), (32, 8, 128)], ids=["praxis", "logos", "dh128"])
 @pytest.mark.parametrize("ctx", [1, 97, 784, 1500])
-def test_decode_token_is_bit_identical_alone_and_in_a_batch(lx, ctx):
-    """Every sequence's decode output is the same bits alone and in batches of 2, 8, 32 and 64 sequences. The cluster
-    split is fixed by the architecture (attention.cu), so the step's size cannot change a token's reduction. The
+def test_decode_token_is_bit_identical_alone_and_in_a_batch(lx, ctx, H, KVH, Dh):
+    """Every sequence's decode output is the same bits alone and in batches of 2, 8, 32 and 64 sequences. The 8-part
+    split is fixed by the architecture (attention.cu): alone and in a batch of 2 the cluster runs the parts, and in
+    batches of 8 and up one block runs them in turn. So the step's size cannot change a token's reduction. The
     rewritten cache rows are identical, so the runs share one cache."""
-    H, KVH, Dh, n = 32, 8, 64, 64
+    n = 64
     cap = ctx + 8
     width = (H + 2 * KVH) * Dh
     torch.manual_seed(ctx)
