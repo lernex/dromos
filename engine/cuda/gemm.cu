@@ -3,8 +3,10 @@
 // cuBLASLt is column-major, and a row-major y[M, N] is the column-major y^T[N, M] with leading
 // dimension ld_y. So the product is computed as y^T = w x^T: w is the left operand, transposed
 // (its row-major [N, K] memory is a column-major [K, N] matrix), and x the right operand as stored.
-// One algorithm serves every row count of a shape (pinned_algo): it is chosen at kPinRows without split-K and
-// reused. Its K loop is then the same at every M, so a row's bits never depend on how many rows share its step.
+// One algorithm serves every prefill row count of a shape (pinned_algo): it is chosen at kPinRows without split-K and
+// reused, so a prefill row's bits never depend on how many rows share its step. Decode steps (M <= kDecodeMaxRows) of
+// plain bf16 shapes may run a faster algorithm from the same candidates, listed in kDecodePins: the prefill algorithm
+// has too few tiles at decode row counts (one 128x128 tile column at M = 32, 94 us against a 20 us floor).
 //
 // The bias goes through cuBLASLt's bias epilogue, which adds after alpha and beta, so the bias
 // has to be alpha * bias. cuBLASLt also wants the bias in the output's dtype. Those two rules mean
@@ -37,6 +39,8 @@ constexpr int kMaxDevices = 16;
 constexpr size_t kMaxPlans = 2048;
 // The row count each shape's algorithm is chosen at: the prefill chunk. Every row count of the shape then runs it.
 constexpr int kPinRows = 512;
+// Decode steps of plain bf16 shapes (up to kDecodeMaxRows rows) may take a faster candidate than the prefill pin.
+constexpr int kDecodeMaxRows = 64;
 
 cudaError_t to_cuda(cublasStatus_t status) {
   switch (status) {
@@ -58,17 +62,19 @@ struct PlanKey {
   auto operator<=>(const PlanKey&) const = default;
 };
 
-// A PlanKey without the row count: the pinned algorithm is one per shape, whatever M is.
+// A PlanKey without the row count: the pinned algorithm is one per shape and per row class (decode or prefill).
 struct AlgoKey {
   int N, K, ld_x, ld_y;
   bool bf16_in, bf16_out;
   bool bias;
   uint32_t align_a, align_b, align_c;
+  bool decode;  // plain bf16 at a decode row count: the decode pin
   auto operator<=>(const AlgoKey&) const = default;
 };
 
 AlgoKey algo_key(const PlanKey& k) {
-  return AlgoKey{k.N, k.K, k.ld_x, k.ld_y, k.bf16_in, k.bf16_out, k.bias, k.align_a, k.align_b, k.align_c};
+  const bool decode = k.M <= kDecodeMaxRows && k.bf16_in;  // plain bf16 weights and activations (lx_gemm_bf16)
+  return AlgoKey{k.N, k.K, k.ld_x, k.ld_y, k.bf16_in, k.bf16_out, k.bias, k.align_a, k.align_b, k.align_c, decode};
 }
 
 struct Plan {
@@ -180,9 +186,33 @@ cublasStatus_t set_prefs(cublasLtMatmulPreference_t pref, const PlanKey& k, uint
   return st;
 }
 
-// The algorithm every row count of this shape runs: the heuristic's best at kPinRows among the candidates that do not
-// split K, with split-K checked in the algorithm's own config as well. cuBLASLt's K loop is fixed by the algorithm, so
-// each output element reduces over K in the same order at any M. Without split-K, nothing reorders that reduction.
+// The decode pins: a plain bf16 shape the model runs at decode rows takes, from the candidates the prefill pin is chosen
+// from, the one with this tile and stage configuration. Each entry was the fastest candidate for its shape at 8, 32 and
+// 64 rows that matched the prefill pin to the bit on every row (a sweep of cuBLASLt's candidates at 512 rows with the
+// engine's alignments, the output dtype each shape runs with). tests/kernels/test_gemm_rows.py checks every entry against
+// the prefill pin through the real call. A shape with no entry, or whose entry is not offered, keeps the prefill pin.
+struct DecodePin {
+  int N, K;
+  uint32_t tile, stages;
+};
+constexpr DecodePin kDecodePins[] = {
+    {1024, 512, 17, 35},   {1024, 768, 17, 35},    {1024, 1024, 17, 35},  {1024, 2048, 17, 35},
+    {1024, 2560, 17, 35},  {1536, 1024, 27, 34},   {2048, 256, 15, 12},   {2048, 1024, 15, 12},
+    {2048, 2048, 15, 12},  {2048, 4096, 15, 12},   {2560, 256, 15, 12},   {2560, 1024, 15, 12},
+    {2560, 5120, 200, 35}, {3072, 2048, 15, 12},   {10304, 2048, 135, 35}, {65536, 2048, 21, 35},
+    {65536, 2560, 15, 35},
+};
+
+uint32_t algo_attr(const cublasLtMatmulAlgo_t& algo, cublasLtMatmulAlgoConfigAttributes_t attr) {
+  uint32_t v = 0;
+  size_t written = 0;
+  cublasLtMatmulAlgoConfigGetAttribute(&algo, attr, &v, sizeof v, &written);
+  return v;
+}
+
+// The algorithm this shape runs at its row class. Both classes choose from the same candidates: the heuristic's order at
+// kPinRows, without split-K (checked in the algorithm's own config as well). The prefill pin is the first of them. Without
+// split-K nothing reorders a row's reduction over K, so a decode pin changes speed, not bits (kDecodePins).
 cublasStatus_t pinned_algo(DeviceState& s, const PlanKey& key, cudaDataType bias_type, cublasLtMatmulAlgo_t& out) {
   const AlgoKey ak = algo_key(key);
   if (auto it = s.algos.find(ak); it != s.algos.end()) {
@@ -204,8 +234,9 @@ cublasStatus_t pinned_algo(DeviceState& s, const PlanKey& key, cudaDataType bias
     st = cublasLtMatmulAlgoGetHeuristic(s.handle, probe.op, probe.a, probe.b, probe.c, probe.c, pref, kCandidates,
                                         candidates.data(), &found);
   if (pref) cublasLtMatmulPreferenceDestroy(pref);
-  bool chosen = false;
-  for (int i = 0; st == CUBLAS_STATUS_SUCCESS && i < found && !chosen; ++i) {
+  std::array<cublasLtMatmulAlgo_t, kCandidates> passing{};
+  int count = 0;
+  for (int i = 0; st == CUBLAS_STATUS_SUCCESS && i < found; ++i) {
     if (candidates[i].state != CUBLAS_STATUS_SUCCESS) continue;
     uint32_t splitk = 0, scheme = 1;
     size_t written = 0;
@@ -216,12 +247,26 @@ cublasStatus_t pinned_algo(DeviceState& s, const PlanKey& key, cudaDataType bias
                                              sizeof scheme, &written) != CUBLAS_STATUS_SUCCESS)
       continue;
     if (splitk != 1 || scheme != CUBLASLT_REDUCTION_SCHEME_NONE) continue;
-    out = candidates[i].algo;
-    chosen = true;
+    passing[count++] = candidates[i].algo;
   }
   probe.destroy();
   if (st != CUBLAS_STATUS_SUCCESS) return st;
-  if (!chosen) return CUBLAS_STATUS_NOT_SUPPORTED;
+  if (count == 0) return CUBLAS_STATUS_NOT_SUPPORTED;
+
+  out = passing[0];  // the prefill pin
+  if (ak.decode) {
+    for (const DecodePin& pin : kDecodePins) {
+      if (pin.N != ak.N || pin.K != ak.K) continue;
+      for (int j = 0; j < count; ++j) {
+        if (algo_attr(passing[j], CUBLASLT_ALGO_CONFIG_TILE_ID) == pin.tile &&
+            algo_attr(passing[j], CUBLASLT_ALGO_CONFIG_STAGES_ID) == pin.stages) {
+          out = passing[j];
+          break;
+        }
+      }
+      break;
+    }
+  }
   s.algos.emplace(ak, out);
   return CUBLAS_STATUS_SUCCESS;
 }

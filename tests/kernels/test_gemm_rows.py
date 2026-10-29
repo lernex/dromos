@@ -64,3 +64,40 @@ def test_gemm_w_fp8_rows_do_not_depend_on_the_step(lx, name, wtype, math, K, N, 
         f"{name}: {differing} of {small} rows differ from the same rows in a {big}-row step "
         f"(max |diff| {(a - b).abs().max().item():.3g})"
     )
+
+
+# Every plain bf16 shape Praxis and Logos run through cuBLASLt (bf16 weights and activations), as (N, K, bias, output
+# dtype) the way the engine calls it: the decode pins (kDecodePins) and the prefill pin must agree to the bit.
+PLAIN_BF16 = sorted({
+    (1024, 512, False, torch.float32), (1024, 768, False, torch.float32), (1024, 1024, False, torch.float32),
+    (1024, 2048, False, torch.float32), (1024, 2560, False, torch.float32), (1536, 1024, False, torch.float32),
+    (2048, 256, True, torch.float32), (2048, 1024, False, torch.float32), (2048, 2048, False, torch.float32),
+    (2048, 4096, False, torch.float32), (2560, 256, True, torch.float32), (2560, 1024, False, torch.float32),
+    (2560, 5120, False, torch.float32), (3072, 2048, False, torch.float32), (3072, 8, False, torch.float32),
+    (3840, 8, False, torch.float32), (10304, 2048, False, torch.float32), (65536, 2048, False, torch.float32),
+    (65536, 2560, False, torch.float32), (256, 256, True, torch.float32), (256, 260, True, torch.float32),
+    (256, 2048, True, torch.float32), (256, 2560, True, torch.float32), (256, 6400, True, torch.float32),
+    (256, 7936, True, torch.float32), (8, 2048, False, torch.bfloat16), (8, 2560, False, torch.bfloat16),
+}, key=lambda t: (t[0], t[1], t[2], str(t[3])))
+
+# Decode steps (1 to 64 rows) against prefill chunks (65 and up), including the boundary itself.
+DECODE_VS_PREFILL = [(1, 512), (8, 512), (32, 512), (64, 65), (64, 512), (33, 2048)]
+
+
+@pytest.mark.parametrize("N,K,bias,out", PLAIN_BF16)
+@pytest.mark.parametrize("small,big", DECODE_VS_PREFILL)
+def test_plain_bf16_decode_rows_match_the_prefill_pin(lx, N, K, bias, out, small, big):
+    torch.manual_seed(N * 31 + K * 7 + small * 3 + big + int(bias))
+    x = torch.randn(big, K, device=DEVICE).to(torch.bfloat16)
+    w = (torch.randn(N, K, device=DEVICE) / K**0.5).to(torch.bfloat16)
+    b = torch.randn(N, device=DEVICE).to(torch.bfloat16) if bias else None
+    y_big = torch.empty(big, N, device=DEVICE, dtype=out)
+    y_small = torch.empty(small, N, device=DEVICE, dtype=out)
+    lx("gemm_bf16", x, K, w, b, y_big, DTYPE[out], N, big, N, K, 1.0, 0.0)
+    lx("gemm_bf16", x[:small].contiguous(), K, w, b, y_small, DTYPE[out], N, small, N, K, 1.0, 0.0)
+    a, c = y_small.float(), y_big[:small].float()
+    differing = int((a != c).any(dim=1).sum().item())
+    assert differing == 0, (
+        f"N={N} K={K} bias={bias} out={out}: {differing} of {small} rows differ from the same rows in a {big}-row step "
+        f"(max |diff| {(a - c).abs().max().item():.3g})"
+    )
