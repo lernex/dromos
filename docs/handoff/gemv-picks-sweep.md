@@ -71,3 +71,14 @@ Only 1024x2560 (latent_down) clears 5%: s2r2d3 is 3.22 us against 3.46 us for s2
 - The shared_join stall check from the brief. No timeline was produced.
 - Activation fold into the gate_up epilogue. Skipped per the coordinator. silu_mul runs on stream 15, and side-stream launches cost the step little.
 - The 48-register cap on moe_gate_up, and the latent_down row, both wait for a later release.
+
+## Follow-up: 1-stream and BF16X at 8 streams
+
+- **1 stream, moe_gate_up.** `__launch_bounds__(kThreads, 5)` gives 48 registers and five blocks per SM. Two of the five instantiations spill (32 and 40 bytes of stack; tip is 58 to 59 registers with no spill). The spec-check is 30 of 30 bit-identical. Five alternating pairs at 1 stream on Praxis INT8 give 404.5 to 404.7 tok/s against 405.2 to 405.4 for tip, five of five losses. Dropped.
+- **1 stream, INT8 M = 1 picks.** For all 12 Praxis INT8 products the chosen variant is already the best same-split variant in `int8-m1.csv`, so no pick change clears 5%. Praxis INT8 measures about 405 tok/s at 1 stream on tip with 512 prompt and 256 generated tokens, not 480.
+- **BF16X at M = 8.** All 23 real Praxis and Logos products, both x types, 12 variants each, timed in a rotated 256 MB pool and checked bit for bit against the production output. Two candidates clear 5% and are bit-identical:
+  - Logos N 2560, K 1024, split 1: r1d2g0 to r4d2g1 (7.98 to 6.11 us).
+  - Logos N 2560, K 5120, split 2: r4d2g1 to r2d3g1 (32.43 to 28.70 us).
+
+  Both are kPicks rows in `engine/cuda/bf16x.cu`. Logos FP8 at 8 streams, five alternating pairs on origin/main: 677.0 to 683.3 tok/s aggregate, five of five wins (about +1%). The suite passes and the spec-check is 30 of 30 on five formats.
+- **Table behaviour.** A kPicks row also changes the nearest-entry pick of products that never run, and can reach M = 4 for some shapes. The two rows above change no pick for the 23 real products at M = 1, 2 or 4. Check the real-product list the same way for any future row.
