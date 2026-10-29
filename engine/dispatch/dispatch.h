@@ -17,6 +17,10 @@ struct Info {
   std::string path;                  // the library loaded, as a full path, or ""
   std::vector<std::string> missing;  // lx_ symbols the loaded backend does not export
   std::string error;                 // why nothing loaded, or ""
+  // The backend libraries the probe found and passed over on its way to this one, in probe order, each as doctor
+  // prints it: "CUDA, dromos_kernels.dll: found no NVIDIA GPU (...)". This is how a CUDA build on a machine
+  // without an NVIDIA GPU says why it runs on the CPU. Empty when LX_KERNELS or LX_BACKEND chose the library.
+  std::vector<std::string> skipped;
 };
 
 // The loaded backend. The first call loads it: LX_KERNELS, then LX_BACKEND, then a probe of the installed

@@ -154,6 +154,9 @@ void print_device(const lx::runtime::DeviceInfo& d) {
     const std::size_t slash = backend.path.find_last_of("/\\");
     const std::string file = slash == std::string::npos ? backend.path : backend.path.substr(slash + 1);
     std::printf("backend    %s, %s (%s)\n", backend.backend.c_str(), file.c_str(), backend.path.c_str());
+    // What the probe passed over first: a CUDA build on a machine without an NVIDIA GPU says here why it runs on
+    // the CPU, and a CUDA library that did not load says which file it needed.
+    for (const std::string& note : backend.skipped) std::printf("skipped    %s\n", note.c_str());
     // CUDA-only fast paths (lx::dispatch::optional) have a fallback everywhere else, so their absence is no gap.
     std::vector<std::string> missing;
     for (const std::string& name : backend.missing)

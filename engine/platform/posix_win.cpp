@@ -16,9 +16,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <cstdint>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace {
 
@@ -71,6 +73,36 @@ void* map_failed() {
   return MAP_FAILED;
 }
 
+// The DLLs the image at `path` imports that cannot be found: not beside it, and not where SearchPathW looks
+// (System32, the Windows folder, PATH), which is the order dlopen falls back to. Read from the import table of the
+// file mapped as an image resource, so nothing in it runs and none of its imports load. API sets (api-ms-*,
+// ext-ms-*) are the loader's own and never missing. Empty when the table cannot be read.
+std::vector<std::string> missing_imports(const std::wstring& path) {
+  std::vector<std::string> out;
+  HMODULE image = LoadLibraryExW(path.c_str(), nullptr, LOAD_LIBRARY_AS_IMAGE_RESOURCE | LOAD_LIBRARY_AS_DATAFILE);
+  if (!image) return out;
+  // A resource module's handle carries flags in its low bits; the image starts at the aligned address.
+  const auto* base = reinterpret_cast<const unsigned char*>(reinterpret_cast<uintptr_t>(image) & ~uintptr_t{3});
+  const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+  const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+  if (dos->e_magic == IMAGE_DOS_SIGNATURE && nt->Signature == IMAGE_NT_SIGNATURE &&
+      nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+    const IMAGE_DATA_DIRECTORY& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    const std::wstring folder = path.substr(0, path.find_last_of(L'\\') + 1);
+    for (auto* d = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress);
+         dir.VirtualAddress && dir.Size && d->Name; ++d) {
+      const char* name = reinterpret_cast<const char*>(base + d->Name);
+      if (_strnicmp(name, "api-ms-", 7) == 0 || _strnicmp(name, "ext-ms-", 7) == 0) continue;
+      const std::wstring wide = widen(name);
+      if (GetFileAttributesW((folder + wide).c_str()) != INVALID_FILE_ATTRIBUTES) continue;
+      if (SearchPathW(nullptr, wide.c_str(), nullptr, 0, nullptr, nullptr) > 0) continue;
+      out.push_back(name);
+    }
+  }
+  FreeLibrary(image);
+  return out;
+}
+
 // The views mmap made from files, by address: munmap unmaps those and frees everything else.
 std::mutex g_views_mu;
 std::unordered_map<void*, bool>& views() {
@@ -101,7 +133,20 @@ void* dlopen(const char* file, int) {
   }
   if (!h) {
     const DWORD code = GetLastError();
-    dl_fail(std::string(file) + ": " + message(code));
+    std::string why = message(code);
+    // 126 for a file that is there means one of the DLLs it links is not, and the system's text names neither.
+    // Linux's dlerror names the library it could not open; this names the ones the file imports and no folder has.
+    if (code == ERROR_MOD_NOT_FOUND && qualified && GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+      std::string names;
+      const std::vector<std::string> missing = missing_imports(path);
+      for (size_t i = 0; i < missing.size(); ++i)
+        names += (i == 0 ? "" : i + 1 == missing.size() ? " and " : ", ") + missing[i];
+      why = missing.empty()
+                ? "a DLL that one of its DLLs needs could not be found (error 126)"
+                : names + (missing.size() == 1 ? ", which it needs, is" : ", which it needs, are") +
+                      " not beside it, in System32 or on PATH (error 126)";
+    }
+    dl_fail(std::string(file) + ": " + why);
     return nullptr;
   }
   return reinterpret_cast<void*>(h);

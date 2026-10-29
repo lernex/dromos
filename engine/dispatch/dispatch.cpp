@@ -33,16 +33,18 @@ namespace {
 #define LX_BACKEND_LIB(name) "lib" name ".so"
 #endif
 
-// The backends LX_BACKEND can name, and the file each one is.
+// The backends LX_BACKEND can name, the file each one is, and how doctor names it.
 struct BackendFile {
-  const char* name;  // lower case, as LX_BACKEND is compared
+  const char* name;   // lower case, as LX_BACKEND is compared
   const char* file;
+  const char* label;  // as lx_rt_backend names it
+  const char* gpus;   // whose GPUs it drives, "" for the CPU
 };
 const BackendFile kBackendFiles[] = {
-    {"cuda", LX_BACKEND_LIB("dromos_kernels")},
-    {"hip", LX_BACKEND_LIB("dromos_hip")},
-    {"metal", "libdromos_metal.dylib"},
-    {"cpu", LX_BACKEND_LIB("dromos_cpu")},
+    {"cuda", LX_BACKEND_LIB("dromos_kernels"), "CUDA", "NVIDIA"},
+    {"hip", LX_BACKEND_LIB("dromos_hip"), "HIP", "AMD"},
+    {"metal", "libdromos_metal.dylib", "Metal", "Apple"},
+    {"cpu", LX_BACKEND_LIB("dromos_cpu"), "CPU", ""},
 };
 
 // The probe's order. The CPU library comes last and qualifies as soon as it loads: it is the fallback.
@@ -139,9 +141,26 @@ void attach(void* handle, const std::string& path) {
   detail::bind(handle, g_info.missing);
 }
 
+// A library the probe passed over, as doctor prints it: "CUDA, dromos_kernels.dll: found no NVIDIA GPU (...)".
+// `why` is the loader's text for one that did not load, or "" for one that loaded and sees no device.
+std::string skipped_note(const char* file, const std::string& candidate, std::string why) {
+  const BackendFile* backend = nullptr;
+  for (const BackendFile& b : kBackendFiles)
+    if (std::string(file) == b.file) backend = &b;
+  const std::string head = std::string(backend ? backend->label : "Unknown") + ", " + file + ": ";
+  if (why.empty())
+    return head + "found no " + (backend && *backend->gpus ? std::string(backend->gpus) + " " : "") +
+           "GPU (there is none, or its driver is missing or too old)";
+  // The loader's text may lead with the path it was given, which the row names already.
+  if (why.rfind(candidate + ": ", 0) == 0) why.erase(0, candidate.size() + 2);
+  return head + "did not load: " + why;
+}
+
 // Probes kProbeOrder in each directory. The first library that loads and qualifies is kept (the handle stays
-// open); each one that loads and does not qualify is closed. On failure `error` lists what was tried.
-void probe(const std::vector<std::string>& dirs, void*& handle, std::string& path, std::string& error) {
+// open); each one that loads and does not qualify is closed, and `skipped` says why. On failure `error` lists
+// what was tried.
+void probe(const std::vector<std::string>& dirs, void*& handle, std::string& path, std::string& error,
+           std::vector<std::string>& skipped) {
   std::vector<std::string> tried;
   std::vector<std::string> notes;
   for (const char* file : kProbeOrder) {
@@ -153,6 +172,7 @@ void probe(const std::vector<std::string>& dirs, void*& handle, std::string& pat
       void* lib = open_library(candidate, why);
       if (!lib) {
         notes.push_back(candidate + " did not load: " + why);
+        skipped.push_back(skipped_note(file, candidate, why));
         continue;
       }
       if (std::string(file) == kCpuFile || device_count(lib) > 0) {
@@ -162,6 +182,7 @@ void probe(const std::vector<std::string>& dirs, void*& handle, std::string& pat
       }
       dlclose(lib);
       notes.push_back(candidate + " has no device");
+      skipped.push_back(skipped_note(file, candidate, ""));
     }
   }
   error = "no backend library could be loaded; looked in " + join(tried);
@@ -206,7 +227,7 @@ void load() {
       }
     }
   } else {
-    probe(dirs, handle, path, error);
+    probe(dirs, handle, path, error, g_info.skipped);
   }
 
   if (handle) attach(handle, path);
