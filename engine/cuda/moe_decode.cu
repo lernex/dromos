@@ -278,6 +278,71 @@ __global__ void __launch_bounds__(kThreads) moe_down_kernel(const bf16* __restri
   if (lane == 0) out[static_cast<int64_t>(t) * L + l] = acc;
 }
 
+// The down stage for steps of several tokens: a copy of moe_down_kernel, above, under a cap of five resident
+// blocks per SM. The two are kept identical except for the launch bound; a change to one goes into both.
+// The cap is measured on sm_120 only. On sm_80 to sm_90a it spills the NVFP4 kernel's registers, so there the copy
+// keeps the original's bound.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 1000
+#define LX_DOWN_CAPPED_BOUNDS __launch_bounds__(kThreads, 5)
+#else
+#define LX_DOWN_CAPPED_BOUNDS __launch_bounds__(kThreads)
+#endif
+template <int F>
+__global__ void LX_DOWN_CAPPED_BOUNDS moe_down_capped_kernel(const bf16* __restrict__ inter,
+                                                           const int32_t* __restrict__ ids,
+                                                           const float* __restrict__ weights, const lx_weight down,
+                                                           float* __restrict__ out, int T, int L, int I, int top_k) {
+  constexpr int kV = kVal<F>;
+  constexpr int D = kDepth<F>;
+  const int t = blockIdx.x % T;
+  const int l = (blockIdx.x / T) * kWarps + (threadIdx.x >> 5);
+  if (l >= L) return;  // whole warps: the row index is per warp
+  const int lane = threadIdx.x & 31;
+
+  const int64_t lane_k = static_cast<int64_t>(lane) * kV, stride = 32 * kV;
+  const int steps = (I + stride - 1) / stride;  // steps of a down row: the same for every lane
+  const int n = top_k * steps;                   // items of the warp's sequence
+  const int64_t p_base = static_cast<int64_t>(t) * top_k;
+
+  // The weight halves of the first ring go out before the wait: they depend on the routing only.
+  DownWeight<F> wring[D];
+  DownAct<F> xring[D];
+  static_for<D>([&](auto d) {
+    if (d < n) issue_down_weight<F>(down, ids, weights, p_base, l, L, I, lane_k, steps, d, wring[d]);
+  });
+  // The gate/up stage's intermediates are read from here on.
+  lx::pdl_wait();
+  static_for<D>([&](auto d) {
+    if (d < n) issue_down_act<F>(inter, p_base, I, lane_k, steps, d, xring[d]);
+  });
+
+  float acc = 0.0f;
+  float dot = 0.0f;
+  for (int j0 = 0; j0 < n; j0 += D) {
+    static_for<D>([&](auto d) {
+      if (j0 + d < n) {
+        const int s = (j0 + d) % steps;
+        if (lane_k + static_cast<int64_t>(s) * stride < I) {  // this lane has a word in this step
+          float xf[kV];
+          unpack_x<kV>(xring[d], xf);
+          dot += dot_word<F>(wring[d].w, xf);
+        }
+        // The last step of expert k: its dot product joins the pair's sum, in k order.
+        if (s == steps - 1) {
+          acc = fmaf(wring[d].ck, dot, acc);
+          dot = 0.0f;
+        }
+        if (j0 + d + D < n) {
+          issue_down_weight<F>(down, ids, weights, p_base, l, L, I, lane_k, steps, j0 + d + D, wring[d]);
+          issue_down_act<F>(inter, p_base, I, lane_k, steps, j0 + d + D, xring[d]);
+        }
+      }
+    });
+  }
+  acc = lx::warp_sum(acc);
+  if (lane == 0) out[static_cast<int64_t>(t) * L + l] = acc;
+}
+
 // ---- launches ----------------------------------------------------------------------------------------
 
 // The down stage, launched programmatically on the gate/up stage (below sm_90 an ordinary launch, in stream
@@ -296,7 +361,13 @@ cudaError_t launch_down(const bf16* inter, const int32_t* ids, const float* weig
   cfg.stream = s;
   cfg.attrs = &attr;
   cfg.numAttrs = lx::pdl_old_on() ? 1 : 0;
-  cudaLaunchKernelEx(&cfg, moe_down_kernel<F>, inter, ids, weights, w, out, T, L, I, top_k);
+  // Steps of one token launch the original kernel. Several tokens take the capped copy, which keeps five
+  // blocks resident per SM.
+  if (T > 1) {
+    cudaLaunchKernelEx(&cfg, moe_down_capped_kernel<F>, inter, ids, weights, w, out, T, L, I, top_k);
+  } else {
+    cudaLaunchKernelEx(&cfg, moe_down_kernel<F>, inter, ids, weights, w, out, T, L, I, top_k);
+  }
   return cudaGetLastError();
 }
 
