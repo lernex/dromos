@@ -831,6 +831,7 @@ constexpr Pick kPicks[] = {
     LX_PICK(true, 8, 1, 2048, 2048, 1, 2, 0) LX_PICK(true, 8, 2, 1024, 2048, 2, 3, 1) LX_PICK(true, 8, 1, 2048, 1024, 1, 2, 0)
     LX_PICK(true, 8, 2, 1024, 1024, 2, 3, 1) LX_PICK(true, 8, 1, 1024, 512, 1, 4, 0) LX_PICK(true, 8, 2, 65536, 2048, 4, 2, 1)
     LX_PICK(true, 8, 8, 256, 2048, 2, 2, 0) LX_PICK(true, 8, 8, 256, 6400, 2, 3, 1) LX_PICK(true, 8, 4, 8, 2048, 1, 4, 0)
+    LX_PICK(true, 8, 1, 2560, 1024, 4, 2, 1) LX_PICK(true, 8, 2, 2560, 5120, 2, 3, 1)
     LX_PICK(false, 1, 1, 10304, 2048, 1, 2, 0) LX_PICK(false, 1, 2, 2048, 4096, 4, 2, 0) LX_PICK(false, 1, 1, 3072, 2048, 2, 3, 0)
     LX_PICK(false, 1, 1, 2048, 2048, 1, 2, 0) LX_PICK(false, 1, 2, 1024, 2048, 1, 2, 0) LX_PICK(false, 1, 1, 2048, 1024, 1, 2, 0)
     LX_PICK(false, 1, 2, 1024, 1024, 2, 3, 0) LX_PICK(false, 1, 1, 1024, 512, 2, 4, 0) LX_PICK(false, 1, 2, 65536, 2048, 4, 2, 0)
