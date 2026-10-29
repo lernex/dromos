@@ -207,9 +207,13 @@ int64_t cache_bytes(int level) {
 }
 
 // The read bandwidth the kernels see: every thread of the pool summing a buffer several times the last-level
-// cache, the best of a few passes. Measured once per process, in a few tens of milliseconds.
+// cache, the best pass. A pass takes a few milliseconds, and the best of a handful moved by 40% from one process to
+// the next on a busy machine or under a hypervisor, so passes run until at least kMinPasses and kMinSeconds of them
+// are timed. Measured once per process, in about a quarter of a second.
 int64_t read_bandwidth() {
   static const int64_t measured = [] {
+    constexpr int kMinPasses = 8, kMaxPasses = 1000;
+    constexpr double kMinSeconds = 0.2;
     const int64_t bytes = std::min<int64_t>(int64_t{512} << 20, std::max<int64_t>(int64_t{128} << 20, 8 * cache_bytes(3)));
     void* buf = nullptr;
     if (alloc(&buf, bytes) != kOk) return int64_t{0};
@@ -220,8 +224,8 @@ int64_t read_bandwidth() {
       for (int64_t i = b; i < e; ++i) w[i] = static_cast<uint64_t>(i);
     });
     std::atomic<uint64_t> sink{0};
-    double best = 0;
-    for (int pass = 0; pass < 5; ++pass) {
+    double best = 0, timed_seconds = 0;
+    for (int pass = 0, timed = 0; pass <= kMaxPasses; ++pass) {
       const auto t0 = std::chrono::steady_clock::now();
       parallel_for(words, grain_for(words, 1 << 16, 1), [&](int64_t b, int64_t e) {
         uint64_t a[8] = {};
@@ -232,7 +236,10 @@ int64_t read_bandwidth() {
         sink.fetch_add(a[0] + a[1] + a[2] + a[3] + a[4] + a[5] + a[6] + a[7], std::memory_order_relaxed);
       });
       const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-      if (pass > 0 && (best == 0 || t < best)) best = t;  // the first pass also faults the pages in
+      if (pass == 0) continue;  // the first pass also faults the pages in
+      if (best == 0 || t < best) best = t;
+      timed_seconds += t;
+      if (++timed >= kMinPasses && timed_seconds >= kMinSeconds) break;
     }
     release(buf);
     return best > 0 && sink.load() != 1 ? static_cast<int64_t>(static_cast<double>(bytes) / best) : int64_t{0};
