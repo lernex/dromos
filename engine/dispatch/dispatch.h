@@ -39,7 +39,8 @@ inline bool has(const char* symbol) {
 // (lx_gemm_skinny, else lx_gemm), and the router's fused GEMV and routing (lx_router_route, else lx_spec_gemv_f32 and
 // lx_moe_route). doctor does not list them as missing.
 inline bool optional(const std::string& symbol) {
-  return symbol.rfind("lx_program_", 0) == 0 || symbol == "lx_gemm_skinny" || symbol == "lx_router_route";
+  return symbol.rfind("lx_program_", 0) == 0 || symbol == "lx_gemm_skinny" || symbol == "lx_router_route" ||
+         symbol == "lx_gemm_f32_seq";
 }
 
 // The last message about a missing symbol ("backend CUDA lacks lx_x"), or "" when there was none.

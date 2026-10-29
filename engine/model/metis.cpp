@@ -155,6 +155,8 @@ struct MetisModel::Impl {
   bool use_graphs = true;
   // decode-sized products (at most this many rows) run as GEMVs; larger ones on the dense GEMM
   static constexpr int kGemvRows = 8;
+  // The rows up to which the router's f32 GEMM runs one kernel with cuBLASLt's bits (gemm_seq.cu).
+  static constexpr int kSeqRows = 64;
   void* cast_bf = nullptr;  // bf16 copy of an f32 input for a dense GEMM product
   size_t cast_capacity = 0;
   void* moe_workspace = nullptr;
@@ -243,6 +245,8 @@ struct MetisModel::Impl {
   // The router of a decode-sized step as one launch (lx_router_route), where the backend has it. router_ticket is the
   // launch's block counter, kept zero by the kernel.
   bool fused_router = false;
+  // The router's f32 GEMM at 9 to kSeqRows rows: lx_gemm_f32_seq, where the backend has it (CUDA).
+  bool seq_router = false;
   int32_t* router_ticket = nullptr;
 
   // The persisting L2 window of the decode (pin.h): its arena holds the hottest decode weights and, when asked,
@@ -807,6 +811,7 @@ MetisModel::MetisModel(const MetisConfig& c, const ModelWeights& weights, const 
   // lx_router_route's bounds: up to 1024 experts, up to 32 picks among them, and a K of at most eight 256-thread chunks.
   m.fused_router = lx::dispatch::has("lx_router_route") && m.E <= 1024 && m.K <= 32 && m.K <= m.E && m.Lat + m.R <= 2048;
   if (m.fused_router) m.router_ticket = m.alloc<int32_t>(1);
+  m.seq_router = lx::dispatch::has("lx_gemm_f32_seq") && (m.Lat + m.R) % 4 == 0 && m.Lat + m.R <= 1536;
 
   size_t unpack_experts = 0;  // the bf16 bytes of an expert layer's BF16X stacks, expanded for prefill
   for (int i = 0; i < m.L_layers; ++i) {
@@ -2082,7 +2087,12 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
                                  layer.selection_bias, m.route_ids, m.route_w, m.entropy, m.confidence, m.router_ticket,
                                  T, E, Lat + R, m.K, s));
       } else {
-        gemm_f32(m.router_in, Lat + R, layer.router_w, layer.router_b, m.router_logits, E, T, E, Lat + R, s);
+        // Nine to kSeqRows rows: the same bits as gemm_f32's cuBLASLt call, in one kernel. The rest keep gemm_f32.
+        if (m.seq_router && T > Impl::kGemvRows && T <= Impl::kSeqRows)
+          LX_CHECK(lx_gemm_f32_seq(m.router_in, Lat + R, layer.router_w, layer.router_b, m.router_logits, E, T, E,
+                                   Lat + R, s));
+        else
+          gemm_f32(m.router_in, Lat + R, layer.router_w, layer.router_b, m.router_logits, E, T, E, Lat + R, s);
         LX_CHECK(lx_moe_route(m.router_logits, layer.selection_bias, m.route_ids, m.route_w, m.entropy, m.confidence, T,
                               E, m.K, s));
       }

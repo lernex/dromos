@@ -73,6 +73,10 @@ LX_API int lx_gemm_bf16(const void* x, int ld_x, const void* w, const void* bias
 // float32 in the checkpoint: y[M, N] = x[M, K] @ w[N, K]^T + bias[N] (bias may be null).
 LX_API int lx_gemm_f32(const float* x, int ld_x, const float* w, const float* bias, float* y,
                        int ld_y, int M, int N, int K, void* stream);
+// lx_gemm_f32 for the router's decode-sized steps (9 to 64 rows) in one kernel, with the same bits at those row
+// counts (gemm_seq.cu). CUDA only: hosts check lx::dispatch::has("lx_gemm_f32_seq") and fall back to lx_gemm_f32.
+LX_API int lx_gemm_f32_seq(const float* x, int ld_x, const float* w, const float* bias, float* y, int ld_y,
+                           int M, int N, int K, void* stream);
 
 // ---- Embedding and the four residual streams (streams.cu) -----------------------------------
 
