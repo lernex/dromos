@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "httplib.h"
+#include "server/request_args.h"
 #include "nlohmann/json.hpp"
 #include "text/json.h"
 #include "text/tokenizer.h"
@@ -25,18 +26,6 @@ using runtime::GenerateRequest;
 using runtime::RequestResult;
 using runtime::TokenDelta;
 
-// A request the client got wrong, with the HTTP status and the OpenAI error type to say so.
-struct ApiError : std::runtime_error {
-  int status;
-  std::string type;
-  std::string param;
-  ApiError(int status_code, std::string type_name, const std::string& message, std::string param_name = "")
-      : std::runtime_error(message), status(status_code), type(std::move(type_name)), param(std::move(param_name)) {}
-};
-
-[[noreturn]] void invalid(const std::string& message, const std::string& param = "") {
-  throw ApiError(400, "invalid_request_error", message, param);
-}
 
 std::string random_hex(size_t digits) {
   static std::mutex mu;
@@ -71,10 +60,6 @@ json bytes_array(const std::string& s) {
 // The defaults a model ships with (generation_config.json), used where a request says nothing.
 // The top level is the thinking sampling; a "direct" object overrides it for requests that
 // turn thinking off, since a direct answer wants a cooler temperature and no penalty.
-struct Sampling {
-  double temperature = 1.0, top_p = 1.0, min_p = 0.0, repetition_penalty = 1.0;
-  int top_k = 0;
-};
 struct Defaults {
   Sampling thinking, direct;
 };
@@ -112,40 +97,12 @@ struct Job {
   std::string model;
 };
 
-// A number as people write it: 2 for 2.0, 0.95 for 0.95.
-std::string shown(double v) {
-  char buf[32];
-  std::snprintf(buf, sizeof buf, "%g", v);
-  return buf;
-}
-
-double number_in(const json& body, const char* key, double lo, double hi, double fallback) {
-  if (!body.contains(key) || body[key].is_null()) return fallback;
-  if (!body[key].is_number()) invalid(std::string(key) + " must be a number", key);
-  const double v = body[key].get<double>();
-  if (!(v >= lo && v <= hi)) invalid(std::string(key) + " must be between " + shown(lo) + " and " + shown(hi), key);
-  return v;
-}
-
-int integer_in(const json& body, const char* key, int lo, int hi, int fallback) {
-  if (!body.contains(key) || body[key].is_null()) return fallback;
-  if (!body[key].is_number_integer()) invalid(std::string(key) + " must be an integer", key);
-  const int64_t v = body[key].get<int64_t>();
-  if (v < lo || v > hi) invalid(std::string(key) + " must be between " + std::to_string(lo) + " and " + std::to_string(hi), key);
-  return static_cast<int>(v);
-}
 
 // Sampling, limits and stop conditions shared by both endpoints.
 void read_common(const json& body, Job& job, const Sampling& d) {
   if (!body.is_object()) invalid("the request body must be a JSON object");
   runtime::SamplingParams& sp = job.request.sampling;
-  sp.temperature = static_cast<float>(number_in(body, "temperature", 0.0, 2.0, d.temperature));
-  sp.top_p = static_cast<float>(number_in(body, "top_p", 1e-6, 1.0, d.top_p));
-  sp.top_k = integer_in(body, "top_k", 0, 1 << 20, d.top_k);
-  sp.min_p = static_cast<float>(number_in(body, "min_p", 0.0, 1.0, d.min_p));
-  sp.repetition_penalty = static_cast<float>(number_in(body, "repetition_penalty", 1e-3, 2.0, d.repetition_penalty));
-  sp.presence_penalty = static_cast<float>(number_in(body, "presence_penalty", -2.0, 2.0, 0.0));
-  sp.frequency_penalty = static_cast<float>(number_in(body, "frequency_penalty", -2.0, 2.0, 0.0));
+  read_sampling_fields(body, d, sp);
   if (body.contains("seed") && !body["seed"].is_null()) {
     if (!body["seed"].is_number_integer()) invalid("seed must be an integer", "seed");
     sp.seed = body["seed"].get<uint64_t>();
