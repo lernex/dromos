@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The chat-mix measurement behind docs/SCOREBOARD.md's prompt-lookup rows.
 
-Runs `lernex spec` on the chat mix with plain decoding and prompt-lookup drafts (ngram), then prints each drafter's
+Runs `dromos spec` on the chat mix with plain decoding and prompt-lookup drafts (ngram), then prints each drafter's
 aggregate tokens per second over the mix and the lookup-to-plain ratio. The mix is seven prompts from the scoreboard's
 prompt file: the five spec prompts, the chat think prompt and the direct tools prompt. Greedy by default; --temp
 samples with the scoreboard's settings (top-p 0.95, top-k 20, seed 1).
@@ -9,7 +9,7 @@ samples with the scoreboard's settings (top-p 0.95, top-k 20, seed 1).
     python3 tools/spec_mix.py MODEL_DIR PROMPTS_JSON --weights int8
 
 The prompt-lookup rows in docs/SCOREBOARD.md are this command's output for their format. Quote the ratio this prints,
-never a `lernex bench --spec` row: greedy continuation of a corpus repeats, and prompt lookup then matches every step.
+never a `dromos bench --spec` row: greedy continuation of a corpus repeats, and prompt lookup then matches every step.
 """
 
 import argparse
@@ -36,7 +36,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("model", help="the model folder")
     ap.add_argument("prompts", help="the prompt file the mix is named in (a JSON object of token id lists)")
-    ap.add_argument("--lernex", default=os.environ.get("LERNEX", "build/lernex"), help="the lernex binary")
+    ap.add_argument("--dromos", default=os.environ.get("DROMOS", "build/dromos"), help="the dromos binary")
     ap.add_argument("--weights", help="weight format (bf16, int8, fp8, nvfp4, bf16x); the folder's own by default")
     ap.add_argument("--tokens", type=int, default=512, help="tokens per prompt (512, the scoreboard's)")
     ap.add_argument("--repeat", type=int, default=2, help="runs per prompt, median reported (2)")
@@ -45,14 +45,14 @@ def main():
     ap.add_argument("--presence", type=float, help="presence penalty (none by default)")
     ap.add_argument("--frequency", type=float, help="frequency penalty (none by default)")
     ap.add_argument("--only", help="comma list: aggregate only these mix prompts (the scoreboard's think row is think_chat)")
-    ap.add_argument("--json", help="keep lernex spec's per-prompt numbers in this file")
+    ap.add_argument("--json", help="keep dromos spec's per-prompt numbers in this file")
     args = ap.parse_args()
     mix = MIX if not args.only else set(args.only.split(","))
     if not mix <= MIX:
         sys.exit(f"--only names outside the chat mix: {sorted(mix - MIX)}")
 
     out = args.json or tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
-    cmd = [args.lernex, "spec", args.model, args.prompts, "--drafters", "plain,ngram", "--tokens", str(args.tokens),
+    cmd = [args.dromos, "spec", args.model, args.prompts, "--drafters", "plain,ngram", "--tokens", str(args.tokens),
            "--repeat", str(args.repeat), "--json", out]
     if args.weights:
         cmd += ["--weights", args.weights]
