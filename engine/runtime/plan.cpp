@@ -455,10 +455,26 @@ double decode_bytes_per_token(const MetisConfig& c, lx_wtype target, bool bf16x_
   return config_decode_traffic(c, target, bf16x_decode, context, dropped).bytes_per_token();
 }
 
-// The share of the card's bandwidth one stream's decode reaches on each path: the tokens per second the kernels measure
-// (Praxis on an RTX 5070 Ti, bench at one stream, 2026-10-24) times the bytes a token reads, over the card's bandwidth.
-// The decode estimates scale the card's bandwidth by these, so a note never promises more than the kernels deliver.
-double decode_efficiency(lx_wtype target, bool bf16x_decode) {
+// The share of the measured bandwidth one stream's decode reaches on each path: the tokens per second the kernels
+// measure times the bytes a token reads, over the bandwidth. The decode estimates scale the bandwidth by these, so a note
+// never promises more than the kernels deliver.
+//   GPU: Praxis on an RTX 5070 Ti, bench at one stream, 2026-10-24, against the card's peak.
+//   CPU: Praxis on an i5-14500 (AVX2 with VNNI), 2026-10-29, against the backend's own read probe. Bare metal on 14
+//   threads read 0.876 (BF16), 0.818 (INT8), 0.778 (FP8) and 0.666 (NVFP4); a 6-vCPU VM on the same chip reached 0.868 of
+//   bare metal on BF16 (0.76), so each is scaled by that and rounded down, the smaller machine's figure. BF16X is the VM's
+//   own: 17.5 tok/s from 2028 MB a token at 64.5 GB/s.
+double decode_efficiency(const DeviceInfo& d, lx_wtype target, bool bf16x_decode) {
+  if (d.cpu) {
+    constexpr double kBF16 = 0.76, kBF16X = 0.55, kINT8 = 0.71, kFP8 = 0.67, kNVFP4 = 0.57;
+    switch (target) {
+      case LX_W_BF16: return bf16x_decode ? kBF16X : kBF16;
+      case LX_W_BF16X: return kBF16X;
+      case LX_W_INT8: return kINT8;
+      case LX_W_FP8: return kFP8;
+      case LX_W_NVFP4: return kNVFP4;
+      default: return kBF16;
+    }
+  }
   constexpr double kBF16 = 0.62, kBF16X = 0.56, kINT8 = 0.48, kFP8 = 0.53, kNVFP4 = 0.49;
   switch (target) {
     case LX_W_BF16: return bf16x_decode ? kBF16X : kBF16;
@@ -473,7 +489,7 @@ double decode_efficiency(lx_wtype target, bool bf16x_decode) {
 double decode_ceiling_tps(const DeviceInfo& d, const MetisConfig& c, lx_wtype target, bool bf16x_decode, int context,
                           const std::set<std::string>* dropped) {
   const double bytes = decode_bytes_per_token(c, target, bf16x_decode, context, dropped);
-  return d.bandwidth_gbs > 0 && bytes > 0 ? d.bandwidth_gbs * 1e9 * decode_efficiency(target, bf16x_decode) / bytes : 0.0;
+  return d.bandwidth_gbs > 0 && bytes > 0 ? d.bandwidth_gbs * 1e9 * decode_efficiency(d, target, bf16x_decode) / bytes : 0.0;
 }
 
 size_t state_bytes_per_slot(const MetisConfig& c) {
@@ -925,7 +941,7 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
   }
   const double active = decode_bytes_per_token(c, target, p.bf16x_decode, p.kv_capacity, &p.bf16x_dropped);
   if (d.bandwidth_gbs > 0 && active > 0)
-    p.decode_ceiling_tps = d.bandwidth_gbs * 1e9 * decode_efficiency(target, p.bf16x_decode) / active;
+    p.decode_ceiling_tps = d.bandwidth_gbs * 1e9 * decode_efficiency(d, target, p.bf16x_decode) / active;
 
   // Notes, in the order a person reads them.
   p.reason = describe_load();

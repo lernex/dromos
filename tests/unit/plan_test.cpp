@@ -633,6 +633,10 @@ TEST_CASE("a CPU makes no BF16X decode copies by default, and doctor's estimate 
   CHECK(p.bf16x_bytes == 0);
   if (bf16x_available()) CHECK(p.bf16x_reason.find("on a CPU") != std::string::npos);
   for (const FormatOption& o : p.options) CHECK(o.bf16x_bytes == 0);
+  // The estimate is the CPU's measured share of its probe (0.76 for BF16), not the GPU's (0.62): about 20 tok/s on the
+  // Windows VM, where 20 was measured.
+  const double bytes = decode_bytes_per_token(praxis(), LX_W_BF16, false, p.kv_capacity);
+  CHECK(p.decode_ceiling_tps == doctest::Approx(d.bandwidth_gbs * 1e9 * 0.76 / bytes).epsilon(0.01));
   CHECK(bf16x_copies_pay(simulated("RTX 5070 Ti 16GB", 120, 16, 896, 70)));
 }
 
