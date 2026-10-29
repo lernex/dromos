@@ -1121,7 +1121,7 @@ void check_rc(int rc, const char* what) {
 }
 
 int run_exactness(const std::string& dir, const std::string& prompts_path, const std::string& name, int draws,
-                  const lx::cli::FormatFlags& format, double rep, double presence, double frequency) {
+                  const lx::cli::FormatFlags& format, double rep, double presence, double frequency, int output_top) {
   nlohmann::json prompts;
   std::ifstream(prompts_path) >> prompts;
   if (!prompts.contains(name)) throw std::runtime_error("no prompt named " + name + " in " + prompts_path);
@@ -1160,10 +1160,27 @@ int run_exactness(const std::string& dir, const std::string& prompts_path, const
   std::vector<float> base(static_cast<size_t>(V));
   check_rc(lx_rt_copy(base.data(), d_logits, static_cast<int64_t>(sizeof(float)) * V, LX_COPY_D2H, s), "copy of logits");
   check_rc(lx_rt_stream_sync(s), "stream sync");
+  // --output-top N: the N most likely tokens also count as output, so presence and frequency act on them. The context's
+  // own tail is too unlikely to hold the candidates, so this is the state the presence and frequency checks need. Both
+  // paths read the same counts.
+  std::vector<int32_t> extra;
+  {
+    std::vector<int> order(static_cast<size_t>(V));
+    std::iota(order.begin(), order.end(), 0);
+    std::partial_sort(order.begin(), order.begin() + output_top, order.end(), [&](int a, int b) {
+      return base[static_cast<size_t>(a)] > base[static_cast<size_t>(b)] ||
+             (base[static_cast<size_t>(a)] == base[static_cast<size_t>(b)] && a < b);
+    });
+    for (int i = 0; i < output_top; ++i) extra.push_back(order[static_cast<size_t>(i)]);
+  }
   std::vector<char> seen_mask(static_cast<size_t>(V), 0);
   std::vector<int32_t> out_host(static_cast<size_t>(V), 0);
   for (int32_t t : ids) seen_mask[static_cast<size_t>(t)] = 1;
   for (size_t i = static_cast<size_t>(head_n); i < ids.size(); ++i) out_host[static_cast<size_t>(ids[i])] += 1;
+  for (int32_t t : extra) {
+    seen_mask[static_cast<size_t>(t)] = 1;
+    out_host[static_cast<size_t>(t)] += 1;
+  }
   const Dist ref = make_dist(base.data(), V, seen_mask, sm, &out_host);
 
   // The plain sampler (lx_sample) on the same logits, as the engine calls it.
@@ -1179,12 +1196,19 @@ int run_exactness(const std::string& dir, const std::string& prompts_path, const
   check_rc(lx_rt_alloc(reinterpret_cast<void**>(&d_params), sizeof(lx_sampling)), "alloc");
   check_rc(lx_rt_copy(d_base, base.data(), static_cast<int64_t>(sizeof(float)) * V, LX_COPY_H2D, s), "copy");
   int32_t* d_ids = nullptr;
+  int32_t* d_extra = nullptr;
+  const int n_extra = static_cast<int>(extra.size());
+  if (n_extra > 0) {
+    check_rc(lx_rt_alloc(reinterpret_cast<void**>(&d_extra), static_cast<int64_t>(sizeof(int32_t)) * n_extra), "alloc");
+    check_rc(lx_rt_copy(d_extra, extra.data(), static_cast<int64_t>(sizeof(int32_t)) * n_extra, LX_COPY_H2D, s), "copy");
+  }
   check_rc(lx_rt_alloc(reinterpret_cast<void**>(&d_ids), static_cast<int64_t>(sizeof(int32_t)) * ids.size()), "alloc");
   check_rc(lx_rt_copy(d_ids, ids.data(), static_cast<int64_t>(sizeof(int32_t)) * ids.size(), LX_COPY_H2D, s), "copy");
   auto restore_counts = [&]() {
     check_rc(lx_sampler_reset(d_seen, d_counts, 0, V, s), "sampler reset");
     check_rc(lx_sampler_observe(d_seen, d_counts, 0, V, d_ids, head_n, 0, s), "sampler observe");
     check_rc(lx_sampler_observe(d_seen, d_counts, 0, V, d_ids + head_n, tail, 1, s), "sampler observe");
+    if (n_extra > 0) check_rc(lx_sampler_observe(d_seen, d_counts, 0, V, d_extra, n_extra, 1, s), "sampler observe");
   };
   auto plain_draws = [&](uint64_t seed) {
     std::vector<long> counts(static_cast<size_t>(V), 0);
@@ -1273,6 +1297,8 @@ int run_exactness(const std::string& dir, const std::string& prompts_path, const
   }
   std::printf("penalties (rep %.3f, presence %.3f, frequency %.3f) move the reference by total variation %.4f\n", rep,
               presence, frequency, moved);
+  if (output_top > 0)
+    std::printf("the %d most likely tokens count as output too (--output-top)\n", output_top);
   std::printf("reference: %zu tokens kept, most likely %d (p %.3f)\n", kept.size(), kept[0],
               ref.p[static_cast<size_t>(kept[0])]);
   bool ok = true;
@@ -1298,6 +1324,7 @@ int run_exactness(const std::string& dir, const std::string& prompts_path, const
   lx_rt_free(d_seen);
   lx_rt_free(d_counts);
   lx_rt_free(d_ids);
+  lx_rt_free(d_extra);
   lx_rt_free(d_work);
   lx_rt_free(d_tok);
   lx_rt_free(d_params);
@@ -1312,6 +1339,7 @@ int cmd_spec_exactness(int argc, char** argv) {
     lx::cli::FormatFlags format;
     std::vector<char*> args = without_format_flags(argc, argv, format);
     double rep = 1.0, presence = 0.0, frequency = 0.0;
+    int output_top = 0;
     std::vector<char*> pos;
     for (size_t i = 0; i < args.size(); ++i) {
       const std::string a = args[i];
@@ -1322,6 +1350,7 @@ int cmd_spec_exactness(int argc, char** argv) {
       if (a == "--rep") rep = std::stod(val());
       else if (a == "--presence") presence = std::stod(val());
       else if (a == "--frequency") frequency = std::stod(val());
+      else if (a == "--output-top") output_top = std::stoi(val());
       else pos.push_back(args[i]);
     }
     const int n = static_cast<int>(pos.size());
@@ -1333,7 +1362,7 @@ int cmd_spec_exactness(int argc, char** argv) {
       return 2;
     }
     const int draws = n == 5 ? std::stoi(pos[4]) : 2000;
-    return run_exactness(pos[1], pos[2], pos[3], draws, format, rep, presence, frequency);
+    return run_exactness(pos[1], pos[2], pos[3], draws, format, rep, presence, frequency, output_top);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "error: %s\n", e.what());
     return 1;
