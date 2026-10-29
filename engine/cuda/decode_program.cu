@@ -12,6 +12,7 @@
 
 #include "cuda/bf16x.cuh"
 #include "cuda/decode_ops.h"
+#include "cuda/decode_caps.h"
 #include "cuda/kernels.h"
 #include "cuda/tunable.h"
 #include "cuda/decode_family.h"
@@ -303,10 +304,9 @@ int lx_program_gemv(lx_program* p, const lx_fx* x, const lx_weight* w, const lx_
   const int kstep = mma ? 4 * cv : 8;
   // K chunks: the chunk's x must fit the x buffer. A norm over the whole row needs the whole row.
   // Sized for the most tokens a step takes, so a row is summed the same way whatever M is.
-  int chunks = ceil_div(static_cast<int64_t>(kMaxM) * (K + xpad) * xe, p->x_cap);
-  if (x->kind == LX_FX_GATED && chunks > 1) chunks = 1 << static_cast<int>(std::ceil(std::log2(chunks)));
-  int Kc = round_up(ceil_div(K, chunks), kstep);
-  chunks = ceil_div(K, Kc);
+  const lx::decode::caps::KSplit split =
+      lx::decode::caps::gemv_k_split(K, xpad, xe, kstep, x->kind == LX_FX_GATED, kMaxM, p->x_cap);
+  int chunks = split.chunks, Kc = split.Kc;
   if (chunks > 1 && (x->kind == LX_FX_RMS || (x->kind == LX_FX_GATED && Kc % x->group))) return -1;
 
   // The x regions every chunk reads.
@@ -460,7 +460,7 @@ int lx_program_memory_read(lx_program* p, const lx_memread_args* a) {
       a->entry_stride % 4 || a->token_stride % 4 || reinterpret_cast<uintptr_t>(a->bank) % 16)
     return -1;
   // the token's entries are staged in the x buffer, one half (keys or values) at a time
-  if (a->n_entries * a->D * 4 > p->x_cap) return -1;
+  if (!lx::decode::caps::memread_fits(a->n_entries, a->D, p->x_cap)) return -1;
   p->x_need = std::max(p->x_need, a->n_entries * a->D * 4);
   const int M = p->M, S = a->S, D = a->D;
   OpDesc d = blank(kMemRead, M);
@@ -555,7 +555,7 @@ int lx_program_experts(lx_program* p, const lx_experts_args* a) {
   const int gt = static_cast<int>(a->gate_up.type), dt = static_cast<int>(a->down.type);
   const int sgt = static_cast<int>(a->shared_gate_up.type);
   if (!chunk_values(gt) || !chunk_values(dt) || !chunk_values(sgt)) return -1;
-  if (K * I * 2 > p->x_cap) return -1;
+  if (!lx::decode::caps::experts_fit(K, I, p->x_cap)) return -1;
   float* shared_gu = static_cast<float*>(p->alloc(static_cast<size_t>(M) * 2 * Is * 4));
   void* inter_r = p->alloc(static_cast<size_t>(M) * K * I * 2);
   float* shared_out = static_cast<float*>(p->alloc(static_cast<size_t>(M) * L * 4));
@@ -609,7 +609,7 @@ int lx_program_experts(lx_program* p, const lx_experts_args* a) {
   };
   {
     const int rb = static_cast<int>(row_bytes_of(gt, L));
-    const bool tc = tc_ok(a->gate_up, L) && I % 8 == 0 && M * (L + 32) * 2 <= p->x_cap;
+    const bool tc = tc_ok(a->gate_up, L) && I % 8 == 0 && lx::decode::caps::expert_up_tc_fits(M, L, p->x_cap);
     const int rows = tc ? 8 : tile_rows(I, static_cast<int>(tile_bytes_of(gt, L)), p->blocks, 2);
     if (I % rows) return -1;
     const int bpp = I / rows;
@@ -629,7 +629,7 @@ int lx_program_experts(lx_program* p, const lx_experts_args* a) {
   }
   {
     const int rb = static_cast<int>(row_bytes_of(dt, I));
-    const bool tc = tc_ok(a->down, I) && L % 16 == 0 && M * K * (I + 32) * 2 <= p->x_cap;
+    const bool tc = tc_ok(a->down, I) && L % 16 == 0 && lx::decode::caps::expert_down_tc_fits(M, K, I, p->x_cap);
     const int rows = tc ? 16 : tile_rows(L, static_cast<int>(tile_bytes_of(dt, I)), p->blocks, K);
     if (L % rows) return -1;
     const int bpt = L / rows;
@@ -693,9 +693,8 @@ int lx_program_memory_entry(lx_program* p, const lx_entry_args* a) {
   const int mb = Km * 2;
   const int rows = tile_rows(a->mem_dim, static_cast<int>(tile_bytes_of(wt, D)) + mb, p->blocks);
   e.rows = rows;
-  int kc = D;
-  while (kMaxM * (Km + kc) * 4 > p->x_cap && kc % 16 == 0) kc /= 2;  // whatever M is
-  if (kMaxM * (Km + kc) * 4 > p->x_cap || D % kc) return -1;
+  const int kc = lx::decode::caps::entry_kc(D, Km, kMaxM, p->x_cap);
+  if (kc < 0) return -1;
   e.kc = kc;
   d.ntasks = ceil_div(a->mem_dim, rows);
   d.pool = kStatic;

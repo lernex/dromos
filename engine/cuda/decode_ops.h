@@ -8,6 +8,7 @@
 #include <stdint.h>
 
 #include "cuda/kernels.h"
+#include "cuda/decode_caps.h"
 
 namespace lx::decode {
 
@@ -228,6 +229,7 @@ struct alignas(16) OpDesc {
     Continuation cont;
   };
 };
+static_assert(kXOff == lx::decode::caps::kXOff, "the x buffer's size is the one the decisions were checked at");
 static_assert(sizeof(OpDesc) <= kDescBytes, "an op descriptor must fit its shared-memory copy");
 
 // An L2 prefetch of [addr, addr + bytes); for the Mamba state of token m - 1 (m > 0), at
