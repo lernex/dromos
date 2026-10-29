@@ -62,6 +62,11 @@ int64_t row_bytes_of(int wtype, int k) {
   return wtype == LX_W_BF16X ? lx::bf16x::row_bytes(k) : static_cast<int64_t>(k) * value_bits(wtype) / 8;
 }
 
+// Bytes of a row of k values as a product's tiles count them: a BF16X row counts as the bf16 row it decodes to. The
+// tile's row count sets the k-split, which sets the reduction order, so BF16X must split exactly as BF16 does (the
+// same bits, not just the same values). row_bytes_of stays the bytes the device addresses rows by.
+int64_t tile_bytes_of(int wtype, int k) { return row_bytes_of(wtype == LX_W_BF16X ? LX_W_BF16 : wtype, k); }
+
 }  // namespace
 
 struct lx_program {
@@ -363,7 +368,7 @@ int lx_program_gemv(lx_program* p, const lx_fx* x, const lx_weight* w, const lx_
     g.k1 = std::min(K, g.k0 + Kc);
     g.row_bytes = row_bytes_of(wtype, g.k1 - g.k0);
     g.ld = row_bytes_of(wtype, K);
-    g.rows = tile_rows(N, g.row_bytes, p->blocks);
+    g.rows = tile_rows(N, static_cast<int>(tile_bytes_of(wtype, g.k1 - g.k0)), p->blocks);
     const int ntasks = ceil_div(N, g.rows);
     g.sh = k_split(g, ntasks, p->blocks, y->kind == LX_FY_WRITE && y->next_parts && c == chunks - 1);
     std::vector<Region> regs = xr;
@@ -605,7 +610,7 @@ int lx_program_experts(lx_program* p, const lx_experts_args* a) {
   {
     const int rb = static_cast<int>(row_bytes_of(gt, L));
     const bool tc = tc_ok(a->gate_up, L) && I % 8 == 0 && M * (L + 32) * 2 <= p->x_cap;
-    const int rows = tc ? 8 : tile_rows(I, rb, p->blocks, 2);
+    const int rows = tc ? 8 : tile_rows(I, static_cast<int>(tile_bytes_of(gt, L)), p->blocks, 2);
     if (I % rows) return -1;
     const int bpp = I / rows;
     int sh = 0;
@@ -625,7 +630,7 @@ int lx_program_experts(lx_program* p, const lx_experts_args* a) {
   {
     const int rb = static_cast<int>(row_bytes_of(dt, I));
     const bool tc = tc_ok(a->down, I) && L % 16 == 0 && M * K * (I + 32) * 2 <= p->x_cap;
-    const int rows = tc ? 16 : tile_rows(L, rb, p->blocks, K);
+    const int rows = tc ? 16 : tile_rows(L, static_cast<int>(tile_bytes_of(dt, I)), p->blocks, K);
     if (L % rows) return -1;
     const int bpt = L / rows;
     int sh = 0;
@@ -686,7 +691,7 @@ int lx_program_memory_entry(lx_program* p, const lx_entry_args* a) {
   e.mem_dim = a->mem_dim;
   e.state_bytes = static_cast<int>(row_bytes_of(wt, D));
   const int mb = Km * 2;
-  const int rows = tile_rows(a->mem_dim, e.state_bytes + mb, p->blocks);
+  const int rows = tile_rows(a->mem_dim, static_cast<int>(tile_bytes_of(wt, D)) + mb, p->blocks);
   e.rows = rows;
   int kc = D;
   while (kMaxM * (Km + kc) * 4 > p->x_cap && kc % 16 == 0) kc /= 2;  // whatever M is
