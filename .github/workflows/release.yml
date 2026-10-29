@@ -1,6 +1,7 @@
-# Release builds (docs/RELEASE.md). A tag vX.Y.Z (or vX.Y.Z-rcN) builds every flavor from scripts/release/build.sh in
-# the base it was proven in, then drafts the GitHub release with SHA256SUMS and install.sh. The owner publishes the
-# draft. workflow_dispatch builds the same tarballs as workflow artifacts and publishes nothing.
+# Release builds (docs/RELEASE.md). A tag vX.Y.Z (or vX.Y.Z-rcN) builds every flavor from scripts/release/build.sh
+# (scripts/release/build.ps1 on Windows) in the base it was proven in, then drafts the GitHub release with SHA256SUMS,
+# install.sh and install.ps1. The owner publishes the draft. workflow_dispatch builds the same archives as workflow
+# artifacts and publishes nothing.
 name: release
 
 on:
@@ -120,10 +121,57 @@ jobs:
           path: ${{ runner.temp }}/release/dromos-linux-x86_64-cuda12.tar.gz
           if-no-files-found: error
 
+  windows-x86_64-cpu:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      # The checkout keeps the repository's line endings, so the zip's text files are the bytes every other archive has.
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - name: Version and commit
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then echo "LX_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"; fi
+          echo "LX_GIT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+      - name: Build (MSVC, static C runtime)
+        shell: pwsh
+        run: scripts\release\build.ps1 windows-x86_64-cpu "$env:RUNNER_TEMP\release"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dromos-windows-x86_64-cpu
+          path: ${{ runner.temp }}/release/dromos-windows-x86_64-cpu.zip
+          if-no-files-found: error
+
+  windows-x86_64-cuda12:
+    runs-on: windows-2022
+    # The same CUDA 12.8 and every architecture as linux-x86_64-cuda12, with MSVC as nvcc's host compiler. The toolkit
+    # comes from NVIDIA's redistributable archives (the installer does not run unattended); the limit is the Linux one.
+    timeout-minutes: 350
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - name: Version and commit
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then echo "LX_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"; fi
+          echo "LX_GIT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+      - name: CUDA 12.8 toolkit
+        shell: pwsh
+        run: scripts\release\cuda-toolkit.ps1 12.8
+      - name: Build (MSVC host compiler, static C runtime)
+        shell: pwsh
+        run: scripts\release\build.ps1 windows-x86_64-cuda12 "$env:RUNNER_TEMP\release"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dromos-windows-x86_64-cuda12
+          path: ${{ runner.temp }}/release/dromos-windows-x86_64-cuda12.zip
+          if-no-files-found: error
+
   publish:
     # Only a tag publishes. A dispatch run stops at the artifacts above.
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [release-address, linux-x86_64-cpu, linux-aarch64-cpu, darwin-arm64, linux-x86_64-cuda12]
+    needs: [release-address, linux-x86_64-cpu, linux-aarch64-cpu, darwin-arm64, linux-x86_64-cuda12, windows-x86_64-cpu,
+            windows-x86_64-cuda12]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -136,6 +184,7 @@ jobs:
       - name: Checksums and installer
         run: |
           cp scripts/install.sh "$RUNNER_TEMP/assets/install.sh"
+          cp scripts/install.ps1 "$RUNNER_TEMP/assets/install.ps1"
           scripts/release/sums.sh "$RUNNER_TEMP/assets"
       - name: Draft the release (the owner publishes it)
         env:
