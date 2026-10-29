@@ -628,6 +628,71 @@ __global__ void gemv_small_kernel(const TX* __restrict__ x, int ld_x, const lx_w
   }
 }
 
+// Two rows a warp, for the vector path with one row per 32 lanes (K = 256). Each lane's 8 weights and its x loads
+// serve both rows, and the two rows' fma chains and xor trees run side by side, so one shuffle's latency is paid for
+// both rows instead of each row waiting on its own tree. Every (row, m) sum is gemv_small_kernel's kVec sum in the same
+// order: its fmas in k order, then the same xor tree over the 32 lanes. The bits do not change.
+constexpr int kSmallRows = 2;
+
+template <int F, typename TX>
+__global__ void gemv_small_rows_kernel(const TX* __restrict__ x, int ld_x, const lx_weight w,
+                                       const void* __restrict__ bias, bool bias_bf16, void* __restrict__ y, bool y_bf16,
+                                       int ld_y, int M, int N, int K, float alpha, float beta) {
+  const int lane = threadIdx.x;  // one warp per block; the lane is the row's 8-value slice index
+  const int64_t n0 = static_cast<int64_t>(blockIdx.x) * kSmallRows;
+
+  Slice<F> row[kSmallRows]{};
+#pragma unroll
+  for (int r = 0; r < kSmallRows; ++r)
+    if (n0 + r < N) row[r] = load_row8<F>(w, n0 + r, K, lane);  // before the wait: weights do not depend on the previous kernel
+  lx::pdl_trigger();
+  lx::pdl_wait();  // x may be written by the previous kernel
+
+  float wf[kSmallRows][8];
+#pragma unroll
+  for (int r = 0; r < kSmallRows; ++r) slice_f32<F>(row[r], wf[r]);
+
+  float acc[kSmallRows][kMaxM];
+#pragma unroll
+  for (int r = 0; r < kSmallRows; ++r)
+#pragma unroll
+    for (int m = 0; m < kMaxM; ++m) acc[r][m] = 0.0f;
+#pragma unroll
+  for (int m = 0; m < kMaxM; ++m) {
+    if (m < M) {
+      float xf[8];
+      load_x8<TX>(x + static_cast<int64_t>(m) * ld_x + lane * 8, xf);
+#pragma unroll
+      for (int r = 0; r < kSmallRows; ++r)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) acc[r][m] = fmaf(wf[r][i], xf[i], acc[r][m]);
+    }
+  }
+
+  // The xor tree over the live outputs only. M is the same in every lane, so each branch is uniform across the warp.
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1)
+#pragma unroll
+    for (int r = 0; r < kSmallRows; ++r)
+#pragma unroll
+      for (int m = 0; m < kMaxM; ++m)
+        if (m < M) acc[r][m] += __shfl_xor_sync(0xffffffffu, acc[r][m], off);
+
+  if (lane == 0) {
+#pragma unroll
+    for (int r = 0; r < kSmallRows; ++r) {
+      const int64_t n = n0 + r;
+      if (n < N) {
+        const float rf = lx::WordFormat<F>::row_factor(w, n);
+        const float b = bias_at(bias, bias_bf16, n);
+#pragma unroll
+        for (int m = 0; m < kMaxM; ++m)
+          if (m < M) store_y(y, y_bf16, static_cast<int64_t>(m) * ld_y + n, rf * acc[r][m] + b, alpha, beta);
+      }
+    }
+  }
+}
+
 // ---- quantizer -------------------------------------------------------------------------------
 
 // One warp per row. The divisions are IEEE (__fdiv_rn), so q and scale match a reference that
@@ -701,6 +766,13 @@ cudaError_t launch_small(const Args& a) {
                        ((reinterpret_cast<uintptr_t>(a.x) | (static_cast<uint64_t>(a.ld_x) * sizeof(TX))) % 16 == 0);
   if constexpr (F != LX_W_NVFP4) {  // NVFP4 keeps its scalar path (its 8 values share two scale bytes)
     if (aligned && e == kLaneK && a.K % kLaneK == 0) {
+      if (lpr == 32) {  // one row per 32 lanes: kSmallRows rows a warp
+        const cudaLaunchConfig_t rows_cfg =
+            pdl_config(static_cast<unsigned>((a.N + kSmallRows - 1) / kSmallRows), 32, a.stream, attr);
+        cudaLaunchKernelEx(&rows_cfg, gemv_small_rows_kernel<F, TX>, static_cast<const TX*>(a.x), a.ld_x, a.w, a.bias,
+                           a.bias_bf16, a.y, a.y_bf16, a.ld_y, a.M, a.N, a.K, a.alpha, a.beta);
+        return cudaGetLastError();
+      }
       cudaLaunchKernelEx(&cfg, gemv_small_kernel<F, TX, true>, static_cast<const TX*>(a.x), a.ld_x, a.w, a.bias,
                          a.bias_bf16, a.y, a.y_bf16, a.ld_y, a.M, a.N, a.K, lpr, e, a.alpha, a.beta);
       return cudaGetLastError();
