@@ -325,7 +325,6 @@ __device__ __forceinline__ void store_state_chunk(float* st, int N, bool vec, in
 template <int NI, bool kCluster>
 __device__ __forceinline__ void mamba_decode_body(const DecodeArgs& a) {
   lx::pdl_trigger();
-  lx::pdl_wait();
   __shared__ float xs[kDecodeMaxP];                  // the head's x conv outputs
   __shared__ __align__(16) float Bs[kDecodeMaxN];    // the group's B conv outputs, zero past N
   __shared__ __align__(16) float Cs[kDecodeMaxN];    // the group's C conv outputs, zero past N
@@ -346,8 +345,7 @@ __device__ __forceinline__ void mamba_decode_body(const DecodeArgs& a) {
   const float* zrow = a.zxbcdt + static_cast<int64_t>(s) * a.ld;
   float* cst = a.conv_state + static_cast<int64_t>(slot) * (W - 1) * conv_dim;
   float* st = a.ssm_state + ((static_cast<int64_t>(slot) * H + h) * P + (valid ? p : 0)) * N;
-  // The head's scalars come first too, with the state, so none of their loads waits behind the conv.
-  const float dt_raw = zrow[I + conv_dim + h];
+  // The head's weights come first too, with the state, so none of their loads waits behind the conv.
   const float dt_bias = a.dt_bias[h];
   const float A_log = a.A_log[h];
   const float Dh = a.D[h];
@@ -370,6 +368,11 @@ __device__ __forceinline__ void mamba_decode_body(const DecodeArgs& a) {
       for (int e = 0; e < 4; ++e) S[i][e] = (load && n0 + e < N) ? __ldcg(st + n0 + e) : 0.0f;
     }
   }
+
+  // The state and the weights are not written by the predecessor kernel (only by an earlier step's scan), so their
+  // loads above went out before the dependency wait. Everything that reads zxbcdt waits for it.
+  lx::pdl_wait();
+  const float dt_raw = zrow[I + conv_dim + h];
 
   // The conv of the head's x channels [h P, h P + P), then the group's B and C channels, in conv order
   // (x | B | C). Each channel's taps are read once. The loop only loads and writes shared memory, so the
