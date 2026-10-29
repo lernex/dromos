@@ -469,3 +469,23 @@ def test_ignore_eos_on_chat_runs_to_max_tokens(server):
     r = requests.post(base + "/v1/chat/completions", json=body).json()
     assert r["usage"]["completion_tokens"] == 12, r
     assert r["choices"][0]["finish_reason"] == "length"
+
+
+def test_penalties_are_parsed_checked_and_applied(client, server):
+    """presence_penalty and frequency_penalty reach the engine on both endpoints.
+
+    Out-of-range values are refused with the parameter named. A penalised greedy reply differs from the plain one,
+    so the penalties act on the request (speculation is on by default, so this exercises the penalised verify path).
+    """
+    base, _ = server
+    for name, value in [("presence_penalty", 3.0), ("frequency_penalty", -2.5)]:
+        r = requests.post(base + "/v1/completions", json={"prompt": PROMPT, "max_tokens": 2, name: value})
+        assert r.status_code == 400 and r.json()["error"]["param"] == name, r.text
+        r = requests.post(base + "/v1/chat/completions",
+                          json={"messages": [{"role": "user", "content": "x"}], name: value})
+        assert r.status_code == 400 and r.json()["error"]["param"] == name, r.text
+    plain = client.completions.create(model="praxis", prompt=PROMPT, max_tokens=24, temperature=0)
+    penal = client.completions.create(model="praxis", prompt=PROMPT, max_tokens=24, temperature=0,
+                                      presence_penalty=2.0, frequency_penalty=2.0)
+    assert penal.choices[0].text != plain.choices[0].text, (plain.choices[0].text, penal.choices[0].text)
+    assert penal.usage.completion_tokens == 24
