@@ -99,6 +99,29 @@ int lx_concat4_bf16(const float* a, const float* b, const float* c, const float*
   return kOk;
 }
 
+// [a | b | c | d] per token, f32: lx_concat4_bf16's layout, copied exactly.
+int lx_concat4_f32(const float* a, const float* b, const float* c, const float* d, void* out, int D, int R, int T,
+                   void* stream) {
+  LX_PROFILE("concat4_f32");
+  (void)stream;
+  if (T <= 0 || D <= 0 || R <= 0) return kOk;
+  if (!a || !b || !c || !d || !out) return fail(kInvalid);
+  float* o = static_cast<float*>(out);
+  const int W = 3 * D + R;
+  for (int t = 0; t < T; ++t) {
+    float* row = o + static_cast<int64_t>(t) * W;
+    const float* sa = a + static_cast<int64_t>(t) * D;
+    const float* sb = b + static_cast<int64_t>(t) * D;
+    const float* sc = c + static_cast<int64_t>(t) * D;
+    const float* sd = d + static_cast<int64_t>(t) * R;
+    for (int j = 0; j < D; ++j) row[j] = sa[j];
+    for (int j = 0; j < D; ++j) row[D + j] = sb[j];
+    for (int j = 0; j < D; ++j) row[2 * D + j] = sc[j];
+    for (int j = 0; j < R; ++j) row[3 * D + j] = sd[j];
+  }
+  return kOk;
+}
+
 // The router's input once the features are ready: the latent's bf16 copy, and the features into the tail.
 int lx_pack_router(float* router_in, void* latent, const float* features, int Lat, int R, int T, void* stream) {
   LX_PROFILE("pack_router");

@@ -65,3 +65,16 @@ def test_add_two_rows_is_two_add_rows(lx, rows, cols):
     lx("add_row_bf16", old, a, rows, cols)
     lx("add_row_bf16", old, b, rows, cols)
     close(fused, old, atol=0.0)
+
+
+@pytest.mark.parametrize("T,D,R", [(1, 2048, 512), (9, 64, 17), (3, 33, 5)])
+def test_concat4_f32_is_the_four_copies(lx, T, D, R):
+    """[a | b | c | d] as one f32 row per token: the continuation head's input, the copy2d calls it used to make."""
+    torch.manual_seed(4)
+    a, b, c = (torch.randn(T, D, device=DEVICE) for _ in range(3))
+    d = torch.randn(T, R, device=DEVICE)
+    out = torch.zeros(T, 3 * D + R, device=DEVICE)
+
+    lx("concat4_f32", a, b, c, d, out, D, R, T)
+
+    close(out, torch.cat([a, b, c, d], dim=1), atol=0.0)

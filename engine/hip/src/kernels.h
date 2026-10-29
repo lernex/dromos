@@ -246,6 +246,9 @@ LX_API int lx_gather_last(const float* src, const int32_t* cu, float* out, int n
 // own width, and out is one row of 3 * D + R bf16 per token (the routing features' input).
 LX_API int lx_concat4_bf16(const float* a, const float* b, const float* c, const float* d, void* out, int D, int R,
                            int T, void* stream);
+// The same row in f32 (one launch on CUDA; the four copies here, the same bits).
+LX_API int lx_concat4_f32(const float* a, const float* b, const float* c, const float* d, void* out, int D, int R,
+                          int T, void* stream);
 // The router's input once the features are ready: latent[t, :Lat] = bf16(router_in[t, :Lat]), then
 // router_in[t, Lat :] = features[t, :R] (f32). router_in is one row of Lat + R f32 per token.
 LX_API int lx_pack_router(float* router_in, void* latent, const float* features, int Lat, int R, int T, void* stream);

@@ -1,5 +1,7 @@
 // Small kernels the Metis forward pass needs between the library kernels (kernels.h, "Model glue"). They
 // are specific to how the model wires its pieces together; every backend provides them as plain ops.
+#include <type_traits>
+
 #include "cuda/common.cuh"
 #include "cuda/kernels.h"
 
@@ -43,9 +45,11 @@ __global__ void gather_last_kernel(const float* src, const int32_t* cu, float* o
   for (int d = threadIdx.x; d < D; d += blockDim.x) out[static_cast<int64_t>(blockIdx.x) * D + d] = src[row * D + d];
 }
 
-// The routing features' input row per token: [a | b | c | d] in bf16. Columns run over the grid's x, tokens over y.
-__global__ void concat4_kernel(const float* a, const float* b, const float* c, const float* d, __nv_bfloat16* out,
-                               int D, int R, int T) {
+// The routing features' input row per token: [a | b | c | d] as bf16 (TOut = __nv_bfloat16), or as f32 (the
+// continuation head's input, a plain copy of each segment). Columns run over the grid's x, tokens over y.
+template <typename TOut>
+__global__ void concat4_kernel(const float* a, const float* b, const float* c, const float* d, TOut* out, int D, int R,
+                               int T) {
   lx::pdl_trigger();
   lx::pdl_wait();
   const int j = blockIdx.x * blockDim.x + threadIdx.x;
@@ -57,7 +61,8 @@ __global__ void concat4_kernel(const float* a, const float* b, const float* c, c
   else if (j < 2 * D) v = b[static_cast<int64_t>(t) * D + (j - D)];
   else if (j < 3 * D) v = c[static_cast<int64_t>(t) * D + (j - 2 * D)];
   else v = d[static_cast<int64_t>(t) * R + (j - 3 * D)];
-  out[static_cast<int64_t>(t) * W + j] = __float2bfloat16_rn(v);
+  if constexpr (std::is_same_v<TOut, float>) out[static_cast<int64_t>(t) * W + j] = v;
+  else out[static_cast<int64_t>(t) * W + j] = __float2bfloat16_rn(v);
 }
 
 // The router's input after the features join: the latent's bf16 copy, and the features' f32 copy into the tail.
@@ -123,7 +128,15 @@ int lx_concat4_bf16(const float* a, const float* b, const float* c, const float*
                     void* stream) {
   const int W = 3 * D + R;
   if (T > 0 && W > 0)
-    lx::launch_pdl(concat4_kernel, dim3(blocks(W), T), 256, 0, static_cast<cudaStream_t>(stream), a, b, c, d, static_cast<__nv_bfloat16*>(out), D, R, T);
+    lx::launch_pdl(concat4_kernel<__nv_bfloat16>, dim3(blocks(W), T), 256, 0, static_cast<cudaStream_t>(stream), a, b, c, d, static_cast<__nv_bfloat16*>(out), D, R, T);
+  return lx::launch_status();
+}
+
+int lx_concat4_f32(const float* a, const float* b, const float* c, const float* d, void* out, int D, int R, int T,
+                   void* stream) {
+  const int W = 3 * D + R;
+  if (T > 0 && W > 0)
+    lx::launch_pdl(concat4_kernel<float>, dim3(blocks(W), T), 256, 0, static_cast<cudaStream_t>(stream), a, b, c, d, static_cast<float*>(out), D, R, T);
   return lx::launch_status();
 }
 

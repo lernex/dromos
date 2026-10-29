@@ -1333,6 +1333,10 @@ void concat4(Impl& m, const float* a, const float* b, const float* c, const floa
     LX_CHECK(lx_concat4_bf16(a, b, c, d, out, D, R, T, s));
     return;
   }
+  if (dtype == LX_F32) {  // the continuation head's input: the same four segments, copied exactly, in one launch
+    LX_CHECK(lx_concat4_f32(a, b, c, d, out, D, R, T, s));
+    return;
+  }
   const size_t es = dtype == LX_F32 ? 4 : 2;
   char* o = static_cast<char*>(out);
   LX_CHECK(lx_copy2d(a, LX_F32, D, o, dtype, ld, T, D, s));

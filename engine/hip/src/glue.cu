@@ -117,6 +117,18 @@ int lx_concat4_bf16(const float* a, const float* b, const float* c, const float*
   return lx::launch_status();
 }
 
+// The four copies (the CUDA build writes the f32 row in one launch): the same bits.
+int lx_concat4_f32(const float* a, const float* b, const float* c, const float* d, void* out, int D, int R, int T,
+                   void* stream) {
+  const int W = 3 * D + R;
+  if (T <= 0 || D <= 0 || R <= 0) return 0;
+  char* o = static_cast<char*>(out);
+  if (int e = lx_copy2d(a, LX_F32, D, o, LX_F32, W, T, D, stream)) return e;
+  if (int e = lx_copy2d(b, LX_F32, D, o + 4 * D, LX_F32, W, T, D, stream)) return e;
+  if (int e = lx_copy2d(c, LX_F32, D, o + 4 * 2 * D, LX_F32, W, T, D, stream)) return e;
+  return lx_copy2d(d, LX_F32, R, o + 4 * 3 * D, LX_F32, W, T, R, stream);
+}
+
 int lx_pack_router(float* router_in, void* latent, const float* features, int Lat, int R, int T, void* stream) {
   const int W = Lat + R;
   if (T > 0 && W > 0)
