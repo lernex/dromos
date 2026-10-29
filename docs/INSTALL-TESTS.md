@@ -1,13 +1,206 @@
 # Install tests
 
 What `scripts/install.sh`, the Docker image, `dromos update` and the install paths were run on, with the result of
-each run. Every row names the machine, the release build it installed and what happened. There have been three
-rounds: Windows (round 3, first below), the release candidate v0.1.0-rc1 (round 2) and the 0.1.0 test builds before it
-(round 1). A row marked "not run" was not run in its round; the Open items say what is left.
+each run. Every row names the machine, the release build it installed and what happened. There have been four
+rounds, newest first: the Linux and macOS channels under the Dromos names (round 4, 0.1.0-rc2), Windows (round 3),
+the release candidate v0.1.0-rc1 (round 2) and the 0.1.0 test builds before it (round 1). A row marked "not run" was
+not run in its round; the Open items say what is left.
 
-The engine was renamed Dromos on 2026-10-29, after both rounds. They ran under the old name, so their commands and
+The engine was renamed Dromos on 2026-10-29, after rounds 1 and 2. They ran under the old name, so their commands and
 output say `lernex`. In today's names: the command is `dromos`, `LERNEX_*` is `DROMOS_*`, `~/.lernex` is `~/.dromos`,
 the assets are `dromos-*.tar.gz`, and the backends are `libdromos_*`.
+
+## Round 4: 0.1.0-rc2, Linux and macOS under the Dromos names (2026-10-29)
+
+Every Linux and macOS channel again, after the rename and before the freeze: `install.sh`, the image, `dromos
+update`, and for the first time Homebrew and pip. `0.1.0-rc2` is the version the builds were given, not a tag: Actions
+is still held on the private repository (round 2), so the builds followed `release.yml` by hand, as in round 2.
+
+### How it was built
+
+| Tarball | Where | How | Bytes | sha256 |
+|---------|-------|-----|------:|--------|
+| `dromos-linux-x86_64-cpu.tar.gz` | GPU server, Docker | `quay.io/pypa/manylinux_2_28_x86_64`, `scripts/release/build.sh`, 1 min at `LX_JOBS=4` | 3,588,035 | `932bdda3…` |
+| `dromos-linux-x86_64-cuda12.tar.gz` | GPU server, Docker | the same base, the source's own `cuda-toolkit.sh 12.8`, then `build.sh`, 18 min at `LX_JOBS=4` | 565,240,808 | `dd7fc551…` |
+| `dromos-linux-aarch64-cpu.tar.gz` | this Mac, Docker Desktop, linux/arm64 | `quay.io/pypa/manylinux_2_28_aarch64`, `build.sh` | 3,010,702 | `65030a86…` |
+| `dromos-darwin-arm64.tar.gz` | this Mac, native, under `heavy.sh` | `build.sh` | 1,250,049 | `baa3aabd…` |
+
+- The CPU and darwin tarballs are from `4a85ea3`, the rename with its release address fixed (Findings). The cuda12
+  tarball is from `be70353`, which is `95e43a2` plus the toolkit change that landed as `6822467`, because the CUDA
+  build of `4a85ea3` failed twice:
+  - NVIDIA's RHEL 8 and 9 repository indexes named files that were not there from 03:13 UTC on October 29, which
+    stopped the build at `dnf`. `cuda-toolkit.sh` now installs from NVIDIA's redistributable archives, pinned to
+    `redistrib_12.8.2.json` and its sha256 with every archive checked against it: nvcc 12.8.93, cudart and CCCL
+    12.8.90, cuBLAS 12.8.5.5, the versions rc1 got from the repository.
+  - `4a85ea3`'s skinny GEMM did not compile for sm_80, 86 and 89 (its cluster calls). `95e43a2` fixed it, and every
+    architecture has been compiled with each benchmark table since.
+- `--version` prints `dromos 0.1.0-rc2 (FLAVOR, 4a85ea3)`, or `be70353` for cuda12. `install.sh` is `4a85ea3`'s,
+  sha256 `2b1416aa…`.
+- The cuda12 tree unpacks to 901 MB: `libcublasLt.so.12` 752 MB, `libdromos_kernels.so` 140 MB (rc1: 129 MB).
+- The release hosts are plain folders shaped like GitHub's, on 127.0.0.1:18370 on the GPU server and 18250 on this
+  Mac, plus `relhost.py` with GitHub's `/latest` redirect on 18380 for row 15. The scripts are `~/installer-rc3/` on
+  the GPU server (`build-rc.sh`, `build-tk.sh`, `rc-tests.sh`, logs in `out-0.1.0-rc2/`); the Mac rows ran from a
+  session scratch folder with the same layout.
+
+### Results
+
+| # | What | Where | Result |
+|---|------|-------|--------|
+| 4 | `install.sh` (latest), native: `--version`, `doctor`, signature, quarantine, re-run | this Mac, macOS 27.0, Apple M5, temp HOME | pass (4c) |
+| 10 | `install.sh` (latest), native, cuda12 chosen by itself: `--version`, `doctor praxis`, one prompt, `serve` and one curl | GPU server, RTX 5070 Ti, driver 595.91.07, temp HOME | pass (10c) |
+| 11 | arm64 Ubuntu 22.04 and 24.04: install, `--version`, `doctor`, re-run | this Mac, Docker Desktop 29.4.0, linux/arm64 | pass (11c) |
+| 12 | x86_64 Ubuntu 22.04 (wget only) and 24.04 (curl): install, `--version`, `doctor`, one prompt on the CPU | GPU server, Docker 29.1.3 | pass (12c) |
+| 13 | Image build from `4a85ea3`'s `docker/Dockerfile` against this round's host | GPU server, Docker 29.1.3 | pass (13c) |
+| 14 | The image through Docker's GPU path: `docker run --gpus all`, its own ENTRYPOINT and CMD, one curl, `doctor`, `update --check` | GPU server, NVIDIA Container Toolkit | pass (13c) |
+| 15 | `dromos update` end to end and the daily notice: 0.1.0-rc2 pinned, two runs, `update` to 0.1.0, a third run, `--rollback` | GPU server, ubuntu:24.04 container, `relhost.py` | pass (15b) |
+| 25 | Homebrew: the formula `bump-formula.sh` writes for this release, in a local tap; install, `--version`, `doctor`, `update --check`, `brew test`, `brew audit --strict`, `brew style`, one prompt on Metal, uninstall and untap | this Mac, Homebrew 7.0.11 | pass (25a) |
+| 26 | pip on macOS: `build_wheel.py` from the darwin tarball, `twine check`, install in a fresh venv, `--version`, `doctor`, `update --check`, one prompt on Metal | this Mac, Python 3.12.13 | pass (25a) |
+| 27 | pip on aarch64 Linux: the `manylinux_2_28_aarch64` wheel, `twine check`, install, `--version`, `doctor`, `update --check` | this Mac, Docker Desktop, Ubuntu 24.04, Python 3.12.3 | pass (27a) |
+| 28 | pip with CUDA: the cuda12 wheel as `pypi.yml` builds it, in a fresh venv on the GPU: `--version`, `doctor praxis`, one prompt, `update --check` | GPU server, Python 3.14, temp venv | pass (28a) |
+| 29 | The same wheel in Ubuntu 24.04 with no GPU: install, `--version`, `doctor`, one prompt on the CPU | GPU server, Docker 29.1.3 | pass (28a) |
+
+Rows 5 to 9 test `install.sh`'s choices and refusals with shims and fake tarballs, and were not rerun. Since rc1,
+`install.sh` changed only by the rename: rc1's file with `LERNEX` made `DROMOS` and `lernex` made `dromos` is this
+round's file line for line, apart from the release address (Findings). Rows 25 to 29 are new; 16 to 24 are round 3's.
+
+### 4c, 11c and 12c. `install.sh` on this Mac, arm64 Ubuntu and x86_64 Ubuntu
+
+```
+4c   this Mac      install rc 0; dromos 0.1.0-rc2 (darwin-arm64, 4a85ea3)
+                   doctor rc 0: Apple M5, Apple 10, 10 GPU cores, 12.71 GB unified memory the GPU can use,
+                   neural accelerators on, macOS 27.0, Metal 4; backend libdromos_metal.dylib; missing none
+                   Signature=adhoc, TeamIdentifier not set; no com.apple.quarantine
+                   re-run: "dromos 0.1.0-rc2 is already installed and current"
+11c  arm64 22.04   install rc 0; dromos 0.1.0-rc2 (linux-aarch64-cpu, 4a85ea3)
+     arm64 24.04   the same; doctor: Advanced SIMD, dot product, I8MM, BF16, 101 GB/s measured on 10 threads;
+                   missing none; re-run "already installed and current"
+12c  x86_64 22.04  wget only: install rc 0; dromos 0.1.0-rc2 (linux-x86_64-cpu, 4a85ea3); run praxis on the CPU: 51
+     x86_64 24.04  curl: the same; 51
+```
+
+`doctor` on the Mac prints the Apple GPU's own fields, the fix round 2 recorded after rc1.
+
+### 10c. GPU server, native (RTX 5070 Ti, driver 595.91.07, temp HOME)
+
+```
+dromos: Linux x86_64: cuda12 build, NVIDIA GeForce RTX 5070 Ti, driver 595.91.07
+version       dromos 0.1.0-rc2 (linux-x86_64-cuda12, be70353)
+doctor praxis rc 0: sm_120; CUDA driver 13.2, runtime 12.8; kernels for sm_80 sm_86 sm_89 sm_90 sm_100 sm_120;
+              backend CUDA, libdromos_kernels.so in the installed tree; missing none; tuning from the installed tree
+run praxis --think off, "What is 17 times 3?": 51
+serve praxis on 127.0.0.1:18371: up to 30 sequences of 8192 tokens, 14.68 GB planned of 14.78 GB
+POST /v1/chat/completions: "51", finish_reason stop
+```
+
+`doctor praxis` lists NVFP4 as a format that fits, with a refusal and a path on the GPU server as its load (Findings).
+
+### 13c and 14d. The image, on the GPU server
+
+Built from `4a85ea3`'s `docker/Dockerfile` on the host network, so the fetch stage reached this round's host:
+
+    docker build --network host -t dromos-rc:0.1.0-rc2 \
+      --build-arg DROMOS_VERSION=0.1.0-rc2 --build-arg DROMOS_RELEASES=http://127.0.0.1:18370 .
+
+```
+fetch stage   dromos-linux-x86_64-cuda12.tar.gz: OK (sha256sum -c against the release's SHA256SUMS)
+build         rc 0 in 1.5 minutes
+image         672,162,371 bytes; source label https://github.com/lernex/dromos
+config        ENTRYPOINT dromos serve --host 0.0.0.0 --port 8080, CMD praxis
+--version     dromos 0.1.0-rc2 (linux-x86_64-cuda12, be70353)
+```
+
+Then the image's own ENTRYPOINT and CMD with `--gpus all` and the models folder mounted, under the GPU lock:
+
+```
+serve           Serving praxis on http://0.0.0.0:8080/v1: up to 30 sequences of 8192 tokens, 14.68 GB planned of 14.78 GB
+POST /v1/chat/completions ("What is 17 times 3?", thinking off): "51", finish_reason stop
+doctor          (docker exec) sm_120; CUDA driver 13.2, runtime 12.8; kernels for sm_80 sm_86 sm_89 sm_90 sm_100 sm_120;
+                backend CUDA, /opt/dromos/lib/libdromos_kernels.so; missing none; tuning from the image
+update --check  this dromos was installed with docker. Update it with `docker pull ghcr.io/lernex/dromos`.
+stopped         docker stop; no compute apps on the GPU afterwards
+```
+
+The image stays on the GPU server as `dromos-rc:0.1.0-rc2` and is not pushed anywhere.
+
+### 15b. `dromos update` end to end
+
+The same method as round 2's 15a, in one container: `relhost.py` answers `/latest` with a 302 to `/tag/v0.1.0`, and a
+test-only 0.1.0 x86_64 CPU tarball built from `4a85ea3` with `LX_VERSION=0.1.0` plays the newer release.
+
+```
+install 0.1.0-rc2 pinned        dromos 0.1.0-rc2 (linux-x86_64-cpu, 4a85ea3)
+run 1 (no cache yet)            51, no notice; afterwards the cache reads latest=0.1.0
+run 2                           51, and on stderr: dromos 0.1.0 is out (you have 0.1.0-rc2). Run `dromos update` to install it.
+update                          dromos 0.1.0 (linux-x86_64-cpu, 4a85ea3); ~/.dromos/versions 0.1.0 0.1.0-rc2, current -> 0.1.0
+run 3                           51, no notice
+update --rollback               dromos 0.1.0-rc2 (linux-x86_64-cpu, 4a85ea3)
+```
+
+Against the plain hosts of rows 4 and 10 to 12, `update --check` printed "the release host names no latest release",
+as it should with no `/latest` redirect.
+
+### 25a. Homebrew and pip on this Mac
+
+The formula is `packaging/homebrew-tap/Formula/dromos.rb` as `bump-formula.sh` rewrites it for this release (its
+`url`, `version` and `sha256` pointed at the Mac's release host), installed from a tap made for the row with `brew
+tap-new --no-git lernex/rehearsal`. Homebrew 7 refuses a formula from an untrusted tap, so the row trusted it with
+`brew trust --formula` and untrusted it afterwards.
+
+```
+brew install       /opt/homebrew/Cellar/dromos/0.1.0-rc2: 12 files, 2.9MB
+--version          dromos 0.1.0-rc2 (darwin-arm64, 4a85ea3)
+doctor             rc 0, Metal backend, missing none
+update --check     this dromos was installed with homebrew. Update it with `brew upgrade dromos`.
+brew test          rc 0 (the formula's test runs --version and doctor)
+brew audit         --strict: rc 0, no problems
+brew style         1 file inspected, no offenses detected
+run praxis         51 on Metal
+uninstall, untap   rc 0; no dromos formula, trust or tap left
+```
+
+pip, from the same tarball:
+
+```
+build_wheel.py     dromos-0.1.0rc2-py3-none-macosx_14_0_arm64.whl (1.26 MB), macOS target 14.0; twine check passes
+pip install        rc 0 in a fresh Python 3.12.13 venv
+--version          dromos 0.1.0-rc2 (darwin-arm64, 4a85ea3)
+update --check     this dromos was installed with pip. Update it with `pip install -U dromos`.
+run praxis         51 on Metal
+```
+
+The first pass of rows 25 and 26 printed rc 127 for the prompt: the row script called `timeout`, which macOS does not
+have. The rerun timed the prompt another way and both passed; nothing in the release changed between them.
+
+### 27a. The aarch64 wheel (Docker Desktop on this Mac)
+
+`build_wheel.py` from the aarch64 tarball makes `dromos-0.1.0rc2-py3-none-manylinux_2_28_aarch64.whl`. In Ubuntu
+24.04 (Python 3.12.3): `twine check` passes, `pip install` rc 0, `dromos 0.1.0-rc2 (linux-aarch64-cpu, 4a85ea3)`,
+`doctor` rc 0 with missing none, and `update --check` names pip.
+
+### 28a and 29a. The cuda12 wheel
+
+`build_wheel.py --tree` from the cuda12 tarball, as `pypi.yml` runs it, makes
+`dromos-0.1.0rc2-py3-none-manylinux_2_28_x86_64.whl` (60 MB). It leaves `libcublasLt.so.12` and `libcudart.so.12` out
+and requires NVIDIA's wheels instead (`nvidia-cuda-runtime-cu12>=12.8.90,<13`, `nvidia-cublas-cu12>=12.8.5.5,<13`),
+so the 752 MB cuBLASLt comes from NVIDIA's wheel, not ours. `twine check` passes.
+
+```
+28a  GPU server, fresh Python 3.14 venv
+     pip install    rc 0: dromos 0.1.0rc2, nvidia-cublas-cu12 12.9.2.10, nvidia-cuda-runtime-cu12 12.9.79, nvidia-cuda-nvrtc-cu12 12.9.86
+     --version      dromos 0.1.0-rc2 (linux-x86_64-cuda12, be70353)
+     doctor praxis  rc 0: RTX 5070 Ti, CUDA driver 13.2, runtime 12.9, backend libdromos_kernels.so from the wheel, missing none
+     run praxis     51 on the GPU
+     update --check this dromos was installed with pip. Update it with `pip install -U dromos`.
+29a  ubuntu:24.04 container on the GPU server, no GPU passed in, Python 3.12.3
+     pip install    rc 0, the same NVIDIA wheels
+     --version      dromos 0.1.0-rc2 (linux-x86_64-cuda12, be70353)
+     doctor         rc 0: the CPU backend (i5-14500, AVX2, FMA, F16C, AVX-VNNI, 68 GB/s measured on 14 threads),
+                    libdromos_cpu.so from the wheel, missing none
+     run praxis     51 on the CPU
+```
+
+pip takes the newest 12.x of NVIDIA's wheels, 12.9 here, under a build made with 12.8. CUDA's minor-version
+compatibility is what lets that run, and row 28 is it running.
 
 ## Round 3: Windows x64 (2026-10-28)
 
@@ -572,6 +765,22 @@ gets the same run once it is built from the RC tarball.
 
 ## Findings
 
+- Fixed in round 4 (`4a85ea3`): the rename (`db23c4e`) wrote the release address as `github.com/dromos/dromos` into
+  `install.sh`, `engine/core/update.cpp`, `docker/Dockerfile` and the Homebrew formula and its bump script. The
+  repository is `lernex/dromos`, so every install, update and image build would have asked a host that does not
+  exist. They now name `github.com/lernex/dromos`, and `release.yml`'s `release-address` job stops a release whose
+  `install.sh`, `update.cpp` or `Dockerfile` names any address but its own repository's.
+- Fixed in round 4 (`6822467`): the CUDA flavors' toolkit came from NVIDIA's package repositories, whose RHEL indexes
+  were broken for hours on October 29, and which serve the newest packages of a series. It now comes from NVIDIA's
+  redistributable archives, pinned by manifest and sha256 (How it was built, round 4). The Windows flavor's
+  `cuda-toolkit.ps1` pins the same manifest.
+- Fixed after round 4 (`d290c4d`): `doctor praxis` on a BF16 checkpoint listed NVFP4 under the formats that fit,
+  with a refusal as its load, and the refusal named a GPTQ checkpoint by its folder on the GPU server
+  (`/home/aiadmin/kronos-scratch/...`); `run`'s refusal listed it the same way. NVFP4's load is now the command that
+  runs it, `dromos run Lernex/Metis-1.6-Praxis-NVFP4` (or Logos), on a line of its own; "fits" lists only what this
+  checkpoint loads; and `release.yml` fails a release whose engine, CLI or installers hold a `/home/` or
+  `kronos-scratch` path. The GPTQ folder behind that name loads in rc2 as stored NVFP4 (`doctor` on it).
+
 - Windows lets a running program's folder be renamed. `dromos update` uses that: a version still serving is moved
   aside whole and keeps running, and the next update deletes what is left (18a). `install.ps1` instead asks the
   process list before it replaces or removes a version, since a rename cannot tell it one is running (23a).
@@ -630,6 +839,9 @@ gets the same run once it is built from the RC tarball.
 
 ## Open items
 
+- `Lernex/Metis-1.6-Praxis-NVFP4` and `Lernex/Metis-1.6-Logos-NVFP4`, the names NVFP4's line gives (`d290c4d`), must
+  be public on launch day, or the two lines of `kNvfp4` in `engine/core/checkpoint.cpp` emptied before the freeze so
+  the line says none is published. The owner's decision. Row 10's `doctor praxis` on the freeze build shows which.
 - `release.yml`, `pypi.yml` and `docker.yml` have not run on GitHub yet: Actions is held on the private repository by
   billing until November 1 (round 2, How the release candidate was built). Their first run is the v0.1.0 tag once the
   repository is public. Round 2 followed `release.yml`'s steps by hand on the same base images and scripts, and
