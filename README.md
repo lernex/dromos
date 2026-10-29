@@ -3,6 +3,30 @@
 The inference engine for Lernex's Metis models, written from scratch for them.
 Private until launch. Architecture: `docs/ARCHITECTURE.md`. Kernel ABI: `engine/cuda/kernels.h`.
 
+## Install
+
+```bash
+curl -fsSL https://github.com/lernex/dromos/releases/latest/download/install.sh | sh   # Linux, macOS
+```
+
+```powershell
+irm https://github.com/lernex/dromos/releases/latest/download/install.ps1 | iex           # Windows 10 1809+ x64
+```
+
+Either installer picks the build for the machine (CUDA 12 on an NVIDIA GPU with a new enough driver, Metal on Apple
+silicon, the CPU otherwise), checks it against the release's `SHA256SUMS`, and puts `dromos` on your `PATH`; run it
+again to upgrade, or `dromos update`. Also `pip install dromos`, `brew trust --formula lernex/tap/dromos && brew install
+lernex/tap/dromos`, and `docker run --gpus all -p 8080:8080 ghcr.io/lernex/dromos praxis`. Where each puts things,
+and the flavors: `docs/RELEASE.md`. Then:
+
+```bash
+dromos doctor          # the backend this machine runs and what it can do
+dromos run praxis      # chat in the terminal (downloads the model the first time)
+dromos serve logos     # the OpenAI API on http://127.0.0.1:8080/v1
+```
+
+## Develop
+
 ```bash
 scripts/remote.sh <slot> test        # build on the GPU server; the kernel tests and the C++ unit tests
 scripts/remote.sh <slot> run ./build/dromos_tests   # the C++ tests (scheduler, digests, hub)

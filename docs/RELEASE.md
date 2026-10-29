@@ -22,7 +22,10 @@ is a stable link:
 | `dromos-linux-x86_64-cpu.tar.gz` | CPU backend only |
 | `dromos-linux-aarch64-cpu.tar.gz` | CPU backend only |
 | `dromos-darwin-arm64.tar.gz` | Metal backend (macOS 14+) |
-| `install.sh` | the installer |
+| `dromos-windows-x86_64-cuda12.zip` | CUDA backend, every architecture, plus the CPU backend (Windows 10 1809+ x64) |
+| `dromos-windows-x86_64-cpu.zip` | CPU backend only |
+| `install.sh` | the installer (Linux, macOS) |
+| `install.ps1` | the installer (Windows) |
 | `SHA256SUMS` | `sha256sum` format, one line per asset above |
 
 One CUDA flavor ships, built with CUDA 12.8. Measured 2026-10-28 on an RTX 5070 Ti (driver 595), Praxis:
@@ -30,12 +33,13 @@ the 12.8 build decodes 293.9 / 1,140 tok/s at 1 / 8 streams against 295.2 / 1,16
 the same KL to the reference, and 12.8 runs on older drivers. The driver it needs: 570.26 or newer for the
 12.8 toolkit (and for any RTX 50 card), 525.60.13 or newer for older cards through NVIDIA's minor-version
 compatibility (the build carries real code for every architecture, no PTX to JIT; drivers below 595 are
-untested). An older driver, or no GPU, gets the CPU flavor. `scripts/release/build.sh` still builds a
+untested). On Windows the floors are 570.65 for the 12.8 toolkit and 527.41 through minor-version compatibility.
+An older driver, or no GPU, gets the CPU flavor. `scripts/release/build.sh` still builds a
 `cuda13` flavor, and install.sh prefers it when a release lists one.
 
 ## The tree
 
-Every tarball unpacks, with no top directory, to:
+Every archive unpacks, with no top directory, to:
 
     bin/dromos
     lib/libdromos_kernels.so  libdromos_cpu.so      (linux; libdromos_metal.dylib on macOS)
@@ -45,8 +49,16 @@ Every tarball unpacks, with no top directory, to:
     share/dromos/licenses/                         third-party licenses (and NVIDIA's EULA, CUDA flavor)
     LICENSE  NOTICE                                Apache-2.0, and what else ships under which terms
 
+The Windows zip is the same tree with the backends beside the engine, where Windows looks for a program's DLLs:
+
+    bin\dromos.exe  dromos_cpu.dll  dromos_kernels.dll
+    bin\cudart64_12.dll  cublasLt64_12.dll          (CUDA flavor only, the toolkit's own)
+    share\dromos\...  LICENSE  NOTICE              as above
+
 `bin/dromos` finds its backends in `../lib` (already done by engine/dispatch), and the backends find
-the bundled CUDA libraries through an `$ORIGIN` rpath. Tuning tables are read from `../share/dromos/tuning`
+the bundled CUDA libraries through an `$ORIGIN` rpath. On Windows the engine loads each backend with its own
+folder searched first for what it links (`LoadLibraryExW`, engine/platform/posix_win.cpp), so the CUDA backend finds
+the DLLs beside it, then `PATH` (where pip's NVIDIA wheels are put). Tuning tables are read from `../share/dromos/tuning`
 next to the real executable, then the source tree they were built from. Nothing reads a path baked in at
 build time unless it exists.
 
@@ -64,6 +76,19 @@ command: `dromos update` for `tarball`, `brew upgrade dromos`, `pip install -U d
 | `~/.cache/dromos/models/` | models (`DROMOS_MODELS` overrides) |
 | `~/.cache/dromos/update-check` | the daily check's cache |
 
+On Windows (engine/platform/platform.cpp and install.ps1 name these folders, and only they do):
+
+| Path | What |
+|---|---|
+| `%LOCALAPPDATA%\Programs\Dromos\versions\X.Y.Z\` | an installed tree (install.ps1 and `dromos update`) |
+| `%LOCALAPPDATA%\Programs\Dromos\current`, `previous` | directory junctions; `current` is retargeted in place |
+| the user `PATH` | gains `%LOCALAPPDATA%\Programs\Dromos\current\bin` once (install.ps1) |
+| `%LOCALAPPDATA%\Dromos\models\` | models (`DROMOS_MODELS` overrides) |
+| `%LOCALAPPDATA%\Dromos\update-check`, `tune\` | the daily check's cache, tuning results |
+
+Programs go under `Programs`, as per-user installs do on Windows; data that can be fetched again goes beside it.
+`~` in a path given on the command line is `%USERPROFILE%`.
+
 Environment: `DROMOS_NO_UPDATE_CHECK=1` turns the daily check off. `DROMOS_RELEASES` (default
 `https://github.com/lernex/dromos/releases`) points install.sh and `dromos update` at another
 release host, for tests.
@@ -73,17 +98,24 @@ release host, for tests.
 - `dromos update` finds the latest release, downloads this install's flavor, checks it against
   `SHA256SUMS`, unpacks it to `~/.dromos/versions/NEW`, flips `current`, and keeps the previous
   version for one rollback. `dromos update --check` only reports.
+- On Windows `current` is a junction, retargeted in place. A version that is still running (a `dromos serve` from
+  before the update) is renamed out of `versions` (Windows lets the folder of a running program move) and deleted
+  once it stops: the next update or install sweeps what it could not remove.
 - `run` and `serve` print one quiet line when a newer release is known: at most one network check a
   day, in the background with a short timeout, cached, so startup never waits on it.
 
 ## Install paths
 
     curl -fsSL https://github.com/lernex/dromos/releases/latest/download/install.sh | sh
+    irm https://github.com/lernex/dromos/releases/latest/download/install.ps1 | iex      (Windows PowerShell)
     brew trust --formula lernex/tap/dromos && brew install lernex/tap/dromos
     pip install dromos
     docker run --gpus all -p 8080:8080 -v dromos:/root/.cache/dromos ghcr.io/lernex/dromos praxis
 
 install.sh picks the flavor from the OS, the architecture and the NVIDIA driver; re-running it upgrades.
+install.ps1 does the same on Windows from `nvidia-smi` (driver and compute capability), needs no administrator
+rights, and puts `current\bin` on the user `PATH`. Both honour `DROMOS_VERSION`, `DROMOS_RELEASES`, and
+`DROMOS_FLAVOR` (`cpu` or `cuda12`; `install.sh` also takes `cuda13`).
 Homebrew 7 loads a formula from a third-party tap only once it is trusted, so the brew install is two
 commands: `brew trust --formula lernex/tap/dromos` once, then `brew install lernex/tap/dromos`. The tap is
 github.com/lernex/homebrew-tap; its `Formula/dromos.rb` is the one in `packaging/homebrew-tap`.
@@ -91,14 +123,14 @@ github.com/lernex/homebrew-tap; its `Formula/dromos.rb` is the one in `packaging
 ## Cutting a release
 
 1. Tag `vX.Y.Z` on `main` and push the tag. `release.yml` builds every flavor and drafts the GitHub release
-   with the tarballs, `install.sh` and `SHA256SUMS`.
+   with the tarballs and zips, `install.sh`, `install.ps1` and `SHA256SUMS`.
 2. Check the draft's assets (install each flavor on a clean machine), then publish it. Publishing starts
    `pypi.yml` (the wheels, through the `pypi` environment) and `docker.yml` (the GHCR image).
 3. Bump the tap: in a checkout of lernex/homebrew-tap, run
    `<engine checkout>/packaging/homebrew-tap/bump-formula.sh X.Y.Z Formula/dromos.rb`, commit and push. Nothing
    automates this step: it needs push access to the tap, and a CI deploy key for it is the owner's decision.
    Copy the bumped formula back into `packaging/homebrew-tap/Formula/dromos.rb` here so the two stay the same.
-4. Check each channel installs the new version: `install.sh`, `brew upgrade dromos`, `pip install -U dromos`,
+4. Check each channel installs the new version: `install.sh`, `install.ps1`, `brew upgrade dromos`, `pip install -U dromos`,
    `docker pull ghcr.io/lernex/dromos`, and `dromos update` from the previous release.
 
 ## Build bases
@@ -107,3 +139,10 @@ Linux builds run on an old base so the binaries run on any current distribution:
 (glibc 2.28) where the CUDA toolkit allows it, else ubuntu 22.04. The CPU backend compiles every ISA
 level and picks at run time (engine/cpu); nothing is built with `-march=native`. macOS builds target 14.0.
 TLS comes from the system libcurl, opened at run time (engine/core/http.cpp), so no OpenSSL is linked.
+
+Windows builds run on `windows-2022` with Visual Studio 2022's MSVC (`scripts/release/build.ps1`), the C runtime
+linked statically so no Visual C++ redistributable is needed, and a manifest that makes the process UTF-8 and
+long-path aware. The CUDA flavor uses nvcc 12.8 with `cl` as its host compiler, from NVIDIA's redistributable archives
+(`scripts/release/cuda-toolkit.ps1`; the toolkit installer does not run unattended). TLS and proxies come from
+WinHTTP, the system's own HTTP stack, so the certificate store and proxy settings are Windows's and nothing ships
+for them. The zip is packed with fixed timestamps (`scripts/release/pack_zip.py`), so a commit gives the same bytes.
