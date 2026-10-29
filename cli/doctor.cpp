@@ -166,7 +166,7 @@ void print_device(const lx::runtime::DeviceInfo& d) {
 }
 
 // The plan for a model folder, as dromos doctor prints it.
-void print_plan(const lx::runtime::Plan& plan, bool cpu) {
+void print_plan(const lx::runtime::Plan& plan, bool cpu, bool automatic) {
   using namespace lx::runtime;
   std::printf("\nformats    %-6s %-4s %10s %12s %-14s %-18s %s\n", "", "fits", "weights", "decode est.", "maths",
               "with --fast-math", "loads");
@@ -232,6 +232,9 @@ void print_plan(const lx::runtime::Plan& plan, bool cpu) {
   else
     std::printf("speculate  on for one stream: prompt-lookup drafts are checked in one pass, output unchanged "
                 "(--no-spec turns it off)\n");
+  if (automatic)
+    std::printf("sequences  %d, as dromos serve sizes them; dromos run plans one, which leaves more room "
+                "(--sequences 1 shows that plan)\n", plan.max_slots);
   std::printf("\nplan\n");
   for (const std::string& note : plan.notes) std::printf("  %s\n", note.c_str());
 }
@@ -321,7 +324,7 @@ void print_roofline(const lx::MetisConfig& config, lx_wtype target, bool bf16x_d
               "decode copies");
   for (const lx::runtime::FormatOption& o : *options) {
     if (!o.loadable) continue;
-    const bool copies = o.format != LX_W_BF16X && lx::runtime::bf16x_available();
+    const bool copies = o.format != LX_W_BF16X && lx::runtime::bf16x_available() && lx::runtime::bf16x_copies_pay(device);
     const DecodeTraffic t = config_decode_traffic(config, o.format, copies, 512);
     std::printf("           %-6s %11.1f MB %13s tok/s %13s tok/s   %s\n", lx::runtime::format_name(o.format).c_str(),
                 t.bytes_per_token() / 1e6,
@@ -385,14 +388,14 @@ int cmd_doctor(int argc, char** argv) {
         const lx_wtype target = static_cast<lx_wtype>(req.weights);
         std::printf("checkpoint not read: counted as the loader's %s recipe holds this config (--modelled)\n",
                     format_name(target).c_str());
-        print_roofline(config, target, req.bf16x && bf16x_available(), device, nullptr);
+        print_roofline(config, target, req.bf16x && bf16x_available() && bf16x_copies_pay(device), device, nullptr);
       } else {
         const CheckpointInfo checkpoint = inspect_checkpoint(dir);
         std::printf("checkpoint %s\n", checkpoint.description.c_str());
         if (const char* v = std::getenv("LX_VRAM_BUDGET_GB")) req.vram_budget = static_cast<size_t>(std::atof(v) * 1073741824.0);
         if (const char* v = std::getenv("LX_RAM_BUDGET_GB")) req.ram_budget = static_cast<size_t>(std::atof(v) * 1073741824.0);
         const Plan plan = make_plan(device, config, checkpoint, req);
-        print_plan(plan, device.cpu);
+        print_plan(plan, device.cpu, req.sequences <= 0);
         print_roofline(config, plan.weights, plan.bf16x_decode, device, &plan.options, &plan.bf16x_dropped);
       }
     }

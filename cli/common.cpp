@@ -116,7 +116,7 @@ LoadedWeights load_weights(const fs::path& dir, const MetisConfig& config, const
   const runtime::DeviceInfo device = runtime::query_device(0);
   LoadedWeights out;
   out.format = target;
-  out.formats = runtime::model_formats(target, device, flags.bf16x && runtime::bf16x_available(), flags.fast_math);
+  out.formats = runtime::model_formats(target, device, flags.bf16x && runtime::bf16x_available() && runtime::bf16x_copies_pay(device), flags.fast_math);
   LoadOptions options;
   options.target = target;
   out.weights = std::make_unique<ModelWeights>(ModelWeights::load(dir, config, options));

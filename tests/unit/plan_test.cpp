@@ -623,6 +623,29 @@ TEST_CASE("a CPU with the model's size in RAM but less of it free: resident, wit
   CHECK(names_no_gpu(p));
 }
 
+TEST_CASE("a CPU makes no BF16X decode copies by default, and doctor's estimate reads the BF16 weights") {
+  // The copies decoded 10% slower than the BF16 weights on an AVX2 desktop (plan.cpp, bf16x_copies_pay).
+  const DeviceInfo d = simulated_cpu("Windows VM CPU", 64);
+  CHECK_FALSE(bf16x_copies_pay(d));
+  const Plan p = make_plan(d, praxis(), bf16_checkpoint(), PlanRequest{});
+  CHECK(p.weights == LX_W_BF16);
+  CHECK_FALSE(p.bf16x_decode);
+  CHECK(p.bf16x_bytes == 0);
+  if (bf16x_available()) CHECK(p.bf16x_reason.find("on a CPU") != std::string::npos);
+  for (const FormatOption& o : p.options) CHECK(o.bf16x_bytes == 0);
+  CHECK(bf16x_copies_pay(simulated("RTX 5070 Ti 16GB", 120, 16, 896, 70)));
+}
+
+TEST_CASE("one sequence is said in the singular") {
+  const DeviceInfo d = simulated_cpu("Windows VM CPU", 64);
+  PlanRequest one;
+  one.sequences = 1;
+  const Plan p = make_plan(d, praxis(), bf16_checkpoint(), one);
+  REQUIRE(p.max_slots == 1);
+  CHECK(has_note(p, "One sequence, "));
+  CHECK_FALSE(has_note(p, "Up to 1 sequences"));
+}
+
 TEST_CASE("a refusal lists what runs from this checkpoint, and NVFP4 with the command that loads it") {
   // The 8.5 GB Windows VM, with the budget held down so BF16 is refused and the narrower formats fit.
   DeviceInfo d = simulated_cpu("Windows VM CPU", 8.5);

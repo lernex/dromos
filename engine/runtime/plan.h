@@ -207,6 +207,8 @@ double decode_ceiling_tps(const DeviceInfo& device, const MetisConfig& config, l
                           int context, const std::set<std::string>* dropped = nullptr);
 // Whether the loaded backend has the BF16X kernels (the CUDA one does).
 bool bf16x_available();
+// Whether decode is faster from the BF16X copies than from the BF16 weights on this device: on a GPU, not on a CPU.
+bool bf16x_copies_pay(const DeviceInfo& device);
 // Persistent state: the Mamba-2 conv and SSM state of one slot, and the attention KV cache of one slot
 // at `capacity` positions. Both count every pass.
 size_t state_bytes_per_slot(const MetisConfig& config);

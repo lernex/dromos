@@ -305,6 +305,11 @@ int weights_from_flag(const std::string& name) {
 
 bool bf16x_available() { return lx_bf16x_row_bytes(1024) > 0; }
 
+// A GPU decodes faster from the BF16X copies: it reads about 1.3x fewer bytes, and the expansion hides behind the loads.
+// A CPU does not. Praxis BF16 on an AVX2 desktop (i5-14500, 6 threads, 2026-10-29) decoded a 200-word answer at 17 to
+// 18 tok/s with the copies and 19 to 20 without: expanding the encoding costs the cores more than the bytes it saves.
+bool bf16x_copies_pay(const DeviceInfo& d) { return !d.cpu; }
+
 WeightRecipe recipe_for(lx_wtype target) {
   WeightRecipe r;
   switch (target) {
@@ -715,9 +720,9 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
     o.loadable = can_load(f, stored, c, &o.load);
     if (f == LX_W_BF16X && !o.loadable && stored != LX_W_BF16) continue;  // only a BF16 file has a BF16X form
     o.weight_bytes = weight_bytes(c, f).total();
-    if (f != LX_W_BF16X && bf16x_kernels) o.bf16x_bytes = weight_bytes(c, f, true).bf16x;
+    if (f != LX_W_BF16X && bf16x_kernels && bf16x_copies_pay(d)) o.bf16x_bytes = weight_bytes(c, f, true).bf16x;
     o.fits = attempt(f, false, useful_slots, kUsefulContext, slot_cap).ok;
-    o.decode_ceiling_tps = decode_ceiling_tps(d, c, f, f != LX_W_BF16X && bf16x_kernels, kUsefulContext);
+    o.decode_ceiling_tps = decode_ceiling_tps(d, c, f, f != LX_W_BF16X && bf16x_kernels && bf16x_copies_pay(d), kUsefulContext);
     o.maths = maths_text(model_formats(f, d, false));
     const std::string fast = maths_text(model_formats(f, d, false, true));
     o.fast_maths = fast == o.maths ? std::string("-") : fast;
@@ -747,7 +752,7 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
   // for (the useful count, by default), and the step's scratch. The copies come after, from what is left (block C).
   const int reserve = req.sequences > 0 ? req.sequences : kUsefulSlots;
   const size_t copies = target == LX_W_BF16X ? 0 : weight_bytes(c, target, true).bf16x;
-  const bool copies_wanted = copies > 0 && req.bf16x && bf16x_kernels;
+  const bool copies_wanted = copies > 0 && req.bf16x && bf16x_kernels && bf16x_copies_pay(d);
   // The count asked for is tried first, in full; failing that, the useful count, with as many as fit up to the count asked.
   Fit chosen = attempt(target, false, reserve, kUsefulContext, reserve);
   if (!chosen.ok) chosen = attempt(target, false, useful_slots, kUsefulContext, reserve);
@@ -755,6 +760,9 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
   if (copies > 0) {
     if (!req.bf16x) bf16x_off = "BF16X decode copies off (--no-bf16x): decode reads the BF16 weights.";
     else if (!bf16x_kernels) bf16x_off = "No BF16X decode copies: the loaded backend has no BF16X kernels.";
+    else if (!bf16x_copies_pay(d))
+      bf16x_off = "No BF16X decode copies: on a CPU, expanding them costs more time than the bytes they save, so decode "
+                  "reads the BF16 weights.";
   }
 
   // Not resident usefully: offload the routed experts in the same format before anything narrower is considered.
@@ -952,8 +960,9 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
     n.push_back(std::string(d.cpu ? "This CPU has no instruction for " : "This GPU has no tensor-core instruction for ") +
                 format_name(p.recipe.dense) + " math, so the weights are expanded in registers and multiplied in " +
                 (d.cpu ? "f32." : "BF16."));
-  n.push_back("Up to " + std::to_string(p.max_slots) + " sequences, " + std::to_string(p.kv_capacity) +
-              " tokens each (" + gb(p.state_bytes + p.kv_bytes) + " of state and cache)" +
+  n.push_back((p.max_slots == 1 ? std::string("One sequence, ") : "Up to " + std::to_string(p.max_slots) + " sequences, ") +
+              std::to_string(p.kv_capacity) + (p.max_slots == 1 ? " tokens (" : " tokens each (") + gb(p.state_bytes + p.kv_bytes) +
+              " of state and cache)" +
               (req.sequences > p.max_slots ? ": " + std::to_string(req.sequences) + " were asked for" : "") + ".");
   n.push_back("A step takes up to " + std::to_string(p.max_step_tokens) + " tokens; prompts are prefilled " +
               std::to_string(p.prefill_chunk) + " tokens at a time.");
