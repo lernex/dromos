@@ -441,6 +441,10 @@ float* connection_params(Impl& m, const ModelWeights& weights, const std::string
 // A projection as the program products read it: its BF16X copy when it has one (the same bf16 values, decoded as
 // read), else its weight in the format the model holds it.
 lx_weight wview(const Linear& l) { return l.x16 ? lx_weight{LX_W_BF16X, l.x16, nullptr, 1.0f, nullptr} : l.w; }
+// The decode program's copy of a projection: the bf16 tensor where the model holds one. Prefill reads it, and the
+// program's BF16X reader is ALU-bound (its copy saves bytes the step is not waiting on), so the bf16 copy decodes
+// faster; the bits are the same either way (BF16X decodes to the bf16 values). Graphs keep wview.
+lx_weight pview(const Linear& l) { return l.w.type == LX_W_BF16 ? l.w : wview(l); }
 
 // A bf16 copy of a projection's weight on the device (dequantized from its format), for reads that take bf16 only.
 const void* dequantized_bf16(Impl& m, const Linear& l) {
@@ -1440,7 +1444,7 @@ void program_memory_write(Impl& m, const MetisConfig& c, lx_program* p, const fl
   const int D = m.D, R = m.R, Mm = m.M, stride = 2 * D + 4;
   lx_entry_args e{};
   e.state = state;
-  e.w_state = wview(m.m_state);
+  e.w_state = pview(m.m_state);
   e.b_state = m.m_state.bias;
   e.summary = m.summary;
   e.entropy = m.entropy;
@@ -1515,7 +1519,7 @@ lx_program* build_program(Impl& m, const MetisConfig& c, int T, float* logits) {
         // routing features: tanh(route_projection([state, retrieved, history]))
         {
           const lx_fx x = fx_concat({{m.state, D}, {m.mem_summary, D}, {m.history, R}}, true);
-          const lx_weight w = wview(m.route_in);
+          const lx_weight w = pview(m.route_in);
           lx_fy y = fy_store(m.features, LX_F32, R);
           y.bias = m.m_route.bias;
           y.bias_dtype = LX_BF16;
@@ -1531,7 +1535,7 @@ lx_program* build_program(Impl& m, const MetisConfig& c, int T, float* logits) {
         wr.next_parts = m.next_parts;
         if (layer.attention) {
           const lx_fx x = fx_plain(m.h_bf, LX_BF16, D);
-          const lx_weight w = wview(layer.qkv);
+          const lx_weight w = pview(layer.qkv);
           lx_fy y = fy_store(m.qkv_buf, LX_F32, m.qkv_width);
           y.lora_up = layer.lora_up.w.data;
           y.lora = m.lora_f;
@@ -1551,11 +1555,11 @@ lx_program* build_program(Impl& m, const MetisConfig& c, int T, float* logits) {
           a.scale = 1.0f / std::sqrt(static_cast<float>(m.Dh));
           add(lx_program_attention(p, &a), "attention");
           const lx_fx xo = fx_plain(m.att_bf, LX_BF16, m.AH * m.Dh);
-          const lx_weight wo = wview(layer.out);
+          const lx_weight wo = pview(layer.out);
           write_op = add(lx_program_gemv(p, &xo, &wo, &wr, D, m.AH * m.Dh), "attention out");
         } else {
           const lx_fx x = fx_plain(m.h_bf, LX_BF16, D);
-          const lx_weight w = wview(layer.in_proj);
+          const lx_weight w = pview(layer.in_proj);
           const lx_fy y = fy_store(m.zxbcdt, LX_F32, m.proj);
           add(lx_program_gemv(p, &x, &w, &y, m.proj, D), "in_proj");
           lx_ssm_args a{};
@@ -1587,7 +1591,7 @@ lx_program* build_program(Impl& m, const MetisConfig& c, int T, float* logits) {
           xo.norm_w = layer.norm_w;
           xo.eps = c.mamba_norm_eps;
           xo.group = m.I / m.G;
-          const lx_weight wo = wview(layer.out_proj);
+          const lx_weight wo = pview(layer.out_proj);
           write_op = add(lx_program_gemv(p, &xo, &wo, &wr, D, m.I), "out_proj");
         }
         const int n_parts = lx_program_tasks(p, write_op);
@@ -1604,7 +1608,7 @@ lx_program* build_program(Impl& m, const MetisConfig& c, int T, float* logits) {
           x.n_parts = n_parts;
           x.norm_w = layer.moe_conn.norm;
           x.eps = c.rms_norm_eps;
-          const lx_weight w = wview(layer.latent_down);
+          const lx_weight w = pview(layer.latent_down);
           lx_fy y = fy_store(m.latent, LX_F32, Lat);
           y.out_bf = m.latent_bf;
           y.ld_bf = Lat;
@@ -1639,11 +1643,12 @@ lx_program* build_program(Impl& m, const MetisConfig& c, int T, float* logits) {
           a.latent = m.latent_bf;
           a.ids = m.route_ids;
           a.weights = m.route_w;
-          a.gate_up = layer.gate_up_x16 ? lx_weight{LX_W_BF16X, layer.gate_up_x16, nullptr, 1.0f, nullptr}
-                                        : layer.gate_up;
-          a.down = layer.down_x16 ? lx_weight{LX_W_BF16X, layer.down_x16, nullptr, 1.0f, nullptr} : layer.down;
-          a.shared_gate_up = wview(layer.shared_gate_up);
-          a.shared_down = wview(layer.shared_down);
+          // the expert stacks as the model holds them: bf16 where it holds bf16 (pview's rule; a BF16X copy is
+          // only ever made of a bf16 stack), so the program's expert products read the bf16 stacks
+          a.gate_up = layer.gate_up;
+          a.down = layer.down;
+          a.shared_gate_up = pview(layer.shared_gate_up);
+          a.shared_down = pview(layer.shared_down);
           a.out = m.routed;
           a.L = Lat;
           a.I = m.Iexp;
@@ -1653,7 +1658,7 @@ lx_program* build_program(Impl& m, const MetisConfig& c, int T, float* logits) {
         }
         {
           const lx_fx x = fx_plain(m.routed, LX_F32, Lat);
-          const lx_weight w = wview(layer.latent_up);
+          const lx_weight w = pview(layer.latent_up);
           lx_fy y = fy_write(m, ec);
           if (layer.attention) y.state = m.wstate;
           add(lx_program_gemv(p, &x, &w, &y, D, Lat), "latent_up");
@@ -1685,7 +1690,7 @@ lx_program* build_program(Impl& m, const MetisConfig& c, int T, float* logits) {
       if (last) break;
       {
         const lx_fx x = fx_concat({{m.state, D}, {m.mem_summary, D}, {m.difference, D}, {m.history, R}}, true);
-        const lx_weight w = wview(m.m_route);
+        const lx_weight w = pview(m.m_route);
         lx_fy y = fy_store(m.features, LX_F32, R);
         y.bias = m.m_route.bias;
         y.bias_dtype = LX_BF16;
@@ -1717,7 +1722,7 @@ lx_program* build_program(Impl& m, const MetisConfig& c, int T, float* logits) {
     x.n_parts = 1;
     x.norm_w = m.final_norm;
     x.eps = c.rms_norm_eps;
-    const lx_weight w = wview(m.head);
+    const lx_weight w = pview(m.head);
     const lx_fy y = fy_store(logits, LX_F32, c.vocab_size);
     add(lx_program_gemv(p, &x, &w, &y, c.vocab_size, D), "head");
     const int e = lx_program_build(p);

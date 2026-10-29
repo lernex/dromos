@@ -838,15 +838,19 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
     const std::string kept =
         target == LX_W_BF16 ? "the BF16 weights" : "the BF16 tensors " + format_name(target) + " keeps wide";
     const std::string seqs = std::to_string(slots) + (slots == 1 ? " sequence" : " sequences");
+    // The graph decode reads the copies. The opt-in decode program reads the same tensors as stored, which holds the
+    // same bits, since a BF16X copy decodes to exactly the bf16 values it was made from.
+    const std::string program = " The opt-in decode program reads " + kept + " as stored, to the same bits.";
     if (!bf16x_off.empty()) bf16x_reason = bf16x_off;
     else if (dropped.empty())
-      bf16x_reason = "Decode reads lossless BF16X copies of " + kept + " (" + gb(copy_bytes) +
-                     " more): the same logits to the bit from about 1.3x fewer bytes. Prefill reads the BF16 copy.";
+      bf16x_reason = "Graph decode reads lossless BF16X copies of " + kept + " (" + gb(copy_bytes) +
+                     " more): the same logits to the bit from about 1.3x fewer bytes." + program +
+                     " Prefill reads the BF16 copy.";
     else if (kept_units > 0)
-      bf16x_reason = "Decode reads lossless BF16X copies of " + std::to_string(kept_units) + " of " +
+      bf16x_reason = "Graph decode reads lossless BF16X copies of " + std::to_string(kept_units) + " of " +
                      std::to_string(units.size()) + " projections of " + kept + " (" + gb(copy_bytes) +
                      " more); the rest (" + gb(dropped_bytes) + ") read the BF16 weights, as their copies do not fit beside the " +
-                     seqs + ".";
+                     seqs + "." + program;
     else
       bf16x_reason = "BF16X decode copies dropped: their " + gb(copies) + " does not fit beside the " + seqs +
                      "; decode reads the BF16 weights.";
