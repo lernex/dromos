@@ -154,11 +154,10 @@ void print_device(const lx::runtime::DeviceInfo& d) {
     const std::size_t slash = backend.path.rfind('/');
     const std::string file = slash == std::string::npos ? backend.path : backend.path.substr(slash + 1);
     std::printf("backend    %s, %s (%s)\n", backend.backend.c_str(), file.c_str(), backend.path.c_str());
-    // The persistent decode program (lx_program_*, opt-in with LX_PROGRAM) is CUDA's alone: elsewhere the model runs
-    // the same step kernel by kernel, so its absence is not a gap worth reporting.
+    // CUDA-only fast paths (lx::dispatch::optional) have a fallback everywhere else, so their absence is no gap.
     std::vector<std::string> missing;
     for (const std::string& name : backend.missing)
-      if (name.rfind("lx_program_", 0) != 0) missing.push_back(name);
+      if (!lx::dispatch::optional(name)) missing.push_back(name);
     std::printf("missing    %s\n", names_text(missing).c_str());
   }
 }
