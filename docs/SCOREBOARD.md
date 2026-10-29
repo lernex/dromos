@@ -260,17 +260,23 @@ Definitions, for whoever fills it:
 
 | Scheme | Model and format | Draft length or pass depth | Tokens per weight sweep | Weight MB per sweep | Streams | Measured tok/s | Share of one-token ceiling | Acceptance or pass utilisation | Commit | Notes |
 |---|---|---|---|---|---|---|---|---|---|---|
-| Prompt lookup, lone stream | Praxis BF16 | up to 6 drafts, adaptive | 1.59 | 1827 | 1 | 418 | 89% | 0.48 accepted | this commit | 1.37x plain, chat mix, greedy |
-| Prompt lookup, lone stream | Praxis INT8 | up to 6 drafts, adaptive | 1.57 | 1340 | 1 | 476 | 75% | 0.49 accepted | this commit | 1.36x plain, chat mix, greedy |
-| Prompt lookup, lone stream | Logos FP8 | up to 6 drafts, adaptive | 1.59 | 3455 | 1 | 225 | 91% | 0.48 accepted | this commit | 1.38x plain, chat mix, greedy |
+| Prompt lookup, lone stream | Praxis BF16 | up to 6 drafts, adaptive | 1.56 | 1827 | 1 | 416 | 89% | 0.56 accepted | 89edbe2 | 1.36x plain, chat mix, greedy |
+| Prompt lookup, lone stream | Praxis INT8 | up to 6 drafts, adaptive | 1.71 | 1340 | 1 | 509 | 80% | 0.71 accepted | 89edbe2 | 1.46x plain, chat mix, greedy |
+| Prompt lookup, lone stream | Logos FP8 | up to 6 drafts, adaptive | 1.56 | 3455 | 1 | 223 | 90% | 0.55 accepted | 89edbe2 | 1.36x plain, chat mix, greedy |
+| Prompt lookup, lone stream, think 0.8 | Praxis BF16 | up to 6 drafts, adaptive | 1.39 | 1827 | 1 | 365 | 78% | 0.38 accepted | 89edbe2 | 1.23x plain, think_chat |
+| Prompt lookup, lone stream, think 0.8 | Praxis INT8 | up to 6 drafts, adaptive | 1.25 | 1340 | 1 | 394 | 62% | 0.25 accepted | 89edbe2 | 1.17x plain, think_chat |
+| Prompt lookup, lone stream, think 0.8 | Logos FP8 | up to 6 drafts, adaptive | 1.35 | 3455 | 1 | 196 | 79% | 0.35 accepted | 89edbe2 | 1.22x plain, think_chat |
+| Prompt lookup, lone stream, think 0.8, repetition 1.05 | Praxis BF16 | up to 6 drafts, adaptive | 1.19 | 1827 | 1 | 328 | 70% | 0.19 accepted | 06e32fb | 1.12x plain, think_chat |
+| Prompt lookup, lone stream, think 0.8, repetition 1.05 | Praxis INT8 | up to 6 drafts, adaptive | 1.28 | 1340 | 1 | 390 | 61% | 0.28 accepted | 06e32fb | 1.17x plain, think_chat |
+| Prompt lookup, lone stream, think 0.8, repetition 1.05 | Logos FP8 | up to 6 drafts, adaptive | 1.13 | 3455 | 1 | 170 | 69% | 0.12 accepted | 06e32fb | 1.07x plain, think_chat |
 
-Speculative rows are prompt-lookup drafts on a lone stream, from `dromos spec` on the chat mix (the five spec prompts, think and direct_tools, 512 tokens, two repeats). Tokens per weight sweep is tokens per decode step, verify and plain steps together. Weight MB per sweep is the bandwidth time in the roofline table times 853 GB/s. Speedups are chat-mix aggregates over plain decode of the same format, and greedy text is identical to plain on every prompt.
+Speculative rows are prompt-lookup drafts on a lone stream, from `dromos spec` on the chat mix (the five spec prompts, think and direct_tools, 512 tokens, two repeats). Tokens per weight sweep is tokens per decode step, verify and plain steps together. Weight MB per sweep is the bandwidth time in the roofline table times 853 GB/s. Speedups are chat-mix aggregates over plain decode of the same format, and greedy text is identical to plain on every prompt. The think rows are think_chat alone, one prompt, so they are noisier than the mix.
 
-- **Praxis BF16:** 1.37x greedy, 1.35x at temperature 0.3, 1.15x for think at 0.8.
-- **Praxis INT8:** 1.36x greedy, 1.35x at 0.3, 1.17x for think at 0.8.
-- **Logos FP8:** 1.38x greedy, 1.32x at 0.3, 1.23x for think at 0.8.
+- **Praxis BF16:** 1.36x greedy, 1.35x at temperature 0.3, 1.23x for think at 0.8.
+- **Praxis INT8:** 1.46x greedy, 1.35x at 0.3, 1.17x for think at 0.8.
+- **Logos FP8:** 1.36x greedy, 1.36x at 0.3, 1.22x for think at 0.8.
 
-The think numbers are unpenalised: the app sends no repetition penalty, and speculation is off for penalised requests. Pass-pipelined rows are not filled yet.
+Penalised requests speculate too. With a repetition penalty of 1.05 the think gain drops (Praxis BF16 1.23x to 1.12x, Logos FP8 1.22x to 1.07x): the penalty pushes down the context tokens prompt lookup copies, so fewer drafts are accepted (0.38 to 0.19 accepted per step on Praxis BF16). The verify step judges each row with the penalties the plain sampler would apply. Pass-pipelined rows are not filled yet.
 
 ## Against other engines
 
