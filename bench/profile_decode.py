@@ -4,10 +4,10 @@ Two nsys runs of the same model, one eager and serial, one as the engine runs it
 
   LX_NO_GRAPHS=1 LX_SERIAL_DECODE=1 LX_LINEAR_TRACE=out/prof/linear.txt \\
     nsys profile --cuda-graph-trace=node -o out/prof/eager --force-overwrite=true \\
-    build/lernex bench MODEL --streams 1 --prompt-tokens 64 --gen-tokens 16
+    build/dromos bench MODEL --streams 1 --prompt-tokens 64 --gen-tokens 16
   nsys export --type sqlite -o out/prof/eager.sqlite --force-overwrite=true out/prof/eager.nsys-rep
   nsys profile --cuda-graph-trace=node -o out/prof/graph --force-overwrite=true \\
-    build/lernex bench MODEL --streams 1 --prompt-tokens 64 --gen-tokens 128
+    build/dromos bench MODEL --streams 1 --prompt-tokens 64 --gen-tokens 128
   nsys export --type sqlite -o out/prof/graph.sqlite --force-overwrite=true out/prof/graph.nsys-rep
 
   python bench/profile_decode.py out/prof/linear.txt out/prof/eager.sqlite [out/prof/graph.sqlite]

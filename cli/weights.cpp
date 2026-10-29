@@ -1,4 +1,4 @@
-// lernex weights MODEL_DIR bf16|int8|fp8|nvfp4|bf16x [--reference DIR] [--bytes-against DIR] [--samples N]
+// dromos weights MODEL_DIR bf16|int8|fp8|nvfp4|bf16x [--reference DIR] [--bytes-against DIR] [--samples N]
 //
 // The acceptance check of the weight formats. Loads MODEL_DIR in the target format and reports the device
 // memory the load held. Sampled projections are read back as bf16 through lx_dequantize_weight, expert by
@@ -32,7 +32,7 @@ void check(int status, const std::string& what) {
 
 void usage() {
   std::fprintf(stderr,
-               "usage: lernex weights MODEL_DIR bf16|int8|fp8|nvfp4|bf16x [--reference DIR] "
+               "usage: dromos weights MODEL_DIR bf16|int8|fp8|nvfp4|bf16x [--reference DIR] "
                "[--bytes-against DIR] [--samples N]\n");
 }
 

@@ -776,7 +776,7 @@ MetisModel::MetisModel(const MetisConfig& c, const ModelWeights& weights, const 
     // A backend built without the program (-DLX_DECODE_PROGRAM=OFF, as the release flavors are, or one that has
     // none) says so once, plainly, and decodes kernel by kernel.
     if (!lx::dispatch::has("lx_program_create")) {
-      std::fprintf(stderr, "lernex: LX_PROGRAM is set, but this build's %s backend has no decode program; "
+      std::fprintf(stderr, "dromos: LX_PROGRAM is set, but this build's %s backend has no decode program; "
                    "decoding kernel by kernel\n", lx::dispatch::info().backend.c_str());
       m.use_program = false;
     }

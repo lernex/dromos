@@ -23,7 +23,7 @@
 #include <vector>
 
 #include "cpu/cpu.h"
-#include "cpu/lernex_cpu.h"
+#include "cpu/dromos_cpu.h"
 
 #if defined(__linux__)
 #include <dirent.h>
@@ -240,7 +240,7 @@ struct Profile {
     std::sort(ops.begin(), ops.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
     int64_t total = 0;
     for (const auto& [name, e] : ops) total += e.ns;
-    fprintf(stderr, "lernex_cpu profile (%s, %d threads): %.1f ms in ops\n", level, n_threads, total / 1e6);
+    fprintf(stderr, "dromos_cpu profile (%s, %d threads): %.1f ms in ops\n", level, n_threads, total / 1e6);
     for (const auto& [name, e] : ops)
       fprintf(stderr, "  %-22s %8lld calls %10.2f ms %6.1f%% %9.2f us/call\n", name, static_cast<long long>(e.calls),
               e.ns / 1e6, 100.0 * e.ns / total, e.ns / 1e3 / e.calls);

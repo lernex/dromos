@@ -148,7 +148,7 @@ Response get(const std::string& url, const std::vector<std::string>& headers, co
   // a connection that moves less than a kilobyte a second for a minute is dead
   c->setopt(easy, kOptLowSpeedLimit, 1024L);
   c->setopt(easy, kOptLowSpeedTime, 60L);
-  c->setopt(easy, kOptUserAgent, "lernex/" LX_VERSION_STRING);
+  c->setopt(easy, kOptUserAgent, "dromos/" LX_VERSION_STRING);
   if (timeout_seconds > 0) c->setopt(easy, kOptTimeout, timeout_seconds);
   if (guard.list) c->setopt(easy, kOptHttpHeader, guard.list);
   c->setopt(easy, kOptWriteFunction, reinterpret_cast<CurlWrite>(&on_body));

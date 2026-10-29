@@ -16,7 +16,7 @@
 #include <mutex>
 
 #include "cpu/cpu.h"
-#include "cpu/lernex_cpu.h"
+#include "cpu/dromos_cpu.h"
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <cpuid.h>

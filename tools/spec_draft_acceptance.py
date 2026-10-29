@@ -4,7 +4,7 @@
     ~/venvs/vllm-metis/bin/python tools/spec_draft_acceptance.py target TARGET_DIR PROMPTS_JSON OUT_DIR
     # 2. the drafter's logits over prompt + continuation (the engine), then the analysis
     $PY tools/spec_draft_acceptance.py drafter OUT_DIR
-    build/lernex eval DRAFT_DIR OUT_DIR/teacher.json OUT_DIR/logits
+    build/dromos eval DRAFT_DIR OUT_DIR/teacher.json OUT_DIR/logits
     $PY tools/spec_draft_acceptance.py analyze OUT_DIR [COSTS]
 
 Greedy: a draft holds while it equals the target's token, so along the target's own greedy output
@@ -59,7 +59,7 @@ def drafter(out_dir):
         for mode in ("greedy", "sampled"):
             teacher[f"{n}.{mode}"] = ids + data[n][mode]["tokens"]
     (out / "teacher.json").write_text(json.dumps(teacher))
-    print(f"wrote {out / 'teacher.json'}: run `lernex eval DRAFT_DIR {out / 'teacher.json'} {out / 'logits'}`")
+    print(f"wrote {out / 'teacher.json'}: run `dromos eval DRAFT_DIR {out / 'teacher.json'} {out / 'logits'}`")
 
 
 def filtered(logits, temperature, top_p, top_k):

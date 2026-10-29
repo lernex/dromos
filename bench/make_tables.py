@@ -4,10 +4,10 @@
 
 Two throughput definitions, side by side, for every engine view:
   per-token     concurrency x 1000 / mean TPOT, where a stream's TPOT is its mean time per token after its first.
-                THIS IS THE ONE THE PUBLISHED TABLE USES, for lernex and vLLM alike.
+                THIS IS THE ONE THE PUBLISHED TABLE USES, for dromos and vLLM alike.
   window        cli/bench.cpp's decode tok/s: tokens generated after every stream has its first token, over the
                 time to the last stream's last token.
-Views: `bench` is `lernex bench` in process (three runs per format); `serve` is `lernex serve` through
+Views: `bench` is `dromos bench` in process (three runs per format); `serve` is `dromos serve` through
 endpoint_bench.py; `vllm` is vLLM through the same client (TAG.vllm.json). Each cell is the median of the repeats,
 with the min-max range beside it.
 """
@@ -47,7 +47,7 @@ def seconds(value: str, unit: str) -> float:
 
 
 def parse_bench(path: str) -> dict:
-    """One `lernex bench` output: {streams: {decode, per_stream, ttft_p50, ttft_p90, prefill, per_token}}.
+    """One `dromos bench` output: {streams: {decode, per_stream, ttft_p50, ttft_p90, prefill, per_token}}.
 
     Row: streams, decode, per stream, TTFT p50 (value, unit), TTFT p90 (value, unit), prefill, then the roofline
     cells (roofline, % of spec, % of peak) and the per-token column, which is the last cell.
@@ -87,7 +87,7 @@ def parse_prefill_txt(path: str):
 
 
 def parse_spec(path: str):
-    """`lernex spec-check` lines: every line that reports rows bit-identical, as (name, identical, of)."""
+    """`dromos spec-check` lines: every line that reports rows bit-identical, as (name, identical, of)."""
     if not os.path.exists(path):
         return None
     out = []
@@ -138,7 +138,7 @@ def main() -> None:
     root = sys.argv[1]
     csv_rows = []
     md = []
-    view_name = {"bench": "lernex bench (in process)", "serve": "lernex serve (client)", "vllm": "vLLM (client)"}
+    view_name = {"bench": "dromos bench (in process)", "serve": "dromos serve (client)", "vllm": "vLLM (client)"}
     for model, formats in FORMATS.items():
         loaded = {}
         for tag, label, _v in formats:
@@ -190,14 +190,14 @@ def main() -> None:
                     tt.append("n/a" if not vals else f"{statistics.median(vals) * 1e3:,.0f} ms")
                 md.append(f"| {label} | {view_name[view]} | " + " | ".join(ps) + " | " + " / ".join(tt) + " |")
 
-        md.append("\n**Prefill tok/s by prompt length T.** In-process `lernex prefill` (one forward of T tokens), "
+        md.append("\n**Prefill tok/s by prompt length T.** In-process `dromos prefill` (one forward of T tokens), "
                   "and the client view as T / TTFT of a max_tokens-1 request.\n")
         md.append("| Format | View | T=512 | T=2048 | T=8192 |")
         md.append("|---|---|---:|---:|---:|")
         for tag, label, _v in formats:
             info = loaded[tag]
             cells = [f"{info['prefill'][T]['tps']:,.0f}" if info["prefill"][T] else "n/a" for T in PREFILL_T]
-            md.append(f"| {label} | lernex prefill (in process) | " + " | ".join(cells) + " |")
+            md.append(f"| {label} | dromos prefill (in process) | " + " | ".join(cells) + " |")
             for view in ("serve", "vllm"):
                 data = info[view]
                 if not data:
@@ -213,7 +213,7 @@ def main() -> None:
                 if info["prefill"][T]:
                     csv_rows.append([model, tag, "prefill-inprocess", T, "prefill_tps", info["prefill"][T]["tps"], "", "", 1])
 
-        md.append("\n**Prefix cache check** (`lernex bench` default, prefix cache on, against `--no-prefix-cache`, "
+        md.append("\n**Prefix cache check** (`dromos bench` default, prefix cache on, against `--no-prefix-cache`, "
                   "decode tok/s by view as above).\n")
         md.append("| Format | streams | prefill tok/s, cache on | prefill tok/s, cache off | TTFT p50, cache on | "
                   "TTFT p50, cache off | window decode tok/s, cache on | window decode tok/s, cache off |")
@@ -229,7 +229,7 @@ def main() -> None:
                           f"{cache[n]['ttft_p50'] * 1e3:,.0f} ms | {nocache[n]['ttft_p50'] * 1e3:,.0f} ms | "
                           f"{cache[n]['decode']:,.1f} | {nocache[n]['decode']:,.1f} |")
 
-        md.append("\n**Correctness** (`lernex spec-check`, verify steps bit-identical to one-token steps).\n")
+        md.append("\n**Correctness** (`dromos spec-check`, verify steps bit-identical to one-token steps).\n")
         md.append("| Format | prompt | rows bit-identical |")
         md.append("|---|---|---:|")
         for tag, label, _v in formats:

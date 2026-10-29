@@ -1,4 +1,4 @@
-// liblernex_cpu.so's kernels at every ISA level this machine runs, without PyTorch.
+// libdromos_cpu.so's kernels at every ISA level this machine runs, without PyTorch.
 //
 // Each case runs at every level (lx_set_arch_override) and is checked two ways: against a reference
 // written here in double precision (the products and experts, whose maths are simple), and against the
@@ -17,7 +17,7 @@
 #include <string>
 #include <vector>
 
-#include "cpu/lernex_cpu.h"
+#include "cpu/dromos_cpu.h"
 #include "cuda/kernels.h"
 #include "cuda/tunable.h"
 
@@ -753,7 +753,7 @@ int main(int argc, char** argv) {
   for (const Level& l : kAll)
     if (l.code <= best && set_level(l.code)) g_levels.push_back(l);
   set_level(0);
-  printf("lernex_cpu: best level %d, %d threads; checking", best, lx_cpu_threads());
+  printf("dromos_cpu: best level %d, %d threads; checking", best, lx_cpu_threads());
   for (const Level& l : g_levels) printf(" %s", l.name);
   printf("\n");
   products();

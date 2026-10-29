@@ -1,7 +1,7 @@
 """The CPU expert kernel (engine/cpu/moe_experts.cpp, lx_moe_experts_decode on host memory) against
 PyTorch, in every weight format, through both the AVX2 and the scalar paths.
 
-The library is build/liblernex_cpu.so beside LX_KERNELS (or LX_CPU_KERNELS). Tensors are CPU tensors;
+The library is build/libdromos_cpu.so beside LX_KERNELS (or LX_CPU_KERNELS). Tensors are CPU tensors;
 the reference dequantizes and computes in float64 with the intermediate rounded to bf16.
 """
 
@@ -28,9 +28,9 @@ class Weight(ctypes.Structure):
 def cpu():
     path = os.environ.get("LX_CPU_KERNELS")
     if not path and os.environ.get("LX_KERNELS"):
-        path = os.path.join(os.path.dirname(os.environ["LX_KERNELS"]), "liblernex_cpu.so")
+        path = os.path.join(os.path.dirname(os.environ["LX_KERNELS"]), "libdromos_cpu.so")
     if not path or not os.path.exists(path):
-        pytest.skip("liblernex_cpu.so not built")
+        pytest.skip("libdromos_cpu.so not built")
     lib = ctypes.CDLL(path)
     lib.lx_moe_experts_decode.restype = ctypes.c_int
     lib.lx_moe_decode_workspace_bytes.restype = ctypes.c_int64

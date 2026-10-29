@@ -23,7 +23,7 @@ index aad6b7f..93462b1 100644
 +    if (!std::strcmp(argv[1], "block-check")) return cmd_block_check(argc - 1, argv + 1);
    }
    std::fprintf(stderr,
-                "usage: lernex <command>\n"
+                "usage: dromos <command>\n"
                 "  inspect MODEL_DIR                         load a model and describe it\n"
                 "  eval MODEL_DIR PROMPTS_JSON OUT_DIR [N]   logits for reference prompts; with N, the\n"
 -               "                                            first N tokens at once and the rest one by one\n");

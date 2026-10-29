@@ -21,7 +21,7 @@ constexpr double kMinResident = 0.5;
 constexpr int kOffloadStepTokens = 512;  // tokens per prefill step (the staged path syncs per layer)
 constexpr size_t kOffloadMarginBytes = 384ull << 20;  // VRAM left free for the CUDA context's growth
 // A CUDA context's own footprint (the plan's device numbers are taken with it already alive, so only a
-// budget, which counts it, needs it): NVML charged 222 MiB to a lernex process on the RTX 5070 Ti.
+// budget, which counts it, needs it): NVML charged 222 MiB to a dromos process on the RTX 5070 Ti.
 constexpr size_t kCudaContextBytes = 256ull << 20;
 
 // Throws std::runtime_error, saying what is missing, when not even one step's experts fit, or for a format the

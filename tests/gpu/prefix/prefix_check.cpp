@@ -1,7 +1,7 @@
 // The prefix cache, end to end on the model: a request that starts from a cached prefix must produce
 // the same greedy tokens as the same request run cold (no cache), token for token.
 //
-//   lernex_prefix_check MODEL_DIR [N]
+//   dromos_prefix_check MODEL_DIR [N]
 //
 // Engine A (cache on) runs a prompt, then two requests that extend it: one continues the prompt's own
 // reply, one diverges after the prompt. Both start from a snapshot on the prefill grid. Engine B
@@ -64,7 +64,7 @@ void report(const char* label, const std::vector<int32_t>& a, const std::vector<
 
 int main(int argc, char** argv) {
   if (argc < 2) {
-    std::fprintf(stderr, "usage: lernex_prefix_check MODEL_DIR [N]\n");
+    std::fprintf(stderr, "usage: dromos_prefix_check MODEL_DIR [N]\n");
     return 2;
   }
   const std::string dir = argv[1];

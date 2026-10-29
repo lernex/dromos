@@ -16,7 +16,7 @@ namespace fs = std::filesystem;
 struct Scratch {
   fs::path path;
   explicit Scratch(const std::string& name)
-      : path(fs::temp_directory_path() / ("lernex-update-test-" + name + "-" +
+      : path(fs::temp_directory_path() / ("dromos-update-test-" + name + "-" +
                                           std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()))) {}
   ~Scratch() {
     std::error_code ec;
@@ -58,26 +58,26 @@ TEST_CASE("versions compare by their numbers, then a release beats its pre-relea
 
 TEST_CASE("a release page's URL names its version") {
   using lx::update::version_from_url;
-  CHECK(version_from_url("https://github.com/lernex/lernex-engine/releases/tag/v0.1.1") == "0.1.1");
+  CHECK(version_from_url("https://github.com/dromos/dromos/releases/tag/v0.1.1") == "0.1.1");
   CHECK(version_from_url("http://127.0.0.1:8000/tag/v0.1.1?expanded=true") == "0.1.1");
   CHECK(version_from_url("http://127.0.0.1:8000/tag/v0.2.0-rc1#top") == "0.2.0-rc1");
-  CHECK(version_from_url("https://github.com/lernex/lernex-engine/releases/latest") == "");
-  CHECK(version_from_url("https://github.com/lernex/lernex-engine/releases/download/v0.1.1/x.tar.gz") == "");
+  CHECK(version_from_url("https://github.com/dromos/dromos/releases/latest") == "");
+  CHECK(version_from_url("https://github.com/dromos/dromos/releases/download/v0.1.1/x.tar.gz") == "");
 }
 
 TEST_CASE("the asset is named for its flavor") {
-  CHECK(lx::update::asset_name("linux-x86_64-cpu") == "lernex-linux-x86_64-cpu.tar.gz");
-  CHECK(lx::update::asset_name("darwin-arm64") == "lernex-darwin-arm64.tar.gz");
+  CHECK(lx::update::asset_name("linux-x86_64-cpu") == "dromos-linux-x86_64-cpu.tar.gz");
+  CHECK(lx::update::asset_name("darwin-arm64") == "dromos-darwin-arm64.tar.gz");
 }
 
 TEST_CASE("SHA256SUMS gives the digest of the named asset, in either sha256sum form") {
   const std::string hash_a(64, 'a');
   const std::string hash_b = std::string(60, 'B') + "dead";
-  const std::string sums = hash_a + "  lernex-linux-x86_64-cpu.tar.gz\n" + hash_b + " *lernex-darwin-arm64.tar.gz\r\n";
-  CHECK(lx::update::checksum_for(sums, "lernex-linux-x86_64-cpu.tar.gz") == hash_a);
-  CHECK(lx::update::checksum_for(sums, "lernex-darwin-arm64.tar.gz") == std::string(60, 'b') + "dead");
-  CHECK(lx::update::checksum_for(sums, "lernex-linux-aarch64-cpu.tar.gz").empty());
-  CHECK(lx::update::checksum_for(std::string("abc  lernex-darwin-arm64.tar.gz\n"), "lernex-darwin-arm64.tar.gz").empty());
+  const std::string sums = hash_a + "  dromos-linux-x86_64-cpu.tar.gz\n" + hash_b + " *dromos-darwin-arm64.tar.gz\r\n";
+  CHECK(lx::update::checksum_for(sums, "dromos-linux-x86_64-cpu.tar.gz") == hash_a);
+  CHECK(lx::update::checksum_for(sums, "dromos-darwin-arm64.tar.gz") == std::string(60, 'b') + "dead");
+  CHECK(lx::update::checksum_for(sums, "dromos-linux-aarch64-cpu.tar.gz").empty());
+  CHECK(lx::update::checksum_for(std::string("abc  dromos-darwin-arm64.tar.gz\n"), "dromos-darwin-arm64.tar.gz").empty());
 }
 
 TEST_CASE("an installed asset hashes to the SHA-256 of its bytes") {
@@ -130,12 +130,12 @@ TEST_CASE("the notice names a newer release and the command of its channel, and 
   using lx::update::notice;
   const Cache newer{"0.1.1", 1800000000};
   const std::string tarball = notice("0.1.0", newer, "tarball");
-  CHECK(tarball.find("lernex 0.1.1 is out") != std::string::npos);
+  CHECK(tarball.find("dromos 0.1.1 is out") != std::string::npos);
   CHECK(tarball.find("you have 0.1.0") != std::string::npos);
-  CHECK(tarball.find("`lernex update`") != std::string::npos);
-  CHECK(notice("0.1.0", newer, "homebrew").find("`brew upgrade lernex`") != std::string::npos);
-  CHECK(notice("0.1.0", newer, "pip").find("`pip install -U lernex`") != std::string::npos);
-  CHECK(notice("0.1.0", newer, "docker").find("`docker pull ghcr.io/lernex/lernex`") != std::string::npos);
+  CHECK(tarball.find("`dromos update`") != std::string::npos);
+  CHECK(notice("0.1.0", newer, "homebrew").find("`brew upgrade dromos`") != std::string::npos);
+  CHECK(notice("0.1.0", newer, "pip").find("`pip install -U dromos`") != std::string::npos);
+  CHECK(notice("0.1.0", newer, "docker").find("`docker pull ghcr.io/lernex/dromos`") != std::string::npos);
 
   CHECK(notice("0.1.1", newer, "tarball").empty());
   CHECK(notice("0.1.2", newer, "tarball").empty());
@@ -146,9 +146,9 @@ TEST_CASE("the notice names a newer release and the command of its channel, and 
 }
 
 TEST_CASE("each channel has one update command") {
-  CHECK(lx::update::update_command("tarball") == "lernex update");
-  CHECK(lx::update::update_command("homebrew") == "brew upgrade lernex");
-  CHECK(lx::update::update_command("pip") == "pip install -U lernex");
-  CHECK(lx::update::update_command("docker") == "docker pull ghcr.io/lernex/lernex");
+  CHECK(lx::update::update_command("tarball") == "dromos update");
+  CHECK(lx::update::update_command("homebrew") == "brew upgrade dromos");
+  CHECK(lx::update::update_command("pip") == "pip install -U dromos");
+  CHECK(lx::update::update_command("docker") == "docker pull ghcr.io/lernex/dromos");
   CHECK(lx::update::update_command("").empty());
 }

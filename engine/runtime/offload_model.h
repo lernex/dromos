@@ -32,7 +32,7 @@ struct OffloadLoadOptions {
   int experts = -1;
   int64_t vram_budget = 0;            // bytes for everything this process puts on the GPU, 0 for the card
   int64_t ram_budget = -1;            // bytes of pinned RAM for experts, -1 for all of them
-  std::filesystem::path routing_stats;  // per-layer expert frequencies (lernex offload stats)
+  std::filesystem::path routing_stats;  // per-layer expert frequencies (dromos offload stats)
   OffloadOptions policy;              // the replacement and CPU lane policy (sizes are filled in)
 };
 

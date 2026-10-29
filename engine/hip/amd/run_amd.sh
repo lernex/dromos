@@ -25,7 +25,7 @@ cmake -S engine/hip -B "$bdir" -DLX_HIP_PLATFORM=amd -DCMAKE_CXX_COMPILER="$clan
   -DLX_HIP_ROCM_PATH="$rocm" -DLX_HIPBLASLT_INCLUDE_HINT="$rocm/include" -DLX_HIP_ARCHS="$arch" \
   > "$out/configure.log" 2>&1
 cmake --build "$bdir" -j "$(nproc 2>/dev/null || echo 4)" > "$out/build.log" 2>&1
-lib="$here/$bdir/liblernex_hip.so"
+lib="$here/$bdir/libdromos_hip.so"
 echo "built $lib" | tee -a "$out/summary.txt"
 
 set +e

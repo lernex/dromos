@@ -347,7 +347,7 @@ MachineProfile probe_machine(const ProbeOptions& o) {
     Dl_info info{};
     if (dladdr(reinterpret_cast<void*>(&lx_offload_plan), &info) && info.dli_fname) {
       path = info.dli_fname;
-      path = path.substr(0, path.rfind('/')) + "/liblernex_cpu.so";
+      path = path.substr(0, path.rfind('/')) + "/libdromos_cpu.so";
     }
     if (const char* env = std::getenv("LX_CPU_KERNELS")) path = env;
     void* lib = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
@@ -425,7 +425,7 @@ MachineProfile probe_machine(const ProbeOptions& o) {
       line(format("  together with GPU zero-copy reads: CPU experts %.1f GB/s + GPU %.1f GB/s = %.1f GB/s", c, g, c + g));
       lx_rt_host_free(hh);
     } else {
-      line("CPU expert kernel: liblernex_cpu.so not found");
+      line("CPU expert kernel: libdromos_cpu.so not found");
     }
   }
 

@@ -1,8 +1,8 @@
-// lernex eval: run reference prompts through the model and write every position's logits, for
+// dromos eval: run reference prompts through the model and write every position's logits, for
 // tools/compare.py. With a split point N the first N tokens go in as one prefill and the rest as
 // single-token decode steps, which checks that the caches carry a sequence exactly.
 //
-//   lernex eval MODEL_DIR PROMPTS_JSON OUT_DIR [N] [--weights bf16|int8|fp8|nvfp4|bf16x] [--no-bf16x]
+//   dromos eval MODEL_DIR PROMPTS_JSON OUT_DIR [N] [--weights bf16|int8|fp8|nvfp4|bf16x] [--no-bf16x]
 //
 // The weights load in the format the folder stores (the published FP8 and GPTQ NVFP4 folders as they are), or
 // the one --weights names, with the maths the plan gives that format on this GPU; stderr says which.
@@ -34,7 +34,7 @@ int cmd_eval(int argc, char** argv) {
     for (int i = 1; i < argc; ++i)
       if (!lx::cli::parse_format_flag(argc, argv, i, format)) args.push_back(argv[i]);
     if (args.size() != 3 && args.size() != 4) {
-      std::fprintf(stderr, "usage: lernex eval MODEL_DIR PROMPTS_JSON OUT_DIR [N] %s\n", lx::cli::kFormatUsage);
+      std::fprintf(stderr, "usage: dromos eval MODEL_DIR PROMPTS_JSON OUT_DIR [N] %s\n", lx::cli::kFormatUsage);
       return 2;
     }
     const std::string dir = args[0];

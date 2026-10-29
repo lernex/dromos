@@ -1,4 +1,4 @@
-// lernex: the command line of the Lernex engine.
+// dromos: the command line of Dromos.
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -30,7 +30,7 @@ namespace {
 
 void usage() {
   std::fprintf(stderr,
-               "usage: lernex <command>\n"
+               "usage: dromos <command>\n"
                "  run MODEL [--think on|off] [--context N]  chat in the terminal\n"
                "  serve MODEL [--host H] [--port P] [--context N] [--sequences N]\n"
                "                                            the OpenAI API on this machine\n"
@@ -47,7 +47,7 @@ void usage() {
                "  inspect MODEL_DIR                         load a model and describe it\n"
                "  eval MODEL_DIR PROMPTS_JSON OUT_DIR [N]   logits for reference prompts; with N, the\n"
                "                                            first N tokens at once and the rest one by one\n"
-               "  offload probe|eval|bench ...              run larger than the GPU (lernex offload for help)\n"
+               "  offload probe|eval|bench ...              run larger than the GPU (dromos offload for help)\n"
                "  spec MODEL_DIR PROMPTS_JSON [options]     speculative decoding against plain decoding\n"
                "  spec-check MODEL_DIR PROMPTS_JSON [N]     verify steps bit-identical to one-token steps\n"
                "  spec-exactness MODEL_DIR PROMPTS_JSON PROMPT [DRAWS]  next-token draws of verify vs plain sampling\n"
@@ -73,7 +73,7 @@ int main(int argc, char** argv) {
   const char* cmd = argv[1];
   // Answered before anything else: no backend is loaded, and no model is looked for.
   if (!std::strcmp(cmd, "--version") || !std::strcmp(cmd, "version")) {
-    std::printf("lernex %s (%s, %s)\n", LX_VERSION_STRING, LX_FLAVOR_STRING, LX_GIT_SHA_STRING);
+    std::printf("dromos %s (%s, %s)\n", LX_VERSION_STRING, LX_FLAVOR_STRING, LX_GIT_SHA_STRING);
     return 0;
   }
   try {
@@ -98,7 +98,7 @@ int main(int argc, char** argv) {
     if (!std::strcmp(cmd, "prefill")) return cmd_prefill(argc - 1, argv + 1);
     if (!std::strcmp(cmd, "update")) return cmd_update(argc - 1, argv + 1);
   } catch (const std::exception& e) {
-    std::fprintf(stderr, "lernex: %s\n", e.what());
+    std::fprintf(stderr, "dromos: %s\n", e.what());
     return 1;
   }
   usage();

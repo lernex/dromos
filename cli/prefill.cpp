@@ -1,4 +1,4 @@
-// lernex prefill: time one sequence's prefill of T tokens (only the last row's logits, as serving asks for
+// dromos prefill: time one sequence's prefill of T tokens (only the last row's logits, as serving asks for
 // them), for measuring prefill throughput. Tokens are taken from PROMPTS_JSON, concatenated and repeated
 // to T, so the experts see text-like routing. The first run warms up; the median of the rest is reported.
 // The weights load in the folder's format or the one --weights names (cli/common.h, load_weights).
@@ -23,7 +23,7 @@ int cmd_prefill(int argc, char** argv) {
     for (int i = 1; i < argc; ++i)
       if (!lx::cli::parse_format_flag(argc, argv, i, format)) args.push_back(argv[i]);
     if (args.size() != 3 && args.size() != 4) {
-      std::fprintf(stderr, "usage: lernex prefill MODEL_DIR PROMPTS_JSON T [RUNS] %s\n", lx::cli::kFormatUsage);
+      std::fprintf(stderr, "usage: dromos prefill MODEL_DIR PROMPTS_JSON T [RUNS] %s\n", lx::cli::kFormatUsage);
       return 2;
     }
     const std::string dir = args[0];

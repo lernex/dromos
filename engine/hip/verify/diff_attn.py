@@ -1,7 +1,7 @@
 """Differential check of lx_attention_varlen: the CUDA library (cluster split mode for few items) against
 the HIP library (one block per item). Same qkv, same caches, both outputs and caches compared.
 
-    $PY proto/diff_attn.py build/liblernex_kernels.so build/e2e/hip/liblernex_hip.so
+    $PY proto/diff_attn.py build/libdromos_kernels.so build/e2e/hip/libdromos_hip.so
 """
 
 import ctypes

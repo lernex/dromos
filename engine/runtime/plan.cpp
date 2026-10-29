@@ -605,7 +605,7 @@ std::string recipe_text(lx_wtype target) {
 
 }  // namespace
 
-// The products' maths as lernex doctor names them: one name, or the dense and the expert ones.
+// The products' maths as dromos doctor names them: one name, or the dense and the expert ones.
 std::string maths_text(const lx::ModelFormats& f) {
   auto name = [](lx_math m) {
     return m == LX_MATH_INT8 ? "INT8" : m == LX_MATH_FP8 ? "FP8" : m == LX_MATH_FP4 ? "FP4" : "BF16";
@@ -690,7 +690,7 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
     return f;
   };
 
-  // Every format, for lernex doctor and for the notes that name a faster one.
+  // Every format, for dromos doctor and for the notes that name a faster one.
   const bool bf16x_kernels = bf16x_available();
   std::vector<FormatOption> options;
   for (const lx_wtype f : {LX_W_BF16, LX_W_BF16X, LX_W_INT8, LX_W_FP8, LX_W_NVFP4}) {

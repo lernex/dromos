@@ -1,5 +1,5 @@
 """Builds the speculative-decoding benchmark prompts: realistic chat requests, rendered with the model's
-chat template (direct mode, no thinking) and tokenized, as {name: token ids} for `lernex spec`.
+chat template (direct mode, no thinking) and tokenized, as {name: token ids} for `dromos spec`.
 
     $PY tools/spec_prompts.py MODEL_DIR OUT_JSON
 

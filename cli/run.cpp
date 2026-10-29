@@ -1,4 +1,4 @@
-// lernex run MODEL [--think on|off] [--context N] [--weights bf16|int8|fp8|nvfp4|bf16x] [--no-bf16x]
+// dromos run MODEL [--think on|off] [--context N] [--weights bf16|int8|fp8|nvfp4|bf16x] [--no-bf16x]
 //
 // The weights run in the format the file stores unless --weights names another (runtime/plan.h); a model larger
 // than the GPU runs with its routed experts offloaded.
@@ -322,7 +322,7 @@ int cmd_run(int argc, char** argv) {
     else throw std::runtime_error("unknown option " + a);
   }
   if (name.empty()) {
-    std::fprintf(stderr, "usage: lernex run MODEL [--think on|off] [--context N] [--no-spec] %s\n", cli::kFormatUsage);
+    std::fprintf(stderr, "usage: dromos run MODEL [--think on|off] [--context N] [--no-spec] %s\n", cli::kFormatUsage);
     return 2;
   }
 

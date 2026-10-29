@@ -1,5 +1,5 @@
-# The lernex CLI and the Metis forward pass on the HIP library: the model code, ported to lx_rt_* (see
-# docs/handoff/hip-metis.diff), linked against liblernex_hip.so. Nothing here is compiled into the
+# The dromos CLI and the Metis forward pass on the HIP library: the model code, ported to lx_rt_* (see
+# docs/handoff/hip-metis.diff), linked against libdromos_hip.so. Nothing here is compiled into the
 # kernel library itself; this is the end-to-end check that the library runs a real model.
 #
 #   scripts/remote.sh hip run 'cmake -S engine/hip/e2e -B build/e2e -DLX_E2E_TREE=$PWD/proto'
@@ -19,7 +19,7 @@ set(LX_HIP_PLATFORM nvidia)
 set(LX_HIP_CUDA_ARCHS "120a")
 set(CMAKE_CUDA_ARCHITECTURES ${LX_HIP_CUDA_ARCHS})
 
-project(lernex_e2e LANGUAGES CXX CUDA)
+project(dromos_e2e LANGUAGES CXX CUDA)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
@@ -42,12 +42,12 @@ set(LX_E2E_SOURCES
   ${LX_E2E_TREE}/cli/eval.cpp
   ${LX_E2E_TREE}/cli/inspect.cpp)
 
-add_executable(lernex ${LX_E2E_SOURCES})
-target_include_directories(lernex BEFORE PRIVATE
+add_executable(dromos ${LX_E2E_SOURCES})
+target_include_directories(dromos BEFORE PRIVATE
   ${LX_E2E_TREE}/engine
   ${LX_ROOT}/engine                     # cuda/kernels.h, the ABI
   ${LX_ROOT}/engine/hip/nvidia          # the HIP names over the CUDA runtime
   ${LX_ROOT}/engine/hip/include         # lx_hip.h
   ${LX_ROOT}/engine/hip/src             # common.cuh, the HIP port of the kernel helpers
   ${LX_ROOT}/third_party)
-target_link_libraries(lernex PRIVATE lernex_hip CUDA::cudart)
+target_link_libraries(dromos PRIVATE dromos_hip CUDA::cudart)

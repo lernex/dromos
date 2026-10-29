@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Builds one release flavor into a tarball (docs/RELEASE.md): lernex-FLAVOR.tar.gz, which unpacks with no top
-# directory to bin/lernex, lib/ (the backends, and the CUDA runtime for the CUDA flavors), share/lernex/tuning,
-# share/lernex/channel (tarball), LICENSE, NOTICE and share/lernex/licenses (with NVIDIA's EULA for the CUDA runtime).
+# Builds one release flavor into a tarball (docs/RELEASE.md): dromos-FLAVOR.tar.gz, which unpacks with no top
+# directory to bin/dromos, lib/ (the backends, and the CUDA runtime for the CUDA flavors), share/dromos/tuning,
+# share/dromos/channel (tarball), LICENSE, NOTICE and share/dromos/licenses (with NVIDIA's EULA for the CUDA runtime).
 #
 #   scripts/release/build.sh FLAVOR OUTDIR
 #
@@ -31,7 +31,7 @@ cuda=${CUDA_HOME:-/usr/local/cuda}
 # The arguments and targets each flavor is built with.
 # No C++20 module scanning: the engine has no modules, and the scan is a compile per source file.
 cmake_args=(-DLX_FLAVOR="$flavor" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_SCAN_FOR_MODULES=OFF)
-targets=(lernex)
+targets=(dromos)
 case "$flavor" in
   linux-x86_64-cuda12 | linux-x86_64-cuda13)
     # -DLX_LINEINFO=OFF drops the device code's line tables: they were most of the fatbin (430 MB to 150 MB for
@@ -39,15 +39,15 @@ case "$flavor" in
     # opt-in decode program, whose kernel alone takes about 30 minutes per architecture to compile.
     cmake_args+=(-DLX_BACKEND_CUDA=ON -DLX_BACKEND_CPU=ON -DLX_BUNDLE_CUDA=ON -DLX_ARCHS=all -DLX_STATIC_LIBSTDCXX=ON
                  -DLX_LINEINFO=OFF -DLX_DECODE_PROGRAM=OFF -DCUDAToolkit_ROOT="$cuda" -DCMAKE_CUDA_COMPILER="$cuda/bin/nvcc")
-    targets+=(lernex_kernels lernex_cpu)
+    targets+=(dromos_kernels dromos_cpu)
     ;;
   linux-x86_64-cpu | linux-aarch64-cpu)
     cmake_args+=(-DLX_BACKEND_CUDA=OFF -DLX_BACKEND_CPU=ON -DLX_STATIC_LIBSTDCXX=ON)
-    targets+=(lernex_cpu)
+    targets+=(dromos_cpu)
     ;;
   darwin-arm64)
     cmake_args+=(-DLX_BACKEND_CUDA=OFF -DLX_BACKEND_CPU=OFF -DLX_BACKEND_METAL=ON -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0)
-    targets+=(lernex_metal)
+    targets+=(dromos_metal)
     ;;
   *)
     echo "build.sh: unknown flavor $flavor" >&2
@@ -77,35 +77,35 @@ cmake -S "$src" -B "$build" -G Ninja "${cmake_args[@]}"
 nice -n 5 cmake --build "$build" --target "${targets[@]}" -j "$jobs"
 cmake --install "$build" --prefix "$stage" >/dev/null
 
-# The packager says how this install was made (docs/RELEASE.md: share/lernex/channel).
-mkdir -p "$stage/share/lernex"
-printf 'tarball\n' > "$stage/share/lernex/channel"
+# The packager says how this install was made (docs/RELEASE.md: share/dromos/channel).
+mkdir -p "$stage/share/dromos"
+printf 'tarball\n' > "$stage/share/dromos/channel"
 
 # Our own binaries lose their local symbols; the exported lx_* symbols and the dynamic tables stay. The toolkit's
 # libraries are NVIDIA's, shipped as they are.
 if [ "$(uname -s)" = Darwin ]; then
-  find "$stage/bin" "$stage/lib" -type f \( -name lernex -o -name 'liblernex_*' \) -exec strip -x {} +
+  find "$stage/bin" "$stage/lib" -type f \( -name dromos -o -name 'libdromos_*' \) -exec strip -x {} +
 else
-  find "$stage/bin" "$stage/lib" -type f \( -name lernex -o -name 'liblernex_*' \) -exec strip --strip-unneeded {} +
+  find "$stage/bin" "$stage/lib" -type f \( -name dromos -o -name 'libdromos_*' \) -exec strip --strip-unneeded {} +
 fi
 
 # The tree must be whole before it is packed.
-for required in bin/lernex share/lernex/channel; do
+for required in bin/dromos share/dromos/channel; do
   [ -e "$stage/$required" ] || { echo "build.sh: $required is missing from the install tree" >&2; exit 1; }
 done
-if ! ls "$stage"/share/lernex/tuning/*.json >/dev/null 2>&1; then
+if ! ls "$stage"/share/dromos/tuning/*.json >/dev/null 2>&1; then
   echo "build.sh: no tuning tables in the install tree" >&2
   exit 1
 fi
-for f in LICENSE NOTICE share/lernex/licenses/cpp-httplib.txt; do
+for f in LICENSE NOTICE share/dromos/licenses/cpp-httplib.txt; do
   [ -f "$stage/$f" ] || { echo "build.sh: the install tree has no $f" >&2; exit 1; }
 done
 case "$flavor" in
-  *cuda*) [ -f "$stage/share/lernex/licenses/NVIDIA-CUDA-EULA.txt" ] || { echo "build.sh: no NVIDIA EULA beside the CUDA runtime" >&2; exit 1; } ;;
+  *cuda*) [ -f "$stage/share/dromos/licenses/NVIDIA-CUDA-EULA.txt" ] || { echo "build.sh: no NVIDIA EULA beside the CUDA runtime" >&2; exit 1; } ;;
 esac
 
 # Packed with no top directory and fixed owners, so the same tree gives the same bytes.
-tarball="$outdir/lernex-$flavor.tar.gz"
+tarball="$outdir/dromos-$flavor.tar.gz"
 rm -f "$tarball"
 top=()
 while IFS= read -r entry; do top+=("$entry"); done < <(cd "$stage" && ls -A)

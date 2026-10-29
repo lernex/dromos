@@ -5,7 +5,7 @@
 Sends the same chat requests (thinking off, greedy, the same corpus excerpts) to an OpenAI-compatible
 server, once with response_format json_schema ("constrained") and once without ("free"), and reports
 the aggregate output tok/s, how many replies parse and satisfy the schema, and any HTTP error. An
-engine that refuses response_format (lernex serve answers 400 "not supported yet") shows that as the
+engine that refuses response_format (dromos serve answers 400 "not supported yet") shows that as the
 error count: the cell is a finding, not a number.
 
   python tools/rivals/structured.py --url http://127.0.0.1:30000 --model NAME \

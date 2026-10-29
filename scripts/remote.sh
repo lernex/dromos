@@ -33,7 +33,7 @@ if [ -n "${LX_ARCHS:-}" ]; then
   cfg="-DLX_ARCHS=$LX_ARCHS"
   [ -n "${LX_BUILD_DIR:-}" ] || bdir="build-$(printf '%s' "$LX_ARCHS" | tr -c 'A-Za-z0-9\n' '-')"
 fi
-env="export PATH=/usr/local/cuda/bin:\$PATH; export LX_KERNELS=\$PWD/$bdir/liblernex_kernels.so; export PY=\$HOME/venvs/hfport/bin/python"
+env="export PATH=/usr/local/cuda/bin:\$PATH; export LX_KERNELS=\$PWD/$bdir/libdromos_kernels.so; export PY=\$HOME/venvs/hfport/bin/python"
 # Every slot compiles inside the server's lernex-build.slice where it is installed (scripts/server/lernex-build.slice:
 # MemoryHigh 14G, MemoryMax 16G across all slots), so an out-of-memory compile kills a compile, never the Windows VM
 # or a GPU run. The slots also build one at a time, under the build lock: four slots compiling the decode kernels'
@@ -47,7 +47,7 @@ q() { [ $# -eq 0 ] || printf '%q ' "$@"; }  # nothing for no arguments: an empty
 case "$verb" in
   build) ssh "$host" "cd $remote && $env && $build" ;;
   # The kernel tests allocate gigabytes on the card, so they hold the GPU lock as model runs do.
-  test) ssh "$host" "cd $remote && $env && $build && flock \$HOME/lernex-engine-dev/.gpu.lock bash -c $(q "$gpuwait; \$PY -m pytest -q tests/kernels $(q "$@")") && { [ ! -x $bdir/lernex_unit ] || $bdir/lernex_unit; }" ;;
+  test) ssh "$host" "cd $remote && $env && $build && flock \$HOME/lernex-engine-dev/.gpu.lock bash -c $(q "$gpuwait; \$PY -m pytest -q tests/kernels $(q "$@")") && { [ ! -x $bdir/dromos_unit ] || $bdir/dromos_unit; }" ;;
   run) ssh "$host" "cd $remote && $env && $*" ;;
   x) ssh "$host" "cd $remote && $env && flock \$HOME/lernex-engine-dev/.gpu.lock bash -c $(q "$gpuwait; $*")" ;;
   *) echo "unknown verb $verb" >&2; exit 2 ;;

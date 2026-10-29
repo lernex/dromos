@@ -406,7 +406,7 @@
 --- a/cli/eval.cpp
 +++ b/cli/eval.cpp
 @@ -1,8 +1,6 @@
- // lernex eval: run reference prompts through the model and write every position's logits, for
+ // dromos eval: run reference prompts through the model and write every position's logits, for
  // tools/compare.py. With a split point N the first N tokens go in as one prefill and the rest as
  // single-token decode steps, which checks that the caches carry a sequence exactly.
 -#include <cuda_runtime.h>

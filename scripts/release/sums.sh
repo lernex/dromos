@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Writes SHA256SUMS (sha256sum format) for the release assets in a directory (docs/RELEASE.md): every
-# lernex-*.tar.gz, and install.sh when it is there. Run it in the directory that holds the assets.
+# dromos-*.tar.gz, and install.sh when it is there. Run it in the directory that holds the assets.
 #
 #   scripts/release/sums.sh DIR
 set -euo pipefail
@@ -11,7 +11,7 @@ if [ $# -ne 1 ]; then
 fi
 cd "$1"
 assets=()
-for f in lernex-*.tar.gz install.sh; do
+for f in dromos-*.tar.gz install.sh; do
   [ -f "$f" ] && assets+=("$f")
 done
 if [ ${#assets[@]} -eq 0 ]; then

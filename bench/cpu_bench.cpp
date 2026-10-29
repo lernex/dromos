@@ -1,4 +1,4 @@
-// How fast liblernex_cpu.so runs on this machine, against what the machine can do.
+// How fast libdromos_cpu.so runs on this machine, against what the machine can do.
 //
 //   lx_cpu_bench [bandwidth|gemv|experts|gemm|overhead|all] [--mib N] [--reps N]
 //
@@ -32,7 +32,7 @@
 #include <thread>
 #include <vector>
 
-#include "cpu/lernex_cpu.h"
+#include "cpu/dromos_cpu.h"
 #include "cuda/kernels.h"
 #include "cuda/tunable.h"
 
@@ -526,7 +526,7 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--reps") && i + 1 < argc) g_reps = atoi(argv[++i]);
     else what = argv[i];
   }
-  printf("lernex_cpu bench: level %d, %d threads\n", lx_arch(), lx_cpu_threads());
+  printf("dromos_cpu bench: level %d, %d threads\n", lx_arch(), lx_cpu_threads());
   if (what == "bandwidth" || what == "all" || what == "gemv" || what == "experts") bandwidth();
   if (what == "hot") hot(ab_n, ab_k);
   if (what == "ab") {

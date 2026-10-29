@@ -1,6 +1,6 @@
 """Time the decode-path kernels of one library on the current GPU, with CUDA/HIP events.
 
-    $PY engine/hip/bench/bench_kernels.py path/to/liblernex_kernels.so [iterations]
+    $PY engine/hip/bench/bench_kernels.py path/to/libdromos_kernels.so [iterations]
 
 Each row is the median over the iterations after a warm-up, in microseconds. The shapes are decode
 shapes (one to eight tokens) and one long-context attention step. Numbers mean something only on an

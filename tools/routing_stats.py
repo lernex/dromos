@@ -2,7 +2,7 @@
 
     python tools/routing_stats.py TRACE [--heldout TRACE2] [--stats OUT] [--experts E] [--layers L]
 
-A trace is what `LX_ROUTE_TRACE=FILE lernex offload eval ...` writes: records of int32
+A trace is what `LX_ROUTE_TRACE=FILE dromos offload eval ...` writes: records of int32
 (pass, layer, T) followed by T * 4 expert ids, in execution order; records whose pass has bit 16 set
 hold the next layer's routing predicted from the streams as they leave the previous layer (8 ids per
 token). Reported:

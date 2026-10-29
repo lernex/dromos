@@ -1,4 +1,4 @@
-// lernex bench MODEL [--streams 1,8,32,64] [--prompt-tokens N] [--gen-tokens N]
+// dromos bench MODEL [--streams 1,8,32,64] [--prompt-tokens N] [--gen-tokens N]
 //                    [--weights bf16|int8|fp8|nvfp4|bf16x] [--no-bf16x] [--spec]
 //
 // The weights run in the format the file stores unless --weights names another, so a speed is always the speed
@@ -233,7 +233,7 @@ int cmd_bench(int argc, char** argv) {
     else throw std::runtime_error("unknown option " + a);
   }
   if (args.model.empty()) {
-    std::fprintf(stderr, "usage: lernex bench MODEL [--streams 1,8,32,64] [--prompt-tokens N] [--gen-tokens N] [--spec] %s\n",
+    std::fprintf(stderr, "usage: dromos bench MODEL [--streams 1,8,32,64] [--prompt-tokens N] [--gen-tokens N] [--spec] %s\n",
                  kFormatUsage);
     return 2;
   }

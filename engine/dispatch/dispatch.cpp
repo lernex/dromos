@@ -36,16 +36,16 @@ struct BackendFile {
   const char* file;
 };
 const BackendFile kBackendFiles[] = {
-    {"cuda", "liblernex_kernels.so"},
-    {"hip", "liblernex_hip.so"},
-    {"metal", "liblernex_metal.dylib"},
-    {"cpu", "liblernex_cpu.so"},
+    {"cuda", "libdromos_kernels.so"},
+    {"hip", "libdromos_hip.so"},
+    {"metal", "libdromos_metal.dylib"},
+    {"cpu", "libdromos_cpu.so"},
 };
 
 // The probe's order. The CPU library comes last and qualifies as soon as it loads: it is the fallback.
-const char* const kProbeOrder[] = {"liblernex_kernels.so", "liblernex_hip.so", "liblernex_metal.dylib",
-                                   "liblernex_cpu.so"};
-const char* const kCpuFile = "liblernex_cpu.so";
+const char* const kProbeOrder[] = {"libdromos_kernels.so", "libdromos_hip.so", "libdromos_metal.dylib",
+                                   "libdromos_cpu.so"};
+const char* const kCpuFile = "libdromos_cpu.so";
 
 // The names of the backends by the id lx_rt_backend returns.
 const char* const kBackendNames[] = {"CUDA", "HIP", "Metal", "CPU"};
@@ -237,7 +237,7 @@ void report_missing(const char* symbol) {
   std::lock_guard<std::mutex> lock(g_mutex);
   if (!g_reported.insert(symbol).second) return;
   g_last = "backend " + (g_info.backend.empty() ? std::string("none") : g_info.backend) + " lacks " + symbol;
-  std::fprintf(stderr, "lernex: %s\n", g_last.c_str());
+  std::fprintf(stderr, "dromos: %s\n", g_last.c_str());
 }
 
 }  // namespace lx::dispatch

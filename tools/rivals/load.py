@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Same-work load generator for docs/RIVALS.md.
 
-Sends identical token-id prompts to any OpenAI-compatible /v1/completions server (`lernex serve`,
+Sends identical token-id prompts to any OpenAI-compatible /v1/completions server (`dromos serve`,
 `sglang.launch_server`) and reports, per wave, the numbers the comparison uses:
 
   e2e tok/s     completion tokens of the whole wave over the time from sending the first request to
@@ -19,13 +19,13 @@ engines never see different text, and they are identical for a given --seed.
   --shared-prefix 0   every request is an independent --prompt-token window (plain batched decode)
 
 Every request is greedy (temperature 0), repetition penalty 1, no penalties, streamed, with usage.
-`ignore_eos` asks the engine to run the full --gen tokens (SGLang honours it; lernex serve ignores
+`ignore_eos` asks the engine to run the full --gen tokens (SGLang honours it; dromos serve ignores
 it, so check the per-wave "finish" counts: "length" for every request means the same work).
 
 Examples (run on the GPU server, from the synced checkout; one server at a time):
 
   python tools/rivals/load.py --url http://127.0.0.1:8080 --model Praxis \\
-      --tokenizer ~/.cache/lernex/models/Lernex/Metis-1.6-Praxis/tokenizer.json \\
+      --tokenizer ~/.cache/dromos/models/Lernex/Metis-1.6-Praxis/tokenizer.json \\
       --shared-prefix 2048 --suffix 64 --gen 256 --concurrency 64,128 --waves 2 --out out/praxis-64-128.json
 """
 
@@ -131,7 +131,7 @@ async def one_request(session, base: str, model: str, prompt: list[int], gen: in
                 return rec
             rec.update(first=first, end=end, tokens=usage["completion_tokens"], prompt_tokens=usage["prompt_tokens"],
                        finish=finish)
-            # Usage can count the prompt as cached (SGLang and Lernex both report it when a prefix hits).
+            # Usage can count the prompt as cached (SGLang and Dromos both report it when a prefix hits).
             details = usage.get("prompt_tokens_details") or {}
             rec["cached_tokens"] = details.get("cached_tokens", 0)
     except Exception as exc:  # the wave records the failure and goes on

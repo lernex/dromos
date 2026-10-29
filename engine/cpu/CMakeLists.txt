@@ -1,4 +1,4 @@
-# liblernex_cpu.so: the CPU backend. Every lx_* function of engine/cuda/kernels.h, no CUDA.
+# libdromos_cpu.so: the CPU backend. Every lx_* function of engine/cuda/kernels.h, no CUDA.
 #
 # The ops (validation, scratch, threading, the small kernels) are compiled once for the baseline of the
 # architecture. The hot kernels (kern/isa.cpp: the dot-product tiles of the GEMV, GEMM and experts, the
@@ -30,7 +30,7 @@ macro(lx_cpu_level name code)
     target_compile_definitions(lx_cpu_${name} PRIVATE LX_ISA=${name} LX_ISA_CODE=${code})
     list(APPEND LX_CPU_LEVELS ${name})
   else()
-    message(STATUS "lernex_cpu: compiler lacks flags for ${name}, level not built")
+    message(STATUS "dromos_cpu: compiler lacks flags for ${name}, level not built")
   endif()
 endmacro()
 
@@ -57,30 +57,30 @@ foreach(level IN LISTS LX_CPU_LEVELS)
   list(APPEND LX_CPU_LEVEL_DEFS LX_CPU_HAVE_${up}=1)
 endforeach()
 
-add_library(lernex_cpu SHARED ${LX_CPU_SOURCES} ${LX_CPU_OBJECTS})
-# liblernex_cpu.so on every platform, so the tests and the model find it by one name.
-# Beside liblernex_kernels.so, where the offload runtime looks for its CPU lane.
-set_target_properties(lernex_cpu PROPERTIES SUFFIX ".so" LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
-target_include_directories(lernex_cpu PUBLIC ${PROJECT_SOURCE_DIR}/engine)
-target_compile_options(lernex_cpu PRIVATE -fvisibility=hidden)
-target_compile_definitions(lernex_cpu PRIVATE ${LX_CPU_LEVEL_DEFS})
+add_library(dromos_cpu SHARED ${LX_CPU_SOURCES} ${LX_CPU_OBJECTS})
+# libdromos_cpu.so on every platform, so the tests and the model find it by one name.
+# Beside libdromos_kernels.so, where the offload runtime looks for its CPU lane.
+set_target_properties(dromos_cpu PROPERTIES SUFFIX ".so" LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+target_include_directories(dromos_cpu PUBLIC ${PROJECT_SOURCE_DIR}/engine)
+target_compile_options(dromos_cpu PRIVATE -fvisibility=hidden)
+target_compile_definitions(dromos_cpu PRIVATE ${LX_CPU_LEVEL_DEFS})
 find_package(Threads REQUIRED)
-target_link_libraries(lernex_cpu PRIVATE Threads::Threads)
+target_link_libraries(dromos_cpu PRIVATE Threads::Threads)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  target_link_options(lernex_cpu PRIVATE -Wl,--no-undefined)
+  target_link_options(dromos_cpu PRIVATE -Wl,--no-undefined)
 endif()
 if(LX_STATIC_RUNTIME)
-  target_link_options(lernex_cpu PRIVATE ${LX_STATIC_RUNTIME})
+  target_link_options(dromos_cpu PRIVATE ${LX_STATIC_RUNTIME})
 endif()
 if(LX_HIDE_LINK_SYMBOLS)
-  target_link_options(lernex_cpu PRIVATE "${LX_HIDE_LINK_SYMBOLS}")
+  target_link_options(dromos_cpu PRIVATE "${LX_HIDE_LINK_SYMBOLS}")
 endif()
 
 # A native check of every level the machine can run against the generic level, without PyTorch
 # (the Mac has no PyTorch): tests/cpu/isa_check.cpp.
 add_executable(lx_cpu_isa_check ${PROJECT_SOURCE_DIR}/tests/cpu/isa_check.cpp)
-target_link_libraries(lx_cpu_isa_check PRIVATE lernex_cpu)
+target_link_libraries(lx_cpu_isa_check PRIVATE dromos_cpu)
 
 # Memory bandwidth and kernel speed on this machine: bench/cpu_bench.cpp.
 add_executable(lx_cpu_bench ${PROJECT_SOURCE_DIR}/bench/cpu_bench.cpp)
-target_link_libraries(lx_cpu_bench PRIVATE lernex_cpu Threads::Threads)
+target_link_libraries(lx_cpu_bench PRIVATE dromos_cpu Threads::Threads)

@@ -4,7 +4,7 @@ Started 2026-10-24, after milestone 2 (295 tok/s single-stream Praxis, int8 deco
 
 ## What it has to become
 
-`lernex run praxis` and `lernex serve logos`: one program that picks the weight format and the
+`dromos run praxis` and `dromos serve logos`: one program that picks the weight format and the
 math for whatever NVIDIA GPU it lands on, batches many users, and is the fastest way to run
 Metis in every format, compared format for format with vLLM, SGLang and llama.cpp.
 
@@ -33,7 +33,7 @@ proposed metis.cpp diff for their part.
 | Decode overhead | fused decode kernels that take the ~900 launches per token down, the decode Mamba step, and the restructured decode path | new `kernels.h` entries it specifies |
 | Hardware | multi-architecture build, device query and arch override, fallbacks for every sm_90+-only kernel, the autotuner and its cache, the plan (format, math, slots, context from VRAM) | `runtime/plan.h`, `runtime/tuner.h` |
 | Text | tokenizer, chat template, reasoning and tool-call parsing, streaming detokenization | `text/tokenizer.h` |
-| Serving | scheduler (continuous batching, chunked prefill), GPU sampling, the OpenAI-compatible server, `lernex run / serve / pull / bench`, model download | `runtime/engine.h`, `server/` |
+| Serving | scheduler (continuous batching, chunked prefill), GPU sampling, the OpenAI-compatible server, `dromos run / serve / pull / bench`, model download | `runtime/engine.h`, `server/` |
 
 ## Correctness
 
@@ -68,7 +68,7 @@ implementation, one set of weight formats, one server and one CLI:
 The backend interface is the kernels.h ABI, including its "Runtime" section (memory, copies,
 streams, events, graph capture), plus tunable.h (each backend reports its own `lx_arch`). Each
 backend is one shared library exporting every `lx_*` function, and the model code calls nothing
-else. The `lernex` binary loads the best backend present at startup (CUDA or HIP when a GPU and
+else. The `dromos` binary loads the best backend present at startup (CUDA or HIP when a GPU and
 driver are found, Metal on a Mac, the CPU otherwise). Every backend runs the same kernel test
 suite (tests/kernels, with a backend option) and the same end-to-end KL check.
 

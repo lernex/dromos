@@ -1,6 +1,6 @@
-// lernex features: the target's hidden states over a tokenized corpus, for training draft models.
+// dromos features: the target's hidden states over a tokenized corpus, for training draft models.
 //
-//   lernex features MODEL_DIR DATA_JSONL OUT_DIR --taps P:L,P:L,... [--epochs E] [--queue Q]
+//   dromos features MODEL_DIR DATA_JSONL OUT_DIR --taps P:L,P:L,... [--epochs E] [--queue Q]
 //                   [--shard-tokens N] [--max-len L] [--seed S] [--limit N] [--skip-seqs N]
 //
 // DATA_JSONL has one sequence per line: {"tokens": [ids], "mask": [0|1 per token]} (mask marks the
@@ -78,7 +78,7 @@ T* device_alloc(size_t count) {
 
 int cmd_features(int argc, char** argv) {
   if (argc < 4) {
-    std::fprintf(stderr, "usage: lernex features MODEL_DIR DATA_JSONL OUT_DIR --taps P:L,... [options]\n");
+    std::fprintf(stderr, "usage: dromos features MODEL_DIR DATA_JSONL OUT_DIR --taps P:L,... [options]\n");
     return 2;
   }
   try {

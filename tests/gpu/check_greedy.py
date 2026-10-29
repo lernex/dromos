@@ -2,7 +2,7 @@
 
   check_greedy.py MODEL_DIR BUILD_DIR [PROMPT_TOKENS] [GENERATED]
 
-lernex_gpu_check runs the engine on a random prompt and generates GENERATED greedy tokens. lernex
+dromos_gpu_check runs the engine on a random prompt and generates GENERATED greedy tokens. dromos
 eval then runs prompt + generated through the model in the reference way (the prompt in one
 prefill, the rest one token at a time) and writes every position's logits. Each generated token
 must be the argmax of the logits at the position before it. Exact ties may flip under float noise,
@@ -26,7 +26,7 @@ prompt = [rng.randrange(1000, 60000) for _ in range(prompt_len)]
 ids = ",".join(str(t) for t in prompt)
 
 out = subprocess.run(
-    [os.path.join(build, "lernex_gpu_check"), model, ids, str(generated_len)],
+    [os.path.join(build, "dromos_gpu_check"), model, ids, str(generated_len)],
     capture_output=True, text=True, check=True,
 ).stdout.strip()
 generated = [int(t) for t in out.split(",")]
@@ -38,7 +38,7 @@ with tempfile.TemporaryDirectory() as tmp:
     with open(prompts, "w") as f:
         json.dump({"check": sequence}, f)
     subprocess.run(
-        [os.path.join(build, "lernex"), "eval", model, prompts, tmp, str(prompt_len)],
+        [os.path.join(build, "dromos"), "eval", model, prompts, tmp, str(prompt_len)],
         capture_output=True, text=True, check=True,
     )
     raw = open(os.path.join(tmp, "check.f32"), "rb").read()

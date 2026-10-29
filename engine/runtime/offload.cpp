@@ -113,7 +113,7 @@ void* open_cpu_backend() {
     if (dladdr(reinterpret_cast<void*>(&lx_offload_plan), &info) && info.dli_fname) {
       path = info.dli_fname;
       const size_t slash = path.rfind('/');
-      path = (slash == std::string::npos ? std::string(".") : path.substr(0, slash)) + "/liblernex_cpu.so";
+      path = (slash == std::string::npos ? std::string(".") : path.substr(0, slash)) + "/libdromos_cpu.so";
     }
   }
   void* lib = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);

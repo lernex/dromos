@@ -1,7 +1,7 @@
 #!/bin/bash
 # One server, the same client, the same cells. Run it on the GPU server through the GPU lock:
 #
-#   scripts/remote.sh rivals x 'tools/rivals/serve.sh lernex NAME MODEL [server flags...]'
+#   scripts/remote.sh rivals x 'tools/rivals/serve.sh dromos NAME MODEL [server flags...]'
 #   scripts/remote.sh rivals x 'tools/rivals/serve.sh sglang NAME MODEL [server flags...]'
 #
 # It starts the engine on MODEL, waits until it answers /v1/models, runs the cells with
@@ -13,13 +13,13 @@
 #   NAME    the served model name and the label of the results: out/rivals/NAME-*.json
 #   MODEL   a model directory; its tokenizer.json makes the prompts (the same bytes for both engines)
 #
-# Environment: PORT (default 8080 lernex, 30000 sglang), PREFIX_CACHE=0 turns the prefix cache off
-# (lernex --no-prefix-cache, sglang --disable-radix-cache), CELLS=shared|unique|both|structured (default both;
+# Environment: PORT (default 8080 dromos, 30000 sglang), PREFIX_CACHE=0 turns the prefix cache off
+# (dromos --no-prefix-cache, sglang --disable-radix-cache), CELLS=shared|unique|both|structured (default both;
 # structured runs tools/rivals/structured.py alone),
 # WAVES (measured waves per level, default 2), PY (client python), SGLANG_PY (sglang python).
 set -euo pipefail
 
-engine=${1:?engine: lernex or sglang}; shift
+engine=${1:?engine: dromos or sglang}; shift
 name=${1:?name}; shift
 model=${1:?model directory}; shift
 model=${model/#\~/$HOME}
@@ -36,10 +36,10 @@ tok=$model/tokenizer.json
 
 nocache_on=${PREFIX_CACHE:-1}
 case $engine in
-  lernex)
+  dromos)
     port=${PORT:-8080}
     nocache=(); [ "$nocache_on" = 0 ] && nocache=(--no-prefix-cache)
-    cmd=(build/lernex serve "$model" --host 127.0.0.1 --port "$port" --name "$name" "${nocache[@]}" "$@")
+    cmd=(build/dromos serve "$model" --host 127.0.0.1 --port "$port" --name "$name" "${nocache[@]}" "$@")
     ;;
   sglang)
     port=${PORT:-30000}
@@ -49,7 +49,7 @@ case $engine in
          --host 127.0.0.1 --port "$port" --reasoning-parser metis --tool-call-parser metis
          "${nocache[@]}" "$@")
     ;;
-  *) echo "engine must be lernex or sglang" >&2; exit 2 ;;
+  *) echo "engine must be dromos or sglang" >&2; exit 2 ;;
 esac
 
 log=$out/$name.server.log

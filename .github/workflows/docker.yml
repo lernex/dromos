@@ -1,7 +1,7 @@
 name: docker
 
 # Packages a published release as the engine's container image. Publishing a GitHub release (the owner publishes the
-# draft that release.yml makes) pushes ghcr.io/lernex/lernex:X.Y.Z, and :latest for a final release. A manual run builds
+# draft that release.yml makes) pushes ghcr.io/lernex/dromos:X.Y.Z, and :latest for a final release. A manual run builds
 # the same image for a release that is already out and pushes nothing.
 on:
   release:
@@ -41,16 +41,16 @@ jobs:
             [0-9]*.[0-9]*.[0-9]*) ;;
             *) echo "not a release version: $v" >&2; exit 1 ;;
           esac
-          tags="ghcr.io/lernex/lernex:$v"
+          tags="ghcr.io/lernex/dromos:$v"
           case "$v" in *-*) pre=true ;; esac
-          if [ "$pre" != true ]; then tags="$tags"$'\n'"ghcr.io/lernex/lernex:latest"; fi
+          if [ "$pre" != true ]; then tags="$tags"$'\n'"ghcr.io/lernex/dromos:latest"; fi
           { echo "version=$v"; echo "tags<<TAGS"; echo "$tags"; echo "TAGS"; } >> "$GITHUB_OUTPUT"
 
       - name: Wait for the release assets
         env:
           V: ${{ steps.v.outputs.version }}
         run: |
-          url="https://github.com/lernex/lernex-engine/releases/download/v$V/SHA256SUMS"
+          url="https://github.com/dromos/dromos/releases/download/v$V/SHA256SUMS"
           for _ in $(seq 1 60); do
             if curl -fsSL -o /dev/null "$url"; then exit 0; fi
             sleep 30
@@ -75,7 +75,7 @@ jobs:
           file: docker/Dockerfile
           platforms: linux/amd64
           build-args: |
-            LERNEX_VERSION=${{ steps.v.outputs.version }}
-            LERNEX_FLAVOR=cuda12
+            DROMOS_VERSION=${{ steps.v.outputs.version }}
+            DROMOS_FLAVOR=cuda12
           tags: ${{ steps.v.outputs.tags }}
           push: ${{ github.event_name != 'workflow_dispatch' }}

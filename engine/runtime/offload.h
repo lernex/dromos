@@ -42,7 +42,7 @@ struct MachineProfile {
   double cpu_expert_gbs = 0;  // the CPU expert kernel (decode, one token), bytes of weights per second
   double cpu_expert_us = 0;   // one expert, one token, at the probe's format
   int cpu_threads = 0;
-  std::vector<std::string> lines;  // every measurement, as `lernex offload probe` prints it
+  std::vector<std::string> lines;  // every measurement, as `dromos offload probe` prints it
 };
 
 struct ProbeOptions {

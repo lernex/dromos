@@ -1,6 +1,6 @@
 """Preflight for draft training: the shards' final-state tap must rebuild the target's logits.
 
-    build/lernex eval MODEL_DIR PROMPTS_JSON LOGITS_DIR
+    build/dromos eval MODEL_DIR PROMPTS_JSON LOGITS_DIR
     $PY tools/draft/check_features.py MODEL_DIR PROMPTS_JSON LOGITS_DIR SHARD_DIR
 
 PROMPTS_JSON maps names to token lists; tools/draft/check_features.py jsonl PROMPTS_JSON OUT.jsonl

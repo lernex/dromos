@@ -1,5 +1,5 @@
-// lernex update [--check|--rollback]: the latest release of this install's flavor, checked and switched to, or the
-// report of whether one exists (docs/RELEASE.md). `lernex run` and `lernex serve` print the daily notice themselves.
+// dromos update [--check|--rollback]: the latest release of this install's flavor, checked and switched to, or the
+// report of whether one exists (docs/RELEASE.md). `dromos run` and `dromos serve` print the daily notice themselves.
 #include <cstdio>
 #include <stdexcept>
 #include <string>
@@ -12,7 +12,7 @@ int cmd_update(int argc, char** argv) {
     const std::string a = argv[i];
     if (a == "--check") check_only = true;
     else if (a == "--rollback") rollback = true;
-    else throw std::runtime_error("unknown option " + a + " (lernex update [--check|--rollback])");
+    else throw std::runtime_error("unknown option " + a + " (dromos update [--check|--rollback])");
   }
   if (check_only && rollback) throw std::runtime_error("--check and --rollback do not go together");
   return lx::update::run_update(check_only, rollback);

@@ -117,7 +117,7 @@ Checks (*measured*, Praxis, a freshly initialized drafter, 5 prompts):
   (`tests/draft`, 5 tests).
 - The engine's kernels match PyTorch (`tests/kernels/test_spec.py`: per-head norm with RoPE, block
   attention, 10 cases).
-- The engine's proposal against the PyTorch model on the same feature rows (`lernex block-check` +
+- The engine's proposal against the PyTorch model on the same feature rows (`dromos block-check` +
   `tools/draft/check_block.py`): with bf16 activations, logits 2.3e-3 to 3.2e-3 from a float64
   reference (relative to each row's largest logit), where PyTorch's own float32 run of the same
   model is 2.8e-3 to 3.2e-3 from it; confidences 1.2e-3 to 6.1e-3 (float32: 8.2e-4 to 8.7e-3);
@@ -142,7 +142,7 @@ Checks (*measured*, Praxis, a freshly initialized drafter, 5 prompts):
   deduplicated, 200,000 conversations plus 96 held out. Praxis regenerates every final answer with
   its own sampling (temperature 0.6, top-p 0.95, top-k 20), 20% of them with thinking on, answers up
   to 2,048 tokens; sequences are cut at 2,048 tokens for training.
-- **Hidden states**: `lernex features` runs each sequence through the engine with the six taps and
+- **Hidden states**: `dromos features` runs each sequence through the engine with the six taps and
   streams bf16 rows (24.6 KB per token on Praxis) through a bounded queue in /dev/shm to the
   trainer, which deletes what it reads. A 200k-sequence epoch at 1,000 tokens per sequence is
   about 5 TB of features, against under 50 GB free on the server's disk (98% full on 2026-10-24), so they are recomputed every
@@ -162,7 +162,7 @@ Praxis, 200,000 conversations, 3 epochs, from rates *measured* on the server's R
 | Stage | Measured | For the full run (*computed*) |
 |---|---|---|
 | Answers (vLLM, `regenerate.py`) | 1,943 answer tok/s over a 384-prompt run, 677 tokens per answer, 16% of answers at the 2,048 cap; peak 13.2 GB GPU, 7.1 GB host | 135M tokens: **19.4 h** |
-| Hidden states (`lernex features`), alone | 4,250 to 4,820 tok/s | |
+| Hidden states (`dromos features`), alone | 4,250 to 4,820 tok/s | |
 | Trainer (`train_block.py`), alone | 2,500 to 2,900 blocks/s at 512 anchors, peak 6.9 GiB | |
 | Both at once, as the pipeline runs them | 2,460 to 2,700 feature tok/s steady on 832-token sequences with 512 anchors (0.86 of the time the two take one after the other); peak 15.7 GB GPU | 0.31 to 0.34 s per sequence: **17 to 19 h per epoch** |
 | Total | | **71 to 76 GPU-hours, about three days** |
@@ -176,7 +176,7 @@ sequences in flight, which the pipeline's 4,096-prompt chunks amortize. The eval
 sequences, every 500 of the 4,688 steps) adds minutes.
 
 Where the time goes: two thirds of each epoch is the target's forward pass over the corpus, one
-sequence per prefill. Batching several sequences into one prefill in `lernex features` is the
+sequence per prefill. Batching several sequences into one prefill in `dromos features` is the
 first thing to try if the run needs to be shorter; the second is 2 epochs instead of 3 (18 h less).
 
 Logos: not measured. The hidden states need the engine to load the FP8 checkpoint; the drafter's
@@ -191,9 +191,9 @@ tools/draft/pipeline.sh praxis
 #   rerun the same command to resume after any stop; progress in $WORK/train.log, features.log
 
 # then, the drafter it wrote:
-build/lernex spec /home/aiadmin/kronos-scratch/logos/engines/praxis/hf out/spec_prompts.json \
+build/dromos spec /home/aiadmin/kronos-scratch/logos/engines/praxis/hf out/spec_prompts.json \
     --drafters plain,ngram,block,block-fixed --draft-head ~/kronos-scratch/draft/praxis/train/draft
-build/lernex spec ... --temp 0.6 --top-p 0.95 --top-k 20      # sampled, same drafter
+build/dromos spec ... --temp 0.6 --top-p 0.95 --top-k 20      # sampled, same drafter
 ```
 
 The pipeline takes the GPU lock for each GPU stage, so it waits for other work and blocks it

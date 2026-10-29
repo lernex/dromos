@@ -1,4 +1,4 @@
-# The HIP backend: liblernex_hip.so, the kernel library's C ABI (engine/cuda/kernels.h) on AMD GPUs.
+# The HIP backend: libdromos_hip.so, the kernel library's C ABI (engine/cuda/kernels.h) on AMD GPUs.
 # Standalone from the CUDA build, so a machine without nvcc configures and builds this one alone.
 #
 #   AMD (ROCm): the sources compile as HIP with ROCm's clang, the compiler hipcc runs underneath.
@@ -19,7 +19,7 @@ set(LX_HIP_DEVICE_LIB_PATH "" CACHE PATH "AMDGPU device bitcode, when it is not 
 set(LX_HIP_CUDA_ARCHS "120a" CACHE STRING "CUDA architectures (LX_HIP_PLATFORM=nvidia)")
 
 if(LX_HIP_PLATFORM STREQUAL "nvidia")
-  project(lernex_hip LANGUAGES CXX CUDA)
+  project(dromos_hip LANGUAGES CXX CUDA)
   set(CMAKE_CUDA_ARCHITECTURES ${LX_HIP_CUDA_ARCHS})
   set(CMAKE_CUDA_STANDARD 20)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
@@ -28,7 +28,7 @@ if(LX_HIP_PLATFORM STREQUAL "nvidia")
 elseif(LX_HIP_PLATFORM STREQUAL "amd")
   # CMake's HIP language wants the ROCm CMake packages; the sources are plain C++ with -x hip, which
   # is what hipcc runs, so the CXX language with ROCm's clang does the same without them.
-  project(lernex_hip LANGUAGES CXX)
+  project(dromos_hip LANGUAGES CXX)
   set(LX_HIP_LANG CXX)
   set(LX_HIP_OFFLOAD "")
   foreach(arch IN LISTS LX_HIP_ARCHS)
@@ -54,26 +54,26 @@ endif()
 file(GLOB LX_HIP_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cu)
 set_source_files_properties(${LX_HIP_SOURCES} PROPERTIES LANGUAGE ${LX_HIP_LANG})
 
-add_library(lernex_hip SHARED ${LX_HIP_SOURCES})
-set_target_properties(lernex_hip PROPERTIES OUTPUT_NAME lernex_hip)
+add_library(dromos_hip SHARED ${LX_HIP_SOURCES})
+set_target_properties(dromos_hip PROPERTIES OUTPUT_NAME dromos_hip)
 if(LX_HIP_PLATFORM STREQUAL "amd")
-  target_compile_options(lernex_hip PRIVATE -x hip ${LX_HIP_OFFLOAD})
-  target_link_options(lernex_hip PRIVATE ${LX_HIP_OFFLOAD})
+  target_compile_options(dromos_hip PRIVATE -x hip ${LX_HIP_OFFLOAD})
+  target_link_options(dromos_hip PRIVATE ${LX_HIP_OFFLOAD})
 endif()
-target_include_directories(lernex_hip PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_include_directories(lernex_hip PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_include_directories(dromos_hip PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_include_directories(dromos_hip PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 if(LX_HIP_PLATFORM STREQUAL "nvidia")
   # The shim's HIP names go first, so they win over anything else on the path.
-  target_include_directories(lernex_hip BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/nvidia)
+  target_include_directories(dromos_hip BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/nvidia)
 # The same constexpr rule the CUDA build uses (the root CMakeLists): device lambdas call constexpr host functions.
-target_compile_options(lernex_hip PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
-  target_link_libraries(lernex_hip PRIVATE CUDA::cudart CUDA::cublasLt)
+target_compile_options(dromos_hip PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+  target_link_libraries(dromos_hip PRIVATE CUDA::cudart CUDA::cublasLt)
 else()
   # hipBLASLt is the dense GEMM. Its headers come from the ROCm install (or LX_HIPBLASLT_INCLUDE).
   find_path(LX_HIPBLASLT_INCLUDE hipblaslt/hipblaslt.h HINTS ${LX_HIPBLASLT_INCLUDE_HINT} /opt/rocm/include)
   if(NOT LX_HIPBLASLT_INCLUDE)
     message(FATAL_ERROR "hipblaslt/hipblaslt.h not found: set LX_HIPBLASLT_INCLUDE to its include directory")
   endif()
-  target_include_directories(lernex_hip PRIVATE ${LX_HIPBLASLT_INCLUDE})
+  target_include_directories(dromos_hip PRIVATE ${LX_HIPBLASLT_INCLUDE})
 endif()

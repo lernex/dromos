@@ -41,7 +41,7 @@ std::string executable_dir() {
 std::string share_dir() {
   const std::string dir = executable_dir();
   if (dir.empty()) return "";
-  return dir + "/../share/lernex";
+  return dir + "/../share/dromos";
 }
 
 std::string channel() {

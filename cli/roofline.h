@@ -1,4 +1,4 @@
-// The roofline, as lernex doctor and lernex bench print it. A decode step's memory traffic (model/traffic.h) against
+// The roofline, as dromos doctor and dromos bench print it. A decode step's memory traffic (model/traffic.h) against
 // the card's memory bandwidth and tensor throughput. The bandwidth ceiling is bandwidth / bytes per step: the tokens
 // per second the memory system allows, and every measured speed reads as a share of it.
 #pragma once

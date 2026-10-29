@@ -10,7 +10,7 @@ stays the source of truth. Nothing under `engine/cuda` or `engine/model` is chan
 | --- | --- |
 | AMD compile, ROCm SDK 7.9rc `amdclang++`, `--offload-arch` per target | gfx942, gfx1100, gfx1201: 0 errors, 0 warnings each |
 | NVIDIA test shim (RTX 5070 Ti, sm_120a), `tests/kernels` | 3743 passed, 42 skipped (the CUDA library: 3784 passed, 1 skipped) |
-| `lernex doctor` with `LX_BACKEND=hip` on the shim | missing none |
+| `dromos doctor` with `LX_BACKEND=hip` on the shim | missing none |
 | End to end, Praxis BF16, HIP library on the NVIDIA shim | prefill bitwise equal to the CUDA library; decode within bf16 noise (below) |
 | Run on AMD hardware | not done: no AMD GPU was available to this port |
 
@@ -25,7 +25,7 @@ on an AMD GPU. The wave64 path (gfx942) is compiled but never run.
 - `include/lx_hip.h`: the portability layer every translated source includes.
 - `nvidia/`: HIP names over the CUDA runtime, for the NVIDIA test build only.
 - `CMakeLists.txt`: `LX_HIP_PLATFORM=amd` (default) or `nvidia`.
-- `e2e/`: the lernex CLI and the Metis model on this library, with `prepare.sh`.
+- `e2e/`: the dromos CLI and the Metis model on this library, with `prepare.sh`.
 - `verify/`: differential checks, CUDA library against HIP library on the same inputs (NVIDIA only).
 - `bench/bench_kernels.py`: times the decode kernels of any library with CUDA/HIP events.
 - `amd/run_amd.sh`: one command on a rented AMD host: build, `tests/kernels`, benchmark.
@@ -101,7 +101,7 @@ compare outputs element by element.
   included) and at prefill, for the output and both caches.
 - `gemv` int8 (five N by K shapes, M 1 to 8), `quantize_w8`, `moe_experts_w8` (T 1 to 300): bitwise.
 
-### End to end, Praxis BF16, `lernex eval` on both builds, scored with `tools/compare.py`
+### End to end, Praxis BF16, `dromos eval` on both builds, scored with `tools/compare.py`
 
 Top-20 KL against the native FP32 reference, mean per position.
 
@@ -169,13 +169,13 @@ an ABI change in `engine/cuda`, which this port does not make.
 NVIDIA test build and kernel tests, from the repository root (through the slot helper):
 
     scripts/remote.sh hip run 'cmake -S engine/hip -B build/nv -DLX_HIP_PLATFORM=nvidia -DLX_HIP_CUDA_ARCHS=120a && cmake --build build/nv -j 4'
-    scripts/remote.sh hip x 'LX_KERNELS=$PWD/build/nv/liblernex_hip.so $PY -m pytest -q tests/kernels'
+    scripts/remote.sh hip x 'LX_KERNELS=$PWD/build/nv/libdromos_hip.so $PY -m pytest -q tests/kernels'
 
 End to end on the NVIDIA shim:
 
     engine/hip/e2e/prepare.sh build/e2e-tree
     cmake -S engine/hip/e2e -B build/e2e -DLX_E2E_TREE=$PWD/build/e2e-tree && cmake --build build/e2e
-    build/e2e/lernex eval MODEL_DIR PROMPTS_JSON OUT_DIR [N]
+    build/e2e/dromos eval MODEL_DIR PROMPTS_JSON OUT_DIR [N]
 
 AMD, on a rented host with ROCm and a ROCm build of torch:
 

@@ -1,7 +1,7 @@
-CPU backend: what the model and CLI need to run on liblernex_cpu.so (git apply -p1 from the repo root;
+CPU backend: what the model and CLI need to run on libdromos_cpu.so (git apply -p1 from the repo root;
 text before the first "diff --git" is ignored).
 
-Measured with exactly this diff applied, on the lernex server's i5-14500 (14 threads, AVX-VNNI level):
+Measured with exactly this diff applied, on the dromos server's i5-14500 (14 threads, AVX-VNNI level):
 Praxis BF16 and INT8 run end to end on the CPU inside the BF16 noise floor (numbers in the CPU
 workstream's report). Nothing here changes what the CUDA build computes.
 
@@ -17,7 +17,7 @@ What the model needs from the runtime ABI, and what this diff does about it:
 2. The four glue kernels (glue.cu: axpby, sub, meta_scalars, gather_last) are CUDA. This diff adds
    glue_cpu.cpp (the same four as loops) and builds it instead of glue.cu in the CPU-only build.
    Recommendation: move them into kernels.h as ABI ops (lx_axpby_f32, lx_sub_f32, lx_meta_scalars,
-   lx_gather_last) so every backend library exports them and one lernex binary can dlopen any
+   lx_gather_last) so every backend library exports them and one dromos binary can dlopen any
    backend; the CPU versions are the loops in glue_cpu.cpp.
 
 3. Zero-copy weights. Weights::upload asks lx_rt_backend(); on the CPU the tensors point into the
@@ -27,8 +27,8 @@ What the model needs from the runtime ABI, and what this diff does about it:
 4. cli/eval.cpp and cli/inspect.cpp use lx_rt_* instead of the CUDA runtime (inspect prints the
    backend and lx_arch instead of the GPU name and free VRAM, which have no ABI call).
 
-5. CMake: with -DLX_BACKEND_CUDA=OFF -DLX_BACKEND_CPU=ON, lernex_core and the lernex CLI build
-   against liblernex_cpu.so; the CUDA build filters *_cpu.cpp out of its sources.
+5. CMake: with -DLX_BACKEND_CUDA=OFF -DLX_BACKEND_CPU=ON, dromos_core and the dromos CLI build
+   against libdromos_cpu.so; the CUDA build filters *_cpu.cpp out of its sources.
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
 index b169552..79ffa4e 100644
@@ -38,36 +38,36 @@ index b169552..79ffa4e 100644
    add_subdirectory(engine/cpu)
  endif()
  
-+# The model and CLI on the CPU backend alone, where there is no CUDA: lernex linked to liblernex_cpu.so.
++# The model and CLI on the CPU backend alone, where there is no CUDA: dromos linked to libdromos_cpu.so.
 +# The glue kernels the model wires between library calls come from glue_cpu.cpp instead of glue.cu.
 +if(LX_BACKEND_CPU AND NOT LX_BACKEND_CUDA)
 +  file(GLOB LX_CPU_CORE_SOURCES CONFIGURE_DEPENDS engine/core/*.cpp engine/model/*.cpp engine/runtime/*.cpp
 +       engine/text/*.cpp engine/server/*.cpp)
-+  add_library(lernex_core STATIC ${LX_CPU_CORE_SOURCES})
-+  target_include_directories(lernex_core PUBLIC engine third_party)
-+  target_link_libraries(lernex_core PUBLIC lernex_cpu)
++  add_library(dromos_core STATIC ${LX_CPU_CORE_SOURCES})
++  target_include_directories(dromos_core PUBLIC engine third_party)
++  target_link_libraries(dromos_core PUBLIC dromos_cpu)
 +  file(GLOB LX_CLI_SOURCES CONFIGURE_DEPENDS cli/*.cpp)
-+  add_executable(lernex ${LX_CLI_SOURCES})
-+  target_link_libraries(lernex PRIVATE lernex_core)
++  add_executable(dromos ${LX_CLI_SOURCES})
++  target_link_libraries(dromos PRIVATE dromos_core)
 +endif()
 +
  if(NOT LX_BACKEND_CUDA)
    return()
  endif()
-@@ -46,6 +59,7 @@ target_link_libraries(lernex_kernels PUBLIC CUDA::cudart CUDA::cublasLt)
+@@ -46,6 +59,7 @@ target_link_libraries(dromos_kernels PUBLIC CUDA::cudart CUDA::cublasLt)
  # The runtime: config, weights, the Metis model, caches and the scheduler.
  file(GLOB LX_CORE_SOURCES CONFIGURE_DEPENDS engine/core/*.cpp engine/model/*.cpp engine/model/*.cu engine/runtime/*.cpp
       engine/runtime/*.cu engine/text/*.cpp engine/server/*.cpp)
 +list(FILTER LX_CORE_SOURCES EXCLUDE REGEX "_cpu\\.cpp$")
  if(LX_CORE_SOURCES)
-   add_library(lernex_core STATIC ${LX_CORE_SOURCES})
-   target_include_directories(lernex_core PUBLIC engine third_party)
+   add_library(dromos_core STATIC ${LX_CORE_SOURCES})
+   target_include_directories(dromos_core PUBLIC engine third_party)
 diff --git a/cli/eval.cpp b/cli/eval.cpp
 index 144cd8c..1dda077 100644
 --- a/cli/eval.cpp
 +++ b/cli/eval.cpp
 @@ -1,8 +1,6 @@
- // lernex eval: run reference prompts through the model and write every position's logits, for
+ // dromos eval: run reference prompts through the model and write every position's logits, for
  // tools/compare.py. With a split point N the first N tokens go in as one prefill and the rest as
  // single-token decode steps, which checks that the caches carry a sequence exactly.
 -#include <cuda_runtime.h>
@@ -130,7 +130,7 @@ index e61211f..8d71747 100644
 --- a/cli/inspect.cpp
 +++ b/cli/inspect.cpp
 @@ -1,10 +1,8 @@
- // lernex inspect MODEL_DIR
+ // dromos inspect MODEL_DIR
  //
 -// Loads the config and the checkpoint, uploads every tensor to the GPU, reads each one back and
 +// Loads the config and the checkpoint, uploads every tensor to the device, reads each one back and

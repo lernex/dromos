@@ -1,16 +1,16 @@
 #!/bin/bash
-# Single-stream and CPU cells: llama.cpp's llama-bench and Lernex's `lernex bench` on the same weights.
+# Single-stream and CPU cells: llama.cpp's llama-bench and Dromos's `dromos bench` on the same weights.
 #
-# Rival cells (llama.cpp) and Lernex cells are separate modes, so each lock hold is one engine's cells:
+# Rival cells (llama.cpp) and Dromos cells are separate modes, so each lock hold is one engine's cells:
 #
 #   llama-gpu      llama-bench, RTX 5070 Ti, full offload              (scripts/remote.sh rivals x ...)
-#   llama-gpu-bf16 llama-bench, BF16 GGUF on the card (Praxis: the matched format for Lernex BF16)
+#   llama-gpu-bf16 llama-bench, BF16 GGUF on the card (Praxis: the matched format for Dromos BF16)
 #   llama-cpu      llama-bench, no GPU, 14 threads                     (scripts/remote.sh rivals run ...)
 #   llama-offload  llama-bench Logos BF16 at NGL layers on the GPU     (scripts/remote.sh rivals x ...)
 #   llama-experts  llama-bench Logos BF16, routed experts on the CPU    (scripts/remote.sh rivals x ...)
-#   lernex-gpu / lernex-cpu / lernex-offload   the Lernex side, run once on final main
+#   dromos-gpu / dromos-cpu / dromos-offload   the Dromos side, run once on final main
 #
-# llama-bench runs at -p 512 -n 128,256 (pp512, tg128, tg256). `lernex bench` runs one stream of 512 prompt
+# llama-bench runs at -p 512 -n 128,256 (pp512, tg128, tg256). `dromos bench` runs one stream of 512 prompt
 # tokens and 256 generated (greedy, synthetic prompts, the engine's own harness); its decode tok/s is
 # "decode" in its report. Results go to out/rivals/single-*.log and out/rivals/single-*.json.
 #
@@ -28,14 +28,14 @@ LLAMA=${LLAMA:-$HOME/lernex-engine-dev/rivals-llama/build-rivals/bin}
 ENG=$HOME/kronos-scratch/logos/engines
 PRAXIS_GGUF=$ENG/praxis/release
 LOGOS_GGUF=$ENG/gguf/release
-PRAXIS_BF16=$HOME/.cache/lernex/models/Lernex/Metis-1.6-Praxis
+PRAXIS_BF16=$HOME/.cache/dromos/models/Lernex/Metis-1.6-Praxis
 PRAXIS_FP8=$ENG/praxis/fp8
 PRAXIS_NVFP4=$ENG/praxis/nvfp4
-LOGOS_BF16=$HOME/.cache/lernex/models/Lernex/Metis-1.6-Logos
-LOGOS_FP8=$HOME/.cache/lernex/models/Lernex/Metis-1.6-Logos-FP8
+LOGOS_BF16=$HOME/.cache/dromos/models/Lernex/Metis-1.6-Logos
+LOGOS_FP8=$HOME/.cache/dromos/models/Lernex/Metis-1.6-Logos-FP8
 
-# Lernex reads its backend from LX_KERNELS first: clear it so LX_BACKEND=cpu selects the CPU library.
-lernex=build/lernex
+# Dromos reads its backend from LX_KERNELS first: clear it so LX_BACKEND=cpu selects the CPU library.
+dromos=build/dromos
 
 llama_bench() {  # name gguf [extra llama-bench args...]
   local name=$1 gguf=$2; shift 2
@@ -46,10 +46,10 @@ llama_bench() {  # name gguf [extra llama-bench args...]
   echo "llama-bench $name: $("${PY:-python3}" -c 'import json,sys; print(" ".join(("pp%d=%.1f" % (r["n_prompt"], r["avg_ts"])) if r["n_prompt"] else ("tg%d=%.1f" % (r["n_gen"], r["avg_ts"])) for r in json.load(open(sys.argv[1]))))' "$out/single-$name.json")"
 }
 
-lx_bench() {  # name dir [extra lernex bench args...]
+lx_bench() {  # name dir [extra dromos bench args...]
   local name=$1 dir=$2; shift 2
-  $lernex bench "$dir" --streams 1 --prompt-tokens 512 --gen-tokens "${GEN:-256}" "$@" >"$out/single-$name.log" 2>&1
-  echo "lernex bench $name:"; grep -E "decode|prefill|plan|Plan|weights|format" "$out/single-$name.log" | head -12
+  $dromos bench "$dir" --streams 1 --prompt-tokens 512 --gen-tokens "${GEN:-256}" "$@" >"$out/single-$name.log" 2>&1
+  echo "dromos bench $name:"; grep -E "decode|prefill|plan|Plan|weights|format" "$out/single-$name.log" | head -12
 }
 
 case $mode in
@@ -77,20 +77,20 @@ case $mode in
     ;;
   llama-experts)
     # The routed experts (ffn_*_exps, 18 GB of the 20.5 GB file) stay in host memory and the rest runs on the card:
-    # the MoE offload Lernex makes on its own, expressed with llama.cpp's tensor override.
+    # the MoE offload Dromos makes on its own, expressed with llama.cpp's tensor override.
     # At the default micro-batch (512) the prompt-processing compute buffer alone is ~18 GB on this build, so the
     # prefill runs in smaller micro-batches (-ub); decode is one token per step and does not change.
     for ub in ${UB:-128 64}; do
       llama_bench logos-bf16-experts-cpu-ub$ub "$LOGOS_GGUF/Metis-1.6-Logos-BF16.gguf" -ngl 99 -ot "ffn_.*_exps=CPU" -ub "$ub" -p 512 -n 128,256 -r 2
     done
     ;;
-  lernex-gpu)
+  dromos-gpu)
     lx_bench praxis-nvfp4 "$PRAXIS_NVFP4"
     lx_bench praxis-fp8 "$PRAXIS_FP8"
     lx_bench praxis-bf16 "$PRAXIS_BF16"
     lx_bench logos-fp8 "$LOGOS_FP8"
     ;;
-  lernex-cpu)
+  dromos-cpu)
     export CUDA_VISIBLE_DEVICES=
     export LX_BACKEND=cpu LX_THREADS=14
     unset LX_KERNELS
@@ -98,8 +98,8 @@ case $mode in
     GEN=128 lx_bench praxis-int8-cpu "$PRAXIS_BF16" --weights int8
     GEN=128 lx_bench logos-fp8-cpu "$LOGOS_FP8"
     ;;
-  lernex-offload)
+  dromos-offload)
     lx_bench logos-bf16-offload "$LOGOS_BF16"
     ;;
-  *) echo "mode must be llama-gpu, llama-cpu, llama-offload, llama-experts, lernex-gpu, lernex-cpu or lernex-offload" >&2; exit 2 ;;
+  *) echo "mode must be llama-gpu, llama-cpu, llama-offload, llama-experts, dromos-gpu, dromos-cpu or dromos-offload" >&2; exit 2 ;;
 esac

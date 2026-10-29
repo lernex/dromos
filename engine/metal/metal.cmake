@@ -1,4 +1,4 @@
-# The Metal backend: liblernex_metal.dylib, one shared library exporting every lx_* function of
+# The Metal backend: libdromos_metal.dylib, one shared library exporting every lx_* function of
 # engine/cuda/kernels.h and tunable.h. Objective-C++ host side, Metal kernels compiled at runtime from
 # the embedded source (no offline Metal toolchain needed).
 set(LX_METAL_DIR "${CMAKE_SOURCE_DIR}/engine/metal")
@@ -33,10 +33,10 @@ add_custom_command(
   VERBATIM)
 
 file(GLOB LX_METAL_HOST CONFIGURE_DEPENDS "${LX_METAL_DIR}/*.mm")
-add_library(lernex_metal SHARED ${LX_METAL_HOST} "${LX_METAL_EMBEDDED}" "${LX_METAL_NAX_EMBEDDED}")
+add_library(dromos_metal SHARED ${LX_METAL_HOST} "${LX_METAL_EMBEDDED}" "${LX_METAL_NAX_EMBEDDED}")
 # engine/ for quoted includes only: its dispatch/ directory would shadow the SDK's <dispatch/dispatch.h>,
 # which Foundation includes.
-target_compile_options(lernex_metal PRIVATE "SHELL:-iquote ${CMAKE_SOURCE_DIR}/engine"
+target_compile_options(dromos_metal PRIVATE "SHELL:-iquote ${CMAKE_SOURCE_DIR}/engine"
                        $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc> -fvisibility=hidden -Wall -Wextra -Wno-unused-parameter)
-target_link_libraries(lernex_metal PUBLIC "-framework Metal" "-framework Foundation" "-framework IOKit")
-set_target_properties(lernex_metal PROPERTIES OBJCXX_STANDARD 20 CXX_STANDARD 20)
+target_link_libraries(dromos_metal PUBLIC "-framework Metal" "-framework Foundation" "-framework IOKit")
+set_target_properties(dromos_metal PROPERTIES OBJCXX_STANDARD 20 CXX_STANDARD 20)

@@ -1,6 +1,6 @@
-// lernex_gpu_check MODEL_DIR IDS N: runs the engine (scheduler, batching, sampler) on one prompt
+// dromos_gpu_check MODEL_DIR IDS N: runs the engine (scheduler, batching, sampler) on one prompt
 // given as comma-separated token ids, greedy, and prints the N tokens it generates, comma-separated.
-// tests/gpu/check_greedy.py compares them with the argmax of the reference path (lernex eval).
+// tests/gpu/check_greedy.py compares them with the argmax of the reference path (dromos eval).
 #include <condition_variable>
 #include <cstdio>
 #include <mutex>
@@ -15,7 +15,7 @@
 int main(int argc, char** argv) {
   try {
     if (argc != 4) {
-      std::fprintf(stderr, "usage: lernex_gpu_check MODEL_DIR IDS N\n");
+      std::fprintf(stderr, "usage: dromos_gpu_check MODEL_DIR IDS N\n");
       return 2;
     }
     std::vector<int32_t> prompt;

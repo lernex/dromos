@@ -149,7 +149,7 @@ bool Arena::open(int64_t budget) {
   if (status != 0) {
     lx_rt_free(base);
     if (status != LX_ERR_NOT_SUPPORTED)
-      std::fprintf(stderr, "lernex: persisting L2 window refused (%s); running unpinned\n",
+      std::fprintf(stderr, "dromos: persisting L2 window refused (%s); running unpinned\n",
                    lx_rt_error_string(status));
     return false;
   }

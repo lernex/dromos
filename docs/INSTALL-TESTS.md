@@ -1,9 +1,13 @@
 # Install tests
 
-What `scripts/install.sh`, the Docker image, `lernex update` and the install paths were run on, with the result of
+What `scripts/install.sh`, the Docker image, `dromos update` and the install paths were run on, with the result of
 each run. Every row names the machine, the release build it installed and what happened. There have been two rounds:
 the release candidate v0.1.0-rc1 (round 2, first below) and the 0.1.0 test builds before it (round 1). A row marked
 "not run" was not run in its round; the Open items say what is left.
+
+The engine was renamed Dromos on 2026-10-29, after both rounds. They ran under the old name, so their commands and
+output say `lernex`. In today's names: the command is `dromos`, `LERNEX_*` is `DROMOS_*`, `~/.lernex` is `~/.dromos`,
+the assets are `dromos-*.tar.gz`, and the backends are `libdromos_*`.
 
 ## Round 2: v0.1.0-rc1 (2026-10-28)
 

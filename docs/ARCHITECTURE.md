@@ -1,4 +1,4 @@
-# Lernex engine: architecture
+# Dromos: architecture
 
 An inference engine written for the Metis models (Metis-1.6 Logos 10.2B, Praxis 3.0B) and
 nothing else. General engines run Metis through layers built for other models; this one is
@@ -44,7 +44,7 @@ reference prompts, must stay inside the BF16 noise floor of the native model its
 - `engine/core/` config, safetensors loading, device memory.
 - `engine/model/` the Metis forward pass, built from the kernels.
 - `engine/runtime/` state slots, scheduler, batching (after the first milestone).
-- `cli/` the `lernex` binary.
+- `cli/` the `dromos` binary.
 - `tools/compare.py` end-to-end check against the reference logits.
 
 ## Milestones

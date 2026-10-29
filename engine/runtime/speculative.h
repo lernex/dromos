@@ -63,7 +63,7 @@ class Drafter {
 };
 
 // How long a draft is worth verifying. cost[T] is a verify step of T tokens in units of a plain
-// one-token step (measured: `lernex spec-cost`). A drafter that knows the chance p_i that its i-th
+// one-token step (measured: `dromos spec-cost`). A drafter that knows the chance p_i that its i-th
 // proposal holds once the ones before it held drafts the i-th only if p_1 ... p_i (the tokens it
 // adds, on average) beats lambda * (cost[i + 1] - cost[i]), where lambda is the tokens per unit of
 // cost the sequence is getting: the rule that maximizes long-run throughput.

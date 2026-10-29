@@ -1,13 +1,13 @@
 """The kernel tests call each kernel through the C ABI (engine/cuda/kernels.h) with ctypes,
 on PyTorch CUDA tensors, and compare against a PyTorch reference written beside the test.
 
-LX_KERNELS points at build/liblernex_kernels.so (scripts/remote.sh sets it).
+LX_KERNELS points at build/libdromos_kernels.so (scripts/remote.sh sets it).
 
 The same tests run against any backend library. LX_BACKEND=cpu (with LX_KERNELS pointing at
-liblernex_cpu.so) runs them on CPU tensors: every tensor (and generator) the tests create on "cuda" is
+libdromos_cpu.so) runs them on CPU tensors: every tensor (and generator) the tests create on "cuda" is
 created on the CPU instead, .cuda() copies as it does on a GPU, torch.cuda's stream and synchronize calls
 become the backend's (the CPU's streams are synchronous), and the kernels get host pointers. The tests
-themselves are unchanged. LX_BACKEND=metal (liblernex_metal.dylib) runs the same way: Metal reads host
+themselves are unchanged. LX_BACKEND=metal (libdromos_metal.dylib) runs the same way: Metal reads host
 memory in place (unified memory), and every call is followed by a stream sync (torch.cuda.synchronize
 waits for the device). Without LX_BACKEND, the library's name picks the backend.
 """

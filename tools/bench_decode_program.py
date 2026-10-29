@@ -1,7 +1,7 @@
 """How fast the persistent decode kernel streams weights: products through lx_program, timed with CUDA
 events, against the card's streaming read rate.
 
-    $PY tools/bench_decode_program.py            (LX_KERNELS points at build/liblernex_kernels.so)
+    $PY tools/bench_decode_program.py            (LX_KERNELS points at build/libdromos_kernels.so)
 
 Cases: one in_proj-sized product; a chain of them where each reads the one before (every op waits on
 the previous one, so this measures how well the ring hides the dependency); the same products with

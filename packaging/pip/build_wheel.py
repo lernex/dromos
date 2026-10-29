@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Builds one lernex wheel from a prebuilt tree (docs/RELEASE.md): the release tarball's contents, or the output of
+"""Builds one dromos wheel from a prebuilt tree (docs/RELEASE.md): the release tarball's contents, or the output of
 `cmake --install`. Nothing here compiles; the binaries are the caller's, byte for byte.
 
     build_wheel.py --tree DIR --out DIR --version X.Y.Z --plat TAG [--cuda 12]
@@ -8,8 +8,8 @@
 the Linux binaries need (auditwheel show), macosx_14_0_arm64 for the Metal build. --cuda names the CUDA toolkit major
 the CUDA backend was built against; the NVIDIA wheels it needs come from CUDA_WHEELS below.
 
-The tree is copied into a staged copy of this directory as lernex/_bin, with share/lernex/channel set to "pip" (so
-`lernex update` names pip). The NVIDIA runtime libraries are never bundled: a tree's libcudart and libcublasLt are
+The tree is copied into a staged copy of this directory as dromos/_bin, with share/dromos/channel set to "pip" (so
+`dromos update` names pip). The NVIDIA runtime libraries are never bundled: a tree's libcudart and libcublasLt are
 left out, and the wheel depends on the NVIDIA wheels that carry them instead.
 """
 
@@ -47,7 +47,7 @@ def engine_binaries(tree):
             path = os.path.join(root, name)
             if os.path.islink(path):
                 continue
-            if name == "lernex" or name.startswith("liblernex_"):
+            if name == "dromos" or name.startswith("libdromos_"):
                 found.append(path)
     return sorted(found)
 
@@ -114,24 +114,24 @@ def requirements(cuda):
 
 
 def check_tree(tree, cuda):
-    engine = os.path.join(tree, "bin", "lernex")
+    engine = os.path.join(tree, "bin", "dromos")
     if not os.path.isfile(engine):
-        fail("no bin/lernex under %s" % tree)
+        fail("no bin/dromos under %s" % tree)
     if not os.access(engine, os.X_OK):
-        fail("bin/lernex is not executable")
+        fail("bin/dromos is not executable")
     lib = os.path.join(tree, "lib")
-    has_kernels = os.path.isfile(os.path.join(lib, "liblernex_kernels.so"))
+    has_kernels = os.path.isfile(os.path.join(lib, "libdromos_kernels.so"))
     if has_kernels and cuda is None:
-        fail("the tree has the CUDA backend (liblernex_kernels.so): pass --cuda MAJOR")
+        fail("the tree has the CUDA backend (libdromos_kernels.so): pass --cuda MAJOR")
     if cuda is not None and not has_kernels:
-        fail("--cuda given, but the tree has no liblernex_kernels.so")
+        fail("--cuda given, but the tree has no libdromos_kernels.so")
     for name in ("LICENSE", "NOTICE"):
         if not os.path.isfile(os.path.join(tree, name)):
             fail("the tree has no %s (build it with scripts/release/build.sh)" % name)
-    if not os.path.isdir(os.path.join(tree, "share", "lernex", "licenses")):
-        fail("the tree has no share/lernex/licenses (build it with scripts/release/build.sh)")
-    if not os.path.isfile(os.path.join(lib, "liblernex_cpu.so")) and not os.path.isfile(
-            os.path.join(lib, "liblernex_metal.dylib")):
+    if not os.path.isdir(os.path.join(tree, "share", "dromos", "licenses")):
+        fail("the tree has no share/dromos/licenses (build it with scripts/release/build.sh)")
+    if not os.path.isfile(os.path.join(lib, "libdromos_cpu.so")) and not os.path.isfile(
+            os.path.join(lib, "libdromos_metal.dylib")):
         fail("the tree has no CPU or Metal backend library")
 
 
@@ -142,19 +142,19 @@ def stage_tree(tree, dest):
     left_out = sorted(n for n in os.listdir(lib_src) if n.startswith(NVIDIA_PREFIXES)) if os.path.isdir(lib_src) else []
     if left_out:
         print("build_wheel: left out of the wheel (from the NVIDIA wheels instead): " + ", ".join(left_out))
-    channel = os.path.join(dest, "share", "lernex")
+    channel = os.path.join(dest, "share", "dromos")
     os.makedirs(channel, exist_ok=True)
     with open(os.path.join(channel, "channel"), "w", encoding="utf-8") as f:
         f.write("pip\n")
     # The wheel bundles no NVIDIA library, so the NVIDIA license that came with the toolkit's libraries is not its
     # to carry: the NVIDIA wheels ship their own.
-    licenses = os.path.join(dest, "share", "lernex", "licenses")
+    licenses = os.path.join(dest, "share", "dromos", "licenses")
     for name in sorted(os.listdir(licenses)) if os.path.isdir(licenses) else []:
         if name.startswith("NVIDIA"):
             os.remove(os.path.join(licenses, name))
             print("build_wheel: left out of the wheel (the NVIDIA wheels carry their own license): " + name)
     # The launcher's own mode bits come from the tree; make sure the engine is executable after staging.
-    engine = os.path.join(dest, "bin", "lernex")
+    engine = os.path.join(dest, "bin", "dromos")
     os.chmod(engine, os.stat(engine).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
@@ -164,7 +164,7 @@ def stage_licenses(dest, stage):
     shutil.copy2(os.path.join(dest, "LICENSE"), os.path.join(stage, "LICENSE"))
     shutil.copy2(os.path.join(dest, "NOTICE"), os.path.join(stage, "NOTICE"))
     os.makedirs(os.path.join(stage, "licenses"), exist_ok=True)
-    source = os.path.join(dest, "share", "lernex", "licenses")
+    source = os.path.join(dest, "share", "dromos", "licenses")
     for name in sorted(os.listdir(source)):
         shutil.copy2(os.path.join(source, name), os.path.join(stage, "licenses", name))
 
@@ -175,11 +175,11 @@ def build(args):
     check_tree(tree, args.cuda)
     floor_check(tree, args.plat)
     os.makedirs(out, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="lernex-wheel-") as work:
+    with tempfile.TemporaryDirectory(prefix="dromos-wheel-") as work:
         stage = os.path.join(work, "pip")
         shutil.copytree(HERE, stage, ignore=shutil.ignore_patterns("build_wheel.py", "__pycache__"))
-        stage_tree(tree, os.path.join(stage, "lernex", "_bin"))
-        stage_licenses(os.path.join(stage, "lernex", "_bin"), stage)
+        stage_tree(tree, os.path.join(stage, "dromos", "_bin"))
+        stage_licenses(os.path.join(stage, "dromos", "_bin"), stage)
         with open(os.path.join(stage, "wheel.json"), "w", encoding="utf-8") as f:
             json.dump({"version": args.version, "requires": requirements(args.cuda)}, f, indent=1)
         # The platform tag goes in setup.cfg, so pip builds the wheel with it (no setup.py command line).

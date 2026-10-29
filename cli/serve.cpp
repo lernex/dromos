@@ -1,4 +1,4 @@
-// lernex serve MODEL [--host H] [--port P] [--weights bf16|int8|fp8|nvfp4|bf16x] [--no-bf16x] [--context N]
+// dromos serve MODEL [--host H] [--port P] [--weights bf16|int8|fp8|nvfp4|bf16x] [--no-bf16x] [--context N]
 //                    [--sequences N]
 //
 // Serves MODEL over the OpenAI API on this machine until Ctrl-C. The weights run in the format the file stores
@@ -55,7 +55,7 @@ int cmd_serve(int argc, char** argv) {
   }
   if (name.empty()) {
     std::fprintf(stderr,
-                 "usage: lernex serve MODEL [--host 127.0.0.1] [--port 8080] [--name NAME]\n"
+                 "usage: dromos serve MODEL [--host 127.0.0.1] [--port 8080] [--name NAME]\n"
                  "                     %s\n"
                  "                     [--context N] [--sequences N] [--no-prefix-cache] [--no-spec]\n",
                  cli::kFormatUsage);

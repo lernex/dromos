@@ -1,4 +1,4 @@
-// What liblernex_cpu.so exports beyond kernels.h: the controls the offload runtime's CPU lane uses
+// What libdromos_cpu.so exports beyond kernels.h: the controls the offload runtime's CPU lane uses
 // (engine/runtime/offload.h). Everything else is the kernels.h ABI.
 #pragma once
 

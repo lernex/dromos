@@ -1,4 +1,4 @@
-// lernex inspect MODEL_DIR
+// dromos inspect MODEL_DIR
 //
 // Loads the config and the checkpoint, uploads every tensor to the GPU, reads each one back and
 // compares it with the file, then reports what landed. This is the loader's end-to-end check.
@@ -69,7 +69,7 @@ void print_config(const std::string& dir, const lx::MetisConfig& c) {
 
 int cmd_inspect(int argc, char** argv) {
   if (argc != 2) {
-    std::fprintf(stderr, "usage: lernex inspect MODEL_DIR\n");
+    std::fprintf(stderr, "usage: dromos inspect MODEL_DIR\n");
     return 2;
   }
   try {

@@ -1,10 +1,10 @@
 # Decode scoreboard
 
-How fast the Lernex engine decodes, measured against the memory bandwidth of the card it runs on.
+How fast Dromos decodes, measured against the memory bandwidth of the card it runs on.
 
-Card: NVIDIA GeForce RTX 5070 Ti (16 GB, sm_120), on the lernex GPU server.
+Card: NVIDIA GeForce RTX 5070 Ti (16 GB, sm_120), on the dromos GPU server.
 Measured: 2026-10-27, on commit 4b25613 (`Add lx_bandwidth_probe and the decode roofline to doctor and bench`, landed on main as f1f60e3), under the GPU lock, on an otherwise idle card.
-The per-component, held-as, modelled NVFP4 and Logos sections were measured 2026-10-28 with the doctor changes that come with this file (`lernex doctor --modelled`, the "held as" column, the routed-experts column in the batched table).
+The per-component, held-as, modelled NVFP4 and Logos sections were measured 2026-10-28 with the doctor changes that come with this file (`dromos doctor --modelled`, the "held as" column, the routed-experts column in the batched table).
 
 ## What the ceiling is
 
@@ -32,7 +32,7 @@ Where each row's weights come from: Praxis BF16 is the BF16 file as stored. Prax
 
 ## Bench prompts and the routing census
 
-**The basis changed at commit 07db7ad.** From that commit `lernex bench` cuts its prompts from `tools/rivals/corpus.txt`, tokenized with the model's own tokenizer: 10,298 tokens, FNV-1a `df6a8031` (the same ids the rival client sends, checked against the HF tokenizer). Stream i of n reads the 512-token window that starts at `(N - 512) * i / (n - 1)`, so the windows spread across the corpus. The rival client's unique-prompt mode uses the same rule by default now (`--random-windows` restores its old random starts), so a rival run at n streams and a bench run at n streams read the same tokens. `--random-prompts` restores the bench's synthetic ids, which every row before 07db7ad was measured on.
+**The basis changed at commit 07db7ad.** From that commit `dromos bench` cuts its prompts from `tools/rivals/corpus.txt`, tokenized with the model's own tokenizer: 10,298 tokens, FNV-1a `df6a8031` (the same ids the rival client sends, checked against the HF tokenizer). Stream i of n reads the 512-token window that starts at `(N - 512) * i / (n - 1)`, so the windows spread across the corpus. The rival client's unique-prompt mode uses the same rule by default now (`--random-windows` restores its old random starts), so a rival run at n streams and a bench run at n streams read the same tokens. `--random-prompts` restores the bench's synthetic ids, which every row before 07db7ad was measured on.
 
 The routing census runs on the same prompts as the timed run, eagerly (graphs off, so it is not timed). It runs after the timed run, so its prefix-cache hits do not turn the timed prefill into a cache read. The warm-up runs on random ids for the same reason.
 
@@ -48,11 +48,11 @@ The real-text decode rate is 5.7% below the random-id rate, and the two censuses
 
 An earlier real-text census (e8b7997) used a 300-token prose passage in 64-token windows and read 49.1 experts per layer-pass, with a roofline of 1946. That passage was too short and too short-windowed to be the bench's basis, so its figures are superseded by the corpus rows above.
 
-## Measured decode: `lernex bench`
+## Measured decode: `dromos bench`
 
 One run per format and stream count on commit 4b25613:
 
-`lernex bench MODEL --streams 1,8,32 --prompt-tokens 512 --gen-tokens 256`
+`dromos bench MODEL --streams 1,8,32 --prompt-tokens 512 --gen-tokens 256`
 
 Greedy sampling, one card. Each cell is decode tok/s, with the share of the measured-bandwidth roofline at that batch size in brackets.
 
@@ -84,7 +84,7 @@ Run again at 26 streams, the slot count, so nothing queues (`--streams 26`): **1
 
 ## Where the bytes go
 
-One stream, context 512, MB per token, from `lernex doctor` on each format. BF16, FP8 and NVFP4 are the stored Praxis folders. INT8 is round-to-nearest from the BF16 file. The modelled FP8 and NVFP4 counts (`lernex doctor --modelled`) match the stored folders on all 38 components.
+One stream, context 512, MB per token, from `dromos doctor` on each format. BF16, FP8 and NVFP4 are the stored Praxis folders. INT8 is round-to-nearest from the BF16 file. The modelled FP8 and NVFP4 counts (`dromos doctor --modelled`) match the stored folders on all 38 components.
 
 | Component | BF16 | INT8 | FP8 | NVFP4 |
 |---|---:|---:|---:|---:|
@@ -206,7 +206,7 @@ Against FP8 the step is 216.5 MB smaller at context 512 (1511.1 to 1294.6). Rout
 
 ## Logos NVFP4, modelled
 
-No Logos NVFP4 checkpoint exists. This is the recipe the Praxis NVFP4 folder uses (`projection_format` in `engine/core/checkpoint.cpp`: experts NVFP4; dense projections, LM head and depth memory key and value FP8; latent_up and Mamba out_proj BF16; router f32) applied to Logos's config, counted with `lernex doctor --modelled --weights nvfp4`. Nothing is read from the folder.
+No Logos NVFP4 checkpoint exists. This is the recipe the Praxis NVFP4 folder uses (`projection_format` in `engine/core/checkpoint.cpp`: experts NVFP4; dense projections, LM head and depth memory key and value FP8; latent_up and Mamba out_proj BF16; router f32) applied to Logos's config, counted with `dromos doctor --modelled --weights nvfp4`. Nothing is read from the folder.
 
 The same command on Praxis reproduces the stored Praxis NVFP4 folder on all 38 components (identical MB), and the FP8 counterpart reproduces the stored Praxis FP8 folder the same way. The recipe is checked against real folders, not only against itself. What this does not establish is the quality of a GPTQ Logos NVFP4 checkpoint, which has to be made and measured.
 
@@ -264,7 +264,7 @@ Definitions, for whoever fills it:
 | Prompt lookup, lone stream | Praxis INT8 | up to 6 drafts, adaptive | 1.57 | 1340 | 1 | 476 | 75% | 0.49 accepted | this commit | 1.36x plain, chat mix, greedy |
 | Prompt lookup, lone stream | Logos FP8 | up to 6 drafts, adaptive | 1.59 | 3455 | 1 | 225 | 91% | 0.48 accepted | this commit | 1.38x plain, chat mix, greedy |
 
-Speculative rows are prompt-lookup drafts on a lone stream, from `lernex spec` on the chat mix (the five spec prompts, think and direct_tools, 512 tokens, two repeats). Tokens per weight sweep is tokens per decode step, verify and plain steps together. Weight MB per sweep is the bandwidth time in the roofline table times 853 GB/s. Speedups are chat-mix aggregates over plain decode of the same format, and greedy text is identical to plain on every prompt.
+Speculative rows are prompt-lookup drafts on a lone stream, from `dromos spec` on the chat mix (the five spec prompts, think and direct_tools, 512 tokens, two repeats). Tokens per weight sweep is tokens per decode step, verify and plain steps together. Weight MB per sweep is the bandwidth time in the roofline table times 853 GB/s. Speedups are chat-mix aggregates over plain decode of the same format, and greedy text is identical to plain on every prompt.
 
 - **Praxis BF16:** 1.37x greedy, 1.35x at temperature 0.3, 1.15x for think at 0.8.
 - **Praxis INT8:** 1.36x greedy, 1.35x at 0.3, 1.17x for think at 0.8.
@@ -286,8 +286,8 @@ Same bench shape as above (512 prompt tokens, 256 generated, greedy), same card,
 | MLX | pending | Praxis, MLX | pending | pending | pending | pending | not measured |
 
 The SGLang rows at 8 and 32 streams are end-to-end output tok/s from `tools/rivals/load.py` (the
-prefill ramp is included), not the decode column above, so compare them with the Lernex e2e
-number from the same client. The 1-stream SGLang rows are the per-stream decode rate. Lernex's
+prefill ramp is included), not the decode column above, so compare them with the Dromos e2e
+number from the same client. The 1-stream SGLang rows are the per-stream decode rate. Dromos's
 column is filled from the final-main run of that same client (see `docs/RIVALS.md`).
 
 ## How to read the numbers
@@ -299,7 +299,7 @@ column is filled from the final-main run of that same client (see `docs/RIVALS.m
 
 ## Open items
 
-- **Bench and slot count.** `lernex bench` should refuse, or at least flag, a stream count above the plan's slot count. Otherwise the row looks like a decode rate and is not one.
+- **Bench and slot count.** `dromos bench` should refuse, or at least flag, a stream count above the plan's slot count. Otherwise the row looks like a decode rate and is not one.
 - **Planner estimate.** `plan.cpp` (`decode_bytes_per_token`) estimates Praxis BF16 at 1730 MB per token and 290 tok/s. The counted figure is 1827 MB at context 512. The gap is the depth-memory routing features, the depth query and output, and the depth head. `doctor`'s "decode est." column uses the planner figure. Not changed here.
 - **Logos NVFP4 quality.** The modelled Logos NVFP4 roofline is a byte count. It needs a GPTQ checkpoint and a quality measurement before any speed is quoted for it.
 - **Compute peaks.** The 87.9 TFLOPS BF16 figure for sm_120 is derived from the 1406 sparse FP4 TOPS on NVIDIA's product page (halved to dense, then divided by 8 for BF16). Rows for other cards in `cli/roofline.cpp` come from datasheet values and have not been re-checked online.

@@ -1,7 +1,7 @@
 """Program GEMV vs lx_gemv: one product at M = 1, run as a decode program (the persistent kernel's GEMV phase, the one
 the decode step uses) and as lx_gemv, on the same weight. Prints GB/s for both and the ratio.
 
-    LX_KERNELS=/path/liblernex_kernels.so python3 tests/kernels/bench_ring_gemv.py [--kinds bf16 int8] [--shapes N,K ...]
+    LX_KERNELS=/path/libdromos_kernels.so python3 tests/kernels/bench_ring_gemv.py [--kinds bf16 int8] [--shapes N,K ...]
 
 Timing is CUDA events around back-to-back runs (no host sync inside the loop); the program's result is checked against a
 float64 reference before timing. The bytes counted are the weight's bytes (the same for both paths).

@@ -47,9 +47,9 @@ std::vector<TuneProblem> model_problems(const MetisConfig& config, const Plan& p
 // current device. The caller holds the GPU (scripts/remote.sh SLOT x).
 TuneReport tune(const std::vector<TuneProblem>& problems, const TuneOptions& options);
 
-// The cache file for a device: ~/.cache/lernex/tune/<slug>_<driver>_<engine>.json.
+// The cache file for a device: ~/.cache/dromos/tune/<slug>_<driver>_<engine>.json.
 std::string tune_cache_path(const DeviceInfo& device);
-// The table shipped for a GPU: <executable>/../share/lernex/tuning/<slug>_<engine>.json in an install, else the
+// The table shipped for a GPU: <executable>/../share/dromos/tuning/<slug>_<engine>.json in an install, else the
 // same name in the source tree (tuning/). The path is returned whether or not the file exists.
 std::string shipped_table_path(const DeviceInfo& device);
 

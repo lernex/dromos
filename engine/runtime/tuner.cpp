@@ -138,7 +138,7 @@ bool agrees(const std::vector<float>& got, const std::vector<float>& want, doubl
 
 std::string gpu_dir() {
   const char* home = std::getenv("HOME");
-  return std::string(home ? home : ".") + "/.cache/lernex/tune";
+  return std::string(home ? home : ".") + "/.cache/dromos/tune";
 }
 
 // The table key of a kernel's problem, as the backend writes it (lx_tune_key), so host and backend agree.
@@ -294,7 +294,7 @@ std::string tune_cache_path(const DeviceInfo& device) {
 
 std::string shipped_table_path(const DeviceInfo& device) {
   const std::string name = device.slug() + "_" + kEngineVersion + ".json";
-  // The install's own tables (<executable>/../share/lernex/tuning) first, then the source tree the build came from.
+  // The install's own tables (<executable>/../share/dromos/tuning) first, then the source tree the build came from.
   const std::string share = lx::install::share_dir();
   if (!share.empty() && std::filesystem::exists(share + "/tuning/" + name)) return share + "/tuning/" + name;
   return std::string(LX_TUNING_DIR) + "/" + name;

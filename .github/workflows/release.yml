@@ -36,8 +36,8 @@ jobs:
             bash -c 'export PATH=/opt/python/cp312-cp312/bin:$PATH && python3 -m pip install -q ninja && /src/scripts/release/build.sh linux-x86_64-cpu /out'
       - uses: actions/upload-artifact@v4
         with:
-          name: lernex-linux-x86_64-cpu
-          path: ${{ runner.temp }}/release/lernex-linux-x86_64-cpu.tar.gz
+          name: dromos-linux-x86_64-cpu
+          path: ${{ runner.temp }}/release/dromos-linux-x86_64-cpu.tar.gz
           if-no-files-found: error
 
   linux-aarch64-cpu:
@@ -56,8 +56,8 @@ jobs:
             bash -c 'export PATH=/opt/python/cp312-cp312/bin:$PATH && python3 -m pip install -q ninja && /src/scripts/release/build.sh linux-aarch64-cpu /out'
       - uses: actions/upload-artifact@v4
         with:
-          name: lernex-linux-aarch64-cpu
-          path: ${{ runner.temp }}/release/lernex-linux-aarch64-cpu.tar.gz
+          name: dromos-linux-aarch64-cpu
+          path: ${{ runner.temp }}/release/dromos-linux-aarch64-cpu.tar.gz
           if-no-files-found: error
 
   darwin-arm64:
@@ -75,8 +75,8 @@ jobs:
           scripts/release/build.sh darwin-arm64 "$RUNNER_TEMP/release"
       - uses: actions/upload-artifact@v4
         with:
-          name: lernex-darwin-arm64
-          path: ${{ runner.temp }}/release/lernex-darwin-arm64.tar.gz
+          name: dromos-darwin-arm64
+          path: ${{ runner.temp }}/release/dromos-darwin-arm64.tar.gz
           if-no-files-found: error
 
   linux-x86_64-cuda12:
@@ -101,8 +101,8 @@ jobs:
             bash -c 'export PATH=/opt/python/cp312-cp312/bin:$PATH && python3 -m pip install -q ninja && /src/scripts/release/cuda-toolkit.sh 12.8 && /src/scripts/release/build.sh linux-x86_64-cuda12 /out'
       - uses: actions/upload-artifact@v4
         with:
-          name: lernex-linux-x86_64-cuda12
-          path: ${{ runner.temp }}/release/lernex-linux-x86_64-cuda12.tar.gz
+          name: dromos-linux-x86_64-cuda12
+          path: ${{ runner.temp }}/release/dromos-linux-x86_64-cuda12.tar.gz
           if-no-files-found: error
 
   publish:
@@ -129,4 +129,4 @@ jobs:
           prerelease=()
           [[ "$GITHUB_REF_NAME" == *-* ]] && prerelease=(--prerelease)
           gh release create "$GITHUB_REF_NAME" --draft "${prerelease[@]}" --verify-tag \
-            --title "Lernex engine ${GITHUB_REF_NAME#v}" "$RUNNER_TEMP"/assets/*
+            --title "Dromos ${GITHUB_REF_NAME#v}" "$RUNNER_TEMP"/assets/*

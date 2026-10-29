@@ -1,6 +1,6 @@
 """The Mamba-2 step of a decode step, per layer-pass, against its state-bytes floor, at 1 to 64 sequences.
 
-Run on the GPU server, after a build so build/liblernex_kernels.so is current:
+Run on the GPU server, after a build so build/libdromos_kernels.so is current:
     scripts/remote.sh mamba2 build
     scripts/remote.sh mamba2 x '$PY bench/bench_mamba_step.py'
 
@@ -19,7 +19,7 @@ import statistics
 import torch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LIB = os.environ.get("LX_KERNELS", os.path.join(ROOT, "build", "liblernex_kernels.so"))
+LIB = os.environ.get("LX_KERNELS", os.path.join(ROOT, "build", "libdromos_kernels.so"))
 _lib = ctypes.CDLL(LIB)
 
 # The Mamba-2 shape of a layer: Praxis by default, LX_MAMBA_SHAPE=logos for Logos (80 heads in 10 groups)

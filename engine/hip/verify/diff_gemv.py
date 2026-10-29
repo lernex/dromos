@@ -1,7 +1,7 @@
 """Differential check of the int8 decode GEMV and the int8 MoE: the CUDA library against the HIP library
 (NVIDIA shim). Weights are quantized once, by the CUDA library, so both libraries see identical bytes.
 
-    $PY proto/diff_gemv.py build/liblernex_kernels.so build/e2e/hip/liblernex_hip.so
+    $PY proto/diff_gemv.py build/libdromos_kernels.so build/e2e/hip/libdromos_hip.so
 """
 
 import ctypes

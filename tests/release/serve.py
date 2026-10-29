@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-# A release host for `lernex update` tests, answering the way github.com/lernex/lernex-engine/releases does.
+# A release host for `dromos update` tests, answering the way github.com/dromos/dromos/releases does.
 #
 #   tests/release/serve.py DIR PORT
 #
 # DIR holds one directory per release, DIR/vX.Y.Z/, with the assets and SHA256SUMS in it, and DIR/LATEST, the version
 # /latest leads to. Requests:
-#   GET /latest                     302 to /tag/vLATEST (the redirect `lernex update` follows)
+#   GET /latest                     302 to /tag/vLATEST (the redirect `dromos update` follows)
 #   GET /tag/vX.Y.Z                 200, a release page (its URL names the tag)
 #   GET /download/vX.Y.Z/NAME       the asset, or 404
 # Binds 127.0.0.1 only. Stop it with Ctrl-C.
@@ -20,7 +20,7 @@ TAG_PATH = re.compile(r"^/tag/(v[0-9][^/]*)$")
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
-    server_version = "lernex-release-host/1"
+    server_version = "dromos-release-host/1"
 
     def log_message(self, fmt, *args):
         sys.stderr.write("serve: %s %s\n" % (self.command, self.path))

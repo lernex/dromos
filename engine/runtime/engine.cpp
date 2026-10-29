@@ -76,7 +76,7 @@ size_t held_suffix(const std::string& text, const std::vector<std::string>& stri
 }  // namespace
 
 // The offload runtime's options for a plan: its formats and budgets, the CPU lane's share as the plan placed it,
-// and the measurement knobs `lernex offload` reads (LX_ROUTING_STATS, LX_OFFLOAD_DYNAMIC, LX_OFFLOAD_CPU_FRACTION,
+// and the measurement knobs `dromos offload` reads (LX_ROUTING_STATS, LX_OFFLOAD_DYNAMIC, LX_OFFLOAD_CPU_FRACTION,
 // LX_OFFLOAD_CPU_PAIRS, LX_OFFLOAD_FILL), which win when set.
 lx::offload::OffloadLoadOptions offload_options(const Plan& plan) {
   auto env = [](const char* name, double fallback) {
@@ -445,7 +445,7 @@ void Engine::Impl::loop() {
       admit();
       if (!running.empty()) step();
     } catch (const std::exception& e) {
-      std::fprintf(stderr, "lernex: the engine stopped: %s\n", e.what());
+      std::fprintf(stderr, "dromos: the engine stopped: %s\n", e.what());
       fail_all(e.what());
       return;
     }

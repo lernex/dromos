@@ -1,7 +1,7 @@
 """Differential check: the decode-path kernels of the CUDA library against the HIP library (NVIDIA shim).
 
 Same inputs go to both libraries; the outputs are compared element by element. Run from the slot root:
-    $PY proto/diff_decode.py build/liblernex_kernels.so build/e2e/hip/liblernex_hip.so
+    $PY proto/diff_decode.py build/libdromos_kernels.so build/e2e/hip/libdromos_hip.so
 """
 
 import ctypes

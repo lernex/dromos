@@ -1,5 +1,5 @@
-// lernex pull MODEL: downloads a model into the cache, resumably and verified.
-// lernex list: the models lernex knows, and which of them are installed.
+// dromos pull MODEL: downloads a model into the cache, resumably and verified.
+// dromos list: the models dromos knows, and which of them are installed.
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -24,7 +24,7 @@ std::string short_path(const std::filesystem::path& p) {
 
 int cmd_pull(int argc, char** argv) {
   if (argc != 2) {
-    std::fprintf(stderr, "usage: lernex pull MODEL   (praxis, logos, praxis:fp8, logos:nvfp4, or owner/name)\n");
+    std::fprintf(stderr, "usage: dromos pull MODEL   (praxis, logos, praxis:fp8, logos:nvfp4, or owner/name)\n");
     return 2;
   }
   const std::string name = argv[1];
@@ -55,7 +55,7 @@ int cmd_pull(int argc, char** argv) {
   });
   if (live) std::fprintf(stderr, "\r%100s\r", "");
   std::printf("Installed %s at %s\n", name.c_str(), short_path(dir).c_str());
-  std::printf("Run it with: lernex run %s\n", name.c_str());
+  std::printf("Run it with: dromos run %s\n", name.c_str());
   return 0;
 }
 

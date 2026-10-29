@@ -1,6 +1,6 @@
 """The engine's block drafter against the PyTorch model it was trained as, on the same inputs.
 
-    build/lernex block-check MODEL_DIR DRAFT_DIR PROMPTS_JSON OUT_DIR
+    build/dromos block-check MODEL_DIR DRAFT_DIR PROMPTS_JSON OUT_DIR
     $PY tools/draft/check_block.py MODEL_DIR DRAFT_DIR OUT_DIR
 
     $PY tools/draft/check_block.py init MODEL_DIR DRAFT_DIR   # a freshly initialized drafter to check

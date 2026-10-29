@@ -1,6 +1,6 @@
-// lernex spec: speculative decoding against plain decoding, per prompt and per drafter.
+// dromos spec: speculative decoding against plain decoding, per prompt and per drafter.
 //
-//   lernex spec MODEL_DIR PROMPTS_JSON [options]
+//   dromos spec MODEL_DIR PROMPTS_JSON [options]
 //     --tokens N        tokens to generate per prompt (256)
 //     --k N             most drafts per step (6; clamped to the model's verify limit)
 //     --drafters LIST   comma list of plain, ngram, ngram-fixed, self, model, block, block-fixed
@@ -19,16 +19,16 @@
 //   Under greedy decoding every speculative run must emit exactly the plain run's tokens; the
 //   command reports the first divergence if one does not.
 //
-//   lernex spec-cost MODEL_DIR [CONTEXT]
+//   dromos spec-cost MODEL_DIR [CONTEXT]
 //     Milliseconds per plain step and per verify step of each size, after a CONTEXT-token prompt.
 //
-//   lernex block-check MODEL_DIR DRAFT_HEAD_DIR PROMPTS_JSON OUT_DIR
+//   dromos block-check MODEL_DIR DRAFT_HEAD_DIR PROMPTS_JSON OUT_DIR
 //     For each prompt: the target prefills all but its last token, the block drafter proposes a
 //     block anchored on that token (greedy, bf16 weights), and OUT_DIR gets what
 //     tools/draft/check_block.py needs to recompute it in PyTorch: the feature rows of the window,
 //     the anchor, and the drafter's logits and confidences.
 //
-//   lernex spec-check MODEL_DIR PROMPTS_JSON [N]
+//   dromos spec-check MODEL_DIR PROMPTS_JSON [N]
 //     Feeds each prompt's second half one token at a time, then again as verify steps of random
 //     sizes with random rollbacks (and an occasional normal step, which folds), and requires every
 //     verify row's logits to be bit-identical to the one-token step at the same position.
@@ -281,7 +281,7 @@ int cmd_spec_cost(int argc, char** argv) {
     std::vector<char*> args = without_format_flags(argc, argv, format);
     const int n = static_cast<int>(args.size());
     if (n < 2 || n > 4) {
-      std::fprintf(stderr, "usage: lernex spec-cost MODEL_DIR [CONTEXT [ROUNDS]] %s\n", lx::cli::kFormatUsage);
+      std::fprintf(stderr, "usage: dromos spec-cost MODEL_DIR [CONTEXT [ROUNDS]] %s\n", lx::cli::kFormatUsage);
       return 2;
     }
     return run_cost(n, args.data(), format);
@@ -297,7 +297,7 @@ int cmd_spec_check(int argc, char** argv) {
     std::vector<char*> args = without_format_flags(argc, argv, format);
     const int n = static_cast<int>(args.size());
     if (n != 3 && n != 4) {
-      std::fprintf(stderr, "usage: lernex spec-check MODEL_DIR PROMPTS_JSON [N] %s\n", lx::cli::kFormatUsage);
+      std::fprintf(stderr, "usage: dromos spec-check MODEL_DIR PROMPTS_JSON [N] %s\n", lx::cli::kFormatUsage);
       return 2;
     }
     return run_check(n, args.data(), format);
@@ -309,7 +309,7 @@ int cmd_spec_check(int argc, char** argv) {
 
 int cmd_block_check(int argc, char** argv) {
   if (argc != 5) {
-    std::fprintf(stderr, "usage: lernex block-check MODEL_DIR DRAFT_HEAD_DIR PROMPTS_JSON OUT_DIR\n");
+    std::fprintf(stderr, "usage: dromos block-check MODEL_DIR DRAFT_HEAD_DIR PROMPTS_JSON OUT_DIR\n");
     return 2;
   }
   try {
@@ -389,7 +389,7 @@ int cmd_block_check(int argc, char** argv) {
 
 int cmd_spec(int argc, char** argv) {
   if (argc < 3) {
-    std::fprintf(stderr, "usage: lernex spec MODEL_DIR PROMPTS_JSON [options] (see cli/spec.cpp)\n");
+    std::fprintf(stderr, "usage: dromos spec MODEL_DIR PROMPTS_JSON [options] (see cli/spec.cpp)\n");
     return 2;
   }
   try {
@@ -562,9 +562,9 @@ int cmd_spec(int argc, char** argv) {
   return 0;
 }
 
-// ---- lernex pass1: the free drafters of the pipelined two-pass schedule ----------------------------------------
+// ---- dromos pass1: the free drafters of the pipelined two-pass schedule ----------------------------------------
 //
-//   lernex pass1 MODEL_DIR PROMPTS_JSON [options]
+//   dromos pass1 MODEL_DIR PROMPTS_JSON [options]
 //     Decodes each prompt one token at a time, as plain decoding does, and at every step records what three free
 //     drafters would have proposed for the next token and whether it held:
 //       early   the argmax of the first pass's readout (metis.h, set_early_logits); under sampling, a draw from it
@@ -831,7 +831,7 @@ double projected(double plain, double sweep2, double pass1, double a) { return p
 int cmd_pass1(int argc, char** argv) {
   if (argc < 3) {
     std::fprintf(stderr,
-                 "usage: lernex pass1 MODEL_DIR PROMPTS_JSON [--tokens N] [--temp T --top-p P --top-k K --min-p P --rep R "
+                 "usage: dromos pass1 MODEL_DIR PROMPTS_JSON [--tokens N] [--temp T --top-p P --top-k K --min-p P --rep R "
                  "--seed S] [--json FILE] [--check] [--time] [--weights F] [--no-bf16x]\n");
     return 2;
   }
@@ -1053,7 +1053,7 @@ int cmd_pass1(int argc, char** argv) {
   return 0;
 }
 
-// lernex spec-exactness: the next token of one prompt, drawn DRAWS times by the verify path and DRAWS times by the plain
+// dromos spec-exactness: the next token of one prompt, drawn DRAWS times by the verify path and DRAWS times by the plain
 // sampler, at the think setting (temperature 0.8, top-p 0.95, top-k 20). Speculation runs without penalties
 // (engine.cpp spec_eligible), so the distributions compared are the unpenalised ones. The verify path draws against a
 // forced draft: a point mass on one token, the way the n-gram drafter proposes (SpecDecoder::verify, q null). The
@@ -1267,7 +1267,7 @@ int cmd_spec_exactness(int argc, char** argv) {
     std::vector<char*> args = without_format_flags(argc, argv, format);
     const int n = static_cast<int>(args.size());
     if (n != 4 && n != 5) {
-      std::fprintf(stderr, "usage: lernex spec-exactness MODEL_DIR PROMPTS_JSON PROMPT [DRAWS] %s\n", lx::cli::kFormatUsage);
+      std::fprintf(stderr, "usage: dromos spec-exactness MODEL_DIR PROMPTS_JSON PROMPT [DRAWS] %s\n", lx::cli::kFormatUsage);
       return 2;
     }
     const int draws = n == 5 ? std::stoi(args[4]) : 2000;

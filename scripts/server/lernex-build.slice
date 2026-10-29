@@ -3,7 +3,7 @@
 # Past MemoryHigh the kernel reclaims and slows the compiles; past MemoryMax it kills a compile inside the slice,
 # never the Windows VM or a GPU run outside it. 31 GB box: the VM needs ~8.5 GB, the system and GPU runs the rest.
 [Unit]
-Description=Lernex engine compiles
+Description=Dromos compiles
 [Slice]
 MemoryHigh=14G
 MemoryMax=16G

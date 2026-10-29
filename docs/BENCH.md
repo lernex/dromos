@@ -1,7 +1,7 @@
-# Batched serving and prefill: Lernex against vLLM
+# Batched serving and prefill: Dromos against vLLM
 
 Status: partial. The vLLM cells, the prefix-cache check and the Logos FP8 runs at a 1024-token context and 0.96 GPU
-memory are measured (the Logos section). The Lernex format sweep (every format, the serve view, prefill, spec-check and
+memory are measured (the Logos section). The Dromos format sweep (every format, the serve view, prefill, spec-check and
 the profile) waits for final main.
 
 Measured 2026-10-28 on `ssh lernex`. Every GPU run went through the lock (`scripts/remote.sh bench x`).
@@ -13,7 +13,7 @@ Measured 2026-10-28 on `ssh lernex`. Every GPU run went through the lock (`scrip
 | GPU | NVIDIA GeForce RTX 5070 Ti, 16 GB, sm_120. Spec 896 GB/s; 851 to 853 GB/s measured across the cache-check runs (the roofline line of the bench output) |
 | Driver, CUDA | driver 595.91.07; CUDA 13.4 toolkit and runtime (driver API 13.2) |
 | Host | Ubuntu 26.04.1 LTS, kernel 7.0.0-38-generic, 30 GB RAM. The server also runs CI runners, so each vLLM run is under a memory cap |
-| Lernex | engine commit `71aa511`. Local main is 8 commits above origin/main `dd0fed5`: four engine and CLI changes (`88b182b`, `156341d`, `b1f9ff6`, `71aa511`) and four bench-driver commits. None is pushed. CMake's default build is `LX_ARCHS=120a-real` |
+| Dromos | engine commit `71aa511`. Local main is 8 commits above origin/main `dd0fed5`: four engine and CLI changes (`88b182b`, `156341d`, `b1f9ff6`, `71aa511`) and four bench-driver commits. None is pushed. CMake's default build is `LX_ARCHS=120a-real` |
 | vLLM | 0.31.0 from `~/venvs/vllm`, started by `~/venvs/vllm-metis/bin/python`. That venv's `.pth` adds the vLLM packages and loads the vllm-metis plugin |
 | Client | `bench/endpoint_bench.py` (aiohttp), on the same host; one streamed `/v1/completions` per stream. `--metrics` polls the server's `/metrics` every 0.25 s for the running and waiting counts |
 
@@ -29,7 +29,7 @@ so the Logos runs at other settings pass `--max-model-len`, `--gpu-memory-utiliz
 
 | Format | Folder | Notes |
 |---|---|---|
-| Praxis BF16 | `~/kronos-scratch/logos/engines/praxis/hf` (model.safetensors, 6,162,552,620 bytes) | the folder Lernex loads too |
+| Praxis BF16 | `~/kronos-scratch/logos/engines/praxis/hf` (model.safetensors, 6,162,552,620 bytes) | the folder Dromos loads too |
 | Praxis FP8 | `~/kronos-scratch/logos/engines/praxis/fp8` | compressed-tensors. Its conversion receipt names source sha256 `9654d9c8...`, and the BF16 folder's config names `861af5db...`. The FP8 weights may not be the BF16 weights rounded. Speed is not affected; a quality comparison would be |
 | Logos FP8 | `~/kronos-scratch/logos/hfport/fp8` | compressed-tensors, 11 GB |
 
@@ -59,15 +59,15 @@ when the server runs fewer requests than the stream count, the formula still mul
 
 The tables publish the per-token formula for both engines, with the window beside it.
 
-## Lernex's decode format
+## Dromos's decode format
 
-Lernex's default BF16 decodes from BF16X copies: a lossless encoding of the BF16 tensors, 4.47 GB more memory, with the
-same logits to the bit (`lernex doctor` says so). vLLM has no BF16X, so the format-matched Lernex row is
-`--no-bf16x`, which is pending. The Lernex numbers below are BF16X and are not set against vLLM's plain BF16 rows.
+Dromos's default BF16 decodes from BF16X copies: a lossless encoding of the BF16 tensors, 4.47 GB more memory, with the
+same logits to the bit (`dromos doctor` says so). vLLM has no BF16X, so the format-matched Dromos row is
+`--no-bf16x`, which is pending. The Dromos numbers below are BF16X and are not set against vLLM's plain BF16 rows.
 
 ## Prefix cache
 
-`lernex bench` keeps the prefix cache on by default, which a speed cell could benefit from. This check runs the same
+`dromos bench` keeps the prefix cache on by default, which a speed cell could benefit from. This check runs the same
 prompts on Praxis BF16 (BF16X decode), once with the cache on and once with `--no-prefix-cache`.
 
 | streams | prefill tok/s, cache on | prefill tok/s, cache off | TTFT p50, cache on | TTFT p50, cache off | window decode tok/s, cache on | window decode tok/s, cache off |
@@ -196,9 +196,9 @@ streams are resident.
 
 ## Caveats
 
-- **The Lernex rows are pending.** Every Lernex format, the `lernex serve` view, prefill, spec-check and the profile are
+- **The Dromos rows are pending.** Every Dromos format, the `dromos serve` view, prefill, spec-check and the profile are
   measured on final main, not here.
-- **BF16 against BF16X.** The Lernex prefix-cache numbers are BF16X, which decodes faster than plain BF16 at the same
+- **BF16 against BF16X.** The Dromos prefix-cache numbers are BF16X, which decodes faster than plain BF16 at the same
   logits. The format-matched comparison needs `--no-bf16x`.
 - **The completions stream changed.** Commit `156341d` sends one chunk per token on `/v1/completions`. The serve view's
   token count is the check that the client reads it correctly. It is not measured yet.
@@ -232,9 +232,9 @@ streams are resident.
 
 ## Pending (final main)
 
-- Lernex: the BF16, `--no-bf16x`, INT8, FP8 and NVFP4 formats, and Logos FP8. Each runs `lernex bench` three times at 1,
-  8, 32 and 64 streams, and `lernex prefill` at T = 512, 2048 and 8192, plus the `lernex serve` view through the client
-  and `lernex spec-check` for each timed configuration.
+- Dromos: the BF16, `--no-bf16x`, INT8, FP8 and NVFP4 formats, and Logos FP8. Each runs `dromos bench` three times at 1,
+  8, 32 and 64 streams, and `dromos prefill` at T = 512, 2048 and 8192, plus the `dromos serve` view through the client
+  and `dromos spec-check` for each timed configuration.
 - A repeat of the prefix-cache check, so the cache-on and cache-off cells get a spread.
 - The profile of where the engine loses, for each cell where vLLM is ahead.
 

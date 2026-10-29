@@ -2,7 +2,7 @@
 # The measurement driver behind docs/BENCH.md. Runs on the GPU server, in the bench slot, through the GPU lock:
 #
 #   scripts/remote.sh bench x 'bash bench/run_bench.sh doctor MODEL TAG [format flags]'
-#   scripts/remote.sh bench x 'bash bench/run_bench.sh engine MODEL TAG [format flags]'     lernex bench x3, prefill, spec-check
+#   scripts/remote.sh bench x 'bash bench/run_bench.sh engine MODEL TAG [format flags]'     dromos bench x3, prefill, spec-check
 #   scripts/remote.sh bench x 'bash bench/run_bench.sh serve-engine MODEL TAG [format flags]'
 #   scripts/remote.sh bench x 'bash bench/run_bench.sh serve-vllm MODEL TAG VOCAB [vllm flags]'
 #   scripts/remote.sh bench x 'bash bench/run_bench.sh spec MODEL TAG [format flags]'
@@ -10,7 +10,7 @@
 #   scripts/remote.sh bench x 'bash bench/run_bench.sh cacheoff MODEL TAG [format flags]'
 #   scripts/remote.sh bench x 'bash bench/run_bench.sh profile MODEL TAG STREAMS [format flags]'
 #
-# MODEL is a folder. TAG names the outputs. Format flags (--weights, --no-bf16x) go to lernex, as they are.
+# MODEL is a folder. TAG names the outputs. Format flags (--weights, --no-bf16x) go to dromos, as they are.
 # Results go to $LX_BENCH_OUT (default ~/lernex-engine-dev/bench-results/2026-10-28), which is outside the slot
 # tree, so the next scripts/remote.sh sync cannot delete them (rsync --delete only touches the slot).
 #
@@ -21,7 +21,7 @@ set -u
 cmd=${1:?command}; shift
 OUT=${LX_BENCH_OUT:-$HOME/lernex-engine-dev/bench-results/2026-10-28}
 mkdir -p "$OUT"
-LX=${LX:-build/lernex}
+LX=${LX:-build/dromos}
 PY=${PY:-$HOME/venvs/hfport/bin/python}
 PROMPTS=${LX_PROMPTS:-$HOME/kronos-scratch/logos/engines/work/praxisrefs/prompts.json}
 ENGINE_PORT=${LX_ENGINE_PORT:-8811}
@@ -52,7 +52,7 @@ case "$cmd" in
 
   engine)
     model=$1; tag=$2; shift 2
-    log "engine $tag: lernex bench x3"
+    log "engine $tag: dromos bench x3"
     for rep in 1 2 3; do
       "$LX" bench "$model" --streams 1,8,32,64 --prompt-tokens 512 --gen-tokens 256 --no-prefix-cache "$@" \
         > "$OUT/$tag.bench.r$rep.txt" 2>&1
@@ -65,7 +65,7 @@ case "$cmd" in
     ;;
 
   cachecheck)
-    # The default lernex bench (prefix cache on) once, to measure what a warm cache does to prefill and TTFT.
+    # The default dromos bench (prefix cache on) once, to measure what a warm cache does to prefill and TTFT.
     model=$1; tag=$2; shift 2
     "$LX" bench "$model" --streams 1,8,32,64 --prompt-tokens 512 --gen-tokens 256 "$@" \
       > "$OUT/$tag.bench-prefixcache.txt" 2>&1
@@ -97,7 +97,7 @@ case "$cmd" in
     if wait_ready "$url" "$pid" 1800; then
       "$PY" bench/endpoint_bench.py --url "$url" --model "$tag" --vocab "$vocab" --streams 1,8,32,64 \
         --prompt-tokens 512 --gen-tokens 256 --repeats 3 --prefill 512,2048,8192 --prefill-runs 5 \
-        --prompts "$PROMPTS" --label "$tag lernex-serve" --out "$OUT/$tag.serve.json" \
+        --prompts "$PROMPTS" --label "$tag dromos-serve" --out "$OUT/$tag.serve.json" \
         > "$OUT/$tag.serve.txt" 2>&1
       log "client exit $?"
     fi
@@ -136,7 +136,7 @@ case "$cmd" in
     ;;
 
   profile)
-    # Kernel time of one lernex bench run at one stream count (CUDA graph nodes traced), for docs/BENCH.md's
+    # Kernel time of one dromos bench run at one stream count (CUDA graph nodes traced), for docs/BENCH.md's
     # "where the engine loses": nsys over the whole run, warm-up and prefill included, so read the decode kernels.
     model=$1; tag=$2; streams=$3; shift 3
     rep="$OUT/$tag.s$streams"

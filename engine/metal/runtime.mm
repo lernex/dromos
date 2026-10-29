@@ -115,7 +115,7 @@ struct Profile {
   }
   void print() {
     if (calibrate) ns_per_tick = calibrate();
-    std::fprintf(stderr, "lernex metal: %llu command buffers, %llu dispatches, %llu barriers, GPU busy %.1f ms\n",
+    std::fprintf(stderr, "dromos metal: %llu command buffers, %llu dispatches, %llu barriers, GPU busy %.1f ms\n",
                  (unsigned long long)buffers.load(), (unsigned long long)dispatches.load(),
                  (unsigned long long)barriers.load(), gpu_ns.load() / 1e6);
     std::vector<std::pair<std::string, std::pair<uint64_t, uint64_t>>> rows(kernels.begin(), kernels.end());
@@ -151,7 +151,7 @@ bool profile_timed() {
     if (!p || p->level < 3) return false;
     id<MTLDevice> d = Device::get().mtl();
     if (![d supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
-      std::fprintf(stderr, "lernex metal: this GPU cannot time encoders; LX_METAL_PROFILE=3 counts only\n");
+      std::fprintf(stderr, "dromos metal: this GPU cannot time encoders; LX_METAL_PROFILE=3 counts only\n");
       return false;
     }
     MTLTimestamp cpu0 = 0, gpu0 = 0;
@@ -188,7 +188,7 @@ id<MTLCounterSampleBuffer> take_samples() {
   NSError* err = nil;
   id<MTLCounterSampleBuffer> b = [d newCounterSampleBufferWithDescriptor:desc error:&err];
   if (!b) {
-    std::fprintf(stderr, "lernex metal: no counter sample buffer: %s\n", err.localizedDescription.UTF8String);
+    std::fprintf(stderr, "dromos metal: no counter sample buffer: %s\n", err.localizedDescription.UTF8String);
     std::abort();
   }
   return b;
@@ -206,7 +206,7 @@ Device& Device::get() {
 Device::Device() {
   device_ = MTLCreateSystemDefaultDevice();
   if (!device_) {
-    std::fprintf(stderr, "lernex metal: no Metal device\n");
+    std::fprintf(stderr, "dromos metal: no Metal device\n");
     return;
   }
   for (int n = 12; n >= 1; --n) {
@@ -218,11 +218,11 @@ Device::Device() {
   // Residency sets are macOS 15 and later (the package targets 14): before that, Metal manages residency by itself.
   if (@available(macOS 15.0, *)) {
     MTLResidencySetDescriptor* desc = [MTLResidencySetDescriptor new];
-    desc.label = @"lernex";
+    desc.label = @"dromos";
     desc.initialCapacity = 512;
     NSError* err = nil;
     residency_ = [device_ newResidencySetWithDescriptor:desc error:&err];
-    if (!residency_) std::fprintf(stderr, "lernex metal: no residency set (%s)\n", err.localizedDescription.UTF8String);
+    if (!residency_) std::fprintf(stderr, "dromos metal: no residency set (%s)\n", err.localizedDescription.UTF8String);
   }
 }
 
@@ -240,7 +240,7 @@ id<MTLLibrary> Device::build(const char* source, MTLLanguageVersion version, con
     opt.languageVersion = version;
     NSError* err = nil;
     id<MTLLibrary> lib = [device_ newLibraryWithSource:@(source) options:opt error:&err];
-    if (!lib) std::fprintf(stderr, "lernex metal: %s failed to compile:\n%s\n", what, err.localizedDescription.UTF8String);
+    if (!lib) std::fprintf(stderr, "dromos metal: %s failed to compile:\n%s\n", what, err.localizedDescription.UTF8String);
     return lib;
   }
 }
@@ -261,7 +261,7 @@ bool Device::nax() {
   if (!wanted || family_ < 10) return false;
   std::call_once(nax_compiled_, [this] {
     nax_library_ = build(lx_metal_nax_source(), MTLLanguageVersion4_0, "the neural accelerator library");
-    if (!nax_library_) std::fprintf(stderr, "lernex metal: running the GEMMs on simdgroup matrices instead\n");
+    if (!nax_library_) std::fprintf(stderr, "dromos metal: running the GEMMs on simdgroup matrices instead\n");
   });
   return nax_library_ != nil;
 }
@@ -269,7 +269,7 @@ bool Device::nax() {
 id<MTLComputePipelineState> Device::pipeline(const std::string& name, bool nax) {
   std::call_once(compiled_, [this] { compile(); });
   if (nax && !this->nax()) {
-    std::fprintf(stderr, "lernex metal: %s needs the neural accelerator library\n", name.c_str());
+    std::fprintf(stderr, "dromos metal: %s needs the neural accelerator library\n", name.c_str());
     std::abort();
   }
   std::lock_guard<std::mutex> g(mu_);
@@ -278,7 +278,7 @@ id<MTLComputePipelineState> Device::pipeline(const std::string& name, bool nax) 
   @autoreleasepool {
     id<MTLFunction> fn = [nax ? nax_library_ : library_ newFunctionWithName:@(name.c_str())];
     if (!fn) {
-      std::fprintf(stderr, "lernex metal: no kernel named %s\n", name.c_str());
+      std::fprintf(stderr, "dromos metal: no kernel named %s\n", name.c_str());
       std::abort();
     }
     MTLComputePipelineDescriptor* desc = [MTLComputePipelineDescriptor new];
@@ -290,7 +290,7 @@ id<MTLComputePipelineState> Device::pipeline(const std::string& name, bool nax) 
                                                                          reflection:nil
                                                                               error:&err];
     if (!ps) {
-      std::fprintf(stderr, "lernex metal: pipeline %s: %s\n", name.c_str(), err.localizedDescription.UTF8String);
+      std::fprintf(stderr, "dromos metal: pipeline %s: %s\n", name.c_str(), err.localizedDescription.UTF8String);
       std::abort();
     }
     pipelines_.emplace(name, ps);
@@ -667,7 +667,7 @@ void wait_for_cpu_lane(const void* state) {
 uint64_t Stream::schedule_mailbox(uint64_t after, const void* state) {
   if (!mailbox_) {
     mailbox_ = [Device::get().mtl() newSharedEvent];
-    poller_ = dispatch_queue_create("net.lernex.metal.offload", DISPATCH_QUEUE_SERIAL);
+    poller_ = dispatch_queue_create("net.dromos.metal.offload", DISPATCH_QUEUE_SERIAL);
   }
   const uint64_t ticket = ++mailbox_ticket_;
   id<MTLSharedEvent> timeline = timeline_, mailbox = mailbox_;
@@ -797,7 +797,7 @@ uint64_t Stream::flush() {
       g_samples.push_back(samples);
     }
     if (b.status == MTLCommandBufferStatusError) {
-      std::fprintf(stderr, "lernex metal: command buffer failed: %s\n", b.error.localizedDescription.UTF8String);
+      std::fprintf(stderr, "dromos metal: command buffer failed: %s\n", b.error.localizedDescription.UTF8String);
       g_async_error.store(kLaunchFailure);
     }
   }];

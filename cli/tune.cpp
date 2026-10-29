@@ -1,4 +1,4 @@
-// lernex tune MODEL_DIR [--out PATH] [--log]
+// dromos tune MODEL_DIR [--out PATH] [--log]
 //
 // Times every variant of every tunable kernel on the shapes the model's plan runs, on this GPU, and
 // writes the winners to the cache (or to --out). Run it under the GPU lock: scripts/remote.sh SLOT x.
@@ -30,7 +30,7 @@ int cmd_tune(int argc, char** argv) {
         throw std::runtime_error("unknown argument " + arg);
       }
     }
-    if (dir.empty()) throw std::runtime_error("usage: lernex tune MODEL_DIR [--out PATH] [--log]");
+    if (dir.empty()) throw std::runtime_error("usage: dromos tune MODEL_DIR [--out PATH] [--log]");
 
     const DeviceInfo device = query_device(0);
     const lx::MetisConfig config = lx::load_config(dir);

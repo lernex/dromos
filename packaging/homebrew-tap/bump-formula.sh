@@ -1,18 +1,18 @@
 #!/bin/sh
-# Points Formula/lernex.rb at a release: its version, the url of lernex-darwin-arm64.tar.gz and its sha256.
+# Points Formula/dromos.rb at a release: its version, the url of dromos-darwin-arm64.tar.gz and its sha256.
 #
 #   packaging/homebrew-tap/bump-formula.sh 0.1.0
-#   packaging/homebrew-tap/bump-formula.sh v0.1.0 path/to/Formula/lernex.rb
-#   packaging/homebrew-tap/bump-formula.sh 0.1.0 Formula/lernex.rb --tarball PATH --url file://PATH
+#   packaging/homebrew-tap/bump-formula.sh v0.1.0 path/to/Formula/dromos.rb
+#   packaging/homebrew-tap/bump-formula.sh 0.1.0 Formula/dromos.rb --tarball PATH --url file://PATH
 #
 # Without --tarball the asset and the release's SHA256SUMS are downloaded, and the tarball must match its line
-# there. LERNEX_RELEASES points at another release host, as install.sh and `lernex update` do (docs/RELEASE.md).
+# there. DROMOS_RELEASES points at another release host, as install.sh and `dromos update` do (docs/RELEASE.md).
 set -eu
 usage() { echo "usage: $0 VERSION [FORMULA] [--tarball PATH] [--url URL]" >&2; exit 2; }
 [ $# -ge 1 ] || usage
 version=${1#v}
 shift
-formula=packaging/homebrew-tap/Formula/lernex.rb
+formula=packaging/homebrew-tap/Formula/dromos.rb
 if [ $# -gt 0 ] && [ "${1#--}" = "$1" ]; then formula=$1; shift; fi
 tarball=
 url=
@@ -23,8 +23,8 @@ while [ $# -gt 0 ]; do
     *) usage ;;
   esac
 done
-releases=${LERNEX_RELEASES:-https://github.com/lernex/lernex-engine/releases}
-asset=lernex-darwin-arm64.tar.gz
+releases=${DROMOS_RELEASES:-https://github.com/dromos/dromos/releases}
+asset=dromos-darwin-arm64.tar.gz
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 want=

@@ -647,7 +647,7 @@ bool Server::run() {
 
   http_->Get("/v1/models", [model](const httplib::Request&, httplib::Response& res) {
     json list = {{"object", "list"},
-                 {"data", json::array({{{"id", model}, {"object", "model"}, {"created", unix_time()}, {"owned_by", "lernex"}}})}};
+                 {"data", json::array({{{"id", model}, {"object", "model"}, {"created", unix_time()}, {"owned_by", "dromos"}}})}};
     res.set_content(list.dump(), "application/json");
   });
 
@@ -726,7 +726,7 @@ bool Server::run() {
       job.request.sampling.logprobs = job.logprobs;
       job.request.sampling.top_logprobs = job.top_logprobs;
       job.request.thinking = false;
-      // A benchmark client asks for exactly max_tokens, as lernex bench does in process (cli/bench.cpp).
+      // A benchmark client asks for exactly max_tokens, as dromos bench does in process (cli/bench.cpp).
       job.request.ignore_eos = body.value("ignore_eos", false);
       if (!body.contains("prompt") || body["prompt"].is_null()) invalid("prompt is required", "prompt");
       const json& prompt = body["prompt"];
@@ -761,7 +761,7 @@ bool Server::run() {
   });
 
   if (!http_->bind_to_port(options_.host, options_.port)) {
-    std::fprintf(stderr, "lernex: cannot listen on %s:%d (is the port in use?)\n", options_.host.c_str(), options_.port);
+    std::fprintf(stderr, "dromos: cannot listen on %s:%d (is the port in use?)\n", options_.host.c_str(), options_.port);
     return false;
   }
   bound_port_ = options_.port;

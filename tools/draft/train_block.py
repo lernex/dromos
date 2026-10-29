@@ -1,8 +1,8 @@
-"""Train a lernex.block/1 drafter on the target's hidden states, streamed from `lernex features`.
+"""Train a lernex.block/1 drafter on the target's hidden states, streamed from `dromos features`.
 
     $PY tools/draft/train_block.py TARGET_DIR SHARD_DIR OUT_DIR --total-seqs N [options]
 
-SHARD_DIR is the queue `lernex features` writes (cli/features.cpp): shards appear whole, the trainer
+SHARD_DIR is the queue `dromos features` writes (cli/features.cpp): shards appear whole, the trainer
 reads them in name order and deletes each one it has read (--keep leaves them), and DONE ends the
 stream. Each shard's features are the drafter's taps (config["taps"], the last one the target's
 final state), so the target's own next-token distribution at every position is

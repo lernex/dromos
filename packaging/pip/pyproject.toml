@@ -1,18 +1,18 @@
-# The lernex wheel. Built by build_wheel.py, which stages this directory with the release tree under
-# lernex/_bin and writes wheel.json (the version and the dependencies); setup.py reads that file.
+# The dromos wheel. Built by build_wheel.py, which stages this directory with the release tree under
+# dromos/_bin and writes wheel.json (the version and the dependencies); setup.py reads that file.
 [build-system]
 requires = ["setuptools>=77.0.3", "wheel>=0.43"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "lernex"
+name = "dromos"
 dynamic = ["version", "dependencies"]
-description = "Lernex's inference engine for the Metis models: the lernex command, run locally."
-readme = { text = """Lernex's inference engine for the Metis models, run on your own machine.
+description = "Dromos, Lernex's inference engine for the Metis models: the dromos command, run locally."
+readme = { text = """Dromos, Lernex's inference engine for the Metis models, run on your own machine.
 
-    pip install lernex
-    lernex run praxis       chat in the terminal
-    lernex serve logos      the OpenAI API on this machine
+    pip install dromos
+    dromos run praxis       chat in the terminal
+    dromos serve logos      the OpenAI API on this machine
 
 The engine picks its backend when it starts: CUDA on an NVIDIA GPU (Linux x86_64; the CUDA runtime comes from
 NVIDIA's own wheels, which this package installs), Metal on Apple silicon (macOS 14 or later), and the CPU otherwise.
@@ -31,4 +31,4 @@ classifiers = [
 ]
 
 [project.scripts]
-lernex = "lernex.cli:main"
+dromos = "dromos.cli:main"

@@ -1,5 +1,5 @@
 """Decode and prefill throughput of an OpenAI-compatible /v1/completions server, measured the way cli/bench.cpp
-measures the engine in process, so `lernex serve` and vLLM are timed by the same client, with the same prompts.
+measures the engine in process, so `dromos serve` and vLLM are timed by the same client, with the same prompts.
 
     python bench/endpoint_bench.py --url http://127.0.0.1:8811 --model NAME --vocab 65536 \
         --streams 1,8,32,64 --prompt-tokens 512 --gen-tokens 256 --repeats 3 \
@@ -103,7 +103,7 @@ async def stream_one(session: aiohttp.ClientSession, url: str, body: dict) -> di
         raise RuntimeError("the stream carried no usage (stream_options.include_usage is needed)")
     if finish is None:
         raise RuntimeError("the stream ended without a finish reason")
-    # lernex serve ends a stream with an empty chunk that carries the reason, after its tokens; vLLM can put the
+    # dromos serve ends a stream with an empty chunk that carries the reason, after its tokens; vLLM can put the
     # reason on the last token's chunk, and that token's text can be empty. The count decides which it was.
     if empty_finish and len(events) < usage["completion_tokens"]:
         events.append(empty_finish[0])

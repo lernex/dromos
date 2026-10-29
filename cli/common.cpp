@@ -38,7 +38,7 @@ Model find_model(const std::string& name, bool download) {
   const hub::ModelRef ref = hub::resolve(name);
   const fs::path dir = hub::install_dir(ref.repo);
   if (hub::installed(dir)) return Model{dir, name, ref.repo};
-  if (!download) throw std::runtime_error(name + " is not installed yet: run `lernex pull " + name + "` first");
+  if (!download) throw std::runtime_error(name + " is not installed yet: run `dromos pull " + name + "` first");
 
   const std::string token = hub::hf_token();
   std::fprintf(stderr, "%s is not installed yet. Pulling %s\n", name.c_str(), ref.repo.c_str());

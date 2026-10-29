@@ -1,8 +1,8 @@
 """The OpenAI-compatible server, end to end, with the official openai client and plain HTTP.
 
-  LX_BIN=build/lernex LX_MODEL=/path/to/model test_openai.py
+  LX_BIN=build/dromos LX_MODEL=/path/to/model test_openai.py
 
-Starts `lernex serve` on a free port and checks the wire format (streaming and not), stop strings,
+Starts `dromos serve` on a free port and checks the wire format (streaming and not), stop strings,
 logprobs, usage, tool requests, errors, concurrent requests, and that a client that disconnects
 mid-stream does not hold the engine. Needs the GPU, so run it under scripts/remote.sh ... x.
 """
@@ -18,7 +18,7 @@ import openai
 import pytest
 import requests
 
-LX_BIN = os.environ.get("LX_BIN", "build/lernex")
+LX_BIN = os.environ.get("LX_BIN", "build/dromos")
 LX_MODEL = os.environ["LX_MODEL"]
 # Greedy from these ids the Praxis checkpoint continues EXPECTED: the engine's tokens
 # [205, 205, 534, 1726, 324, 8232] agree with the reference argmax at every step (tests/gpu).

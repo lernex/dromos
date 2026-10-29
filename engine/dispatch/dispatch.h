@@ -1,5 +1,5 @@
 // The backend dispatcher, as host code sees it. The lx_* functions of engine/cuda/kernels.h are stubs that
-// forward to one backend shared library, opened at run time, so the lernex executable links no GPU backend.
+// forward to one backend shared library, opened at run time, so the dromos executable links no GPU backend.
 // This header says which library was opened and what it does not export.
 #pragma once
 

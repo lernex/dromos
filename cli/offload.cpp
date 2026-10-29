@@ -1,10 +1,10 @@
-// lernex offload: run a model larger than the GPU, and measure what offloading has to work with.
+// dromos offload: run a model larger than the GPU, and measure what offloading has to work with.
 //
-//   lernex offload probe [FILE]                       the machine's bandwidths (PCIe, RAM, NVMe, CPU experts;
+//   dromos offload probe [FILE]                       the machine's bandwidths (PCIe, RAM, NVMe, CPU experts;
 //                                                     LX_EXPERTS=bf16|int8|fp8 picks the expert format measured)
-//   lernex offload eval MODEL PROMPTS OUT [N]         like `lernex eval`, with the experts offloaded (OUT "-"
+//   dromos offload eval MODEL PROMPTS OUT [N]         like `dromos eval`, with the experts offloaded (OUT "-"
 //                                                     writes nothing: for LX_ROUTE_TRACE runs)
-//   lernex offload bench MODEL PROMPTS [N] [REPEAT]   single-stream decode speed: prefill N tokens of each
+//   dromos offload bench MODEL PROMPTS [N] [REPEAT]   single-stream decode speed: prefill N tokens of each
 //                                                     prompt, then decode the rest one token at a time
 //
 // The weights load in the format the folder stores, the dense ones and the experts, unless --weights names another
@@ -128,7 +128,7 @@ int cmd_probe(int argc, char** argv) {
 
 int cmd_eval(int argc, char** argv) {
   if (argc != 4 && argc != 5) {
-    std::fprintf(stderr, "usage: lernex offload eval MODEL_DIR PROMPTS_JSON OUT_DIR [N]\n");
+    std::fprintf(stderr, "usage: dromos offload eval MODEL_DIR PROMPTS_JSON OUT_DIR [N]\n");
     return 2;
   }
   const std::string dir = argv[1];
@@ -183,7 +183,7 @@ int cmd_eval(int argc, char** argv) {
 
 int cmd_bench(int argc, char** argv) {
   if (argc < 3 || argc > 5) {
-    std::fprintf(stderr, "usage: lernex offload bench MODEL_DIR PROMPTS_JSON [N] [REPEAT]\n");
+    std::fprintf(stderr, "usage: dromos offload bench MODEL_DIR PROMPTS_JSON [N] [REPEAT]\n");
     return 2;
   }
   const std::string dir = argv[1];
@@ -266,8 +266,8 @@ int cmd_offload(int argc_in, char** argv_in) {
     return 1;
   }
   std::fprintf(stderr,
-               "usage: lernex offload probe [FILE]\n"
-               "       lernex offload eval MODEL_DIR PROMPTS_JSON OUT_DIR [N] [--weights bf16|int8|fp8]\n"
-               "       lernex offload bench MODEL_DIR PROMPTS_JSON [N] [REPEAT] [--weights bf16|int8|fp8]\n");
+               "usage: dromos offload probe [FILE]\n"
+               "       dromos offload eval MODEL_DIR PROMPTS_JSON OUT_DIR [N] [--weights bf16|int8|fp8]\n"
+               "       dromos offload bench MODEL_DIR PROMPTS_JSON [N] [REPEAT] [--weights bf16|int8|fp8]\n");
   return 2;
 }

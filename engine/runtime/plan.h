@@ -115,7 +115,7 @@ std::string weights_flag(lx_wtype format);
 // The lx_wtype a --weights value names. Throws std::runtime_error, listing the values, for anything else.
 int weights_from_flag(const std::string& name);
 
-// One weight format for this model on this device, as lernex doctor lists them.
+// One weight format for this model on this device, as dromos doctor lists them.
 struct FormatOption {
   lx_wtype format = LX_W_BF16;
   bool loadable = false;
@@ -149,8 +149,8 @@ struct Plan {
   double decode_ceiling_tps = 0;   // bandwidth / bytes read per token: the most tokens per second one stream can make
   std::string reason;              // why this format: "the format the file stores", "as asked: ..."
   std::string bf16x_reason;        // why the BF16X decode copies are on or off, in one line
-  std::vector<FormatOption> options;  // every format, for lernex doctor
-  std::vector<std::string> notes;  // plain-language lines `lernex` prints (why this format, etc.)
+  std::vector<FormatOption> options;  // every format, for dromos doctor
+  std::vector<std::string> notes;  // plain-language lines `dromos` prints (why this format, etc.)
 
   // Running larger than the GPU (make_offload_plan in runtime/offload_plan.h): every routed expert is
   // in pinned RAM (or, beyond the RAM budget, on NVMe), and VRAM keeps the ones in use in an LRU cache
@@ -200,7 +200,7 @@ WeightBytes weight_bytes(const MetisConfig& config, lx_wtype target, bool bf16x_
 // fixed rows (lx_bf16x_row_bytes; the rare overflow records are not counted), 0 without a backend that has it.
 size_t projection_bytes(lx_wtype format, int64_t rows, int64_t cols, int64_t stack_experts = 0);
 // What one stream reads per decoded token in a target format at `context` positions, and the most tokens per second
-// bandwidth allows. The count is the traffic model's (model/traffic.h), the one `lernex bench` checks its roofline against.
+// bandwidth allows. The count is the traffic model's (model/traffic.h), the one `dromos bench` checks its roofline against.
 double decode_bytes_per_token(const MetisConfig& config, lx_wtype target, bool bf16x_decode, int context,
                              const std::set<std::string>* dropped = nullptr);
 double decode_ceiling_tps(const DeviceInfo& device, const MetisConfig& config, lx_wtype target, bool bf16x_decode,

@@ -1,6 +1,6 @@
 """Per-call time of the residual-stream and depth-memory kernels at decode and prefill widths.
 
-Run on the GPU server, after a build so build/liblernex_kernels.so is current:
+Run on the GPU server, after a build so build/libdromos_kernels.so is current:
     scripts/remote.sh streams2 build
     scripts/remote.sh streams2 run '$PY bench/bench_streams.py'
 
@@ -18,7 +18,7 @@ import statistics
 import torch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LIB = os.environ.get("LX_KERNELS", os.path.join(ROOT, "build", "liblernex_kernels.so"))
+LIB = os.environ.get("LX_KERNELS", os.path.join(ROOT, "build", "libdromos_kernels.so"))
 _lib = ctypes.CDLL(LIB)
 
 BF16 = 1

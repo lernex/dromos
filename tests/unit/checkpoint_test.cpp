@@ -5,7 +5,7 @@
 //   LX_CKPT_FP8_DIR     the published FP8 folder (Praxis fp8)
 //   LX_CKPT_NVFP4_DIR   the GPTQ NVFP4 folder (Praxis nvfp4)
 // Run them under the GPU lock on the server:
-//   scripts/remote.sh ckpt x 'LX_CKPT_BF16_DIR=... LX_CKPT_FP8_DIR=... LX_CKPT_NVFP4_DIR=... build/lernex_unit -tc="checkpoint*"'
+//   scripts/remote.sh ckpt x 'LX_CKPT_BF16_DIR=... LX_CKPT_FP8_DIR=... LX_CKPT_NVFP4_DIR=... build/dromos_unit -tc="checkpoint*"'
 #include <algorithm>
 #include <functional>
 #include <cstdio>

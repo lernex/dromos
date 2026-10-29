@@ -1,9 +1,9 @@
-# Rivals: Lernex against each engine on its home turf
+# Rivals: Dromos against each engine on its home turf
 
 Same RTX 5070 Ti (16 GB), same Metis-1.6 weights, same client, same prompts. Each table cell reads
-`Lernex X vs Rival Y (ratio)`. The rival side of every cell was measured here, pinned as listed
-below. **The Lernex column is pending final main**: Lernex is measured once, at the end, on final
-main, with the commands in the last section. Nothing in a Lernex column below was measured on this
+`Dromos X vs Rival Y (ratio)`. The rival side of every cell was measured here, pinned as listed
+below. **The Dromos column is pending final main**: Dromos is measured once, at the end, on final
+main, with the commands in the last section. Nothing in a Dromos column below was measured on this
 doc's commit.
 
 Status: rival numbers measured 2026-10-27/28 on `ssh lernex` (Intel i5-14500, 14 physical cores,
@@ -16,7 +16,7 @@ logs stay in `~/lernex-engine-dev/rivals/out/rivals/` on the GPU server.
 |---|---|---|---|
 | SGLang | 0.5.22, with `sglang-metis` 0.1.0 (`sglang.srt.plugins`), xgrammar 0.2.7, torch 2.14.1, transformers 5.19.0, flashinfer 0.7.1 | `~/venvs/sglang` | `python -m sglang.launch_server --reasoning-parser metis --tool-call-parser metis` plus the flags in each table |
 | llama.cpp | `metis16` branch at `07cacf7fa` (model: Add support for Metis-1.6 models), CUDA 13.4, sm_120, `GGML_CUDA_FA=ON` | `~/lernex-engine-dev/rivals-llama` (a `git archive` of that commit, built with `cmake -S . -B build-rivals -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=OFF`, target `llama-bench`) | `llama-bench -p 512 -n 128,256 -r 3` (`-r 2` for the BF16 expert cells) |
-| Lernex | main at `6b8731f` for the preliminary runs (not in the tables); final main is measured at the end | `~/lernex-engine-dev/rivals`, built with `scripts/remote.sh rivals build` | `build/lernex serve` |
+| Dromos | main at `6b8731f` for the preliminary runs (not in the tables); final main is measured at the end | `~/lernex-engine-dev/rivals`, built with `scripts/remote.sh rivals build` | `build/dromos serve` |
 
 A note on the llama.cpp build: the `build-cuda` directory already on the server was built from an
 older commit (`065905776`), so the numbers here come from a fresh build at the pinned commit.
@@ -31,15 +31,15 @@ GGUF element counts come from the file headers.
 | Praxis (2.94 B weights) | GGUF Q4_K_M | 2.02 GB | 5.49 |
 | Praxis | GGUF Q8_0 | 3.22 GB | 8.76 |
 | Praxis | GGUF BF16 | 5.90 GB | 16.03 |
-| Praxis | Lernex NVFP4 (`praxis/nvfp4`) | 2.01 GB | about 5.46 (same tensor set as the GGUF) |
+| Praxis | Dromos NVFP4 (`praxis/nvfp4`) | 2.01 GB | about 5.46 (same tensor set as the GGUF) |
 | Praxis | FP8 checkpoint (`praxis/fp8`, both engines) | 3.53 GB | 9.6 (several tensors are kept BF16) |
 | Logos (10.23 B weights) | GGUF Q4_K_M | 6.74 GB | 5.28 |
 | Logos | GGUF Q8_0 | 11.11 GB | 8.69 |
 | Logos | GGUF BF16 | 20.47 GB | 16.02 (does not fit the card) |
 | Logos | FP8 checkpoint (`hfport/fp8`, both engines) | 11.66 GB | about 9.1 |
 
-Lernex has no 4-bit Logos format: the closest Lernex format to Logos Q4_K_M is FP8, so the Logos
-row compares FP8 with Q8_0 (8.7 bits) and says so. Lernex NVFP4 Praxis and llama.cpp Q4_K_M are
+Dromos has no 4-bit Logos format: the closest Dromos format to Logos Q4_K_M is FP8, so the Logos
+row compares FP8 with Q8_0 (8.7 bits) and says so. Dromos NVFP4 Praxis and llama.cpp Q4_K_M are
 both about 5.5 bits per weight in the file, which is the fair pairing for 4-bit.
 
 ## Method
@@ -63,12 +63,12 @@ both about 5.5 bits per weight in the file, which is the fair pairing for 4-bit.
   requests that each generate exactly `--gen` tokens (`ignore_eos`), at the same concurrency.
 - `tools/rivals/serve.sh`: starts one server, waits for `/v1/models`, runs the cells, stops the
   whole process group. Each GPU window holds the lock for one engine's cells, back to back.
-- `tools/rivals/single.sh`: llama-bench and `lernex bench` single-stream and CPU cells.
+- `tools/rivals/single.sh`: llama-bench and `dromos bench` single-stream and CPU cells.
 - `tools/rivals/summarize.py`: prints the waves of any result file.
 
-Lernex ignores `ignore_eos`, so a Lernex request can stop at an end token. The client records
-`tokens_min` and `tokens_max` per wave. The final Lernex run must show 256 for every request or
-say which waves did not, because a short request lowers Lernex's e2e number.
+Dromos ignores `ignore_eos`, so a Dromos request can stop at an end token. The client records
+`tokens_min` and `tokens_max` per wave. The final Dromos run must show 256 for every request or
+say which waves did not, because a short request lowers Dromos's e2e number.
 
 ## 1. SGLang home turf
 
@@ -80,7 +80,7 @@ requests, a 16,838-token KV pool); Logos FP8 `--max-mamba-cache-size 24 --max-to
 --cuda-graph-max-bs-decode 8 --mem-fraction-static 0.85` with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
 (8 running requests).
 
-| Model and format | Streams | Lernex | SGLang e2e tok/s (waves) | SGLang TTFT p50 / p90 (ms, wave 0) | Ratio |
+| Model and format | Streams | Dromos | SGLang e2e tok/s (waves) | SGLang TTFT p50 / p90 (ms, wave 0) | Ratio |
 |---|---|---|---|---|---|
 | Praxis BF16 | 64 | pending final main | 1607, 1609 | 258 / 6136 | pending |
 | Praxis BF16 | 128 | pending final main | 1896, 1900 | 6122 / 12068 | pending |
@@ -98,12 +98,12 @@ is where the high p90 TTFT comes from. Per-stream decode at 64 streams is 44 tok
 
 Measured on commit `05d1855` (rebased onto `c7342e0`, which carries the lone-stream speculation), not final main. The server ran with `--sequences 32`, so all 32 requests are resident; the default plan held 31 on this GPU and queued the 32nd.
 
-| Mode | SGLang e2e tok/s | Valid replies | Lernex |
+| Mode | SGLang e2e tok/s | Valid replies | Dromos |
 |---|---|---|---|
 | Free (no `response_format`) | 789 | 49 of 64 | 1,303 and 1,519 (two waves), 49 and 47 of 64 valid |
 | `json_schema` (xgrammar) | 957 | 64 of 64 | 1,400 and 1,422 (two waves), 64 of 64 valid, 1.46 to 1.49 times SGLang |
 
-Lernex enforces `response_format` `json_object` and `json_schema` on chat and completions. A schema
+Dromos enforces `response_format` `json_object` and `json_schema` on chat and completions. A schema
 compiles to a byte-level pushdown automaton, every decode step masks the logits of the constrained
 rows through `lx_mask_logits`, and the reply stops when its grammar completes. Compiling this schema
 takes 0.015 milliseconds.
@@ -136,12 +136,12 @@ allowed token, two per reply. Strict jump-forward is not implemented: those step
 and a jump would only merge adjacent forced tokens.
 
 Logits and KL on the unconstrained path were checked before the rebase: prefill and decode logits
-match the `orch` baseline byte for byte on all three reference prompts. `lernex spec-check` is
+match the `orch` baseline byte for byte on all three reference prompts. `dromos spec-check` is
 bit-identical on the rebased build on every row (40 of 40).
 
 ### 1c. Plain batched decode (independent 512-token prompts, 256 generated)
 
-| Model and format | Streams | Lernex | SGLang e2e tok/s (waves) | SGLang stream tok/s | Ratio |
+| Model and format | Streams | Dromos | SGLang e2e tok/s (waves) | SGLang stream tok/s | Ratio |
 |---|---|---|---|---|---|
 | Praxis BF16 | 1 | pending final main | 139 | 142 | pending |
 | Praxis BF16 | 8 | pending final main | 674 (669, 679) | 88 to 89 | pending |
@@ -183,25 +183,25 @@ session found on this card, not its ceiling on a bigger one.
 
 llama-bench, `-p 512 -n 128,256`, 3 repetitions, tok/s.
 
-| Format (bits per weight) | pp512 | tg128 | tg256 | Lernex, same weight class | Ratio |
+| Format (bits per weight) | pp512 | tg128 | tg256 | Dromos, same weight class | Ratio |
 |---|---|---|---|---|---|
 | Praxis Q4_K_M (5.49) | 3945 (+/- 197) | 252.4 | 253.3 | pending final main: Praxis NVFP4 (about 5.5) | pending |
 | Praxis Q8_0 (8.76) | 4104 | 235.1 | 235.8 | pending final main: Praxis FP8 (9.6) | pending |
 | Praxis BF16 (16.03) | 3471 | 184.5 | 185.2 | pending final main: Praxis BF16 | pending |
-| Logos Q4_K_M (5.28) | 1868 | 124.4 | 124.9 | pending final main: no Lernex 4-bit Logos; FP8 is the nearest | pending |
+| Logos Q4_K_M (5.28) | 1868 | 124.4 | 124.9 | pending final main: no Dromos 4-bit Logos; FP8 is the nearest | pending |
 | Logos Q8_0 (8.69) | 1897 | 115.0 | 115.5 | pending final main: Logos FP8 (about 9.1) | pending |
 
-The Lernex side is `lernex bench` at one stream, 512 prompt and 256 generated tokens, through the
-same card. Its earlier numbers (at 6b8731f) are in `tools/rivals/results/lernex-6b8731f-preliminary/`
+The Dromos side is `dromos bench` at one stream, 512 prompt and 256 generated tokens, through the
+same card. Its earlier numbers (at 6b8731f) are in `tools/rivals/results/dromos-6b8731f-preliminary/`
 and are not in these tables.
 
 ### 2b. CPU only (14 threads, no GPU)
 
-llama-bench with `CUDA_VISIBLE_DEVICES=` and `-ngl 0 -t 14`, tok/s. Lernex's CPU backend is
+llama-bench with `CUDA_VISIBLE_DEVICES=` and `-ngl 0 -t 14`, tok/s. Dromos's CPU backend is
 selected with `LX_BACKEND=cpu` and `LX_THREADS=14`. The CPU backend implements BF16, INT8, FP8 and
 NVFP4 (`engine/cpu/gemm.cpp`).
 
-| Model | Format (bits per weight) | pp512 | tg128 | tg256 | Lernex CPU, same class | Ratio |
+| Model | Format (bits per weight) | pp512 | tg128 | tg256 | Dromos CPU, same class | Ratio |
 |---|---|---|---|---|---|---|
 | Praxis | Q4_K_M (5.49) | 170.1 | 27.4 | 25.8 | pending final main: NVFP4 (about 5.5) | pending |
 | Praxis | Q8_0 (8.76) | 127.3 | 22.4 | 23.6 | pending final main: INT8 (`--weights int8`, 8 bits plus a scale per row) | pending |
@@ -237,15 +237,15 @@ asks for a 17.3 GB device buffer at micro-batch 512, 128 and 64, so the micro-ba
 Values from 37 to 40 and a host-side layer split were not tried; the upstream check comes first.
 
 The logs are in `tools/rivals/results/single-logos-bf16-*.log`. This is a llama.cpp limit in this
-build, not a Lernex loss. The Lernex side (routed experts offloaded automatically) is pending final
+build, not a Dromos loss. The Dromos side (routed experts offloaded automatically) is pending final
 main.
 
 ## Cells we lose
 
-Pending final main. The only losses known before the Lernex run, from the code and the rival side:
+Pending final main. The only losses known before the Dromos run, from the code and the rival side:
 
-1. **Concurrency on 16 GB.** Lernex's default plan holds 37 BF16 sequences at 8,192 context, and
-   21 Logos FP8 sequences at 2,560 context. SGLang holds 53 Praxis and 8 Logos. The Lernex final
+1. **Concurrency on 16 GB.** Dromos's default plan holds 37 BF16 sequences at 8,192 context, and
+   21 Logos FP8 sequences at 2,560 context. SGLang holds 53 Praxis and 8 Logos. The Dromos final
    run must use the tuned settings below, or it under-reports the engine.
 
 ## Commands and reproduction
@@ -256,16 +256,16 @@ Lock windows, one engine each. Every GPU window has a `timeout`. The rivals slot
 ```bash
 # rival side (already run; repeat only if the rival or the card changes)
 scripts/remote.sh rivals x 'PORT=30000 timeout 1500 tools/rivals/serve.sh sglang sglang-praxis-bf16 \
-  ~/.cache/lernex/models/Lernex/Metis-1.6-Praxis \
+  ~/.cache/dromos/models/Lernex/Metis-1.6-Praxis \
   --max-mamba-cache-size 160 --max-total-tokens 131072 --cuda-graph-max-bs-decode 64 --mem-fraction-static 0.8'
 scripts/remote.sh rivals x 'PORT=30000 timeout 1500 tools/rivals/serve.sh sglang sglang-praxis-fp8 \
   ~/kronos-scratch/logos/engines/praxis/fp8 --max-mamba-cache-size 160 --max-total-tokens 131072 \
   --cuda-graph-max-bs-decode 64 --mem-fraction-static 0.8'
 scripts/remote.sh rivals x 'PORT=30000 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True timeout 1500 \
-  tools/rivals/serve.sh sglang sglang-logos-fp8 ~/.cache/lernex/models/Lernex/Metis-1.6-Logos-FP8 \
+  tools/rivals/serve.sh sglang sglang-logos-fp8 ~/.cache/dromos/models/Lernex/Metis-1.6-Logos-FP8 \
   --max-mamba-cache-size 24 --max-total-tokens 16384 --cuda-graph-max-bs-decode 8 --mem-fraction-static 0.85'
 scripts/remote.sh rivals x 'CELLS=structured PORT=30000 timeout 1500 tools/rivals/serve.sh sglang \
-  sglang-praxis-bf16-structured ~/.cache/lernex/models/Lernex/Metis-1.6-Praxis \
+  sglang-praxis-bf16-structured ~/.cache/dromos/models/Lernex/Metis-1.6-Praxis \
   --max-mamba-cache-size 160 --max-total-tokens 131072 --cuda-graph-max-bs-decode 64 --mem-fraction-static 0.8'
 scripts/remote.sh rivals x 'timeout 900 tools/rivals/single.sh llama-gpu'
 scripts/remote.sh rivals x 'timeout 900 tools/rivals/single.sh llama-gpu-bf16'
@@ -274,28 +274,28 @@ scripts/remote.sh rivals x 'NGL="24 22 20 16" timeout 1800 tools/rivals/single.s
 scripts/remote.sh rivals x 'timeout 1800 tools/rivals/single.sh llama-experts'
 ```
 
-Lernex, final main (to run once, on the lead's final commit; each window is one model and one
+Dromos, final main (to run once, on the lead's final commit; each window is one model and one
 format, with the same client):
 
 ```bash
 # BF16, the default plan and the tuned plans (the tuned ones lift the slot count for 64 and 128 streams)
-scripts/remote.sh rivals x 'PORT=8080 timeout 1500 tools/rivals/serve.sh lernex lernex-praxis-bf16 \
-  ~/.cache/lernex/models/Lernex/Metis-1.6-Praxis'
-scripts/remote.sh rivals x 'PORT=8080 timeout 1500 tools/rivals/serve.sh lernex lernex-praxis-bf16-nobf16x \
-  ~/.cache/lernex/models/Lernex/Metis-1.6-Praxis --sequences 128 --context 2560 --no-bf16x'
+scripts/remote.sh rivals x 'PORT=8080 timeout 1500 tools/rivals/serve.sh dromos dromos-praxis-bf16 \
+  ~/.cache/dromos/models/Lernex/Metis-1.6-Praxis'
+scripts/remote.sh rivals x 'PORT=8080 timeout 1500 tools/rivals/serve.sh dromos dromos-praxis-bf16-nobf16x \
+  ~/.cache/dromos/models/Lernex/Metis-1.6-Praxis --sequences 128 --context 2560 --no-bf16x'
 # FP8 and Logos FP8 (same client, tuned context)
-scripts/remote.sh rivals x 'PORT=8080 timeout 1500 tools/rivals/serve.sh lernex lernex-praxis-fp8 \
+scripts/remote.sh rivals x 'PORT=8080 timeout 1500 tools/rivals/serve.sh dromos dromos-praxis-fp8 \
   ~/kronos-scratch/logos/engines/praxis/fp8 --sequences 128 --context 2560'
-scripts/remote.sh rivals x 'PORT=8080 timeout 1500 tools/rivals/serve.sh lernex lernex-logos-fp8 \
-  ~/.cache/lernex/models/Lernex/Metis-1.6-Logos-FP8 --sequences 128 --context 2560'
-# structured output: json_schema on lernex serve, 64 of 64 valid expected
-scripts/remote.sh rivals x 'CELLS=structured PORT=8080 timeout 600 tools/rivals/serve.sh lernex lernex-structured \
-  ~/.cache/lernex/models/Lernex/Metis-1.6-Praxis'
+scripts/remote.sh rivals x 'PORT=8080 timeout 1500 tools/rivals/serve.sh dromos dromos-logos-fp8 \
+  ~/.cache/dromos/models/Lernex/Metis-1.6-Logos-FP8 --sequences 128 --context 2560'
+# structured output: json_schema on dromos serve, 64 of 64 valid expected
+scripts/remote.sh rivals x 'CELLS=structured PORT=8080 timeout 600 tools/rivals/serve.sh dromos dromos-structured \
+  ~/.cache/dromos/models/Lernex/Metis-1.6-Praxis'
 # single stream and CPU
-scripts/remote.sh rivals x 'timeout 1200 tools/rivals/single.sh lernex-gpu'
-scripts/remote.sh rivals run 'timeout 2700 tools/rivals/single.sh lernex-cpu'
-scripts/remote.sh rivals x 'timeout 1200 tools/rivals/single.sh lernex-offload'
+scripts/remote.sh rivals x 'timeout 1200 tools/rivals/single.sh dromos-gpu'
+scripts/remote.sh rivals run 'timeout 2700 tools/rivals/single.sh dromos-cpu'
+scripts/remote.sh rivals x 'timeout 1200 tools/rivals/single.sh dromos-offload'
 ```
 
-Each Lernex window also records the plan lines (`Up to N sequences`) in
+Each Dromos window also records the plan lines (`Up to N sequences`) in
 `out/rivals/<name>.server.log`, so the final table can say how many sequences each run held.

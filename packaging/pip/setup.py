@@ -11,8 +11,8 @@ with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "wheel.json")
 setup(
     version=meta["version"],
     install_requires=meta["requires"],
-    # The tree under lernex/_bin is data, but its directories are packages to setuptools (no __init__.py), so
+    # The tree under dromos/_bin is data, but its directories are packages to setuptools (no __init__.py), so
     # listing them all keeps the build quiet and ships every file once.
-    packages=find_namespace_packages(include=["lernex", "lernex.*"]),
-    package_data={"lernex._bin": ["*", "*/*", "*/*/*", "*/*/*/*", "*/*/*/*/*"]},
+    packages=find_namespace_packages(include=["dromos", "dromos.*"]),
+    package_data={"dromos._bin": ["*", "*/*", "*/*/*", "*/*/*/*", "*/*/*/*/*"]},
 )

@@ -9,7 +9,7 @@
 // Two providers feed one traversal (traffic.cpp), so the number cannot drift between them: MetisModel::decode_traffic
 // reads the matrices the model loaded (their held formats, their decode copies), and config_decode_traffic reads the
 // same rules the loader applies (projection_format, the BF16X copy rule) for a folder nothing has been loaded from,
-// which is what lernex doctor prints. `lernex bench` prints both and checks that they agree.
+// which is what dromos doctor prints. `dromos bench` prints both and checks that they agree.
 #pragma once
 
 #include <cstdint>

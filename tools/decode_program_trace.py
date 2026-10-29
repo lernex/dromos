@@ -2,7 +2,7 @@
 
 Run one step of the program with the trace on (the 32nd decode step, or LX_PROGRAM_TRACE_STEP):
 
-    LX_PROGRAM=1 LX_PROGRAM_TRACE=1 LX_PROGRAM_TRACE_OUT=DIR build/lernex bench MODEL --streams 1 \\
+    LX_PROGRAM=1 LX_PROGRAM_TRACE=1 LX_PROGRAM_TRACE_OUT=DIR build/dromos bench MODEL --streams 1 \\
         --prompt-tokens 512 --gen-tokens 64
 
 DIR then holds trace.bin (the timestamps of the traced step, from lx_program_trace: per list entry, then per run),

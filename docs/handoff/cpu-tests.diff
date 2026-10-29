@@ -3,7 +3,7 @@ native clone's tests/kernels/{test_gemm_w,test_moe_grouped,wformats}.py and the 
 test_cpu_experts.py as of 2026-10-24).
 
 With tests/kernels/conftest.py's LX_BACKEND=cpu (committed in the CPU clone), these tests run against
-liblernex_cpu.so. Three things in them are CUDA-specific and are gated on BACKEND == "cuda" here:
+libdromos_cpu.so. Three things in them are CUDA-specific and are gated on BACKEND == "cuda" here:
 the sm_89/sm_80 arch-override families (the CPU's lx_arch is an ISA level, not an SM), the tile-variant
 tuner tests (the CPU registers no variants), and the grouped kernel's NOT_SUPPORTED cases for tile shapes
 the CUDA kernels cannot take (the CPU takes them). The ctypes lx_weight in wformats.py and

@@ -1,27 +1,27 @@
 # Releases and installs
 
 How a tagged commit becomes something people install, and the contract every installer shares.
-Every install path ends in the same tree, so `lernex` behaves the same however it arrived.
+Every install path ends in the same tree, so `dromos` behaves the same however it arrived.
 
 ## Versions
 
 A release is a git tag `vX.Y.Z` on `main` (`vX.Y.Z-rcN` for a pre-release). The build bakes the
 version in: CMake takes `-DLX_VERSION=X.Y.Z`, and without it reads `git describe --tags --match 'v*'`
-(an untagged build is `0.0.0-dev+<sha>`). `lernex --version` prints one line and loads no backend:
+(an untagged build is `0.0.0-dev+<sha>`). `dromos --version` prints one line and loads no backend:
 
-    lernex 0.1.0 (linux-x86_64-cuda12, 777d965)
+    dromos 0.1.0 (linux-x86_64-cuda12, 777d965)
 
 ## Release assets
 
-Names carry no version, so `https://github.com/lernex/lernex-engine/releases/latest/download/NAME`
+Names carry no version, so `https://github.com/dromos/dromos/releases/latest/download/NAME`
 is a stable link:
 
 | Asset | Contents |
 |---|---|
-| `lernex-linux-x86_64-cuda12.tar.gz` | CUDA backend, every architecture (`-DLX_ARCHS=all`), plus the CPU backend |
-| `lernex-linux-x86_64-cpu.tar.gz` | CPU backend only |
-| `lernex-linux-aarch64-cpu.tar.gz` | CPU backend only |
-| `lernex-darwin-arm64.tar.gz` | Metal backend (macOS 14+) |
+| `dromos-linux-x86_64-cuda12.tar.gz` | CUDA backend, every architecture (`-DLX_ARCHS=all`), plus the CPU backend |
+| `dromos-linux-x86_64-cpu.tar.gz` | CPU backend only |
+| `dromos-linux-aarch64-cpu.tar.gz` | CPU backend only |
+| `dromos-darwin-arm64.tar.gz` | Metal backend (macOS 14+) |
 | `install.sh` | the installer |
 | `SHA256SUMS` | `sha256sum` format, one line per asset above |
 
@@ -37,56 +37,56 @@ untested). An older driver, or no GPU, gets the CPU flavor. `scripts/release/bui
 
 Every tarball unpacks, with no top directory, to:
 
-    bin/lernex
-    lib/liblernex_kernels.so  liblernex_cpu.so      (linux; liblernex_metal.dylib on macOS)
+    bin/dromos
+    lib/libdromos_kernels.so  libdromos_cpu.so      (linux; libdromos_metal.dylib on macOS)
     lib/libcudart.so.N  lib/libcublasLt.so.N      (CUDA flavor only, the toolkit's own)
-    share/lernex/tuning/*.json
-    share/lernex/channel                           tarball | homebrew | pip | docker
-    share/lernex/licenses/                         third-party licenses (and NVIDIA's EULA, CUDA flavor)
+    share/dromos/tuning/*.json
+    share/dromos/channel                           tarball | homebrew | pip | docker
+    share/dromos/licenses/                         third-party licenses (and NVIDIA's EULA, CUDA flavor)
     LICENSE  NOTICE                                Apache-2.0, and what else ships under which terms
 
-`bin/lernex` finds its backends in `../lib` (already done by engine/dispatch), and the backends find
-the bundled CUDA libraries through an `$ORIGIN` rpath. Tuning tables are read from `../share/lernex/tuning`
+`bin/dromos` finds its backends in `../lib` (already done by engine/dispatch), and the backends find
+the bundled CUDA libraries through an `$ORIGIN` rpath. Tuning tables are read from `../share/dromos/tuning`
 next to the real executable, then the source tree they were built from. Nothing reads a path baked in at
 build time unless it exists.
 
-`share/lernex/channel` says who installed it, so `lernex update` and the daily notice name the right
-command: `lernex update` for `tarball`, `brew upgrade lernex`, `pip install -U lernex`,
-`docker pull ghcr.io/lernex/lernex`. A tree without the file is a source build.
+`share/dromos/channel` says who installed it, so `dromos update` and the daily notice name the right
+command: `dromos update` for `tarball`, `brew upgrade dromos`, `pip install -U dromos`,
+`docker pull ghcr.io/lernex/dromos`. A tree without the file is a source build.
 
 ## Where things live
 
 | Path | What |
 |---|---|
-| `~/.lernex/versions/X.Y.Z/` | an installed tree (install.sh and `lernex update`) |
-| `~/.lernex/current` | symlink to the active version; switched atomically |
-| `~/.local/bin/lernex` | symlink to `~/.lernex/current/bin/lernex` (install.sh adds it to PATH if needed) |
-| `~/.cache/lernex/models/` | models (`LERNEX_MODELS` overrides) |
-| `~/.cache/lernex/update-check` | the daily check's cache |
+| `~/.dromos/versions/X.Y.Z/` | an installed tree (install.sh and `dromos update`) |
+| `~/.dromos/current` | symlink to the active version; switched atomically |
+| `~/.local/bin/dromos` | symlink to `~/.dromos/current/bin/dromos` (install.sh adds it to PATH if needed) |
+| `~/.cache/dromos/models/` | models (`DROMOS_MODELS` overrides) |
+| `~/.cache/dromos/update-check` | the daily check's cache |
 
-Environment: `LERNEX_NO_UPDATE_CHECK=1` turns the daily check off. `LERNEX_RELEASES` (default
-`https://github.com/lernex/lernex-engine/releases`) points install.sh and `lernex update` at another
+Environment: `DROMOS_NO_UPDATE_CHECK=1` turns the daily check off. `DROMOS_RELEASES` (default
+`https://github.com/dromos/dromos/releases`) points install.sh and `dromos update` at another
 release host, for tests.
 
 ## Updates
 
-- `lernex update` finds the latest release, downloads this install's flavor, checks it against
-  `SHA256SUMS`, unpacks it to `~/.lernex/versions/NEW`, flips `current`, and keeps the previous
-  version for one rollback. `lernex update --check` only reports.
+- `dromos update` finds the latest release, downloads this install's flavor, checks it against
+  `SHA256SUMS`, unpacks it to `~/.dromos/versions/NEW`, flips `current`, and keeps the previous
+  version for one rollback. `dromos update --check` only reports.
 - `run` and `serve` print one quiet line when a newer release is known: at most one network check a
   day, in the background with a short timeout, cached, so startup never waits on it.
 
 ## Install paths
 
-    curl -fsSL https://github.com/lernex/lernex-engine/releases/latest/download/install.sh | sh
-    brew trust --formula lernex/tap/lernex && brew install lernex/tap/lernex
-    pip install lernex
-    docker run --gpus all -p 8080:8080 -v lernex:/root/.cache/lernex ghcr.io/lernex/lernex praxis
+    curl -fsSL https://github.com/dromos/dromos/releases/latest/download/install.sh | sh
+    brew trust --formula lernex/tap/dromos && brew install lernex/tap/dromos
+    pip install dromos
+    docker run --gpus all -p 8080:8080 -v dromos:/root/.cache/dromos ghcr.io/lernex/dromos praxis
 
 install.sh picks the flavor from the OS, the architecture and the NVIDIA driver; re-running it upgrades.
 Homebrew 7 loads a formula from a third-party tap only once it is trusted, so the brew install is two
-commands: `brew trust --formula lernex/tap/lernex` once, then `brew install lernex/tap/lernex`. The tap is
-github.com/lernex/homebrew-tap; its `Formula/lernex.rb` is the one in `packaging/homebrew-tap`.
+commands: `brew trust --formula lernex/tap/dromos` once, then `brew install lernex/tap/dromos`. The tap is
+github.com/lernex/homebrew-tap; its `Formula/dromos.rb` is the one in `packaging/homebrew-tap`.
 
 ## Cutting a release
 
@@ -95,11 +95,11 @@ github.com/lernex/homebrew-tap; its `Formula/lernex.rb` is the one in `packaging
 2. Check the draft's assets (install each flavor on a clean machine), then publish it. Publishing starts
    `pypi.yml` (the wheels, through the `pypi` environment) and `docker.yml` (the GHCR image).
 3. Bump the tap: in a checkout of lernex/homebrew-tap, run
-   `<engine checkout>/packaging/homebrew-tap/bump-formula.sh X.Y.Z Formula/lernex.rb`, commit and push. Nothing
+   `<engine checkout>/packaging/homebrew-tap/bump-formula.sh X.Y.Z Formula/dromos.rb`, commit and push. Nothing
    automates this step: it needs push access to the tap, and a CI deploy key for it is the owner's decision.
-   Copy the bumped formula back into `packaging/homebrew-tap/Formula/lernex.rb` here so the two stay the same.
-4. Check each channel installs the new version: `install.sh`, `brew upgrade lernex`, `pip install -U lernex`,
-   `docker pull ghcr.io/lernex/lernex`, and `lernex update` from the previous release.
+   Copy the bumped formula back into `packaging/homebrew-tap/Formula/dromos.rb` here so the two stay the same.
+4. Check each channel installs the new version: `install.sh`, `brew upgrade dromos`, `pip install -U dromos`,
+   `docker pull ghcr.io/lernex/dromos`, and `dromos update` from the previous release.
 
 ## Build bases
 

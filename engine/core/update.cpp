@@ -26,7 +26,7 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr long long kDay = 24 * 60 * 60;
-const char* kDefaultReleases = "https://github.com/lernex/lernex-engine/releases";
+const char* kDefaultReleases = "https://github.com/dromos/dromos/releases";
 
 std::string home() {
   const char* h = std::getenv("HOME");
@@ -34,8 +34,8 @@ std::string home() {
   return h;
 }
 
-// The lernex directory of this user: ~/.lernex (versions, current, previous).
-fs::path lernex_home() { return fs::path(home()) / ".lernex"; }
+// The dromos directory of this user: ~/.dromos (versions, current, previous).
+fs::path dromos_home() { return fs::path(home()) / ".dromos"; }
 
 // Runs a program and waits for it. With `captured`, its standard output is collected there. Returns its exit status,
 // or -1 when it did not run to an exit.
@@ -121,12 +121,12 @@ fs::path link_target(const fs::path& link) {
   return fs::read_symlink(link, ec);
 }
 
-// Installs a verified release tree under ~/.lernex/versions/VERSION and makes it current. The version that was current
+// Installs a verified release tree under ~/.dromos/versions/VERSION and makes it current. The version that was current
 // becomes the previous one, and every other installed version is removed.
 void install_release(const std::string& releases, const std::string& version) {
   const std::string flavor = LX_FLAVOR_STRING;
   if (flavor == "source") throw std::runtime_error("this build has no release flavor to download");
-  const fs::path root = lernex_home();
+  const fs::path root = dromos_home();
   const fs::path versions = root / "versions";
   fs::create_directories(versions);
 
@@ -144,7 +144,7 @@ void install_release(const std::string& releases, const std::string& version) {
 
   const std::string asset = asset_name(flavor);
   const std::string base = releases + "/download/v" + version + "/";
-  std::fprintf(stderr, "downloading lernex %s (%s)\n", version.c_str(), flavor.c_str());
+  std::fprintf(stderr, "downloading dromos %s (%s)\n", version.c_str(), flavor.c_str());
   const std::string expected = checksum_for(fetch(base + "SHA256SUMS"), asset);
   if (expected.empty()) throw std::runtime_error("SHA256SUMS lists no " + asset);
   const fs::path tarball = staging / asset;
@@ -157,10 +157,10 @@ void install_release(const std::string& releases, const std::string& version) {
     throw std::runtime_error("could not unpack " + asset);
   // The unpacked binary has to be the release it claims, before anything points at it.
   std::string printed;
-  const std::string expect = "lernex " + version + " (" + flavor + ",";
-  if (run_process({(tree / "bin" / "lernex").string(), "--version"}, &printed) != 0 ||
+  const std::string expect = "dromos " + version + " (" + flavor + ",";
+  if (run_process({(tree / "bin" / "dromos").string(), "--version"}, &printed) != 0 ||
       printed.rfind(expect, 0) != 0)
-    throw std::runtime_error("the unpacked lernex does not report " + version + " (" + flavor + ")");
+    throw std::runtime_error("the unpacked dromos does not report " + version + " (" + flavor + ")");
 
   const fs::path dest = versions / version;
   fs::remove_all(dest, ec);
@@ -176,22 +176,22 @@ void install_release(const std::string& releases, const std::string& version) {
     fs::remove_all(entry.path(), ec);
   }
 
-  std::printf("lernex %s is installed and current.", version.c_str());
+  std::printf("dromos %s is installed and current.", version.c_str());
   if (!keep_previous.empty())
-    std::printf(" lernex %s is kept: `lernex update --rollback` returns to it.", keep_previous.c_str());
+    std::printf(" dromos %s is kept: `dromos update --rollback` returns to it.", keep_previous.c_str());
   std::printf("\n");
 }
 
-// Switches ~/.lernex/current back to the version the last update replaced.
+// Switches ~/.dromos/current back to the version the last update replaced.
 int rollback_to_previous() {
-  const fs::path root = lernex_home();
+  const fs::path root = dromos_home();
   const fs::path previous = link_target(root / "previous");
   const fs::path current = link_target(root / "current");
   if (previous.empty() || !fs::is_directory(previous))
     throw std::runtime_error("there is no previous version to roll back to");
   set_link(root / "current", previous);
   if (!current.empty()) set_link(root / "previous", current);
-  std::printf("lernex switched back to %s. The next run uses it.\n", previous.filename().string().c_str());
+  std::printf("dromos switched back to %s. The next run uses it.\n", previous.filename().string().c_str());
   return 0;
 }
 
@@ -267,7 +267,7 @@ std::string version_from_url(const std::string& url) {
   return url.substr(start, end == std::string::npos ? std::string::npos : end - start);
 }
 
-std::string asset_name(const std::string& flavor) { return "lernex-" + flavor + ".tar.gz"; }
+std::string asset_name(const std::string& flavor) { return "dromos-" + flavor + ".tar.gz"; }
 
 std::string checksum_for(const std::string& sums, const std::string& file) {
   std::istringstream in(sums);
@@ -303,7 +303,7 @@ std::string sha256_file(const fs::path& file) {
 }
 
 std::string releases_url() {
-  if (const char* env = std::getenv("LERNEX_RELEASES"); env && *env) {
+  if (const char* env = std::getenv("DROMOS_RELEASES"); env && *env) {
     std::string url = env;
     while (!url.empty() && url.back() == '/') url.pop_back();
     return url;
@@ -322,16 +322,16 @@ std::string latest_version(const std::string& releases, long timeout_seconds) {
 }
 
 std::string update_command(const std::string& channel) {
-  if (channel == "tarball") return "lernex update";
-  if (channel == "homebrew") return "brew upgrade lernex";
-  if (channel == "pip") return "pip install -U lernex";
-  if (channel == "docker") return "docker pull ghcr.io/lernex/lernex";
+  if (channel == "tarball") return "dromos update";
+  if (channel == "homebrew") return "brew upgrade dromos";
+  if (channel == "pip") return "pip install -U dromos";
+  if (channel == "docker") return "docker pull ghcr.io/lernex/dromos";
   return "";
 }
 
 fs::path cache_path() {
   const char* h = std::getenv("HOME");
-  return fs::path(h && *h ? h : ".") / ".cache" / "lernex" / "update-check";
+  return fs::path(h && *h ? h : ".") / ".cache" / "dromos" / "update-check";
 }
 
 Cache read_cache(const fs::path& file) {
@@ -372,17 +372,17 @@ std::string notice(const std::string& current, const Cache& cache, const std::st
   if (cache.latest.empty() || compare(cache.latest, current) <= 0) return "";
   const std::string how = update_command(channel);
   if (how.empty()) return "";
-  return "lernex " + cache.latest + " is out (you have " + current + "). Run `" + how + "` to install it.";
+  return "dromos " + cache.latest + " is out (you have " + current + "). Run `" + how + "` to install it.";
 }
 
 int run_update(bool check_only, bool rollback) {
   const std::string channel = lx::install::channel();
   if (channel.empty()) {
-    std::printf("this lernex was built from source, so it has no release channel. Update the checkout and build again.\n");
+    std::printf("this dromos was built from source, so it has no release channel. Update the checkout and build again.\n");
     return 0;
   }
   if (channel != "tarball") {
-    std::printf("this lernex was installed with %s. Update it with `%s`.\n", channel.c_str(),
+    std::printf("this dromos was installed with %s. Update it with `%s`.\n", channel.c_str(),
                 update_command(channel).c_str());
     return 0;
   }
@@ -392,11 +392,11 @@ int run_update(bool check_only, bool rollback) {
   const std::string latest = latest_version(releases, 30);
   const std::string current = LX_VERSION_STRING;
   if (compare(latest, current) <= 0) {
-    std::printf("lernex %s is the latest release.\n", current.c_str());
+    std::printf("dromos %s is the latest release.\n", current.c_str());
     return 0;
   }
   if (check_only) {
-    std::printf("lernex %s is available (you have %s). Run `lernex update` to install it.\n", latest.c_str(),
+    std::printf("dromos %s is available (you have %s). Run `dromos update` to install it.\n", latest.c_str(),
                 current.c_str());
     return 0;
   }
@@ -406,7 +406,7 @@ int run_update(bool check_only, bool rollback) {
 
 void start_daily_check() {
   try {
-    if (const char* off = std::getenv("LERNEX_NO_UPDATE_CHECK"); off && *off && std::string(off) != "0") return;
+    if (const char* off = std::getenv("DROMOS_NO_UPDATE_CHECK"); off && *off && std::string(off) != "0") return;
     const std::string channel = lx::install::channel();
     if (channel.empty()) return;  // a source build has no release to compare with
     const fs::path file = cache_path();

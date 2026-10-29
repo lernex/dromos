@@ -26,7 +26,7 @@ index e77600b..413f562 100644
      if (!std::strcmp(cmd, "list")) return cmd_list(argc - 1, argv + 1);
 +    if (!std::strcmp(cmd, "prefill")) return cmd_prefill(argc - 1, argv + 1);
    } catch (const std::exception& e) {
-     std::fprintf(stderr, "lernex: %s\n", e.what());
+     std::fprintf(stderr, "dromos: %s\n", e.what());
      return 1;
 diff --git a/cli/prefill.cpp b/cli/prefill.cpp
 new file mode 100644
@@ -34,7 +34,7 @@ index 0000000..57e2264
 --- /dev/null
 +++ b/cli/prefill.cpp
 @@ -0,0 +1,80 @@
-+// lernex prefill: time one sequence's prefill of T tokens (only the last row's logits, as serving asks for
++// dromos prefill: time one sequence's prefill of T tokens (only the last row's logits, as serving asks for
 +// them), for measuring prefill throughput. Tokens are taken from PROMPTS_JSON, concatenated and repeated
 +// to T, so the experts see text-like routing. The first run warms up; the median of the rest is reported.
 +#include <cuda_runtime.h>
@@ -55,7 +55,7 @@ index 0000000..57e2264
 +
 +int cmd_prefill(int argc, char** argv) {
 +  if (argc != 4 && argc != 5) {
-+    std::fprintf(stderr, "usage: lernex prefill MODEL_DIR PROMPTS_JSON T [RUNS]\n");
++    std::fprintf(stderr, "usage: dromos prefill MODEL_DIR PROMPTS_JSON T [RUNS]\n");
 +    return 2;
 +  }
 +  try {

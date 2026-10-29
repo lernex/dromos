@@ -184,9 +184,9 @@ std::string alias_repo(const Alias& alias, const std::string& format) {
 }
 
 fs::path cache_root() {
-  // LERNEX_MODELS moves the cache (docs/RELEASE.md); by default it is ~/.cache/lernex/models.
-  if (const char* env = std::getenv("LERNEX_MODELS"); env && *env) return fs::path(env);
-  return fs::path(home()) / ".cache" / "lernex" / "models";
+  // DROMOS_MODELS moves the cache (docs/RELEASE.md); by default it is ~/.cache/dromos/models.
+  if (const char* env = std::getenv("DROMOS_MODELS"); env && *env) return fs::path(env);
+  return fs::path(home()) / ".cache" / "dromos" / "models";
 }
 
 fs::path install_dir(const std::string& repo) {
@@ -204,7 +204,7 @@ std::string hf_token() {
 }
 
 bool installed(const fs::path& dir) {
-  const Manifest m = Manifest::load(dir / "lernex.json");
+  const Manifest m = Manifest::load(dir / "dromos.json");
   if (!m.complete) return false;
   for (const auto& [path, v] : m.verified) {
     std::error_code ec;
@@ -262,7 +262,7 @@ RemoteModel describe(const std::string& repo, const std::string& token) {
 
 void pull(const RemoteModel& model, const fs::path& dir, const std::string& token, const ProgressFn& progress) {
   fs::create_directories(dir);
-  const fs::path manifest_path = dir / "lernex.json";
+  const fs::path manifest_path = dir / "dromos.json";
   Manifest m = Manifest::load(manifest_path);
   if (m.repo != model.repo || m.revision != model.revision) {
     // another revision (or no manifest): nothing in it is trusted until verified again

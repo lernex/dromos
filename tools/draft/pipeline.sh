@@ -3,17 +3,17 @@
 #
 #   tools/draft/pipeline.sh praxis            # or logos, or a target checkpoint directory
 #
-# Run it from the engine checkout on the GPU server, after a build (build/lernex). Every stage is
+# Run it from the engine checkout on the GPU server, after a build (build/dromos). Every stage is
 # resumable and skipped once its output is complete, so the same command picks up where a stopped
 # run left off:
 #   1. prompts     tools/draft/prompts.py: SOURCE conversations (perfectblend downloads DSpark's
 #                  open-perfectblend; local is an offline mix for smoke tests), N_TRAIN + N_EVAL
 #   2. answers     tools/draft/regenerate.py (vLLM): the target answers every conversation
-#   3. eval        lernex features over the eval set, kept on disk
-#   4. train       lernex features streams the target's hidden states for EPOCHS epochs through a
+#   3. eval        dromos features over the eval set, kept on disk
+#   4. train       dromos features streams the target's hidden states for EPOCHS epochs through a
 #                  bounded queue in /dev/shm (QUEUE shards), and tools/draft/train_block.py trains
 #                  on them as they come, deleting what it has read; the drafter lands in
-#                  $WORK/train/draft (config.json, model.safetensors), what `lernex spec
+#                  $WORK/train/draft (config.json, model.safetensors), what `dromos spec
 #                  --drafters block --draft-head DIR` loads
 # Every GPU stage holds the shared GPU lock (~/lernex-engine-dev/.gpu.lock) while it runs.
 #
@@ -58,7 +58,7 @@ gpu() {
 }
 lines() { [ -f "$1" ] && wc -l < "$1" || echo 0; }
 
-[ -x build/lernex ] || { echo "build/lernex is missing: build the engine first" >&2; exit 1; }
+[ -x build/dromos ] || { echo "build/dromos is missing: build the engine first" >&2; exit 1; }
 taps=$("$PY" -c "
 import json, sys
 sys.path.insert(0, 'tools/draft')
@@ -86,7 +86,7 @@ done
 # 3. eval features, once
 if [ ! -f "$WORK/eval-shards/DONE" ]; then
   log "eval features"
-  gpu build/lernex features "$target" "$WORK/eval.jsonl" "$WORK/eval-shards" --taps "$taps" \
+  gpu build/dromos features "$target" "$WORK/eval.jsonl" "$WORK/eval-shards" --taps "$taps" \
     --queue 1000000 --max-len "$MAX_LEN" --shard-tokens "$SHARD_TOKENS"
 fi
 
@@ -106,7 +106,7 @@ train() {
   rm -rf "$queue_dir"
   mkdir -p "$queue_dir"
   # the producer marks the queue FAILED if it dies, so the trainer stops instead of waiting
-  ( build/lernex features "$target" "$WORK/train.jsonl" "$queue_dir" --taps "$taps" --epochs "$EPOCHS" \
+  ( build/dromos features "$target" "$WORK/train.jsonl" "$queue_dir" --taps "$taps" --epochs "$EPOCHS" \
       --queue "$QUEUE" --max-len "$MAX_LEN" --shard-tokens "$SHARD_TOKENS" --skip-seqs "$seen" \
       > "$WORK/features.log" 2>&1 || touch "$queue_dir/FAILED" ) &
   local producer=$!

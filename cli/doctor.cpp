@@ -1,4 +1,4 @@
-// lernex doctor [MODEL] [--weights bf16|int8|fp8|nvfp4|bf16x] [--no-bf16x] [--context N] [--sequences N] [--modelled]
+// dromos doctor [MODEL] [--weights bf16|int8|fp8|nvfp4|bf16x] [--no-bf16x] [--context N] [--sequences N] [--modelled]
 //
 // --modelled counts the roofline of a folder in a format it cannot be loaded in yet: the loader's recipe for that
 // format applied to the folder's config, with nothing read from the folder (NVFP4 needs a GPTQ folder to load).
@@ -162,7 +162,7 @@ void print_device(const lx::runtime::DeviceInfo& d) {
   }
 }
 
-// The plan for a model folder, as lernex doctor prints it.
+// The plan for a model folder, as dromos doctor prints it.
 void print_plan(const lx::runtime::Plan& plan) {
   using namespace lx::runtime;
   std::printf("\nformats    %-6s %-4s %10s %12s %-14s %-18s %s\n", "", "fits", "weights", "decode est.", "maths",
@@ -356,7 +356,7 @@ int cmd_doctor(int argc, char** argv) {
       std::printf("tuning     none needed: each CPU product has one order, so there is nothing to choose\n");
     else
       std::printf("tuning     %s\n", table.empty() ? "none for this GPU; the kernels use their own heuristics "
-                                                      "(lernex tune MODEL_DIR makes one)"
+                                                      "(dromos tune MODEL_DIR makes one)"
                                                 : table.c_str());
 
     if (modelled && dir.empty()) throw std::runtime_error("--modelled needs a model folder");
