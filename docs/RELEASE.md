@@ -138,6 +138,10 @@ github.com/lernex/homebrew-tap; its `Formula/dromos.rb` is the one in `packaging
 Linux builds run on an old base so the binaries run on any current distribution: manylinux_2_28
 (glibc 2.28) where the CUDA toolkit allows it, else ubuntu 22.04. The CPU backend compiles every ISA
 level and picks at run time (engine/cpu); nothing is built with `-march=native`. macOS builds target 14.0.
+The CUDA flavors' toolkit comes from NVIDIA's redistributable archives, pinned by one manifest per series
+(`scripts/release/cuda-toolkit.sh`: `redistrib_12.8.2.json` for 12.8) and each archive checked against its sha256, so a
+release builds against exactly the versions its release candidate was tested with. NVIDIA's package repositories are
+not used: they serve the newest packages of a series, and their index has been republished broken.
 TLS comes from the system libcurl, opened at run time (engine/core/http.cpp), so no OpenSSL is linked.
 
 Windows builds run on `windows-2022` with Visual Studio 2022's MSVC (`scripts/release/build.ps1`), the C runtime
