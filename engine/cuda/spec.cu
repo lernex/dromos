@@ -338,40 +338,32 @@ int launch_spec_scan(const SpecScanArgs& args, int n_seq, int threads, cudaStrea
 constexpr int kGemvThreads = 256;
 constexpr int kGemvRows = 8;
 
-// One block per output column n. Thread t takes k = t, t + 256, ... in order with one sum per input
-// row; the warps' sums are then added in warp order. No step of that order depends on M.
+// One block per (output column n, input row m). Thread t takes k = t, t + 256, ... in order with one sum for its row;
+// the warps' sums are then added in warp order. No step of that order depends on M, so each row's bits are the same
+// whether it runs alone or beside seven others. (One block per column read every row of x in the same block; one
+// block per row and column gives the GPU eight times the blocks for the same arithmetic.)
 __global__ void __launch_bounds__(kGemvThreads) gemv_f32_kernel(const float* __restrict__ x, int ld_x,
                                                                const float* __restrict__ w,
                                                                const float* __restrict__ bias, float* __restrict__ y,
                                                                int ld_y, int M, int K) {
   lx::pdl_trigger();
   lx::pdl_wait();
-  __shared__ float part[kGemvThreads / 32][kGemvRows];
-  const int n = blockIdx.x;
+  __shared__ float part[kGemvThreads / 32];
+  const int n = blockIdx.x, m = blockIdx.y;
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   const float* wr = w + static_cast<int64_t>(n) * K;
-  float acc[kGemvRows];
-#pragma unroll
-  for (int m = 0; m < kGemvRows; ++m) acc[m] = 0.0f;
-  for (int k = threadIdx.x; k < K; k += kGemvThreads) {
-    const float wv = wr[k];
-#pragma unroll
-    for (int m = 0; m < kGemvRows; ++m)
-      if (m < M) acc[m] = fmaf(wv, x[static_cast<int64_t>(m) * ld_x + k], acc[m]);
-  }
-#pragma unroll
-  for (int m = 0; m < kGemvRows; ++m) acc[m] = lx::warp_sum(acc[m]);
-  if (lane == 0) {
-#pragma unroll
-    for (int m = 0; m < kGemvRows; ++m) part[warp][m] = acc[m];
-  }
+  const float* xr = x + static_cast<int64_t>(m) * ld_x;
+  float acc = 0.0f;
+  for (int k = threadIdx.x; k < K; k += kGemvThreads) acc = fmaf(wr[k], xr[k], acc);
+  acc = lx::warp_sum(acc);
+  if (lane == 0) part[warp] = acc;
   __syncthreads();
-  if (threadIdx.x < M) {
+  if (threadIdx.x == 0) {
     float sum = 0.0f;
 #pragma unroll
-    for (int i = 0; i < kGemvThreads / 32; ++i) sum += part[i][threadIdx.x];
+    for (int i = 0; i < kGemvThreads / 32; ++i) sum += part[i];
     if (bias) sum += bias[n];
-    y[static_cast<int64_t>(threadIdx.x) * ld_y + n] = sum;
+    y[static_cast<int64_t>(m) * ld_y + n] = sum;
   }
 }
 
@@ -943,7 +935,7 @@ extern "C" int lx_spec_gemv_f32(const float* x, int ld_x, const float* w, const 
   if (M == 0 || N == 0) return 0;
   if (M < 0 || M > kGemvRows || K <= 0 || ld_x < K || ld_y < N || !x || !w || !y)
     return static_cast<int>(cudaErrorInvalidValue);
-  lx::launch_pdl(gemv_f32_kernel, N, kGemvThreads, 0, static_cast<cudaStream_t>(stream), x, ld_x, w, bias, y, ld_y, M, K);
+  lx::launch_pdl(gemv_f32_kernel, dim3(N, M), kGemvThreads, 0, static_cast<cudaStream_t>(stream), x, ld_x, w, bias, y, ld_y, M, K);
   return lx::launch_status();
 }
 
