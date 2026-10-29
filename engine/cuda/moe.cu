@@ -86,20 +86,36 @@ __global__ void __launch_bounds__(kRouterThreads) router_route_kernel(
     float* __restrict__ weights, float* __restrict__ entropy, float* __restrict__ confidence,
     int32_t* __restrict__ ticket, int M, int K, int top_k) {
   lx::pdl_trigger();
+  // The router weights, this expert's bias and the selection bias are static: they are loaded before the wait, and
+  // only the activations wait for the predecessor.
+  const int E = gridDim.x;
+  const int n = blockIdx.x;
+  float wv[J];
+  lx::route::load_w<J>(w + static_cast<int64_t>(n) * K, K, threadIdx.x, wv);
+  constexpr int kSelPer = kRouterMaxE / kRouterThreads;  // E <= kRouterMaxE: this thread's selection bias values
+  float sel[kSelPer];
+#pragma unroll
+  for (int i = 0; i < kSelPer; ++i) {
+    const int ei = threadIdx.x + i * kRouterThreads;
+    sel[i] = (selection_bias && ei < E) ? selection_bias[ei] : 0.0f;
+  }
+  const float bn = bias ? bias[n] : 0.0f;
   lx::pdl_wait();
   __shared__ float part[kRouterThreads / 32][kRouterRows];
   __shared__ float rows[kRouterRows][kRouterMaxE];
   __shared__ float bsm[kRouterMaxE];  // the selection bias, staged once per block for the picks
   __shared__ int picked[kRouterRows][kMaxTopK];
   __shared__ int last;
-  const int E = gridDim.x;
-  const int n = blockIdx.x;
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
 
   if (selection_bias)
-    for (int i = threadIdx.x; i < E; i += kRouterThreads) bsm[i] = selection_bias[i];
+#pragma unroll
+    for (int i = 0; i < kSelPer; ++i) {
+      const int ei = threadIdx.x + i * kRouterThreads;
+      if (ei < E) bsm[ei] = sel[i];
+    }
   float acc[kRouterRows];
-  lx::route::gemv_partials<J, kRouterRows>(x, ld_x, w + static_cast<int64_t>(n) * K, M, K, threadIdx.x, acc);
+  lx::route::gemv_partials<J, kRouterRows>(x, ld_x, wv, M, K, threadIdx.x, acc);
 #pragma unroll
   for (int m = 0; m < kRouterRows; ++m)
     if (m < M) acc[m] = lx::warp_sum(acc[m]);  // rows past M are never read
@@ -112,7 +128,7 @@ __global__ void __launch_bounds__(kRouterThreads) router_route_kernel(
     float sum = 0.0f;
 #pragma unroll
     for (int i = 0; i < kRouterThreads / 32; ++i) sum += part[i][threadIdx.x];
-    if (bias) sum += bias[n];
+    if (bias) sum += bn;
     logits[threadIdx.x * E + n] = sum;
   }
   // Publish this block's logits, then count it. The block that counts the last one routes every row.

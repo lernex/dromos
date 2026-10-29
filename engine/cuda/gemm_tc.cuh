@@ -169,15 +169,25 @@ __device__ __forceinline__ float row_col_scale(float row, float col, float globa
   return s;
 }
 
+// An Epi that prefetches its bias before the predecessor's wait sets kPreBias (see gemm_body's phase 0).
+template <class E, class = void>
+struct has_pre_bias : std::false_type {};
+template <class E>
+struct has_pre_bias<E, std::void_t<decltype(E::kPreBias)>> : std::bool_constant<E::kPreBias> {};
+
 // The kernel body. Prob: tile assignment and row addresses; Epi: what to do with the results.
 //
 // kSplit > 1 (sm_90+, launched as clusters of kSplit CTAs along x): the cluster shares one tile and each
 // CTA takes a contiguous part of K, for small problems whose tiles alone would leave SMs idle. The
 // partial accumulators meet in distributed shared memory: every CTA writes its own, then reduces a
 // slice of the tile's rows across the cluster in rank order (deterministic) and runs the epilogue on it.
-template <int kKind, int kArch, int BM, int BN, int WM, int WN, int ST, int RB, class Prob, class Epi, int kSplit = 1>
+// kPhase 0 runs before the predecessor's wait and loads only static operands: the B side of the prologue stages
+// (weight tiles and their scales) and, when Epi has kPreBias, the bias of this thread's epilogue columns into bpre.
+// kPhase 1 runs after the wait and does the rest, reusing both. kPhase 2 is the whole body in one call.
+template <int kKind, int kArch, int BM, int BN, int WM, int WN, int ST, int RB, class Prob, class Epi, int kSplit = 1,
+          int kPhase = 2>
 __device__ __forceinline__ void gemm_body(const typename Prob::Params& pp, const typename Epi::Params& ep,
-                                          uint8_t* smem) {
+                                          uint8_t* smem, float* bpre = nullptr) {
   using C = Config<kKind, kArch, BM, BN, WM, WN, ST, RB>;
   using T = typename C::T;
   constexpr int kThreads = C::kThreads, kMT = C::kMT, kNT = C::kNT;
@@ -237,10 +247,11 @@ __device__ __forceinline__ void gemm_body(const typename Prob::Params& pp, const
   }
   const int k_bytes_a = K * T::kABits / 8, k_bytes_b = K * T::kBBits / 8, k_sf = K / 16;
 
-  auto load_tile = [&](int stage, int kt) {
+  auto load_tile = [&](int stage, int kt, bool a_side, bool b_side) {
     kt += kt0;
     const uint32_t base = s0 + stage * C::kStage;
     const int ka = kt * C::kARow, kb = kt * C::kBRow;
+    if (a_side)
 #pragma unroll
     for (int i = 0; i < kAIt; ++i) {
       if (kAChunks % kThreads == 0 || tid + i * kThreads < kAChunks) {
@@ -248,6 +259,7 @@ __device__ __forceinline__ void gemm_body(const typename Prob::Params& pp, const
         mma::cp_async16(base + a_dst[i], ok ? a_src[i] + ka + a_col[i] : t.b, ok);
       }
     }
+    if (b_side)
 #pragma unroll
     for (int i = 0; i < kBIt; ++i) {
       if (kBChunks % kThreads == 0 || tid + i * kThreads < kBChunks) {
@@ -256,7 +268,7 @@ __device__ __forceinline__ void gemm_body(const typename Prob::Params& pp, const
       }
     }
     const int ks = kt * C::kSfRow;
-    if constexpr (T::kASf) {
+    if constexpr (T::kASf) if (a_side) {
 #pragma unroll
     for (int i = 0; i < kASfIt; ++i) {
       const int rr = tid + i * kThreads;
@@ -273,7 +285,7 @@ __device__ __forceinline__ void gemm_body(const typename Prob::Params& pp, const
       }
     }
     }
-    if constexpr (T::kBSf) {
+    if constexpr (T::kBSf) if (b_side) {
 #pragma unroll
     for (int i = 0; i < kBSfIt; ++i) {
       const int rr = tid + i * kThreads;
@@ -465,9 +477,19 @@ __device__ __forceinline__ void gemm_body(const typename Prob::Params& pp, const
   // Tile kt + ST - 1 is issued while tile kt is consumed. The barrier for tile kt + 1 sits before the
   // last k-step of tile kt, so its first fragments load while that step's MMAs run; the barrier also
   // retires every read of the stage the next issue overwrites.
+  if constexpr (kPhase == 0) {
+#pragma unroll
+    for (int s = 0; s < ST - 1; ++s)
+      if (s < KT) load_tile(s, s, false, true);  // no commit: phase 1's first commit closes these groups
+    if constexpr (kSplit == 1 && has_pre_bias<Epi>::value) {
+#pragma unroll
+      for (int nt = 0; nt < kNT; ++nt) Epi::load_bias2(ep, t, col0 + nt * 8 + 2 * fq, bpre[2 * nt], bpre[2 * nt + 1]);
+    }
+    return;
+  }
 #pragma unroll
   for (int s = 0; s < ST - 1; ++s) {
-    if (s < KT) load_tile(s, s);
+    if (s < KT) load_tile(s, s, true, kPhase != 1);
     mma::cp_async_commit();
   }
   mma::cp_async_wait<ST - 2>();
@@ -485,7 +507,7 @@ __device__ __forceinline__ void gemm_body(const typename Prob::Params& pp, const
       }
       load_frags(f[(ks + 1) & 1], s0 + rs * C::kStage, (ks + 1) % KS);
       if (ks == 0) {
-        if (kt + ST - 1 < KT) load_tile(wst, kt + ST - 1);
+        if (kt + ST - 1 < KT) load_tile(wst, kt + ST - 1, true, true);
         mma::cp_async_commit();
         wst = wst + 1 == ST ? 0 : wst + 1;
       }
@@ -571,7 +593,10 @@ __device__ __forceinline__ void gemm_body(const typename Prob::Params& pp, const
             if (tc >= t.cols) continue;
             const float v0 = static_cast<float>(acc[mt][nt][2 * h]) * row_col_scale<kKind>(rs, col_scale(tc), global);
             const float v1 = static_cast<float>(acc[mt][nt][2 * h + 1]) * row_col_scale<kKind>(rs, col_scale(tc + 1), global);
-            Epi::store2(ep, t, row, tc, v0, v1);
+            if constexpr (kPhase == 1 && kSplit == 1 && has_pre_bias<Epi>::value)
+              Epi::store2_pre(ep, t, row, tc, v0, v1, bpre[2 * nt], bpre[2 * nt + 1]);
+            else
+              Epi::store2(ep, t, row, tc, v0, v1);
           }
         }
       }

@@ -672,20 +672,35 @@ gemv_small_kernel(const TX* __restrict__ x, int ld_x, const uint8_t* __restrict_
       }
     }
   } else if (n < N) {
-    lx::pdl_wait();
+    // The weight row is static: the first quad's bytes are read before the wait, the activations come after it.
     const uint8_t* row = w + n * fx::row_bytes(K);
+    const bool quads = e % 4 == 0 && K % 4 == 0;
+    const int H = fx::header_bytes(K), bo = fx::base_offset(K);
+    const int q0 = c * e;
+    uint32_t sm0 = 0, cd0 = 0, bb0 = 0;
+    if (quads && q0 < K) {
+      const uint8_t* blk0 = row + H + (q0 >> 7) * fx::kBlockBytes;
+      const int off0 = q0 & 127;
+      sm0 = *reinterpret_cast<const uint32_t*>(blk0 + off0);
+      cd0 = *reinterpret_cast<const uint32_t*>(blk0 + fx::kCodes + 4 * (off0 >> 3));
+      bb0 = row[bo + (q0 >> 7)];
+    }
+    lx::pdl_wait();
     fx::Patches pc;
     pc.start(row, fx::patch_slots(K));
-    if (e % 4 == 0 && K % 4 == 0) {
+    if (quads) {
       // Whole quads (e and every run start are multiples of 4): decode four values per load, then
       // multiply them in order, exactly as the one-at-a-time loop below would.
-      const int H = fx::header_bytes(K), bo = fx::base_offset(K);
-      for (int q = c * e; q < c * e + e && q < K; q += 4) {
-        const uint8_t* blk = row + H + (q >> 7) * fx::kBlockBytes;
+      for (int q = q0; q < q0 + e && q < K; q += 4) {
         const int off = q & 127;
-        const uint32_t sm = *reinterpret_cast<const uint32_t*>(blk + off);
-        const uint32_t cd = *reinterpret_cast<const uint32_t*>(blk + fx::kCodes + 4 * (off >> 3));
-        uint32_t ex = fx::exponents(row[bo + (q >> 7)], cd >> (off & 4));
+        uint32_t sm = sm0, cd = cd0, bb = bb0;
+        if (q != q0) {
+          const uint8_t* blk = row + H + (q >> 7) * fx::kBlockBytes;
+          sm = *reinterpret_cast<const uint32_t*>(blk + off);
+          cd = *reinterpret_cast<const uint32_t*>(blk + fx::kCodes + 4 * (off >> 3));
+          bb = row[bo + (q >> 7)];
+        }
+        uint32_t ex = fx::exponents(bb, cd >> (off & 4));
         while (pc.pos() < static_cast<uint32_t>(q + 4)) {
           ex = fx::patch(ex, pc.next, static_cast<uint32_t>(q));
           pc.advance();

@@ -80,20 +80,29 @@ __device__ __forceinline__ void row_weights(const float* row, const int* pick, i
   }
 }
 
+// The router's weights for one output column: thread t (of 256) takes k = t + 256 j, j = 0 .. J - 1, zero past K.
+// They are static, so the caller loads them before the predecessor's wait.
+template <int J>
+__device__ __forceinline__ void load_w(const float* __restrict__ wr, int K, int t, float (&wv)[J]) {
+#pragma unroll
+  for (int j = 0; j < J; ++j) {
+    const int k = t + j * 256;
+    wv[j] = k < K ? wr[k] : 0.0f;
+  }
+}
+
 // The router's GEMV partials for one output column, for the rows m < M: thread t (of 256) returns in acc[m] its
-// chain over k = t + 256 j, j = 0 .. J - 1, in that order. Every load is issued before the first product, so the
-// J * (1 + M) loads of a thread are in flight together rather than one DRAM round trip after another. The caller
-// reduces acc across the warp exactly as lx_spec_gemv_f32 does.
+// chain over k = t + 256 j, j = 0 .. J - 1, in that order, with wv from load_w. The activation loads are issued before
+// the first product, so the J * M loads of a thread are in flight together. The caller reduces acc across the warp
+// exactly as lx_spec_gemv_f32 does.
 template <int J, int Rows>
-__device__ __forceinline__ void gemv_partials(const float* __restrict__ x, int ld_x, const float* __restrict__ wr,
-                                              int M, int K, int t, float (&acc)[Rows]) {
-  float wv[J];
+__device__ __forceinline__ void gemv_partials(const float* __restrict__ x, int ld_x, const float (&wv)[J], int M,
+                                              int K, int t, float (&acc)[Rows]) {
   float xv[J][Rows];
 #pragma unroll
   for (int j = 0; j < J; ++j) {
     const int k = t + j * 256;
     const bool in = k < K;
-    wv[j] = in ? wr[k] : 0.0f;
 #pragma unroll
     for (int m = 0; m < Rows; ++m) xv[j][m] = (in && m < M) ? x[m * ld_x + k] : 0.0f;
   }

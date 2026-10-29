@@ -64,6 +64,7 @@ struct DenseProb {
 // y = alpha * (v + bias) + beta * y, v already scaled. Pairs of columns, stored together when aligned.
 struct DenseEpi {
   static constexpr bool kGated = false;
+  static constexpr bool kPreBias = true;  // gemm_body reads the bias of this thread's columns before the wait
   using Row = int;  // the tile row
   struct Params {
     void* y;
@@ -77,14 +78,31 @@ struct DenseEpi {
     return e.bias_bf16 ? __bfloat162float(static_cast<const __nv_bfloat16*>(e.bias)[n]) : static_cast<const float*>(e.bias)[n];
   }
   static __device__ __forceinline__ Row row(const Params&, const Tile&, int r) { return r; }
+  // The bias that store2 adds to columns c and c + 1 of the tile; zero where the epilogue does not store them.
+  static __device__ __forceinline__ void load_bias2(const Params& e, const Tile& t, int c, float& b0, float& b1) {
+    b0 = (e.bias && c < t.cols) ? bias_at(e, t.n0 + c) : 0.0f;
+    b1 = (e.bias && c + 1 < t.cols) ? bias_at(e, t.n0 + c + 1) : 0.0f;
+  }
   static __device__ __forceinline__ void store2(const Params& e, const Tile& t, Row r, int c, float v0, float v1) {
+    if (e.bias) {
+      v0 += bias_at(e, t.n0 + c);
+      if (c + 1 < t.cols) v1 += bias_at(e, t.n0 + c + 1);
+    }
+    store_scaled(e, t, r, c, v0, v1);
+  }
+  static __device__ __forceinline__ void store2_pre(const Params& e, const Tile& t, Row r, int c, float v0, float v1,
+                                                    float b0, float b1) {
+    if (e.bias) {
+      v0 += b0;
+      if (c + 1 < t.cols) v1 += b1;
+    }
+    store_scaled(e, t, r, c, v0, v1);
+  }
+  // alpha and beta, then the store: a pair when both columns are in the tile and the row is aligned.
+  static __device__ __forceinline__ void store_scaled(const Params& e, const Tile& t, Row r, int c, float v0, float v1) {
     const int64_t m = t.m0 + r;
     const int n = t.n0 + c;
     const bool two = c + 1 < t.cols;
-    if (e.bias) {
-      v0 += bias_at(e, n);
-      if (two) v1 += bias_at(e, n + 1);
-    }
     v0 *= e.alpha;
     v1 *= e.alpha;
     if (e.y_bf16) {
@@ -119,9 +137,13 @@ template <int kKind, int kArch, int BM, int BN, int WM, int WN, int ST, int RB, 
 __global__ void __launch_bounds__(WM * WN * 32, (lx::tc::Config<kKind, kArch, BM, BN, WM, WN, ST, RB>::kMinBlocks))
     dense_kernel(const DenseProb::Params pp, const DenseEpi::Params ep) {
   lx::pdl_trigger();
-  lx::pdl_wait();
+  // Weights, their scales and the bias are static: phase 0 loads them before the predecessor's wait; the activations
+  // are loaded by phase 1, after it.
   extern __shared__ __align__(128) uint8_t smem[];
-  lx::tc::gemm_body<kKind, kArch, BM, BN, WM, WN, ST, RB, DenseProb, DenseEpi, kSplit>(pp, ep, smem);
+  float bpre[2 * lx::tc::Config<kKind, kArch, BM, BN, WM, WN, ST, RB>::kNT];
+  lx::tc::gemm_body<kKind, kArch, BM, BN, WM, WN, ST, RB, DenseProb, DenseEpi, kSplit, 0>(pp, ep, smem, bpre);
+  lx::pdl_wait();
+  lx::tc::gemm_body<kKind, kArch, BM, BN, WM, WN, ST, RB, DenseProb, DenseEpi, kSplit, 1>(pp, ep, smem, bpre);
 }
 
 using LaunchFn = int (*)(DenseProb::Params, const DenseEpi::Params&, cudaStream_t);
