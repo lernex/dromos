@@ -1,14 +1,13 @@
 // The router's f32 GEMM at decode-sized row counts (9 to 64 rows), bit for bit as lx_gemm_f32 computes them.
 //
 // lx_gemm_f32 runs cuBLASLt's pinned algorithm, a simt sgemm with no split-K: each output adds its K terms in
-// increasing k into one accumulator, with fmaf, and the bias last. This kernel keeps that chain exactly. What it
-// changes is the layout: a block stages 8 rows of x and 8 rows of w into shared memory with vector loads, and each
-// of its 64 outputs runs its chain from there. The cuBLASLt algorithm runs the whole output in one block at these
-// shapes (grid 1), which is why it takes 78 us at 32 rows and this takes about 12.
-//
-// The chain order is the only thing that fixes the bits, so the tile sizes are free to change. The M <= 8 path
-// (lx_spec_gemv_f32) sums in a different order and is not touched.
+// increasing k into one accumulator, with fmaf, and adds the bias last. This kernel keeps that chain exactly and
+// changes how the operands reach it. A block owns a 16 x 4 tile of outputs, one thread each, and streams K through a
+// four-stage ring of shared-memory chunks filled by cp.async, so the next chunks load while the current one runs its
+// chain. The tiles are small enough to spread over the GPU, and no chain depends on another, so the bits do not depend
+// on the tile shape or the ring depth. The M <= 8 path (lx_spec_gemv_f32) sums in another order and is not touched.
 
+#include <cuda_pipeline.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -18,60 +17,85 @@
 
 namespace {
 
-constexpr int kSeqTile = 8;        // x rows and w rows per block: an 8 x 8 tile of outputs
-constexpr int kSeqThreads = 256;   // all of them stage; the first 64 each run one output
-constexpr int kSeqMaxRows = 64;
-constexpr int kSeqMaxK = 1536;     // 16 staged rows of K + 1 floats stay under the 99 KB opt-in shared memory
+constexpr int kTileN = 16;         // output columns per block (one thread each, with kTileM rows)
+constexpr int kTileM = 4;          // output rows per block
+constexpr int kChunk = 128;        // k terms per staged chunk
+constexpr int kStages = 4;         // chunks in flight: the ring fills kStages - 1 chunks ahead of use
+constexpr int kStride = kChunk + 4;  // floats per staged row: a 16-byte multiple, conflict-free for float4 reads
+constexpr int kThreads = kTileN * kTileM;
+constexpr int kMaxRows = 64;
 
-size_t seq_smem_bytes(int K) { return static_cast<size_t>(2 * kSeqTile) * static_cast<size_t>(K + 1) * sizeof(float); }
+constexpr size_t kSmemBytes = static_cast<size_t>(kStages) * (kTileN + kTileM) * kStride * sizeof(float);
 
-__global__ void __launch_bounds__(kSeqThreads) seq_gemm_f32_kernel(const float* __restrict__ x, int ld_x,
-                                                                  const float* __restrict__ w,
-                                                                  const float* __restrict__ bias, float* __restrict__ y,
-                                                                  int ld_y, int M, int N, int K) {
-  extern __shared__ float smem[];
-  const int ldk = K + 1;
-  float* sx = smem;
-  float* sw = smem + kSeqTile * ldk;
-  const int n0 = blockIdx.x * kSeqTile, m0 = blockIdx.y * kSeqTile;
-  const int K4 = K >> 2;
-  for (int r = 0; r < kSeqTile; ++r) {
-    float* dst = sx + r * ldk;
-    if (m0 + r < M) {
-      const float4* src = reinterpret_cast<const float4*>(x + static_cast<int64_t>(m0 + r) * ld_x);
-      for (int i = threadIdx.x; i < K4; i += kSeqThreads) {
-        const float4 v = src[i];
-        dst[4 * i] = v.x, dst[4 * i + 1] = v.y, dst[4 * i + 2] = v.z, dst[4 * i + 3] = v.w;
+__global__ void __launch_bounds__(kThreads) seq_gemm_f32_kernel(const float* __restrict__ x, int ld_x,
+                                                               const float* __restrict__ w,
+                                                               const float* __restrict__ bias, float* __restrict__ y,
+                                                               int ld_y, int M, int N, int K) {
+  extern __shared__ __align__(16) float smem[];
+  float* sw = smem;                                  // [kStages][kTileN][kStride]
+  float* sx = smem + kStages * kTileN * kStride;     // [kStages][kTileM][kStride]
+  const int tn = threadIdx.x % kTileN, tm = threadIdx.x / kTileN;
+  const int n0 = blockIdx.x * kTileN, m0 = blockIdx.y * kTileM;
+  const int m = m0 + tm, n = n0 + tn;
+  const int nchunks = (K + kChunk - 1) / kChunk;
+  constexpr int kPieces = kChunk / 4;  // 16-byte pieces per staged row
+
+  // Stage chunk c into ring slot c % kStages. Rows past N or M are clamped to a valid row; their results are never stored.
+  auto issue = [&](int c) {
+    if (c >= nchunks) return;
+    const int buf = c % kStages;
+    const int k0 = c * kChunk;
+    const int kc = min(kChunk, K - k0);
+    for (int i = threadIdx.x; i < kTileN * kPieces; i += kThreads) {
+      const int r = i / kPieces, p = i - (i / kPieces) * kPieces;
+      if (p * 4 < kc)
+        __pipeline_memcpy_async(sw + (buf * kTileN + r) * kStride + p * 4,
+                                w + static_cast<int64_t>(min(n0 + r, N - 1)) * K + k0 + p * 4, 16);
+    }
+    for (int i = threadIdx.x; i < kTileM * kPieces; i += kThreads) {
+      const int r = i / kPieces, p = i - (i / kPieces) * kPieces;
+      if (p * 4 < kc)
+        __pipeline_memcpy_async(sx + (buf * kTileM + r) * kStride + p * 4,
+                                x + static_cast<int64_t>(min(m0 + r, M - 1)) * ld_x + k0 + p * 4, 16);
+    }
+  };
+
+  float acc = 0.0f;
+#pragma unroll
+  for (int c = 0; c < kStages - 1; ++c) {
+    issue(c);
+    __pipeline_commit();
+  }
+  for (int c = 0; c < nchunks; ++c) {
+    issue(c + kStages - 1);
+    __pipeline_commit();
+    __pipeline_wait_prior(kStages - 1);
+    __syncthreads();
+    const int buf = c % kStages;
+    const float4* wr = reinterpret_cast<const float4*>(sw + (buf * kTileN + tn) * kStride);
+    const float4* xr = reinterpret_cast<const float4*>(sx + (buf * kTileM + tm) * kStride);
+    const int kc = min(kChunk, K - c * kChunk);
+    if (kc == kChunk) {
+#pragma unroll
+      for (int j = 0; j < kChunk / 4; ++j) {
+        const float4 a = xr[j], b = wr[j];
+        acc = fmaf(a.x, b.x, acc);
+        acc = fmaf(a.y, b.y, acc);
+        acc = fmaf(a.z, b.z, acc);
+        acc = fmaf(a.w, b.w, acc);
       }
     } else {
-      for (int i = threadIdx.x; i < K; i += kSeqThreads) dst[i] = 0.0f;
-    }
-  }
-  for (int r = 0; r < kSeqTile; ++r) {
-    float* dst = sw + r * ldk;
-    if (n0 + r < N) {
-      const float4* src = reinterpret_cast<const float4*>(w + static_cast<int64_t>(n0 + r) * K);
-      for (int i = threadIdx.x; i < K4; i += kSeqThreads) {
-        const float4 v = src[i];
-        dst[4 * i] = v.x, dst[4 * i + 1] = v.y, dst[4 * i + 2] = v.z, dst[4 * i + 3] = v.w;
+      for (int j = 0; j < kc / 4; ++j) {
+        const float4 a = xr[j], b = wr[j];
+        acc = fmaf(a.x, b.x, acc);
+        acc = fmaf(a.y, b.y, acc);
+        acc = fmaf(a.z, b.z, acc);
+        acc = fmaf(a.w, b.w, acc);
       }
-    } else {
-      for (int i = threadIdx.x; i < K; i += kSeqThreads) dst[i] = 0.0f;
     }
+    __syncthreads();
   }
-  __syncthreads();
-  if (threadIdx.x < kSeqTile * kSeqTile) {
-    const int tx = threadIdx.x % kSeqTile, ty = threadIdx.x / kSeqTile;
-    const int n = n0 + tx, m = m0 + ty;
-    if (m < M && n < N) {
-      const float* xr = sx + ty * ldk;
-      const float* wr = sw + tx * ldk;
-      float acc = 0.0f;
-#pragma unroll 8
-      for (int c = 0; c < K; ++c) acc = fmaf(xr[c], wr[c], acc);
-      y[static_cast<int64_t>(m) * ld_y + n] = bias ? acc + bias[n] : acc;
-    }
-  }
+  if (m < M && n < N) y[static_cast<int64_t>(m) * ld_y + n] = bias ? acc + bias[n] : acc;
 }
 
 }  // namespace
@@ -79,17 +103,16 @@ __global__ void __launch_bounds__(kSeqThreads) seq_gemm_f32_kernel(const float* 
 extern "C" int lx_gemm_f32_seq(const float* x, int ld_x, const float* w, const float* bias, float* y, int ld_y, int M,
                                int N, int K, void* stream) {
   if (M <= 0 || N <= 0) return 0;
-  if (M > kSeqMaxRows || K <= 0 || K > kSeqMaxK || K % 4 != 0 || ld_x < K || ld_x % 4 != 0 || ld_y < N || !x || !w || !y)
+  if (M > kMaxRows || K <= 0 || K % 4 != 0 || ld_x < K || ld_x % 4 != 0 || ld_y < N || !x || !w || !y)
     return static_cast<int>(cudaErrorInvalidValue);
   if ((reinterpret_cast<uintptr_t>(x) | reinterpret_cast<uintptr_t>(w)) % 16 != 0)
     return static_cast<int>(cudaErrorInvalidValue);
-  const size_t smem = seq_smem_bytes(K);
   auto s = static_cast<cudaStream_t>(stream);
   if (cudaError_t e = cudaFuncSetAttribute(seq_gemm_f32_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                           static_cast<int>(smem));
+                                           static_cast<int>(kSmemBytes));
       e != cudaSuccess)
     return static_cast<int>(e);
-  seq_gemm_f32_kernel<<<dim3((N + kSeqTile - 1) / kSeqTile, (M + kSeqTile - 1) / kSeqTile), kSeqThreads, smem, s>>>(
+  seq_gemm_f32_kernel<<<dim3((N + kTileN - 1) / kTileN, (M + kTileM - 1) / kTileM), kThreads, kSmemBytes, s>>>(
       x, ld_x, w, bias, y, ld_y, M, N, K);
   return lx::launch_status();
 }

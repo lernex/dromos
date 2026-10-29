@@ -87,16 +87,17 @@ ROUTER_SHAPES = [(128, 1280), (192, 1280)]  # Praxis and Logos: E experts, K = l
 
 @pytest.mark.skipif(BACKEND != "cuda", reason="lx_gemm_f32_seq is CUDA only")
 @pytest.mark.parametrize("with_bias", [False, True])
-@pytest.mark.parametrize("N,K", ROUTER_SHAPES)
+@pytest.mark.parametrize("K", [1280, 1100])  # 1100 leaves a short last chunk
+@pytest.mark.parametrize("N", [128, 192])
 def test_gemm_f32_seq_is_gemm_f32_bit_for_bit(lx, N, K, with_bias):
     torch.manual_seed(N * 17 + K)
     ld_x = K + 4
     w = torch.randn(N, K, device=DEVICE) * 0.05
     bias = torch.randn(N, device=DEVICE) if with_bias else None
-    for M in (9, 16, 17, 24, 32, 40, 64):
+    for M in range(9, 65):  # every row count the kernel takes, including the ones that leave a partial tile
         x = torch.randn(M, ld_x, device=DEVICE)
         want = torch.full((M, N), float("nan"), device=DEVICE)
         got = torch.full((M, N), float("nan"), device=DEVICE)
         lx("gemm_f32", x, ld_x, w, bias, want, N, M, N, K)
         lx("gemm_f32_seq", x, ld_x, w, bias, got, N, M, N, K)
-        assert torch.equal(got.view(torch.int32), want.view(torch.int32)), f"bits differ, N = {N}, M = {M}"
+        assert torch.equal(got.view(torch.int32), want.view(torch.int32)), f"bits differ, N = {N}, K = {K}, M = {M}"
