@@ -7,9 +7,12 @@
 #   scripts/release/cuda-toolkit.ps1 12.8                   # windows-x86_64-cuda12, into C:\cuda\12.8
 #   scripts/release/cuda-toolkit.ps1 12.8 -Dest D:\cuda     # somewhere else
 #
-# The series' newest manifest is used (redistrib_12.8.1.json for 12.8, today). The toolkit lands in
-# DEST\bin\nvcc.exe with include\ and lib\x64\ beside it. That is CUDA_HOME for build.ps1. Each archive's license
-# is kept in DEST\licenses. Under GitHub Actions, CUDA_HOME and CUDA_PATH are exported to the following steps.
+# Each series is pinned to one manifest and that manifest's SHA-256, the file cuda-toolkit.sh pins too (one manifest
+# serves every platform), so Windows and Linux bundle the same libraries and a release cannot drift from what its
+# test round ran: redistrib_12.8.2.json for 12.8, with nvcc 12.8.93, cudart and CCCL 12.8.90 and cuBLAS 12.8.5.5,
+# the cuBLAS the pip wheel requires. The toolkit lands in DEST\bin\nvcc.exe with include\ and lib\x64\ beside it.
+# That is CUDA_HOME for build.ps1. Each archive's license is kept in DEST\licenses. Under GitHub Actions, CUDA_HOME
+# and CUDA_PATH are exported to the following steps.
 param(
   [Parameter(Mandatory = $true)][string]$Version,
   [string]$Dest = ""
@@ -22,19 +25,24 @@ if (-not $Dest) { $Dest = "C:\cuda\$Version" }
 $redist = "https://developer.download.nvidia.com/compute/cuda/redist"
 $components = @("cuda_nvcc", "cuda_cudart", "cuda_cccl", "libcublas", "cuda_documentation")
 
-# The newest manifest of the series: redistrib_12.8.1.json beats redistrib_12.8.0.json.
-$index = (Invoke-WebRequest -UseBasicParsing -Uri "$redist/").Content
-$escaped = [regex]::Escape($Version)
-$found = [regex]::Matches($index, "redistrib_($escaped(?:\.\d+)?)\.json") | ForEach-Object { $_.Groups[1].Value } |
-  Sort-Object -Unique { [version]($_ + $(if ($_.Split('.').Count -lt 3) { ".0" } else { "" })) }
-if (-not $found) { throw "cuda-toolkit.ps1: NVIDIA lists no redistributable manifest for CUDA $Version" }
-$release = @($found)[-1]
-$manifest = Invoke-RestMethod -UseBasicParsing -Uri "$redist/redistrib_$release.json"
+# The manifest each series is built from, and its SHA-256 (the same pin as cuda-toolkit.sh).
+$pinned = @{
+  "12.8" = @{ Release = "12.8.2"; Sha256 = "bbf0798e9aabdd6887b429f0d1ff27412bca2ead081f898a18f0381cd8cb7359" }
+}
+$pin = $pinned[$Version]
+if (-not $pin) { throw "cuda-toolkit.ps1: no manifest is pinned for CUDA $Version (pinned: $($pinned.Keys -join ', '))" }
+$release = $pin.Release
 Write-Host "cuda-toolkit.ps1: CUDA $release into $Dest"
 
 $work = Join-Path ([IO.Path]::GetTempPath()) ("cuda-redist-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Force $work, $Dest, (Join-Path $Dest "licenses") | Out-Null
 try {
+  # The manifest's own bytes are checked before any of its hashes are trusted.
+  $manifestFile = Join-Path $work "redistrib_$release.json"
+  Invoke-WebRequest -UseBasicParsing -Uri "$redist/redistrib_$release.json" -OutFile $manifestFile
+  $sha = (Get-FileHash -Algorithm SHA256 $manifestFile).Hash.ToLowerInvariant()
+  if ($sha -ne $pin.Sha256) { throw "cuda-toolkit.ps1: redistrib_$release.json does not match its pinned SHA-256 (expected $($pin.Sha256), got $sha)" }
+  $manifest = Get-Content -Raw -Encoding UTF8 $manifestFile | ConvertFrom-Json
   foreach ($name in $components) {
     $entry = $manifest.$name
     if (-not $entry) { throw "cuda-toolkit.ps1: the CUDA $release manifest has no $name" }
