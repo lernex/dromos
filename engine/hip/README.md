@@ -149,6 +149,9 @@ The single-sequence attention is the largest cost. It is the case the CUDA split
 6. Tensor cores. There is no WMMA (RDNA 3 and 4) or MFMA (CDNA 3) path yet. The CUDA source has none
    to port; the dense products go through hipBLASLt.
 7. hipBLASLt on AMD: its heuristic, and the 16-byte alignment guard in `gemm.cu`.
+   The GEMM is not pinned: HIP prefill rows are not batch-invariant (CUDA pins its algorithm per shape, so a row's
+   bits do not depend on the step around it). Pinning needs the hipBLASLt algorithm-config names (algorithm
+   config get and check, split-K, reduction scheme), which are to be checked against the ROCm headers.
 8. Graph capture and replay on HIP. The model replays decode steps as graphs.
 9. `lx_arch` and `hipDeviceAttributeWarpSize` on each board.
 10. The model on AMD: apply the handoff diff and run the Praxis KL there.
