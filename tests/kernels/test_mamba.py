@@ -294,8 +294,12 @@ def fused_step(lx, w, zb, slots, has, conv_state, ssm_state, sync, eps=1e-5):
     I, H, P, G, N, W = w["I"], w["H"], w["P"], w["G"], w["N"], w["W"]
     y = torch.full((n, I), NAN, device=DEVICE)  # NaN where nothing is written
     out = torch.full((n, I), NAN, device=DEVICE, dtype=torch.bfloat16)
-    lx("mamba_decode_step", zb, ld, w["conv_w"], w["conv_b"], conv_state, ssm_state, w["A_log"], w["D"],
-       w["dt_bias"], slots, has, w["norm_w"], eps, y, out, sync, n, H, P, G, N, W)
+    status = lx.status("mamba_decode_step", zb, ld, w["conv_w"], w["conv_b"], conv_state, ssm_state, w["A_log"],
+                       w["D"], w["dt_bias"], slots, has, w["norm_w"], eps, y, out, sync, n, H, P, G, N, W)
+    if status == 801:  # LX_ERR_NOT_SUPPORTED: the backend has no fused step and the model runs the three kernels
+        pytest.skip("this backend answers NOT_SUPPORTED for lx_mamba_decode_step (the model runs the three kernels)")
+    assert status == 0, f"lx_mamba_decode_step returned CUDA error {status}"
+    lx.sync()
     assert int(sync.abs().sum()) == 0, "the group counters must be zero after a step"
     return y, out
 

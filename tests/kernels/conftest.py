@@ -87,6 +87,19 @@ class Kernels:
 
     def __call__(self, name, *args):
         """Call lx_<name>(*args, stream=current); tensors pass as device pointers."""
+        status = self.status(name, *args)
+        assert status == 0, f"lx_{name} returned CUDA error {status}"
+        self.sync()
+
+    def sync(self):
+        """Wait for the device, as a call's result needs."""
+        if DEVICE == "cpu":
+            assert self.lib.lx_rt_stream_sync(None) == 0
+        else:
+            torch.cuda.synchronize()
+
+    def status(self, name, *args):
+        """Call lx_<name> and return its status unchecked, for a test that expects a backend to answer it."""
         fn = getattr(self.lib, "lx_" + name)
         fn.restype = ctypes.c_int
         conv = []
@@ -105,12 +118,7 @@ class Kernels:
             else:
                 conv.append(a)
         conv.append(ctypes.c_void_p(torch.cuda.current_stream().cuda_stream))
-        status = fn(*conv)
-        assert status == 0, f"lx_{name} returned CUDA error {status}"
-        if DEVICE == "cpu":
-            assert self.lib.lx_rt_stream_sync(None) == 0
-        else:
-            torch.cuda.synchronize()
+        return fn(*conv)
 
 
 def pytest_addoption(parser):
