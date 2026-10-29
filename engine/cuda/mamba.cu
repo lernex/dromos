@@ -411,15 +411,10 @@ __global__ void __launch_bounds__(kDecodeThreads) mamba_decode_kernel(const Deco
       S[i][e] = fmaf(decay, S[i][e], dtx * bv[e]);
       acc[e] = fmaf(S[i][e], cv[e], acc[e]);
     }
-  }
-  float y = (acc[0] + acc[1]) + (acc[2] + acc[3]);
-#pragma unroll
-  for (int o = 1; o < 4; o <<= 1) y += __shfl_xor_sync(0xffffffffu, y, o);
-  if (valid && q == 0) a.y[static_cast<int64_t>(s) * I + h * P + p] = y + Dh * xp;
-  if (valid) {
-#pragma unroll
-    for (int i = 0; i < NI; ++i) {
-      const int n0 = 4 * (q + 4 * i);
+    // This chunk's new state goes out as soon as it is computed, so its stores drain while the later chunks' state
+    // loads are still in flight. The stores are the same values in the same places, whatever order they go out in.
+    const int n0 = 4 * (q + 4 * i);
+    if (valid) {
       if (vec) {
         if (n0 < N) __stcg(reinterpret_cast<float4*>(st + n0), make_float4(S[i][0], S[i][1], S[i][2], S[i][3]));
       } else {
@@ -427,6 +422,27 @@ __global__ void __launch_bounds__(kDecodeThreads) mamba_decode_kernel(const Deco
         for (int e = 0; e < 4; ++e)
           if (n0 + e < N) __stcg(st + n0 + e, S[i][e]);
       }
+    }
+  }
+  float y = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+#pragma unroll
+  for (int o = 1; o < 4; o <<= 1) y += __shfl_xor_sync(0xffffffffu, y, o);
+  if (valid && q == 0) a.y[static_cast<int64_t>(s) * I + h * P + p] = y + Dh * xp;
+
+  // The group's B and C conv state, read now, behind the arrival: only the last block moves it on, and nothing writes
+  // it before that block does, so every block may read it. The last block then has it in registers, a round trip
+  // sooner. A block that is not last drops it. Two elements per thread cover 2N up to 2 * kDecodeThreads.
+  float bc_xn[2] = {0.0f, 0.0f};
+  float bc_old[2][8];
+#pragma unroll
+  for (int r = 0; r < 2; ++r) {
+    const int j = tid + r * kDecodeThreads;
+    if (j < 2 * N) {
+      const int c = I + (j < N ? g * N + j : GN + g * N + (j - N));
+      bc_xn[r] = zrow[I + c];
+#pragma unroll
+      for (int k = 0; k < 8; ++k)
+        bc_old[r][k] = (k < W - 1 && has) ? __ldcg(cst + static_cast<int64_t>(k) * conv_dim + c) : 0.0f;
     }
   }
 
@@ -439,17 +455,15 @@ __global__ void __launch_bounds__(kDecodeThreads) mamba_decode_kernel(const Deco
   __threadfence();
 
   // The group's B and C conv state moves on: every head of the group has read the old state.
-  for (int j = tid; j < 2 * N; j += kDecodeThreads) {
-    const int c = I + (j < N ? g * N + j : GN + g * N + (j - N));
-    const float xn = zrow[I + c];
-    float old[8];
 #pragma unroll
-    for (int k = 0; k < 8; ++k) old[k] = (k < W - 1 && has) ? __ldcg(cst + static_cast<int64_t>(k) * conv_dim + c) : 0.0f;
-    if (W >= 2) {
+  for (int r = 0; r < 2; ++r) {
+    const int j = tid + r * kDecodeThreads;
+    if (j < 2 * N && W >= 2) {
+      const int c = I + (j < N ? g * N + j : GN + g * N + (j - N));
 #pragma unroll
       for (int k = 0; k < 6; ++k)
-        if (k < W - 2) cst[static_cast<int64_t>(k) * conv_dim + c] = old[k + 1];
-      cst[static_cast<int64_t>(W - 2) * conv_dim + c] = xn;
+        if (k < W - 2) cst[static_cast<int64_t>(k) * conv_dim + c] = bc_old[r][k + 1];
+      cst[static_cast<int64_t>(W - 2) * conv_dim + c] = bc_xn[r];
     }
   }
 
