@@ -1,0 +1,9 @@
+# Every engine compile on the GPU server shares this slice: scripts/remote.sh runs cmake --build inside it when it is installed.
+# Install: copy to ~/.config/systemd/user/ on the server, then `systemctl --user daemon-reload`. No root needed.
+# Past MemoryHigh the kernel reclaims and slows the compiles; past MemoryMax it kills a compile inside the slice,
+# never the Windows VM or a GPU run outside it. 31 GB box: the VM needs ~8.5 GB, the system and GPU runs the rest.
+[Unit]
+Description=Lernex engine compiles
+[Slice]
+MemoryHigh=14G
+MemoryMax=16G
