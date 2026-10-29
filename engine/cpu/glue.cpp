@@ -122,6 +122,14 @@ int lx_concat4_f32(const float* a, const float* b, const float* c, const float* 
   return kOk;
 }
 
+// The stream mean (into mean, as lx_stream_mean writes it), then the routing concat over it: the same bits.
+int lx_stream_mean(const float* streams, float* mean, int T, int S, int D, void* stream);
+int lx_stream_concat4_bf16(const float* streams, float* mean, int S, const float* b, const float* c, const float* d,
+                           void* out, int D, int R, int T, void* stream) {
+  if (int e = lx_stream_mean(streams, mean, T, S, D, stream)) return e;
+  return lx_concat4_bf16(mean, b, c, d, out, D, R, T, stream);
+}
+
 // The router's input once the features are ready: the latent's bf16 copy, and the features into the tail.
 int lx_pack_router(float* router_in, void* latent, const float* features, int Lat, int R, int T, void* stream) {
   LX_PROFILE("pack_router");

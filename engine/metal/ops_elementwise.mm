@@ -137,6 +137,14 @@ int lx_concat4_bf16(const float* a, const float* b, const float* c, const float*
   return k.launch(stream, g, size3(ceil_div(W, kThreads), T, 1), size1(kThreads));
 }
 
+// The stream mean (into mean, as lx_stream_mean writes it), then the routing concat over it: the same bits.
+int lx_stream_mean(const float* streams, float* mean, int T, int S, int D, void* stream);
+int lx_stream_concat4_bf16(const float* streams, float* mean, int S, const float* b, const float* c, const float* d,
+                           void* out, int D, int R, int T, void* stream) {
+  if (int e = lx_stream_mean(streams, mean, T, S, D, stream)) return e;
+  return lx_concat4_bf16(mean, b, c, d, out, D, R, T, stream);
+}
+
 int lx_pack_router(float* router_in, void* latent, const float* features, int Lat, int R, int T, void* stream) {
   static Kernel k("pack_router");
   const int W = Lat + R;

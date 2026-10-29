@@ -274,6 +274,10 @@ LX_API int lx_concat4_bf16(const float* a, const float* b, const float* c, const
 // The same row in f32 (out: [T, 3 * D + R] f32): the four copies lx_copy2d made, in one launch.
 LX_API int lx_concat4_f32(const float* a, const float* b, const float* c, const float* d, void* out, int D, int R,
                           int T, void* stream);
+// The stream mean and the routing features' bf16 row in one launch: mean[t, :] = the mean of streams[t] over its S
+// rows (as lx_stream_mean writes it), and out[t, :] = bf16 of [mean[t] | b[t] | c[t] | d[t]].
+LX_API int lx_stream_concat4_bf16(const float* streams, float* mean, int S, const float* b, const float* c,
+                                  const float* d, void* out, int D, int R, int T, void* stream);
 // The router's input once the features are ready: latent[t, :Lat] = bf16(router_in[t, :Lat]), then
 // router_in[t, Lat :] = features[t, :R] (f32). router_in is one row of Lat + R f32 per token.
 LX_API int lx_pack_router(float* router_in, void* latent, const float* features, int Lat, int R, int T, void* stream);

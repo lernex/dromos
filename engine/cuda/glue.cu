@@ -65,6 +65,30 @@ __global__ void concat4_kernel(const float* a, const float* b, const float* c, c
   else out[static_cast<int64_t>(t) * W + j] = __float2bfloat16_rn(v);
 }
 
+// The routing features' input row with the stream mean as its first segment: each column's mean over the S streams,
+// summed in stream order and divided by S as stream_mean_kernel does, written to mean and rounded into the row; then
+// b, c and d as concat4_kernel writes them. Columns run over the grid's x, tokens over y.
+__global__ void stream_concat4_kernel(const float* streams, float* mean, int S, const float* b, const float* c,
+                                      const float* d, __nv_bfloat16* out, int D, int R, int T) {
+  lx::pdl_trigger();
+  lx::pdl_wait();
+  const int j = blockIdx.x * blockDim.x + threadIdx.x;
+  const int t = blockIdx.y;
+  const int W = 3 * D + R;
+  if (j >= W || t >= T) return;
+  float v;
+  if (j < D) {
+    const float* in = streams + static_cast<int64_t>(t) * S * D + j;
+    float acc = 0.0f;
+    for (int s = 0; s < S; ++s) acc += in[s * D];
+    v = acc / S;
+    mean[static_cast<int64_t>(t) * D + j] = v;
+  } else if (j < 2 * D) v = b[static_cast<int64_t>(t) * D + (j - D)];
+  else if (j < 3 * D) v = c[static_cast<int64_t>(t) * D + (j - 2 * D)];
+  else v = d[static_cast<int64_t>(t) * R + (j - 3 * D)];
+  out[static_cast<int64_t>(t) * W + j] = __float2bfloat16_rn(v);
+}
+
 // The router's input after the features join: the latent's bf16 copy, and the features' f32 copy into the tail.
 __global__ void pack_router_kernel(float* router_in, __nv_bfloat16* latent, const float* features, int Lat, int R,
                                    int T) {
@@ -137,6 +161,16 @@ int lx_concat4_f32(const float* a, const float* b, const float* c, const float* 
   const int W = 3 * D + R;
   if (T > 0 && W > 0)
     lx::launch_pdl(concat4_kernel<float>, dim3(blocks(W), T), 256, 0, static_cast<cudaStream_t>(stream), a, b, c, d, static_cast<float*>(out), D, R, T);
+  return lx::launch_status();
+}
+
+// The stream mean (into mean, as lx_stream_mean writes it) and the routing concat over it, in one launch: the same bits.
+int lx_stream_concat4_bf16(const float* streams, float* mean, int S, const float* b, const float* c, const float* d,
+                           void* out, int D, int R, int T, void* stream) {
+  const int W = 3 * D + R;
+  if (T > 0 && W > 0 && S > 0 && D > 0)
+    lx::launch_pdl(stream_concat4_kernel, dim3(blocks(W), T), 256, 0, static_cast<cudaStream_t>(stream), streams, mean,
+                   S, b, c, d, static_cast<__nv_bfloat16*>(out), D, R, T);
   return lx::launch_status();
 }
 

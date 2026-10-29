@@ -78,3 +78,22 @@ def test_concat4_f32_is_the_four_copies(lx, T, D, R):
     lx("concat4_f32", a, b, c, d, out, D, R, T)
 
     close(out, torch.cat([a, b, c, d], dim=1), atol=0.0)
+
+
+@pytest.mark.parametrize("T,S,D,R", [(1, 4, 2048, 512), (9, 4, 64, 17), (3, 2, 33, 5)])
+def test_stream_concat4_is_the_stream_mean_then_concat(lx, T, S, D, R):
+    """The stream mean as the first segment of the routing row, in one launch: the mean is written as lx_stream_mean
+    writes it, and the row is the bf16 concat of that mean with b, c and d."""
+    torch.manual_seed(5)
+    streams = torch.randn(T, S, D, device=DEVICE)
+    b, c = (torch.randn(T, D, device=DEVICE) for _ in range(2))
+    d = torch.randn(T, R, device=DEVICE)
+    mean, out = torch.zeros(T, D, device=DEVICE), torch.zeros(T, 3 * D + R, device=DEVICE).to(torch.bfloat16)
+    ref_mean, ref_out = torch.zeros(T, D, device=DEVICE), torch.zeros(T, 3 * D + R, device=DEVICE).to(torch.bfloat16)
+
+    lx("stream_concat4_bf16", streams, mean, S, b, c, d, out, D, R, T)
+
+    lx("stream_mean", streams, ref_mean, T, S, D)
+    lx("concat4_bf16", ref_mean, b, c, d, ref_out, D, R, T)
+    close(mean, ref_mean, atol=0.0)
+    close(out, ref_out, atol=0.0)

@@ -1352,9 +1352,17 @@ void concat4(Impl& m, const float* a, const float* b, const float* c, const floa
   LX_CHECK(lx_copy2d(d, LX_F32, R, o + es * 3 * D, dtype, ld, T, R, s));
 }
 
-// Routing features: tanh(route_projection([state, retrieved, difference, history])).
-void routing_features(Impl& m, int T, void* s) {
-  concat4(m, m.state, m.mem_summary, m.difference, m.history, m.feat_in_bf, LX_BF16, T, s);
+// Routing features: tanh(route_projection([state, retrieved, difference, history])). From the streams, the state is
+// their mean, and the mean and the concat are one launch that reads the streams; read_done then records route_read on
+// s, so the mixer may write the streams while the projection runs. Otherwise the state already holds the mean.
+void routing_features(Impl& m, int T, void* s, bool from_streams, bool read_done) {
+  if (from_streams) {
+    LX_CHECK(lx_stream_concat4_bf16(m.streams, m.state, m.S, m.mem_summary, m.difference, m.history, m.feat_in_bf, m.D,
+                                    m.R, T, s));
+    if (read_done) check(lx_rt_event_record(m.route_read, s), "event record");
+  } else {
+    concat4(m, m.state, m.mem_summary, m.difference, m.history, m.feat_in_bf, LX_BF16, T, s);
+  }
   linear(m, m.m_route, m.feat_in_bf, LX_BF16, 3 * m.D + m.R, m.features, LX_F32, m.R, T, s);
   LX_CHECK(lx_activate_f32(m.features, static_cast<int64_t>(T) * m.R, 0, s));
 }
@@ -2000,10 +2008,9 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
         check(lx_rt_event_record(m.route_fork, s), "event record");
         check(lx_rt_stream_wait(rs, m.route_fork), "stream wait");
       }
-      LX_CHECK(lx_stream_mean(m.streams, m.state, T, S, D, rs));
-      // The side's read of the streams is done: the mixer may now write them (the wait is before lx_mhc_write below).
-      if (beside) check(lx_rt_event_record(m.route_read, rs), "event record");
-      routing_features(m, T, rs);
+      // The stream mean and the routing concat are one launch that reads the streams. The side's read of them is done
+      // when it returns, so the mixer may write them (the wait is before lx_mhc_write below).
+      routing_features(m, T, rs, /*from_streams=*/true, /*read_done=*/beside);
       if (beside) check(lx_rt_event_record(m.route_join, rs), "event record");
 
       // mixer
@@ -2204,7 +2211,7 @@ void MetisModel::run(int T, int n_seq, bool all_rows, float* logits, bool spec, 
     if (const int col = m.tap_col[static_cast<size_t>(pass) * (m.L_layers + 1)]; col >= 0)
       copy_f32(m.state, D, m.tap_out + col, m.tap_dim, T, D, s);
     LX_CHECK(glue::sub(m.state, m.previous, m.difference, static_cast<int64_t>(T) * D, s));
-    routing_features(m, T, s);
+    routing_features(m, T, s, /*from_streams=*/false, /*read_done=*/false);
     concat4(m, m.state, m.mem_summary, m.difference, m.features, m.cont_in, LX_F32, T, s);
     gemm_f32(m.cont_in, 3 * D + R, m.c_hidden_w, m.c_hidden_b, m.cont_hidden, R, T, R, 3 * D + R, s);
     LX_CHECK(lx_activate_f32(m.cont_hidden, static_cast<int64_t>(T) * R, 1, s));
