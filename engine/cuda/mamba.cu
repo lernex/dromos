@@ -369,6 +369,24 @@ __device__ __forceinline__ void mamba_decode_body(const DecodeArgs& a) {
     }
   }
 
+  // The conv's weights and the norm's weights are static (never written by any kernel), and their addresses come
+  // from the head's indices, so the first two conv iterations' taps and the norm's first two elements load with the
+  // state, before the wait. Two sets of registers, not more, so two blocks still fit an SM (see the kernel's use).
+  const int pK = I / G, pbase = g * pK, prank = h - g * (H / G);
+  float cw[2][8], cb[2], nw[2];
+#pragma unroll
+  for (int r = 0; r < 2; ++r) {
+    const int j = tid + r * kDecodeThreads;
+    const bool ok = j < P + 2 * N;
+    const int c = j < P ? h * P + j : (j < P + N ? I + g * N + (j - P) : I + GN + g * N + (j - P - N));
+    cb[r] = ok ? __bfloat162float(a.conv_b[c]) : 0.0f;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) cw[r][k] = (ok && k < W) ? __bfloat162float(a.conv_w[c * W + k]) : 0.0f;
+    const int ni = kCluster ? prank * P + tid : tid + r * kDecodeThreads;
+    const bool nok = kCluster ? (r == 0 && tid < P) : ni < pK;
+    nw[r] = nok ? __bfloat162float(a.norm_w[pbase + ni]) : 0.0f;
+  }
+
   // The state and the weights are not written by the predecessor kernel (only by an earlier step's scan), so their
   // loads above went out before the dependency wait. Everything that reads zxbcdt waits for it.
   lx::pdl_wait();
@@ -378,29 +396,35 @@ __device__ __forceinline__ void mamba_decode_body(const DecodeArgs& a) {
   // (x | B | C). Each channel's taps are read once. The loop only loads and writes shared memory, so the
   // loads of its next iterations can go out early; the x channels' new state rows wait in shared memory
   // for the barrier, and B and C wait for the last block of the group.
-#pragma unroll 3
-  for (int j = tid; j < P + 2 * N; j += kDecodeThreads) {
-    const int c = j < P ? h * P + j : (j < P + N ? I + g * N + (j - P) : I + GN + g * N + (j - P - N));
-    const float xn = zrow[I + c];
-    float old[8];
 #pragma unroll
-    for (int k = 0; k < 8; ++k) old[k] = (k < W - 1 && has) ? __ldcg(cst + static_cast<int64_t>(k) * conv_dim + c) : 0.0f;
-    float acc = __bfloat162float(a.conv_b[c]);
+  for (int r = 0; r < 3; ++r) {
+    const int j = tid + r * kDecodeThreads;
+    if (j < P + 2 * N) {
+      const int c = j < P ? h * P + j : (j < P + N ? I + g * N + (j - P) : I + GN + g * N + (j - P - N));
+      const float xn = zrow[I + c];
+      float old[8];
 #pragma unroll
-    for (int k = 0; k < 8; ++k)
-      if (k < W) acc = fmaf(__bfloat162float(a.conv_w[c * W + k]), k < W - 1 ? old[k] : xn, acc);
-    const float out = lx::silu(acc);
-    if (j < P) {
-      xs[j] = out;
-      if (W >= 2) {
+      for (int k = 0; k < 8; ++k) old[k] = (k < W - 1 && has) ? __ldcg(cst + static_cast<int64_t>(k) * conv_dim + c) : 0.0f;
+      float acc = r < 2 ? cb[r < 2 ? r : 0] : __bfloat162float(a.conv_b[c]);
 #pragma unroll
-        for (int k = 0; k < 7; ++k)
-          if (k < W - 1) nst[k][j] = k < W - 2 ? old[k + 1] : xn;
+      for (int k = 0; k < 8; ++k)
+        if (k < W) {
+          const float wk = r < 2 ? cw[r < 2 ? r : 0][k] : __bfloat162float(a.conv_w[c * W + k]);
+          acc = fmaf(wk, k < W - 1 ? old[k] : xn, acc);
+        }
+      const float out = lx::silu(acc);
+      if (j < P) {
+        xs[j] = out;
+        if (W >= 2) {
+#pragma unroll
+          for (int k = 0; k < 7; ++k)
+            if (k < W - 1) nst[k][j] = k < W - 2 ? old[k + 1] : xn;
+        }
+      } else if (j < P + N) {
+        Bs[j - P] = out;
+      } else {
+        Cs[j - P - N] = out;
       }
-    } else if (j < P + N) {
-      Bs[j - P] = out;
-    } else {
-      Cs[j - P - N] = out;
     }
   }
   // Padding past N is zero, as in the scan: a chunk's lanes read whole float4s.
@@ -500,8 +524,7 @@ __device__ __forceinline__ void mamba_decode_body(const DecodeArgs& a) {
     for (int j = tid; j < P; j += kDecodeThreads) {
       const int i = rank * P + j;
       const float v = ysh[j] * lx::silu(zr[i]);
-      a.out[static_cast<int64_t>(s) * I + base + i] =
-          lx::from_f32<__nv_bfloat16>(v * scale * __bfloat162float(a.norm_w[base + i]));
+      a.out[static_cast<int64_t>(s) * I + base + i] = lx::from_f32<__nv_bfloat16>(v * scale * nw[0]);
     }
     cluster.sync();  // no block leaves while another still reads its shared memory
     return;
@@ -541,8 +564,8 @@ __device__ __forceinline__ void mamba_decode_body(const DecodeArgs& a) {
   const float scale = rsqrtf(lx::block_sum(sum, red) / K + a.eps);
   for (int i = tid; i < K; i += kDecodeThreads) {
     const float v = __ldcg(yr + i) * lx::silu(zr[i]);
-    a.out[static_cast<int64_t>(s) * I + base + i] =
-        lx::from_f32<__nv_bfloat16>(v * scale * __bfloat162float(a.norm_w[base + i]));
+    const float nwv = i == tid ? nw[0] : (i == tid + kDecodeThreads ? nw[1] : __bfloat162float(a.norm_w[base + i]));
+    a.out[static_cast<int64_t>(s) * I + base + i] = lx::from_f32<__nv_bfloat16>(v * scale * nwv);
   }
   if (tid == 0) a.sync[static_cast<int64_t>(s) * G + g] = 0;  // the next step starts from zero counters
 }
