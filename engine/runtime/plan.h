@@ -63,6 +63,9 @@ CheckpointInfo inspect_checkpoint(const std::string& model_dir);
 constexpr int kUsefulSlots = 4;
 constexpr int kUsefulContext = 4096;
 
+// The memory fraction a request takes by default, and the one the CLI passes when the user names none.
+constexpr double kDefaultMemoryFraction = 0.92;
+
 // The user's wishes; anything left unset is decided from the checkpoint and the hardware.
 struct PlanRequest {
   // An lx_wtype the user named (--weights), or -1 for the format the file stores. Nothing narrower than the
@@ -78,7 +81,9 @@ struct PlanRequest {
   bool speculative = true;
   int context = 0;    // context each sequence is sized for, 0 for automatic
   int sequences = 0;  // concurrent sequences wanted, 0 for automatic
-  double memory_fraction = 0.92;  // of the free memory at startup; the rest is left for others
+  // Of the free memory at startup, the share the plan may fill. At the default, a card nothing else uses holds back a
+  // fixed margin instead of the share (plan.cpp, kIdleHeadroomBytes); a fraction the user sets is a cap and is kept.
+  double memory_fraction = kDefaultMemoryFraction;
   // The GPU memory this process may use, 0 for the card (LX_VRAM_BUDGET_GB), and the pinned RAM offloaded
   // experts may take, 0 for all of them (LX_RAM_BUDGET_GB; the rest are read from the checkpoint on NVMe).
   // A model that does not fit the GPU, or the budget, runs with its experts offloaded (runtime/offload_plan.h).

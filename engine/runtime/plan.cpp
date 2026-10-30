@@ -34,6 +34,15 @@ constexpr int kMinStepTokens = 512;
 constexpr int kMaxStepTokens = 2048;
 // What the plan keeps back beyond its own accounting: cuBLASLt's workspace and the allocator's slack.
 constexpr size_t kReserveBytes = 256 * kMiB;
+// The fixed margin a card nothing else uses holds back from its free memory, in place of the default share (8%).
+// The share exists for other processes that may grow into the card after the plan is made; with none on the card
+// there is nothing to grow, and what the engine adds on its own (lazily loaded kernels, CUDA graph capture, the
+// cuBLASLt workspace) is what kReserveBytes and this margin cover together. On an 8 GiB card the share is 0.6 GiB, and
+// the margin 0.25 GiB.
+constexpr size_t kIdleHeadroomBytes = 256 * kMiB;
+// Memory in use beyond this process's own CUDA context that still counts as a card nothing else uses: the driver's
+// reservation and a display's small share. More than this is another process on the card, and the share holds.
+constexpr size_t kOtherUsersBytes = 384 * kMiB;
 // Free memory the plan leaves untouched at startup, so another process that grows (or an allocator
 // that needs slack) does not turn a working plan into an out-of-memory failure.
 constexpr size_t kStartupMarginBytes = 1024 * kMiB;
@@ -620,9 +629,25 @@ size_t cpu_budget(const DeviceInfo& d, const PlanRequest& req) {
   return budget;
 }
 
+// Whether another process uses the card: the memory in use beyond this process's own context is more than
+// kOtherUsersBytes. Read when the plan is made, before the model is loaded.
+bool card_shared(const DeviceInfo& d) {
+  const size_t used = d.total_bytes > d.free_bytes ? d.total_bytes - d.free_bytes : 0;
+  return used > kCudaContextBytes + kOtherUsersBytes;
+}
+
+// The free memory a resident plan may fill. The request's fraction holds back its share of the free memory. On a
+// card nothing else uses, the default fraction's share is replaced by kIdleHeadroomBytes, whichever is smaller; a
+// fraction the user set (or a card another process uses) keeps the share as asked.
+size_t plan_free(const DeviceInfo& d, double fraction) {
+  size_t hold = d.free_bytes - static_cast<size_t>(static_cast<double>(d.free_bytes) * fraction);
+  if (fraction == kDefaultMemoryFraction && !card_shared(d)) hold = std::min(hold, kIdleHeadroomBytes);
+  return d.free_bytes - hold;
+}
+
 size_t resident_budget(const DeviceInfo& d, const PlanRequest& req) {
   if (d.cpu) return cpu_budget(d, req);
-  size_t free_budget = static_cast<size_t>(static_cast<double>(d.free_bytes) * req.memory_fraction);
+  size_t free_budget = plan_free(d, req.memory_fraction);
   if (req.vram_budget > 0)
     free_budget = std::min(free_budget, req.vram_budget > kCudaContextBytes ? req.vram_budget - kCudaContextBytes : 0);
   return free_budget > kReserveBytes ? free_budget - kReserveBytes : 0;

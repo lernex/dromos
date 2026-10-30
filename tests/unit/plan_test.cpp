@@ -189,6 +189,14 @@ const Gpu& gpu(const char* name) {
   throw std::runtime_error(std::string("no simulated GPU named ") + name);
 }
 
+// The 8 GiB card the brief names, with 7.6 GiB free and nothing else on it: the free figure an idle card reports once
+// this process's CUDA context is in (7.6 GiB is 0.4 GiB in use, of which the context is 0.25 GiB).
+DeviceInfo idle_8gib() {
+  DeviceInfo d = simulated("RTX 4060 8GB", 89, 8, 272, 24);
+  d.free_bytes = static_cast<size_t>(7.6 * kGiB);
+  return d;
+}
+
 }  // namespace
 
 TEST_CASE("the recipe: kinds per format, the published FP8 and GPTQ NVFP4 choices") {
@@ -548,11 +556,14 @@ TEST_CASE("the plan's choices across the brief's GPUs") {
 }
 
 TEST_CASE("a request that cannot fit says why, and a plan never overflows the budget") {
-  // BF16 Logos does not run on 2 GB even offloaded; NVFP4 Logos holds nothing on 8 GB (no offload for NVFP4)
+  // BF16 Logos does not run on 2 GB even offloaded; NVFP4 Logos (no offload for NVFP4) runs on an idle 8 GB card with
+  // the fixed margin, and does not run on one with 6.6 GiB free, where the 8% share holds
   CHECK_THROWS_AS(make_plan(simulated("Tiny 2GB", 89, 2, 272, 24), logos(), bf16_checkpoint(), weights(LX_W_BF16)),
                   std::runtime_error);
-  CHECK_THROWS_AS(make_plan(simulated("RTX 4060 8GB", 89, 8, 272, 24), logos(), nvfp4_checkpoint(), PlanRequest{}),
-                  std::runtime_error);
+  CHECK_NOTHROW(make_plan(simulated("RTX 4060 8GB", 89, 8, 272, 24), logos(), nvfp4_checkpoint(), PlanRequest{}));
+  DeviceInfo busy8 = simulated("RTX 4060 8GB", 89, 8, 272, 24);
+  busy8.free_bytes = static_cast<size_t>(6.6 * kGiB);
+  CHECK_THROWS_AS(make_plan(busy8, logos(), nvfp4_checkpoint(), PlanRequest{}), std::runtime_error);
   for (const Gpu& g : kGpus) {
     for (const MetisConfig& c : {praxis(), logos()}) {
       for (const CheckpointInfo& ck : {bf16_checkpoint(), fp8_checkpoint(), nvfp4_checkpoint()}) {
@@ -695,3 +706,84 @@ TEST_CASE("a CPU with less RAM free than the model: says so in RAM terms, no VRA
   CHECK((why.find("--weights") == std::string::npos || why.find("fits") != std::string::npos));
 }
 
+
+TEST_CASE("Logos NVFP4 on an 8 GiB card with 7.6 GiB free holds one 8192-token sequence") {
+  // The brief's card: nothing else on it, so the default share is replaced by the fixed margin (plan.cpp).
+  const DeviceInfo d = idle_8gib();
+  PlanRequest one;
+  one.context = 8192;
+  one.sequences = 1;
+  const Plan p = make_plan(d, logos(), nvfp4_checkpoint(), one);
+  CHECK(p.weights == LX_W_NVFP4);
+  CHECK_FALSE(p.offload.enabled);
+  CHECK(p.max_slots == 1);
+  CHECK(p.kv_capacity == 8192);
+  CHECK(p.weight_bytes + p.state_bytes + p.kv_bytes + p.scratch_bytes <= p.budget_bytes);
+  // The budget is the free memory less the fixed margin and the reserve: 256 MiB each, 7.1 GiB (7.62 GB) here.
+  CHECK(p.budget_bytes == static_cast<size_t>(7.6 * kGiB) - 512 * 1024 * 1024);
+  // The automatic request aims for 8192 tokens too, and fits one sequence of them.
+  const Plan a = make_plan(d, logos(), nvfp4_checkpoint(), PlanRequest{});
+  CHECK(a.max_slots >= 1);
+  CHECK(a.kv_capacity == 8192);
+  CHECK(a.weight_bytes + a.state_bytes + a.kv_bytes + a.scratch_bytes <= a.budget_bytes);
+}
+
+TEST_CASE("the same request under LX_VRAM_BUDGET_GB=7.6 on a 16 GB card: the same budget, the same plan") {
+  const DeviceInfo big = simulated("RTX 5070 Ti 16GB", 120, 16, 896, 70);
+  PlanRequest capped;
+  capped.context = 8192;
+  capped.sequences = 1;
+  capped.vram_budget = static_cast<size_t>(7.6 * kGiB);  // the budget counts the CUDA context, and the reserve is kept
+  const Plan p = make_plan(big, logos(), nvfp4_checkpoint(), capped);
+  CHECK(p.max_slots == 1);
+  CHECK(p.kv_capacity == 8192);
+  CHECK(p.budget_bytes == static_cast<size_t>(7.6 * kGiB) - 512 * 1024 * 1024);
+}
+
+TEST_CASE("a card another process uses keeps the share; a fraction the user set is their cap") {
+  constexpr size_t kReserve = 256ull * 1024 * 1024;
+  // 6.6 GiB free of 8: 1.4 GiB in use beyond this process's context, so the 8% share holds and the model does not fit
+  DeviceInfo shared = idle_8gib();
+  shared.free_bytes = static_cast<size_t>(6.6 * kGiB);
+  PlanRequest one;
+  one.context = 8192;
+  one.sequences = 1;
+  CHECK_THROWS_AS(make_plan(shared, logos(), nvfp4_checkpoint(), one), std::runtime_error);
+  // Praxis BF16 on a shared 16 GB card: the budget is the share, as it was before the margin existed
+  DeviceInfo busy = simulated("RTX 5070 Ti 16GB", 120, 16, 896, 70);
+  busy.free_bytes = static_cast<size_t>(12.0 * kGiB);
+  PlanRequest plain;
+  plain.bf16x = false;
+  const Plan s = make_plan(busy, praxis(), bf16_checkpoint(), plain);
+  CHECK(s.budget_bytes == static_cast<size_t>(static_cast<double>(busy.free_bytes) * 0.92) - kReserve);
+  // A fraction the user sets is a cap, on an idle card as on any other
+  DeviceInfo idle = simulated("RTX 5070 Ti 16GB", 120, 16, 896, 70);
+  PlanRequest half;
+  half.bf16x = false;
+  half.memory_fraction = 0.5;
+  const Plan h = make_plan(idle, praxis(), bf16_checkpoint(), half);
+  CHECK(h.budget_bytes == (idle.free_bytes - static_cast<size_t>(static_cast<double>(idle.free_bytes) * 0.5)) - kReserve);
+}
+
+TEST_CASE("the fixed margin never shrinks a plan's budget on any simulated card") {
+  // The margin replaces an 8% share with 256 MiB, so an idle card's budget can only grow, and a shared card's stays.
+  constexpr size_t kReserve = 256ull * 1024 * 1024;
+  for (const Gpu& g : kGpus) {
+    DeviceInfo d = simulated(g.name, g.cc, g.gib, g.bandwidth, g.sms);
+    const size_t share_budget = static_cast<size_t>(static_cast<double>(d.free_bytes) * 0.92) - kReserve;
+    for (const MetisConfig& c : {praxis(), logos()}) {
+      for (const CheckpointInfo& ck : {bf16_checkpoint(), fp8_checkpoint(), nvfp4_checkpoint()}) {
+        try {
+          const Plan p = make_plan(d, c, ck, PlanRequest{});
+          // An offloaded plan's budget is the offload planner's (its own margin, runtime/offload_plan.cpp): not compared.
+          if (p.offload.enabled) continue;
+          INFO(g.name << " " << c.family << " " << format_name(ck.stored));
+          CHECK(p.budget_bytes >= share_budget);
+          CHECK(p.budget_bytes <= d.free_bytes - kReserve);
+        } catch (const std::runtime_error&) {
+          // a card that cannot hold the model at all
+        }
+      }
+    }
+  }
+}
