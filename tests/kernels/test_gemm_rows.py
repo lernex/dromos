@@ -1,9 +1,10 @@
-"""A row's bits do not depend on the step it runs in.
+"""A row's bits do not depend on the step it runs in, when batch-invariant (LX_BATCH_INVARIANT=1, --batch-invariant).
 
-Each dense GEMM pins the algorithm it runs per shape, not per row count: cuBLASLt's (gemm.cu, pinned_algo) and lx_gemm_w's
-variant and split (gemm_w.cu, run_family). A prefill chunk's rows must come out the same whatever else is in the step, or
-a request's state (and so its tokens) depends on what other requests are doing when it arrives. Both the BF16 path (cuBLASLt)
-and the FP8 path (lx_gemm_w, the engine's FP8 products) are checked, at tails of one and nine rows as well.
+Batch-invariant, each dense GEMM pins the algorithm it runs per shape, not per row count: cuBLASLt's (gemm.cu,
+pinned_algo) and lx_gemm_w's variant and split (gemm_w.cu, run_family). A prefill chunk's rows must come out the same
+whatever else is in the step, or a request's state (and so its tokens) depends on what other requests are doing when it
+arrives. Both the BF16 path (cuBLASLt) and the FP8 path (lx_gemm_w, the engine's FP8 products) are checked, at tails of
+one and nine rows as well.
 """
 
 import pytest
@@ -12,6 +13,13 @@ import torch
 from conftest import DEVICE, DTYPE
 from test_gemm_w import call_gemm_w, workspace_bytes
 from wformats import MATH_BF16, MATH_FP8, W_FP8, quantize_weight
+
+
+@pytest.fixture(autouse=True)
+def batch_invariant(monkeypatch):
+    # The GEMMs read the switch on every call (cuda/common.cuh, batch_invariant), so it applies to this module alone.
+    monkeypatch.setenv("LX_BATCH_INVARIANT", "1")
+
 
 SHAPES = [(2048, 10304), (4096, 2048)]  # (K, N): Praxis's in_proj and out_proj
 ROWS = [  # (rows alone, rows in the larger step): tails of one and nine rows included

@@ -61,5 +61,10 @@ folder, nothing wider than the file. A model decodes its BF16 tensors (every one
 quantized model) from lossless BF16X copies when they fit (`--no-bf16x` turns them off), and a model
 that does not fit the GPU runs with its routed experts offloaded rather than in a narrower format. `dromos doctor MODEL` shows every format, what fits, and the decode ceiling of each.
 
+Batched steps pick each matrix product's algorithm for the rows in the step, so a request's tokens can depend on what
+else is decoding beside it, as in other engines. `--batch-invariant` (run, serve, bench, spec) runs every row count of a
+product on one algorithm instead: a request gets the same bits whatever shares its steps, about 15% slower at
+32 streams. `dromos eval` always runs this way. Speculation never changes the output in either mode.
+
 `LX_ARCH_OVERRIDE=80|86|89|90` (or `--lx-arch=N` on the kernel tests) makes a newer card run the code paths
 of an older architecture, so the fallbacks are tested on one GPU.

@@ -61,7 +61,7 @@ Model find_model(const std::string& name, bool download) {
   return Model{dir, name, ref.repo};
 }
 
-const char* const kFormatUsage = "[--weights bf16|int8|fp8|nvfp4|bf16x] [--no-bf16x] [--fast-math]";
+const char* const kFormatUsage = "[--weights bf16|int8|fp8|nvfp4|bf16x] [--no-bf16x] [--fast-math] [--batch-invariant]";
 
 bool parse_format_flag(int argc, char** argv, int& i, FormatFlags& flags) {
   const std::string a = argv[i];
@@ -71,6 +71,10 @@ bool parse_format_flag(int argc, char** argv, int& i, FormatFlags& flags) {
   }
   if (a == "--fast-math") {
     flags.fast_math = true;
+    return true;
+  }
+  if (a == "--batch-invariant") {
+    lx::platform::set_env("LX_BATCH_INVARIANT", "1");  // read by the GEMMs (cuda/common.cuh, batch_invariant)
     return true;
   }
   if (a != "--weights") return false;

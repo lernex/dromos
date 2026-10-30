@@ -31,7 +31,9 @@ struct FormatFlags {
   bool bf16x = true;
   bool fast_math = false;  // --fast-math: the quantized tensor-core maths (native_math, fast)
 };
-// When argv[i] is --weights (with its value, which it consumes) or --no-bf16x, records it and returns true.
+// When argv[i] is --weights (with its value, which it consumes), --no-bf16x, --fast-math or --batch-invariant,
+// records it and returns true. --batch-invariant sets LX_BATCH_INVARIANT=1: every row count of a GEMM shape runs one
+// algorithm, so a request's tokens do not depend on what else shares its step.
 bool parse_format_flag(int argc, char** argv, int& i, FormatFlags& flags);
 // "[--weights bf16|int8|fp8|nvfp4|bf16x] [--no-bf16x]", for usage lines.
 extern const char* const kFormatUsage;

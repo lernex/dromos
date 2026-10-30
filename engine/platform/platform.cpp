@@ -272,6 +272,15 @@ fs::path expand_home(const std::string& path) {
   return fs::path(path);
 }
 
+void set_env(const char* name, const char* value) {
+#if defined(_WIN32)
+  SetEnvironmentVariableA(name, value);
+  _putenv_s(name, value);
+#else
+  setenv(name, value, 1);
+#endif
+}
+
 int run_process(const std::vector<std::string>& args, const OutputSink& output, bool merge_stderr) {
   if (args.empty()) return -1;
 #if defined(_WIN32)

@@ -39,6 +39,10 @@ std::filesystem::path expand_home(const std::string& path);
 using OutputSink = std::function<void(const char* data, std::size_t size)>;
 int run_process(const std::vector<std::string>& args, const OutputSink& output = {}, bool merge_stderr = false);
 
+// Sets an environment variable for this process and everything it loads afterwards. On Windows a library with its own
+// C runtime copies the environment when it loads, so set it before the backend library is opened.
+void set_env(const char* name, const char* value);
+
 // The terminal. console_init() sets up a Windows console for the engine's output (UTF-8 in and out, and VT
 // sequences for colour and cursor movement), and puts it back as it was at exit; elsewhere it does nothing.
 void console_init();

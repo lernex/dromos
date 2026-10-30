@@ -81,7 +81,8 @@ def test_gemm_f32(lx, M, N, K, with_bias, pad):
 
 
 # The router's f32 GEMM at decode-sized row counts. lx_gemm_f32_seq (gemm_seq.cu) must give the same bits as the
-# cuBLASLt call it replaces, at every row count from 9 up to its limit, on both models' router shapes.
+# cuBLASLt call it replaces, at every row count from 9 up to its limit, on both models' router shapes. That is the
+# batch-invariant contract (the pinned algorithm); by default lx_gemm_f32 picks per row count.
 ROUTER_SHAPES = [(128, 1280), (192, 1280)]  # Praxis and Logos: E experts, K = latent + route features
 
 
@@ -89,7 +90,8 @@ ROUTER_SHAPES = [(128, 1280), (192, 1280)]  # Praxis and Logos: E experts, K = l
 @pytest.mark.parametrize("with_bias", [False, True])
 @pytest.mark.parametrize("K", [1280, 1100])  # 1100 leaves a short last chunk
 @pytest.mark.parametrize("N", [128, 192])
-def test_gemm_f32_seq_is_gemm_f32_bit_for_bit(lx, N, K, with_bias):
+def test_gemm_f32_seq_is_gemm_f32_bit_for_bit(lx, N, K, with_bias, monkeypatch):
+    monkeypatch.setenv("LX_BATCH_INVARIANT", "1")  # read by lx_gemm_f32 on every call (cuda/common.cuh)
     torch.manual_seed(N * 17 + K)
     ld_x = K + 4
     w = torch.randn(N, K, device=DEVICE) * 0.05

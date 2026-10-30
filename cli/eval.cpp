@@ -27,6 +27,7 @@
 #include "core/config.h"
 #include "cuda/kernels.h"
 #include "model/metis.h"
+#include "platform/platform.h"
 
 namespace {
 
@@ -117,6 +118,8 @@ int cmd_eval(int argc, char** argv) {
     std::filesystem::create_directories(out_dir);
     nlohmann::json prompts;
     std::ifstream(args[1]) >> prompts;
+    // Eval runs batch-invariant, so K concurrent streams (LX_EVAL_STREAMS) give each prompt the bits one stream does.
+    lx::platform::set_env("LX_BATCH_INVARIANT", "1");
     const char* streams_env = std::getenv("LX_EVAL_STREAMS");
     const int streams = streams_env != nullptr ? std::max(0, std::atoi(streams_env)) : 0;
 

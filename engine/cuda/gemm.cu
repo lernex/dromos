@@ -3,12 +3,14 @@
 // cuBLASLt is column-major, and a row-major y[M, N] is the column-major y^T[N, M] with leading
 // dimension ld_y. So the product is computed as y^T = w x^T: w is the left operand, transposed
 // (its row-major [N, K] memory is a column-major [K, N] matrix), and x the right operand as stored.
-// One algorithm serves every prefill row count of a shape (pinned_algo): it is chosen at kPinRows without split-K and
-// reused, so a prefill row's bits never depend on how many rows share its step. Decode steps (M <= kDecodeMaxRows) of
-// plain bf16 shapes may run a faster algorithm from the same candidates, listed in kDecodePins: the prefill algorithm
-// has too few tiles at decode row counts (one 128x128 tile column at M = 32, 94 us against a 20 us floor). A decode pin
-// keeps K unsplit, but a different tile can still sum in a different order, so each entry is one that was measured to
-// match the prefill pin bit for bit, and it applies only on the architecture and cuBLASLt it was measured on.
+// By default each problem, row count included, runs the heuristic's first algorithm for it (split-K allowed).
+// Batch-invariant (lx::batch_invariant), one algorithm serves every prefill row count of a shape (pinned_algo): it is
+// chosen at kPinRows without split-K and reused, so a prefill row's bits never depend on how many rows share its step.
+// Decode steps (M <= kDecodeMaxRows) of plain bf16 shapes may run a faster algorithm from the same candidates, listed in
+// kDecodePins: the prefill algorithm has too few tiles at decode row counts (one 128x128 tile column at M = 32, 94 us
+// against a 20 us floor). A decode pin keeps K unsplit, but a different tile can still sum in a different order, so each
+// entry is one that was measured to match the prefill pin bit for bit, and it applies only on the architecture and
+// cuBLASLt it was measured on.
 //
 // The bias goes through cuBLASLt's bias epilogue, which adds after alpha and beta, so the bias
 // has to be alpha * bias. cuBLASLt also wants the bias in the output's dtype. Those two rules mean
@@ -65,6 +67,7 @@ struct PlanKey {
   bool bf16_in, bf16_out;
   bool bias;
   uint32_t align_a, align_b, align_c;
+  bool invariant;  // lx::batch_invariant() when the plan was made: a plan of either mode is never served to the other
   auto operator<=>(const PlanKey&) const = default;
 };
 
@@ -221,10 +224,31 @@ uint32_t algo_attr(const cublasLtMatmulAlgo_t& algo, cublasLtMatmulAlgoConfigAtt
   return v;
 }
 
-// The algorithm this shape runs at its row class. Both classes choose from the same candidates: the heuristic's order at
-// kPinRows, without split-K (checked in the algorithm's own config as well). The prefill pin is the first of them. A decode
-// pin changes speed, not bits, because each kDecodePins entry was measured to match the prefill pin (s.decode_pins).
+// The default: the heuristic's first algorithm for this problem at its own row count, any reduction scheme.
+cublasStatus_t heuristic_algo(DeviceState& s, const PlanKey& key, cudaDataType bias_type, cublasLtMatmulAlgo_t& out) {
+  Plan probe;
+  cublasStatus_t st = describe(key, bias_type, probe);
+  cublasLtMatmulPreference_t pref = nullptr;
+  if (st == CUBLAS_STATUS_SUCCESS) st = cublasLtMatmulPreferenceCreate(&pref);
+  if (st == CUBLAS_STATUS_SUCCESS) st = set_prefs(pref, key, CUBLASLT_REDUCTION_SCHEME_MASK);
+  cublasLtMatmulHeuristicResult_t best{};
+  int found = 0;
+  if (st == CUBLAS_STATUS_SUCCESS)
+    st = cublasLtMatmulAlgoGetHeuristic(s.handle, probe.op, probe.a, probe.b, probe.c, probe.c, pref, 1, &best, &found);
+  if (pref) cublasLtMatmulPreferenceDestroy(pref);
+  probe.destroy();
+  if (st != CUBLAS_STATUS_SUCCESS) return st;
+  if (found == 0 || best.state != CUBLAS_STATUS_SUCCESS) return CUBLAS_STATUS_NOT_SUPPORTED;
+  out = best.algo;
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+// Batch-invariant: the algorithm this shape runs at its row class. Both classes choose from the same candidates: the
+// heuristic's order at kPinRows, without split-K (checked in the algorithm's own config as well). The prefill pin is the
+// first of them. A decode pin changes speed, not bits, because each kDecodePins entry was measured to match the prefill
+// pin (s.decode_pins).
 cublasStatus_t pinned_algo(DeviceState& s, const PlanKey& key, cudaDataType bias_type, cublasLtMatmulAlgo_t& out) {
+  if (!key.invariant) return heuristic_algo(s, key, bias_type, out);
   const AlgoKey ak = algo_key(key);
   if (auto it = s.algos.find(ak); it != s.algos.end()) {
     out = it->second;
@@ -391,6 +415,7 @@ cudaError_t run(const Problem& q) {
       .align_a = alignment(q.w, static_cast<uint64_t>(q.K) * in_bytes),
       .align_b = alignment(q.x, static_cast<uint64_t>(q.ld_x) * in_bytes),
       .align_c = alignment(q.y, static_cast<uint64_t>(q.ld_y) * out_bytes),
+      .invariant = lx::batch_invariant(),
   };
 
   auto it = s->plans.find(key);

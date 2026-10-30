@@ -143,7 +143,7 @@ const char* default_tile(int kind, int M, int N) {
 // against the cluster's sum: 4-way from 8 K tiles each with a handful of tiles (16 each up to 17 tiles),
 // 2-way from 8 each up to 24 tiles and 16 each up to 35; past that a split costs up to 11% (measured on
 // the RTX 5070 Ti, int8, fp8 and fp4, M 16 to 96, N 1024 to 4096, K 1024 to 8192). A split is a rank-ordered
-// sum over the cluster (gemm_tc.cuh), and run_family chooses it once per shape, so it costs no batch invariance.
+// sum over the cluster (gemm_tc.cuh); batch-invariant, run_family chooses it once per shape, so it keeps invariance.
 int split_for(int kind, int tiles, int k_tiles, int arch) {
   if (arch < 90) return 1;
   const bool mixed = kind == kW8I8 || kind == kW8F8 || kind == kW4A16 || kind == kW4A8;
@@ -157,21 +157,22 @@ int split_for(int kind, int tiles, int k_tiles, int arch) {
   return 1;
 }
 
-// The variant, and its split, that every row count of the shape runs: the tuner's or the default's at kPinRows, as
-// cuBLASLt's algorithm is pinned (gemm.cu, pinned_algo). The chosen variant then reduces K in the same order at any M.
+// The variant and its split: the tuner's or the default's at the step's rows. Batch-invariant, at kPinRows for every row
+// count, as cuBLASLt's algorithm is pinned (gemm.cu, pinned_algo), so the variant reduces K in the same order at any M.
 template <int kKind, int kArch>
 int run_family(const DenseProb::Params& pp, const DenseEpi::Params& ep, cudaStream_t s) {
   int n = 0;
   const Variant* v = Family<kKind, kArch>::variants(n);
   const int arch = lx_arch();
-  int pick = lx_tune_get(Family<kKind, kArch>::name(), kPinRows, pp.N, pp.K);
+  const int rows = lx::batch_invariant() ? kPinRows : pp.M;
+  int pick = lx_tune_get(Family<kKind, kArch>::name(), rows, pp.N, pp.K);
   if (pick < 0 || pick >= n || v[pick].min_arch > arch) {
-    const char* want = default_tile(kKind, kPinRows, pp.N);
+    const char* want = default_tile(kKind, rows, pp.N);
     pick = 0;
     for (int i = 0; i < n; ++i)
       if (!std::strcmp(v[i].name, want)) pick = i;
     const int k_tile = lx::tc::Config<kKind, kArch, 32, 128, 1, 4, 4, (kKind == kF4 ? 64 : 128)>::kKTile;
-    const int tiles = ((kPinRows + 31) / 32) * ((pp.N + 127) / 128);
+    const int tiles = ((rows + 31) / 32) * ((pp.N + 127) / 128);
     const int split = v[pick].bm == 32 ? split_for(kKind, tiles, (pp.K + k_tile - 1) / k_tile, arch) : 1;
     for (int i = 0; split > 1 && i < n; ++i)
       if (v[i].split == split && v[i].bm == 32) pick = i;

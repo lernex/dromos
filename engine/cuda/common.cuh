@@ -63,6 +63,14 @@ inline bool pdl_on() {
   static const bool on = pdl_available() && !pdl_env_off("LX_PDL");
   return on;
 }
+// Batch-invariant GEMMs (LX_BATCH_INVARIANT=1, set by --batch-invariant and by dromos eval): every row count of a
+// shape runs the algorithm chosen at the prefill chunk's rows, so a row's bits never depend on what else shares its
+// step. Off by default: each row count gets the algorithm that fits it (split-K and decode-sized tiles), which at 32
+// streams decodes 17 to 20% faster. Read on every call, not cached, so a process (the kernel tests) can switch it.
+inline bool batch_invariant() {
+  const char* v = std::getenv("LX_BATCH_INVARIANT");
+  return v && *v && v[0] != '0';
+}
 // The two sets of sites separately, for the race hunt: the four launches that predate the rollout, and launch_pdl.
 inline bool pdl_old_on() {
   static const bool on = pdl_on() && !pdl_env_off("LX_PDL_OLD");
