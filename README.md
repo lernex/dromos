@@ -25,6 +25,19 @@ dromos run praxis      # chat in the terminal (downloads the model the first tim
 dromos serve logos     # the OpenAI API on http://127.0.0.1:8080/v1
 ```
 
+## Build from source
+
+```bash
+cmake -B build -DLX_ARCHS=all -DLX_DECODE_PROGRAM=OFF && cmake --build build -j
+```
+
+CMake 3.28 or newer, a C++20 compiler, and the CUDA toolkit 12.8 or newer (the release is built with 12.8). `LX_ARCHS`
+names the GPUs the build runs on: `all` is RTX 30 / A100 up to RTX 50, H100 and B200; the default, `120a-real`, is
+RTX 50 only and compiles fastest. `-DLX_DECODE_PROGRAM=OFF` leaves out the opt-in persistent decode program, as the
+release does: its kernel takes about 30 minutes per architecture to compile, and more than 14 GB of memory for sm_80. Without an
+NVIDIA GPU, `-DLX_BACKEND_CUDA=OFF` builds the CPU backend only; on macOS the default is the Metal backend. The binary
+is `build/dromos`.
+
 ## Develop
 
 ```bash
