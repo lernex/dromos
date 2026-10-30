@@ -467,7 +467,8 @@ double decode_bytes_per_token(const MetisConfig& c, lx_wtype target, bool bf16x_
 // The share of the measured bandwidth one stream's decode reaches on each path: the tokens per second the kernels
 // measure times the bytes a token reads, over the bandwidth. The decode estimates scale the bandwidth by these, so a note
 // never promises more than the kernels deliver.
-//   GPU: Praxis on an RTX 5070 Ti, bench at one stream, 2026-10-24, against the card's peak.
+//   GPU: Praxis on an RTX 5070 Ti, bench at one stream, 2026-10-30 (the median of three runs, cut to three places),
+//   against the card's peak.
 //   CPU: Praxis on an i5-14500 (AVX2 with VNNI), 2026-10-29, against the backend's own read probe. Bare metal on 14
 //   threads read 0.876 (BF16), 0.818 (INT8), 0.778 (FP8) and 0.666 (NVFP4); a 6-vCPU VM on the same chip reached 0.868 of
 //   bare metal on BF16 (0.76), so each is scaled by that and rounded down, the smaller machine's figure. BF16X is the VM's
@@ -484,7 +485,7 @@ double decode_efficiency(const DeviceInfo& d, lx_wtype target, bool bf16x_decode
       default: return kBF16;
     }
   }
-  constexpr double kBF16 = 0.62, kBF16X = 0.56, kINT8 = 0.48, kFP8 = 0.53, kNVFP4 = 0.49;
+  constexpr double kBF16 = 0.795, kBF16X = 0.720, kINT8 = 0.650, kFP8 = 0.680, kNVFP4 = 0.648;
   switch (target) {
     case LX_W_BF16: return bf16x_decode ? kBF16X : kBF16;
     case LX_W_BF16X: return kBF16X;
