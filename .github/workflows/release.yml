@@ -105,8 +105,8 @@ jobs:
 
   linux-x86_64-cuda12:
     runs-on: ubuntu-24.04
-    # The one CUDA build ships on CUDA 12.8: as fast as 13.4 on an RTX 5070 Ti (docs/RELEASE.md) and it runs on older
-    # drivers. Every architecture took 21 minutes at 2 jobs on a 20-core server; the limit leaves room for a 4-core runner.
+    # CUDA 12.8 runs on drivers from 525 (docs/RELEASE.md); a driver of 580 or newer gets linux-x86_64-cuda13, which is
+    # faster. Every architecture took 21 minutes at 2 jobs on a 20-core server; the limit leaves room for a 4-core runner.
     timeout-minutes: 350
     steps:
       - name: Free disk space on the runner
@@ -127,6 +127,32 @@ jobs:
         with:
           name: dromos-linux-x86_64-cuda12
           path: ${{ runner.temp }}/release/dromos-linux-x86_64-cuda12.tar.gz
+          if-no-files-found: error
+
+  linux-x86_64-cuda13:
+    runs-on: ubuntu-24.04
+    # CUDA 13.4, the toolkit the engine is developed and measured on: 10 to 17% faster than 12.8 at 32 streams on an RTX
+    # 5070 Ti (docs/RELEASE.md). It needs a 580 driver; install.sh gives older drivers cuda12. The limit is cuda12's.
+    timeout-minutes: 350
+    steps:
+      - name: Free disk space on the runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/.ghcup
+          df -h /
+      - uses: actions/checkout@v4
+      - name: Version and commit
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then echo "LX_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"; fi
+          echo "LX_GIT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+      - name: Toolkit and build in the manylinux_2_28 base
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/src" -v "$RUNNER_TEMP/release:/out" \
+            -e LX_VERSION -e LX_GIT_SHA -e LX_JOBS -e CUDA_HOME=/usr/local/cuda-13.4 quay.io/pypa/manylinux_2_28_x86_64 \
+            bash -c 'export PATH=/opt/python/cp312-cp312/bin:$PATH && python3 -m pip install -q ninja && /src/scripts/release/cuda-toolkit.sh 13.4 && /src/scripts/release/build.sh linux-x86_64-cuda13 /out'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dromos-linux-x86_64-cuda13
+          path: ${{ runner.temp }}/release/dromos-linux-x86_64-cuda13.tar.gz
           if-no-files-found: error
 
   windows-x86_64-cpu:
@@ -178,8 +204,8 @@ jobs:
   publish:
     # Only a tag publishes. A dispatch run stops at the artifacts above.
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [release-address, linux-x86_64-cpu, linux-aarch64-cpu, darwin-arm64, linux-x86_64-cuda12, windows-x86_64-cpu,
-            windows-x86_64-cuda12]
+    needs: [release-address, linux-x86_64-cpu, linux-aarch64-cpu, darwin-arm64, linux-x86_64-cuda12, linux-x86_64-cuda13,
+            windows-x86_64-cpu, windows-x86_64-cuda12]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

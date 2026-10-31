@@ -18,7 +18,8 @@ is a stable link:
 
 | Asset | Contents |
 |---|---|
-| `dromos-linux-x86_64-cuda12.tar.gz` | CUDA backend, every architecture (`-DLX_ARCHS=all`), plus the CPU backend |
+| `dromos-linux-x86_64-cuda13.tar.gz` | CUDA 13.4 backend, every architecture (`-DLX_ARCHS=all`), plus the CPU backend |
+| `dromos-linux-x86_64-cuda12.tar.gz` | CUDA 12.8 backend, every architecture, plus the CPU backend |
 | `dromos-linux-x86_64-cpu.tar.gz` | CPU backend only |
 | `dromos-linux-aarch64-cpu.tar.gz` | CPU backend only |
 | `dromos-darwin-arm64.tar.gz` | Metal backend (macOS 14+) |
@@ -28,14 +29,15 @@ is a stable link:
 | `install.ps1` | the installer (Windows) |
 | `SHA256SUMS` | `sha256sum` format, one line per asset above |
 
-One CUDA flavor ships, built with CUDA 12.8. Measured 2026-10-28 on an RTX 5070 Ti (driver 595), Praxis:
-the 12.8 build decodes 293.9 / 1,140 tok/s at 1 / 8 streams against 295.2 / 1,165 for a 13.4 build, with
-the same KL to the reference, and 12.8 runs on older drivers. The driver it needs: 570.26 or newer for the
-12.8 toolkit (and for any RTX 50 card), 525.60.13 or newer for older cards through NVIDIA's minor-version
-compatibility (the build carries real code for every architecture, no PTX to JIT; drivers below 595 are
-untested). On Windows the floors are 570.65 for the 12.8 toolkit and 527.41 through minor-version compatibility.
-An older driver, or no GPU, gets the CPU flavor. `scripts/release/build.sh` still builds a
-`cuda13` flavor, and install.sh prefers it when a release lists one.
+Linux ships two CUDA flavors. `cuda13` is built with CUDA 13.4 (cuBLAS 13.8), the toolkit the engine is
+developed and measured on, and install.sh gives it to any driver of 580 or newer. Measured 2026-10-30 on an RTX
+5070 Ti (driver 595), the same commit built both ways, the 12.8 build decodes 3 to 5% slower at one stream
+and 10 to 17% slower at 32 streams across Praxis BF16, INT8, FP8 and NVFP4 and Logos FP8. `cuda12` is built
+with CUDA 12.8 for older drivers: 570.26 or newer for the 12.8 toolkit (and for any RTX 50 card), 525.60.13 or
+newer for older cards through NVIDIA's minor-version compatibility (the builds carry real code for every
+architecture, no PTX to JIT; drivers below 595 are untested). Windows ships `cuda12` only, with floors of
+570.65 for the 12.8 toolkit and 527.41 through minor-version compatibility. An older driver, or no GPU, gets
+the CPU flavor.
 
 ## The tree
 
@@ -139,7 +141,7 @@ Linux builds run on an old base so the binaries run on any current distribution:
 (glibc 2.28) where the CUDA toolkit allows it, else ubuntu 22.04. The CPU backend compiles every ISA
 level and picks at run time (engine/cpu); nothing is built with `-march=native`. macOS builds target 14.0.
 The CUDA flavors' toolkit comes from NVIDIA's redistributable archives, pinned by one manifest per series
-(`scripts/release/cuda-toolkit.sh`: `redistrib_12.8.2.json` for 12.8) and each archive checked against its sha256, so a
+(`scripts/release/cuda-toolkit.sh`: `redistrib_12.8.2.json` for 12.8, `redistrib_13.4.3.json` for 13.4) and each archive checked against its sha256, so a
 release builds against exactly the versions its release candidate was tested with. NVIDIA's package repositories are
 not used: they serve the newest packages of a series, and their index has been republished broken.
 TLS comes from the system libcurl, opened at run time (engine/core/http.cpp), so no OpenSSL is linked.
