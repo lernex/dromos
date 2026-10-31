@@ -21,7 +21,28 @@ env:
   LX_JOBS: '4'
 
 jobs:
+  already-released:
+    # A release can be built on the Lernex server and uploaded as a draft (docs/RELEASE.md). Publishing that draft
+    # creates its tag, which starts this workflow: then nothing here builds or drafts, and pypi.yml publishes the wheels
+    # from the release's own assets.
+    runs-on: ubuntu-24.04
+    outputs:
+      exists: ${{ steps.check.outputs.exists }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          exists=false
+          if [[ "$GITHUB_REF" == refs/tags/v* ]] && gh release view "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            exists=true
+            echo "::notice::$GITHUB_REF_NAME is already released; nothing to build"
+          fi
+          echo "exists=$exists" >> "$GITHUB_OUTPUT"
+
   release-address:
+    needs: already-released
+    if: needs.already-released.outputs.exists != 'true'
     # install.sh, install.ps1, `dromos update` and the image download releases from this address, built in. A rename
     # or transfer that misses one of them ships an engine that cannot find its own releases, so a release from anywhere
     # else stops here.
@@ -45,6 +66,8 @@ jobs:
           fi
 
   linux-x86_64-cpu:
+    needs: already-released
+    if: needs.already-released.outputs.exists != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -65,6 +88,8 @@ jobs:
           if-no-files-found: error
 
   linux-aarch64-cpu:
+    needs: already-released
+    if: needs.already-released.outputs.exists != 'true'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 120
     steps:
@@ -85,6 +110,8 @@ jobs:
           if-no-files-found: error
 
   darwin-arm64:
+    needs: already-released
+    if: needs.already-released.outputs.exists != 'true'
     runs-on: macos-15
     timeout-minutes: 120
     steps:
@@ -104,6 +131,8 @@ jobs:
           if-no-files-found: error
 
   linux-x86_64-cuda12:
+    needs: already-released
+    if: needs.already-released.outputs.exists != 'true'
     runs-on: ubuntu-24.04
     # CUDA 12.8 runs on drivers from 525 (docs/RELEASE.md); a driver of 580 or newer gets linux-x86_64-cuda13, which is
     # faster. Every architecture took 21 minutes at 2 jobs on a 20-core server; the limit leaves room for a 4-core runner.
@@ -130,6 +159,8 @@ jobs:
           if-no-files-found: error
 
   linux-x86_64-cuda13:
+    needs: already-released
+    if: needs.already-released.outputs.exists != 'true'
     runs-on: ubuntu-24.04
     # CUDA 13.4, the toolkit the engine is developed and measured on: 10 to 17% faster than 12.8 at 32 streams on an RTX
     # 5070 Ti (docs/RELEASE.md). It needs a 580 driver; install.sh gives older drivers cuda12. The limit is cuda12's.
@@ -156,6 +187,8 @@ jobs:
           if-no-files-found: error
 
   windows-x86_64-cpu:
+    needs: already-released
+    if: needs.already-released.outputs.exists != 'true'
     runs-on: windows-2022
     timeout-minutes: 120
     steps:
@@ -177,6 +210,8 @@ jobs:
           if-no-files-found: error
 
   windows-x86_64-cuda12:
+    needs: already-released
+    if: needs.already-released.outputs.exists != 'true'
     runs-on: windows-2022
     # The same CUDA 12.8 and every architecture as linux-x86_64-cuda12, with MSVC as nvcc's host compiler. The toolkit
     # comes from NVIDIA's redistributable archives (the installer does not run unattended); the limit is the Linux one.
@@ -201,11 +236,39 @@ jobs:
           path: ${{ runner.temp }}/release/dromos-windows-x86_64-cuda12.zip
           if-no-files-found: error
 
+
+  windows-x86_64-cuda13:
+    needs: already-released
+    if: needs.already-released.outputs.exists != 'true'
+    runs-on: windows-2022
+    # The same CUDA 13.4 and every architecture as linux-x86_64-cuda13, with MSVC as nvcc's host compiler. install.ps1
+    # gives it to a driver of 580 or newer and cuda12 to older ones; the limit is the Linux one.
+    timeout-minutes: 350
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - name: Version and commit
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then echo "LX_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"; fi
+          echo "LX_GIT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+      - name: CUDA 13.4 toolkit
+        shell: pwsh
+        run: scripts\release\cuda-toolkit.ps1 13.4
+      - name: Build (MSVC host compiler, static C runtime)
+        shell: pwsh
+        run: scripts\release\build.ps1 windows-x86_64-cuda13 "$env:RUNNER_TEMP\release"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dromos-windows-x86_64-cuda13
+          path: ${{ runner.temp }}/release/dromos-windows-x86_64-cuda13.zip
+          if-no-files-found: error
+
   publish:
     # Only a tag publishes. A dispatch run stops at the artifacts above.
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [release-address, linux-x86_64-cpu, linux-aarch64-cpu, darwin-arm64, linux-x86_64-cuda12, linux-x86_64-cuda13,
-            windows-x86_64-cpu, windows-x86_64-cuda12]
+    if: startsWith(github.ref, 'refs/tags/v') && needs.already-released.outputs.exists != 'true'
+    needs: [already-released, release-address, linux-x86_64-cpu, linux-aarch64-cpu, darwin-arm64, linux-x86_64-cuda12,
+            linux-x86_64-cuda13, windows-x86_64-cpu, windows-x86_64-cuda12, windows-x86_64-cuda13]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

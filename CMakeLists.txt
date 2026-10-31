@@ -47,7 +47,7 @@ endif()
 #                       tag are X.Y.Z-dev.N+gSHA, and an untagged checkout is 0.0.0-dev+SHA.
 #   -DLX_FLAVOR=NAME    the release flavor this build is packaged as, or source (the default).
 set(LX_FLAVORS source linux-x86_64-cuda12 linux-x86_64-cuda13 linux-x86_64-cpu linux-aarch64-cpu darwin-arm64
-    windows-x86_64-cpu windows-x86_64-cuda12)
+    windows-x86_64-cpu windows-x86_64-cuda12 windows-x86_64-cuda13)
 set(LX_FLAVOR "source" CACHE STRING "The release flavor: one of ${LX_FLAVORS}")
 set_property(CACHE LX_FLAVOR PROPERTY STRINGS ${LX_FLAVORS})
 if(NOT LX_FLAVOR IN_LIST LX_FLAVORS)
@@ -238,6 +238,11 @@ if(LX_BACKEND_CUDA)
     # makes (the NVML loader) from engine/platform.
     target_compile_definitions(dromos_kernels PRIVATE LX_BUILDING_BACKEND)
     target_compile_options(dromos_kernels PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8,/Zc:__cplusplus>)
+    # CCCL 3, which CUDA 13 ships, refuses MSVC's traditional preprocessor in host code; the C++ sources already use
+    # the conforming one. CUDA 12 builds keep the flags they were proven with.
+    if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13)
+      target_compile_options(dromos_kernels PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
+    endif()
     target_link_libraries(dromos_kernels PRIVATE dromos_platform)
     lx_windows_binary(dromos_kernels "Dromos CUDA backend" DLL)
   endif()
@@ -254,11 +259,13 @@ if(LX_BACKEND_CUDA)
     # Windows: the toolkit's cudart64_N.dll and cublasLt64_N.dll go beside dromos_kernels.dll in bin\, which the
     # backend loads them from first. Their license goes with them: the toolkit's EULA.txt from NVIDIA's installer, or
     # the LICENSE of the cudart redistributable archive (scripts/release/cuda-toolkit.ps1), which is the same EULA.
+    # CUDA 12 keeps the DLLs in bin\ beside nvcc, and CUDA 13 in bin\x64.
     foreach(pattern IN ITEMS cudart64_*.dll cublasLt64_*.dll)
-      file(GLOB lib_dll "${CUDAToolkit_BIN_DIR}/${pattern}")
+      file(GLOB lib_dll "${CUDAToolkit_BIN_DIR}/${pattern}" "${CUDAToolkit_BIN_DIR}/x64/${pattern}")
       list(LENGTH lib_dll lib_count)
       if(NOT lib_count EQUAL 1)
-        message(FATAL_ERROR "LX_BUNDLE_CUDA: expected one ${pattern} in ${CUDAToolkit_BIN_DIR}, found ${lib_count}")
+        message(FATAL_ERROR "LX_BUNDLE_CUDA: expected one ${pattern} in ${CUDAToolkit_BIN_DIR} or its x64 folder, "
+                            "found ${lib_count}")
       endif()
       install(FILES ${lib_dll} DESTINATION bin)
     endforeach()

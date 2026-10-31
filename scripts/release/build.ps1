@@ -1,13 +1,14 @@
 # Builds one Windows release flavor into a zip (docs/RELEASE.md), the Windows twin of build.sh: dromos-FLAVOR.zip, which
 # unpacks with no top folder to bin\dromos.exe and bin\dromos_cpu.dll (with dromos_kernels.dll and the CUDA runtime's
-# cudart64_12.dll and cublasLt64_12.dll for cuda12), share\dromos\tuning, share\dromos\channel (tarball), LICENSE,
+# cudart64_N.dll and cublasLt64_N.dll for the CUDA flavors), share\dromos\tuning, share\dromos\channel (tarball), LICENSE,
 # NOTICE and share\dromos\licenses (with NVIDIA's EULA for the CUDA runtime).
 #
 #   scripts\release\build.ps1 FLAVOR OUTDIR
 #
-# FLAVOR is windows-x86_64-cpu or windows-x86_64-cuda12. Run it on Windows with Visual Studio 2022 or its Build Tools
-# (the C++ workload, which brings CMake and Ninja) and Python 3, and for cuda12 the CUDA 12.8 toolkit under CUDA_HOME
-# (scripts\release\cuda-toolkit.ps1 12.8 puts it in C:\cuda\12.8). The MSVC environment (vcvars64) is loaded here when
+# FLAVOR is windows-x86_64-cpu, windows-x86_64-cuda12 or windows-x86_64-cuda13. Run it on Windows with Visual Studio
+# 2022 or its Build Tools (the C++ workload, which brings CMake and Ninja) and Python 3, and for the CUDA flavors the
+# flavor's toolkit under CUDA_HOME (scripts\release\cuda-toolkit.ps1 12.8 puts CUDA 12.8 in C:\cuda\12.8 for cuda12,
+# and 13.4 puts CUDA 13.4 in C:\cuda\13.4 for cuda13). The MSVC environment (vcvars64) is loaded here when
 # cl is not on PATH, so a plain PowerShell will do. The binaries link the C runtime statically: the build refuses one
 # that would need the Visual C++ redistributable on the user's machine.
 #
@@ -16,7 +17,7 @@
 #   LX_GIT_SHA        the commit's short id, when the checkout has no git (default: git rev-parse)
 #   LX_JOBS           build parallelism (default 2)
 #   LX_ALLOW_DIRTY    1 to build an uncommitted tree (refused by default, so a release is a commit)
-#   CUDA_HOME         the CUDA toolkit for cuda12 (default C:\cuda\12.8, else CUDA_PATH)
+#   CUDA_HOME         the CUDA toolkit (default C:\cuda\12.8 for cuda12 and C:\cuda\13.4 for cuda13, else CUDA_PATH)
 #   SOURCE_DATE_EPOCH the zip's timestamps (default: the commit time, or now)
 param(
   [Parameter(Mandatory = $true, Position = 0)][string]$Flavor,
@@ -72,9 +73,10 @@ $cmakeArgs = @("-DLX_FLAVOR=$Flavor", "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_CXX
                "-DPython3_EXECUTABLE=$python")
 $targets = @("dromos")
 switch ($Flavor) {
-  "windows-x86_64-cuda12" {
-    $cuda = if ($env:CUDA_HOME) { $env:CUDA_HOME } elseif (Test-Path "C:\cuda\12.8\bin\nvcc.exe") { "C:\cuda\12.8" } else { $env:CUDA_PATH }
-    if (-not $cuda -or -not (Test-Path "$cuda\bin\nvcc.exe")) { Fail "no CUDA toolkit: set CUDA_HOME (scripts\release\cuda-toolkit.ps1 12.8 installs one)" }
+  { $_ -in @("windows-x86_64-cuda12", "windows-x86_64-cuda13") } {
+    $series = if ($Flavor -eq "windows-x86_64-cuda13") { "13.4" } else { "12.8" }
+    $cuda = if ($env:CUDA_HOME) { $env:CUDA_HOME } elseif (Test-Path "C:\cuda\$series\bin\nvcc.exe") { "C:\cuda\$series" } else { $env:CUDA_PATH }
+    if (-not $cuda -or -not (Test-Path "$cuda\bin\nvcc.exe")) { Fail "no CUDA toolkit: set CUDA_HOME (scripts\release\cuda-toolkit.ps1 $series installs one)" }
     $cmakeArgs += @("-DLX_BACKEND_CUDA=ON", "-DLX_BACKEND_CPU=ON", "-DLX_BUNDLE_CUDA=ON", "-DLX_ARCHS=all",
                     "-DLX_LINEINFO=OFF", "-DLX_DECODE_PROGRAM=OFF", "-DCUDAToolkit_ROOT=$cuda",
                     "-DCMAKE_CUDA_COMPILER=$cuda\bin\nvcc.exe")
@@ -84,7 +86,7 @@ switch ($Flavor) {
     $cmakeArgs += @("-DLX_BACKEND_CUDA=OFF", "-DLX_BACKEND_CPU=ON")
     $targets += @("dromos_cpu")
   }
-  default { Fail "unknown flavor $Flavor (windows-x86_64-cpu or windows-x86_64-cuda12)" }
+  default { Fail "unknown flavor $Flavor (windows-x86_64-cpu, windows-x86_64-cuda12 or windows-x86_64-cuda13)" }
 }
 if ($env:LX_VERSION) { $cmakeArgs += "-DLX_VERSION=$($env:LX_VERSION)" }
 

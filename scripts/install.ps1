@@ -2,13 +2,14 @@
 #
 #   irm https://github.com/lernex/dromos/releases/latest/download/install.ps1 | iex
 #
-# It picks the build this PC can run (CUDA 12 when an NVIDIA driver is new enough, else CPU), checks it against
+# It picks the build this PC can run (CUDA 13 on an NVIDIA driver of 580 or newer, CUDA 12 on an older one that is new
+# enough, else CPU), checks it against
 # SHA256SUMS, unpacks it to %LOCALAPPDATA%\Programs\Dromos\versions\X.Y.Z, points current at it and puts
 # current\bin on your user PATH. Run it again to upgrade. Nothing here needs administrator rights.
 #
 # Environment:
 #   DROMOS_VERSION=X.Y.Z        install this release (default: the latest)
-#   DROMOS_FLAVOR=cpu|cuda12    install this build (default: the best one for this PC)
+#   DROMOS_FLAVOR=cpu|cuda12|cuda13   install this build (default: the best one for this PC)
 #   DROMOS_RELEASES=URL         the release host, laid out like GitHub's (default: GitHub)
 #
 # Needs 64-bit Windows 10 build 17763 or newer, and Windows PowerShell 5.1 or PowerShell 7.
@@ -18,8 +19,11 @@
 $DromosFolderName = 'Dromos'
 $DromosCommandName = 'dromos'
 
-# The CUDA build's floor: NVIDIA's Windows driver for CUDA 12 minor-version compatibility, and the first GPU's
-# compute capability (sm_80 is 80).
+# What each CUDA build needs: NVIDIA's Windows driver for minor-version compatibility in its CUDA series (the 580
+# branch for 13, 527.41 for 12), and the first GPU's compute capability (sm_80 is 80). cuda13 is preferred when the
+# release ships it, as install.sh does.
+$DromosCuda13MinDriver = [version]'580.0'
+$DromosCuda13MinSm = 80
 $DromosCuda12MinDriver = [version]'527.41'
 $DromosCuda12MinSm = 80
 
@@ -129,6 +133,12 @@ function Get-DromosListedHash([string]$sums, [string]$name) {
   return ''
 }
 
+# The driver and compute capability a CUDA flavor needs.
+function Get-DromosCudaFloor([string]$flavor) {
+  if ($flavor -eq 'cuda13') { return [pscustomobject]@{ Driver = $DromosCuda13MinDriver; Sm = $DromosCuda13MinSm } }
+  return [pscustomobject]@{ Driver = $DromosCuda12MinDriver; Sm = $DromosCuda12MinSm }
+}
+
 # Decides the flavor the way install.sh does, with Windows numbers. Returns Flavor, Why (one line for the user),
 # Asset (the zip's name) and Nvidia (what the GPU reported).
 function Select-DromosBuild([string]$sums) {
@@ -138,8 +148,8 @@ function Select-DromosBuild([string]$sums) {
   $why = ''
   if ($forced) {
     $flavor = $forced.ToLowerInvariant()
-    if ($flavor -ne 'cpu' -and $flavor -ne 'cuda12') {
-      throw "dromos: DROMOS_FLAVOR must be cpu or cuda12, not $forced"
+    if ($flavor -notin @('cpu', 'cuda12', 'cuda13')) {
+      throw "dromos: DROMOS_FLAVOR must be cpu, cuda12 or cuda13, not $forced"
     }
     $why = 'DROMOS_FLAVOR asks for it'
   } elseif (-not $nv.Driver) {
@@ -154,12 +164,20 @@ function Select-DromosBuild([string]$sums) {
   } elseif ($nv.Sm -lt $DromosCuda12MinSm) {
     $flavor = 'cpu'
     $why = "$($nv.Gpu) is sm_$($nv.Sm), and the CUDA builds need sm_$DromosCuda12MinSm or newer"
-  } elseif (Get-DromosListedHash $sums "$DromosCommandName-windows-x86_64-cuda12.zip") {
-    $flavor = 'cuda12'
-    $why = "$($nv.Gpu), driver $($nv.Driver)"
   } else {
-    $flavor = 'cpu'
-    $why = "this release has no CUDA build for driver $($nv.Driver)"
+    foreach ($candidate in @('cuda13', 'cuda12')) {
+      $floor = Get-DromosCudaFloor $candidate
+      if ($nv.DriverVersion -lt $floor.Driver -or $nv.Sm -lt $floor.Sm) { continue }
+      if (Get-DromosListedHash $sums "$DromosCommandName-windows-x86_64-$candidate.zip") {
+        $flavor = $candidate
+        $why = "$($nv.Gpu), driver $($nv.Driver)"
+        break
+      }
+    }
+    if (-not $flavor) {
+      $flavor = 'cpu'
+      $why = "this release has no CUDA build for driver $($nv.Driver)"
+    }
   }
   return [pscustomobject]@{
     Flavor = $flavor
@@ -354,13 +372,13 @@ function Invoke-DromosInstall {
     }
     Show-DromosLine "Windows x64: $($build.Flavor) build, $($build.Why)"
 
-    $min = $DromosCuda12MinDriver
-    if ($build.Flavor -eq 'cuda12' -and ([string]$env:DROMOS_FLAVOR -ne '')) {
+    if ($build.Flavor -like 'cuda*' -and ([string]$env:DROMOS_FLAVOR -ne '')) {
+      $min = (Get-DromosCudaFloor $build.Flavor).Driver
       $nv = $build.Nvidia
       if (-not $nv.Driver -or $nv.DriverVersion -lt $min) {
         $have = 'none'
         if ($nv.Driver) { $have = $nv.Driver }
-        Show-DromosWarning "cuda12 needs an NVIDIA driver of $min or newer, and this PC has ${have}: the engine may not start"
+        Show-DromosWarning "$($build.Flavor) needs an NVIDIA driver of $min or newer, and this PC has ${have}: the engine may not start"
       }
     }
 

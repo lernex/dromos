@@ -23,7 +23,8 @@ is a stable link:
 | `dromos-linux-x86_64-cpu.tar.gz` | CPU backend only |
 | `dromos-linux-aarch64-cpu.tar.gz` | CPU backend only |
 | `dromos-darwin-arm64.tar.gz` | Metal backend (macOS 14+) |
-| `dromos-windows-x86_64-cuda12.zip` | CUDA backend, every architecture, plus the CPU backend (Windows 10 1809+ x64) |
+| `dromos-windows-x86_64-cuda13.zip` | CUDA 13.4 backend, every architecture, plus the CPU backend (Windows 10 1809+ x64) |
+| `dromos-windows-x86_64-cuda12.zip` | CUDA 12.8 backend, every architecture, plus the CPU backend (Windows 10 1809+ x64) |
 | `dromos-windows-x86_64-cpu.zip` | CPU backend only |
 | `install.sh` | the installer (Linux, macOS) |
 | `install.ps1` | the installer (Windows) |
@@ -35,9 +36,9 @@ developed and measured on, and install.sh gives it to any driver of 580 or newer
 and 10 to 17% slower at 32 streams across Praxis BF16, INT8, FP8 and NVFP4 and Logos FP8. `cuda12` is built
 with CUDA 12.8 for older drivers: 570.26 or newer for the 12.8 toolkit (and for any RTX 50 card), 525.60.13 or
 newer for older cards through NVIDIA's minor-version compatibility (the builds carry real code for every
-architecture, no PTX to JIT; drivers below 595 are untested). Windows ships `cuda12` only, with floors of
-570.65 for the 12.8 toolkit and 527.41 through minor-version compatibility. An older driver, or no GPU, gets
-the CPU flavor.
+architecture, no PTX to JIT; drivers below 595 are untested). Windows ships the same two, and install.ps1
+chooses the same way: `cuda13` for a driver of 580 or newer, `cuda12` with floors of 570.65 for the 12.8
+toolkit and 527.41 through minor-version compatibility. An older driver, or no GPU, gets the CPU flavor.
 
 ## The tree
 
@@ -117,7 +118,7 @@ release host, for tests.
 install.sh picks the flavor from the OS, the architecture and the NVIDIA driver; re-running it upgrades.
 install.ps1 does the same on Windows from `nvidia-smi` (driver and compute capability), needs no administrator
 rights, and puts `current\bin` on the user `PATH`. Both honour `DROMOS_VERSION`, `DROMOS_RELEASES`, and
-`DROMOS_FLAVOR` (`cpu` or `cuda12`; `install.sh` also takes `cuda13`).
+`DROMOS_FLAVOR` (`cpu`, `cuda12` or `cuda13`).
 Homebrew 7 loads a formula from a third-party tap only once it is trusted, so the brew install is two
 commands: `brew trust --formula lernex/tap/dromos` once, then `brew install lernex/tap/dromos`. The tap is
 github.com/lernex/homebrew-tap; its `Formula/dromos.rb` is the one in `packaging/homebrew-tap`.
@@ -126,6 +127,12 @@ github.com/lernex/homebrew-tap; its `Formula/dromos.rb` is the one in `packaging
 
 1. Tag `vX.Y.Z` on `main` and push the tag. `release.yml` builds every flavor and drafts the GitHub release
    with the tarballs and zips, `install.sh`, `install.ps1` and `SHA256SUMS`.
+   The draft can also be built off GitHub, as v0.1.0 was: each flavor with `build.sh` or `build.ps1` in its base
+   (manylinux_2_28 containers on the Lernex server, macOS on a Mac, Windows on the Windows VM), the installers
+   copied beside them and `scripts/release/sums.sh` run over the folder, then
+   `gh release create vX.Y.Z --draft --target <commit> --title "Dromos X.Y.Z" <folder>/*`. A draft has no tag
+   yet. Publishing it creates the tag, which starts `release.yml`, and its first job sees the release already
+   exists, so nothing is built twice.
 2. Check the draft's assets (install each flavor on a clean machine), then publish it. Publishing starts
    `pypi.yml` (the wheels, through the `pypi` environment) and `docker.yml` (the GHCR image).
 3. Bump the tap: in a checkout of lernex/homebrew-tap, run
@@ -148,7 +155,7 @@ TLS comes from the system libcurl, opened at run time (engine/core/http.cpp), so
 
 Windows builds run on `windows-2022` with Visual Studio 2022's MSVC (`scripts/release/build.ps1`), the C runtime
 linked statically so no Visual C++ redistributable is needed, and a manifest that makes the process UTF-8 and
-long-path aware. The CUDA flavor uses nvcc 12.8 with `cl` as its host compiler, from NVIDIA's redistributable archives
-(`scripts/release/cuda-toolkit.ps1`; the toolkit installer does not run unattended). TLS and proxies come from
+long-path aware. The CUDA flavors use nvcc 12.8 and 13.4 with `cl` as their host compiler, from the same pinned
+manifests as Linux (`scripts/release/cuda-toolkit.ps1`; the toolkit installer does not run unattended). TLS and proxies come from
 WinHTTP, the system's own HTTP stack, so the certificate store and proxy settings are Windows's and nothing ships
 for them. The zip is packed with fixed timestamps (`scripts/release/pack_zip.py`), so a commit gives the same bytes.
