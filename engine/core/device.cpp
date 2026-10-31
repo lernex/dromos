@@ -155,6 +155,7 @@ DeviceInfo query_device(int ordinal) {
   d.l1_bytes = static_cast<size_t>(props.l1_bytes);
   d.l3_bytes = static_cast<size_t>(props.l3_bytes);
   d.cpu = lx_rt_backend() == LX_BACKEND_CPU;
+  d.unified = d.cpu || lx_rt_backend() == LX_BACKEND_METAL;
   d.isa.assign(props.isa, strnlen(props.isa, sizeof props.isa));
   d.native_math = props.native_math;
   // Peak bandwidth: the memory clock (kHz) with two transfers per clock, times the bus width in bytes. A

@@ -36,7 +36,8 @@ class PrefixCache {
 
   // Keeps a snapshot of tokens[0..length), `bytes` long: `fill` writes it into the memory it is
   // given (device or pinned host) and the call returns once the copies are done. A prefix already
-  // cached is only marked recently used. Returns false when the snapshot cannot be kept at all.
+  // cached is only marked recently used. Returns false when the snapshot cannot be kept at all, the
+  // memory for it included.
   bool store(const std::vector<int32_t>& tokens, int length, size_t bytes,
              const std::function<void(void* dst)>& fill);
 
@@ -67,5 +68,17 @@ class PrefixCache {
 
 // The FNV-1a hash of a token prefix, one value per length: out[k] hashes tokens[0..k).
 std::vector<uint64_t> prefix_hashes(const std::vector<int32_t>& tokens, int limit);
+
+// Whether a prompt of `prompt` tokens is snapshotted at grid point `length`. Each snapshot holds the whole prefix, so
+// one at every grid point would grow with the square of the prompt's length: a 20K-token prompt made 40 of them. A
+// prompt keeps its last grid point, where a follow-up turn starts, and the grid points at a power of two times the
+// grid (512, 1024, 2048, ...), where another prompt that shares only its start picks up at most twice as early as it
+// could have.
+inline bool snapshot_wanted(int length, int prompt, int grid) {
+  if (grid <= 0 || length <= 0 || length % grid != 0) return false;
+  if (length + grid > prompt) return true;  // the prompt's last grid point
+  const int k = length / grid;
+  return (k & (k - 1)) == 0;
+}
 
 }  // namespace lx::runtime

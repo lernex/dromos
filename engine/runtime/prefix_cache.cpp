@@ -79,7 +79,12 @@ bool PrefixCache::store(const std::vector<int32_t>& tokens, int length, size_t b
   e.bytes = bytes;
   if (bytes <= device_budget_) {
     make_room(bytes, true);
-    e.device = DeviceBuffer(bytes);
+    // A snapshot is an optimisation: when the memory for it is not there, the prompt is simply not kept.
+    try {
+      e.device = DeviceBuffer(bytes);
+    } catch (const std::exception&) {
+      return false;
+    }
     fill(e.device.data());
   } else if (bytes <= host_budget_) {
     make_room(bytes, false);

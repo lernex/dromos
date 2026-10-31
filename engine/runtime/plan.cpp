@@ -49,6 +49,10 @@ constexpr size_t kStartupMarginBytes = 1024 * kMiB;
 // The prefix cache's shares: device memory up to a cap, and pinned host memory spilled into.
 constexpr size_t kPrefixDeviceCap = 8192 * kMiB;
 constexpr size_t kPrefixHostBytes = 4096 * kMiB;
+// On unified memory the device is the machine's RAM, which the system and every other program use too, and "pinned
+// host memory" is the same RAM again. There the cache takes a quarter of what the plan leaves, no more than this, and
+// has no second tier: on a 16 GB Mac the two shares above came to 12 GB of snapshots beside a 4.6 GB plan.
+constexpr size_t kPrefixUnifiedCap = 2048 * kMiB;
 // Decode-sized products (at most this many rows) run as GEMVs, and the decode experts' workspace is sized
 // for them (metis.cpp, kGemvRows).
 constexpr int kGemvRows = 8;
@@ -962,8 +966,8 @@ Plan make_plan(const DeviceInfo& d, const MetisConfig& c, const CheckpointInfo& 
   {
     const size_t planned_bytes = p.weight_bytes + p.state_bytes + p.kv_bytes + p.scratch_bytes;
     const size_t spare = budget > planned_bytes + kStartupMarginBytes ? budget - planned_bytes - kStartupMarginBytes : 0;
-    p.prefix_device_bytes = std::min(spare, kPrefixDeviceCap);
-    p.prefix_host_bytes = kPrefixHostBytes;
+    p.prefix_device_bytes = d.unified ? std::min(spare / 4, kPrefixUnifiedCap) : std::min(spare, kPrefixDeviceCap);
+    p.prefix_host_bytes = d.unified ? 0 : kPrefixHostBytes;
   }
   const double active = decode_bytes_per_token(c, target, p.bf16x_decode, p.kv_capacity, &p.bf16x_dropped);
   if (d.bandwidth_gbs > 0 && active > 0)

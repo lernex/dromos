@@ -787,3 +787,25 @@ TEST_CASE("the fixed margin never shrinks a plan's budget on any simulated card"
     }
   }
 }
+
+TEST_CASE("the prefix cache on unified memory: a quarter of what the plan leaves, at most 2 GiB, and no host tier") {
+  // An M5 MacBook with 16 GB: Metal's working set is 12.7 GB, and the old shares (all the spare memory up to 8 GiB,
+  // then 4 GiB of "pinned host" memory that is the same RAM) let a long chat's snapshots reach 13.9 GB of footprint.
+  DeviceInfo mac = simulated("16 GB Mac, unified", 120, 12.71, 154, 10);
+  mac.unified = true;
+  DeviceInfo cpu = simulated_cpu("16 GB laptop CPU", 16);
+  cpu.unified = true;
+  for (const DeviceInfo& d : {mac, cpu}) {
+    INFO(d.name);
+    const Plan p = make_plan(d, praxis(), nvfp4_checkpoint(), PlanRequest{});
+    const size_t planned = p.weight_bytes + p.state_bytes + p.kv_bytes + p.scratch_bytes;
+    CHECK(p.prefix_host_bytes == 0);
+    CHECK(p.prefix_device_bytes > 0);
+    CHECK(p.prefix_device_bytes <= 2 * kGiB);
+    CHECK(p.prefix_device_bytes <= (p.budget_bytes - planned) / 4);
+  }
+  // A discrete card keeps its spare VRAM for snapshots and spills to pinned RAM, which is memory of its own there.
+  const Plan card = make_plan(simulated("RTX 5070 Ti 16GB", 120, 16, 896, 70), praxis(), nvfp4_checkpoint(), PlanRequest{});
+  CHECK(card.prefix_host_bytes == 4 * kGiB);
+  CHECK(card.prefix_device_bytes > 2 * kGiB);
+}

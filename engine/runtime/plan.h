@@ -27,6 +27,7 @@ struct DeviceInfo {
   double bandwidth_gbs = 0;  // peak, from the memory clock and bus width, or measured (bandwidth_measured)
   bool bandwidth_measured = false;
   bool cpu = false;          // the CPU backend: host memory is the device's
+  bool unified = false;      // the device and the host share one memory the whole system uses (Apple silicon, a CPU)
   std::string isa;           // the instruction set the kernels run, in words (a CPU's)
   int native_math = 0;       // bit (1 << m): the hardware multiplies lx_math m with an instruction of its own
   bool bf16_mma = false, int8_mma = false, fp8_mma = false, fp4_mma = false, clusters = false;

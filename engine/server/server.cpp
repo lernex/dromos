@@ -599,6 +599,13 @@ bool Server::run() {
     health["speculation"] = {{"verify_steps", st.spec_steps},
                              {"drafted", st.spec_drafted},
                              {"accepted", st.spec_accepted}};
+    // The prefix cache: requests that started from a snapshot, the prompt tokens they skipped, the snapshots taken,
+    // and the bytes the cache holds now.
+    health["prefix"] = {{"hits", st.prefix_hits},
+                        {"tokens_reused", st.prefix_tokens_reused},
+                        {"snapshots", st.prefix_snapshots},
+                        {"device_bytes", st.prefix_device_bytes},
+                        {"host_bytes", st.prefix_host_bytes}};
     res.set_content(health.dump(), "application/json");
   });
 

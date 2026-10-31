@@ -546,7 +546,8 @@ void Engine::Impl::step() {
   model->forward(batch, static_cast<float*>(logits.data()), false, stream);
   if (cache && grid > 0)
     for (const auto& s : prompt_moved)
-      if (s->prompt_fed % grid == 0) snapshot(s, s->prompt_fed, s->request.prompt);  // queued before the next step
+      if (snapshot_wanted(s->prompt_fed, static_cast<int>(s->request.prompt.size()), grid))
+        snapshot(s, s->prompt_fed, s->request.prompt);  // queued before the next step
   {
     std::lock_guard<std::mutex> lock(mu);
     stats.steps += 1;
