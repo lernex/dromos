@@ -48,6 +48,7 @@ Every archive unpacks, with no top directory, to:
     lib/libdromos_kernels.so  libdromos_cpu.so      (linux; libdromos_metal.dylib on macOS)
     lib/libcudart.so.N  lib/libcublasLt.so.N      (CUDA flavor only, the toolkit's own)
     share/dromos/tuning/*.json
+    share/dromos/bench/corpus.txt                  the text dromos bench cuts its prompts from
     share/dromos/channel                           tarball | homebrew | pip | docker
     share/dromos/licenses/                         third-party licenses (and NVIDIA's EULA, CUDA flavor)
     LICENSE  NOTICE                                Apache-2.0, and what else ships under which terms

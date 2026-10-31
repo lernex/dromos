@@ -95,10 +95,17 @@ struct StreamTiming {
 };
 
 // The corpus the prompts are cut from: tools/rivals/corpus.txt, tokenized with the model's own tokenizer, the same ids the
-// rival client sends. FNV-1a of the ids is printed so the two can be checked against each other.
+// rival client sends. FNV-1a of the ids is printed so the two can be checked against each other. An install reads its
+// own copy (<executable>/../share/dromos/bench/corpus.txt), a build tree the source tree's.
 std::vector<int32_t> corpus_tokens(const lx::text::Tokenizer& tok) {
-  std::ifstream in(LX_CORPUS_PATH, std::ios::binary);
-  if (!in) throw std::runtime_error(std::string("bench: cannot read the corpus at ") + LX_CORPUS_PATH);
+  const std::string share = lx::install::share_dir();
+  const std::string shipped = share.empty() ? "" : share + "/bench/corpus.txt";
+  std::ifstream in;
+  if (!shipped.empty()) in.open(shipped, std::ios::binary);
+  if (!in) in.open(LX_CORPUS_PATH, std::ios::binary);
+  if (!in)
+    throw std::runtime_error("bench: cannot read the corpus at " + (shipped.empty() ? "" : shipped + " or ") +
+                             LX_CORPUS_PATH + " (--random-prompts needs none)");
   std::stringstream text;
   text << in.rdbuf();
   return tok.encode(text.str());

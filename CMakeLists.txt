@@ -396,8 +396,8 @@ if(LX_SLOT_STATE AND TARGET dromos_core)
 endif()
 
 # The install tree (docs/RELEASE.md, `cmake --install BUILD --prefix DIR`): bin/dromos, lib/ with the backends (and the
-# toolkit's libraries and their EULA, LX_BUNDLE_CUDA), share/dromos/tuning, LICENSE, NOTICE and the third-party licenses
-# in share/dromos/licenses. The packager writes share/dromos/channel.
+# toolkit's libraries and their EULA, LX_BUNDLE_CUDA), share/dromos/tuning, share/dromos/bench, LICENSE, NOTICE and the
+# third-party licenses in share/dromos/licenses. The packager writes share/dromos/channel.
 # Relocatable: the CLI finds its backends in ../lib, and each backend finds the libraries beside it ($ORIGIN). The
 # build tree keeps CMake's own rpath.
 if(APPLE)
@@ -422,5 +422,7 @@ foreach(backend dromos_kernels dromos_cpu dromos_metal)
   endif()
 endforeach()
 install(DIRECTORY tuning/ DESTINATION share/dromos/tuning FILES_MATCHING PATTERN "*.json")
+# dromos bench cuts its prompts from this corpus (cli/bench.cpp), so an install benches the text a build tree does.
+install(FILES tools/rivals/corpus.txt DESTINATION share/dromos/bench)
 install(FILES LICENSE NOTICE DESTINATION .)
 install(DIRECTORY licenses/ DESTINATION share/dromos/licenses)

@@ -113,8 +113,8 @@ New-Item -ItemType Directory -Force (Join-Path $stage "share\dromos") | Out-Null
 [IO.File]::WriteAllText((Join-Path $stage "share\dromos\channel"), "tarball`n")
 
 # The tree must be whole before it is packed.
-$required = @("bin\dromos.exe", "bin\dromos_cpu.dll", "share\dromos\channel", "LICENSE", "NOTICE",
-              "share\dromos\licenses\cpp-httplib.txt")
+$required = @("bin\dromos.exe", "bin\dromos_cpu.dll", "share\dromos\channel", "share\dromos\bench\corpus.txt", "LICENSE",
+              "NOTICE", "share\dromos\licenses\cpp-httplib.txt")
 if ($Flavor -like "*cuda*") {
   $required += @("bin\dromos_kernels.dll", "share\dromos\licenses\NVIDIA-CUDA-EULA.txt")
   foreach ($pattern in @("cudart64_*.dll", "cublasLt64_*.dll")) {

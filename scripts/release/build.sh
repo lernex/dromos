@@ -90,7 +90,7 @@ else
 fi
 
 # The tree must be whole before it is packed.
-for required in bin/dromos share/dromos/channel; do
+for required in bin/dromos share/dromos/channel share/dromos/bench/corpus.txt; do
   [ -e "$stage/$required" ] || { echo "build.sh: $required is missing from the install tree" >&2; exit 1; }
 done
 if ! ls "$stage"/share/dromos/tuning/*.json >/dev/null 2>&1; then
