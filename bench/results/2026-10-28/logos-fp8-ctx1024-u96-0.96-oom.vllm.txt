@@ -1,10 +1,10 @@
 logos-fp8-ctx1024-u96 vllm streams= 32 rep=0 decode=   453.8 tok/s per-stream=   14.2 TTFT p50=2.026s prefill=    1753 tok/s tpot-formula=  1259.2 overall=   644.1 peak1s=962 running=26 waiting=15 mismatch=0 short=0
 logos-fp8-ctx1024-u96 vllm streams= 32 rep=1 decode=   453.9 tok/s per-stream=   14.2 TTFT p50=1.634s prefill=    1829 tok/s tpot-formula=  1260.2 overall=   664.6 peak1s=962 running=26 waiting=15 mismatch=0 short=0
 Traceback (most recent call last):
-  File "/home/aiadmin/lernex-engine-dev/bench/bench/endpoint_bench.py", line 333, in <module>
+  File "~/lernex-engine-dev/bench/bench/endpoint_bench.py", line 333, in <module>
     main()
     ~~~~^^
-  File "/home/aiadmin/lernex-engine-dev/bench/bench/endpoint_bench.py", line 326, in main
+  File "~/lernex-engine-dev/bench/bench/endpoint_bench.py", line 326, in main
     result = asyncio.run(main_async(args))
   File "/usr/lib/python3.14/asyncio/runners.py", line 204, in run
     return runner.run(main)
@@ -15,20 +15,20 @@ Traceback (most recent call last):
   File "/usr/lib/python3.14/asyncio/base_events.py", line 719, in run_until_complete
     return future.result()
            ~~~~~~~~~~~~~^^
-  File "/home/aiadmin/lernex-engine-dev/bench/bench/endpoint_bench.py", line 270, in main_async
+  File "~/lernex-engine-dev/bench/bench/endpoint_bench.py", line 270, in main_async
     row = await run_streams(
           ^^^^^^^^^^^^^^^^^^
         session, url, args.model, n, args.prompt_tokens, args.gen_tokens, args.vocab, samples
         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
     )
     ^
-  File "/home/aiadmin/lernex-engine-dev/bench/bench/endpoint_bench.py", line 188, in run_streams
+  File "~/lernex-engine-dev/bench/bench/endpoint_bench.py", line 188, in run_streams
     results = await asyncio.gather(
               ^^^^^^^^^^^^^^^^^^^^^
         *(stream_one(session, url, completion_body(name, p, gen_tokens)) for p in prompts)
         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
     )
     ^
-  File "/home/aiadmin/lernex-engine-dev/bench/bench/endpoint_bench.py", line 103, in stream_one
+  File "~/lernex-engine-dev/bench/bench/endpoint_bench.py", line 103, in stream_one
     raise RuntimeError("the stream carried no usage (stream_options.include_usage is needed)")
 RuntimeError: the stream carried no usage (stream_options.include_usage is needed)

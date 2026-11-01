@@ -26,13 +26,13 @@ set -euo pipefail
 
 name=${1:?usage: tools/draft/pipeline.sh praxis|logos|TARGET_DIR}
 case "$name" in
-  praxis) target=/home/aiadmin/kronos-scratch/logos/engines/praxis/hf ;;
-  logos) target=/home/aiadmin/kronos-scratch/logos/hfport/fp8 ;;
+  praxis) target=${LX_WORK:-$HOME/lx-work}/logos/engines/praxis/hf ;;
+  logos) target=${LX_WORK:-$HOME/lx-work}/logos/hfport/fp8 ;;
   *) target=$name; name=$(basename "$target") ;;
 esac
 here=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$here"
-WORK=${WORK:-$HOME/kronos-scratch/draft/$name}
+WORK=${WORK:-${LX_WORK:-$HOME/lx-work}/draft/$name}
 SOURCE=${SOURCE:-perfectblend}
 N_TRAIN=${N_TRAIN:-200000}
 N_EVAL=${N_EVAL:-96}

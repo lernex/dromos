@@ -187,12 +187,12 @@ side is *computed* at about 1.6 times Praxis's per block (206.5M parameters agai
 ```
 # on the GPU server, in the engine checkout, after a build
 tools/draft/pipeline.sh praxis
-#   WORK=~/kronos-scratch/draft/praxis by default; N_TRAIN, EPOCHS, BATCH, LR, ... in the script's header
+#   WORK=$LX_WORK/draft/praxis by default; N_TRAIN, EPOCHS, BATCH, LR, ... in the script's header
 #   rerun the same command to resume after any stop; progress in $WORK/train.log, features.log
 
 # then, the drafter it wrote:
-build/dromos spec /home/aiadmin/kronos-scratch/logos/engines/praxis/hf out/spec_prompts.json \
-    --drafters plain,ngram,block,block-fixed --draft-head ~/kronos-scratch/draft/praxis/train/draft
+build/dromos spec $LX_WORK/logos/engines/praxis/hf out/spec_prompts.json \
+    --drafters plain,ngram,block,block-fixed --draft-head $LX_WORK/draft/praxis/train/draft
 build/dromos spec ... --temp 0.6 --top-p 0.95 --top-k 20      # sampled, same drafter
 ```
 

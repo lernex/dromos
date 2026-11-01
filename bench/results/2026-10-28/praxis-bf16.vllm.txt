@@ -13,4 +13,4 @@ praxis-bf16 vllm streams= 64 rep=2 decode=  2898.1 tok/s per-stream=   45.3 TTFT
 praxis-bf16 vllm prefill T=512: TTFT median 42.2 ms, 12119 tok/s
 praxis-bf16 vllm prefill T=2048: TTFT median 142.2 ms, 14398 tok/s
 praxis-bf16 vllm prefill T=8192: TTFT median 513.8 ms, 15945 tok/s
-wrote /home/aiadmin/lernex-engine-dev/bench-results/2026-10-28/praxis-bf16.vllm.json
+wrote ~/lernex-engine-dev/bench-results/2026-10-28/praxis-bf16.vllm.json

@@ -6,7 +6,7 @@ below. **The Dromos column is pending final main**: Dromos is measured once, at 
 main, with the commands in the last section. Nothing in a Dromos column below was measured on this
 doc's commit.
 
-Status: rival numbers measured 2026-10-27/28 on `ssh lernex` (Intel i5-14500, 14 physical cores,
+Status: rival numbers measured 2026-10-27/28 on the benchmark machine (Intel i5-14500, 14 physical cores,
 30 GB RAM, RTX 5070 Ti 16 GB, Ubuntu). Raw results are in `tools/rivals/results/` and the server
 logs stay in `~/lernex-engine-dev/rivals/out/rivals/` on the GPU server.
 
@@ -259,7 +259,7 @@ scripts/remote.sh rivals x 'PORT=30000 timeout 1500 tools/rivals/serve.sh sglang
   ~/.cache/dromos/models/Lernex/Metis-1.6-Praxis \
   --max-mamba-cache-size 160 --max-total-tokens 131072 --cuda-graph-max-bs-decode 64 --mem-fraction-static 0.8'
 scripts/remote.sh rivals x 'PORT=30000 timeout 1500 tools/rivals/serve.sh sglang sglang-praxis-fp8 \
-  ~/kronos-scratch/logos/engines/praxis/fp8 --max-mamba-cache-size 160 --max-total-tokens 131072 \
+  $LX_WORK/logos/engines/praxis/fp8 --max-mamba-cache-size 160 --max-total-tokens 131072 \
   --cuda-graph-max-bs-decode 64 --mem-fraction-static 0.8'
 scripts/remote.sh rivals x 'PORT=30000 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True timeout 1500 \
   tools/rivals/serve.sh sglang sglang-logos-fp8 ~/.cache/dromos/models/Lernex/Metis-1.6-Logos-FP8 \
@@ -285,7 +285,7 @@ scripts/remote.sh rivals x 'PORT=8080 timeout 1500 tools/rivals/serve.sh dromos 
   ~/.cache/dromos/models/Lernex/Metis-1.6-Praxis --sequences 128 --context 2560 --no-bf16x'
 # FP8 and Logos FP8 (same client, tuned context)
 scripts/remote.sh rivals x 'PORT=8080 timeout 1500 tools/rivals/serve.sh dromos dromos-praxis-fp8 \
-  ~/kronos-scratch/logos/engines/praxis/fp8 --sequences 128 --context 2560'
+  $LX_WORK/logos/engines/praxis/fp8 --sequences 128 --context 2560'
 scripts/remote.sh rivals x 'PORT=8080 timeout 1500 tools/rivals/serve.sh dromos dromos-logos-fp8 \
   ~/.cache/dromos/models/Lernex/Metis-1.6-Logos-FP8 --sequences 128 --context 2560'
 # structured output: json_schema on dromos serve, 64 of 64 valid expected

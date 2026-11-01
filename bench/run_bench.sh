@@ -23,7 +23,7 @@ OUT=${LX_BENCH_OUT:-$HOME/lernex-engine-dev/bench-results/2026-10-28}
 mkdir -p "$OUT"
 LX=${LX:-build/dromos}
 PY=${PY:-$HOME/venvs/hfport/bin/python}
-PROMPTS=${LX_PROMPTS:-$HOME/kronos-scratch/logos/engines/work/praxisrefs/prompts.json}
+PROMPTS=${LX_PROMPTS:-${LX_WORK:-$HOME/lx-work}/logos/engines/work/praxisrefs/prompts.json}
 ENGINE_PORT=${LX_ENGINE_PORT:-8811}
 VLLM_PORT=${LX_VLLM_PORT:-8812}
 VLLM_PY=${VLLM_PY:-$HOME/venvs/vllm-metis/bin/python}

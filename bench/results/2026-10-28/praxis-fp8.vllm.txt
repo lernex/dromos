@@ -13,4 +13,4 @@ praxis-fp8 vllm streams= 64 rep=2 decode=  3436.6 tok/s per-stream=   53.7 TTFT 
 praxis-fp8 vllm prefill T=512: TTFT median 35.1 ms, 14592 tok/s
 praxis-fp8 vllm prefill T=2048: TTFT median 130.1 ms, 15748 tok/s
 praxis-fp8 vllm prefill T=8192: TTFT median 467.8 ms, 17510 tok/s
-wrote /home/aiadmin/lernex-engine-dev/bench-results/2026-10-28/praxis-fp8.vllm.json
+wrote ~/lernex-engine-dev/bench-results/2026-10-28/praxis-fp8.vllm.json

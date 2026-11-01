@@ -5,4 +5,4 @@ logos-fp8-ctx1024-mbt2048-u96 vllm streams= 64 rep=0 decode=  1057.4 tok/s per-s
 logos-fp8-ctx1024-mbt2048-u96 vllm streams= 64 rep=1 decode=  1057.5 tok/s per-stream=   16.5 TTFT p50=2.372s prefill=    2760 tok/s tpot-formula=  1917.5 overall=   873.2 peak1s=1155 running=35 waiting=59 mismatch=0 short=0
 logos-fp8-ctx1024-mbt2048-u96 vllm streams= 64 rep=2 decode=  1057.1 tok/s per-stream=   16.5 TTFT p50=2.373s prefill=    2758 tok/s tpot-formula=  1916.3 overall=   872.7 peak1s=1165 running=35 waiting=59 mismatch=0 short=0
 logos-fp8-ctx1024-mbt2048-u96 vllm prefill T=512: TTFT median 78.5 ms, 6525 tok/s
-wrote /home/aiadmin/lernex-engine-dev/bench-results/2026-10-28/logos-fp8-ctx1024-mbt2048-u96.vllm.json
+wrote ~/lernex-engine-dev/bench-results/2026-10-28/logos-fp8-ctx1024-mbt2048-u96.vllm.json

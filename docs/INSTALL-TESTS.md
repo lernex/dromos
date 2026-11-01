@@ -211,7 +211,7 @@ Visual Studio Build Tools 17.14 (MSVC 14.44) with its own CMake and Ninja, Pytho
 `scripts/release/build.ps1`, the script `release.yml`'s Windows jobs run, and every install from `install.ps1` under
 Windows PowerShell 5.1 (`irm | iex`), against two release hosts on the server shaped like GitHub's: `/latest` and
 `/latest/download/NAME` answer 302, each asset redirects once more as GitHub's do to its object store, and every
-asset is `application/octet-stream` (`relhost-gh.py` in `~/installer-win`, reached from the VM as 10.0.2.2). One
+asset is `application/octet-stream`, served by a local release host on the VM's host machine. One
 says the latest release is 0.1.1, the other 0.1.2; the three CPU zips 0.1.0, 0.1.1 and 0.1.2 differ only in
 `LX_VERSION`.
 
@@ -776,10 +776,10 @@ gets the same run once it is built from the RC tarball.
   `cuda-toolkit.ps1` pins the same manifest.
 - Fixed after round 4 (`d290c4d`): `doctor praxis` on a BF16 checkpoint listed NVFP4 under the formats that fit,
   with a refusal as its load, and the refusal named a GPTQ checkpoint by its folder on the GPU server
-  (`/home/aiadmin/kronos-scratch/...`); `run`'s refusal listed it the same way. NVFP4's load is now the command that
+  (`$LX_WORK/...`); `run`'s refusal listed it the same way. NVFP4's load is now the command that
   runs it, `dromos run Lernex/Metis-1.6-Praxis-NVFP4` (or Logos), on a line of its own; "fits" lists only what this
-  checkpoint loads; and `release.yml` fails a release whose engine, CLI or installers hold a `/home/` or
-  `kronos-scratch` path. The GPTQ folder behind that name loads in rc2 as stored NVFP4 (`doctor` on it).
+  checkpoint loads; and `release.yml` fails a release whose engine, CLI or installers hold a `/home/` path or
+  a path into the server's work folder. The GPTQ folder behind that name loads in rc2 as stored NVFP4 (`doctor` on it).
 
 - Windows lets a running program's folder be renamed. `dromos update` uses that: a version still serving is moved
   aside whole and keeps running, and the next update deletes what is left (18a). `install.ps1` instead asks the

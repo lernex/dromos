@@ -56,8 +56,8 @@ def run_parser(ref, tokenizer, thinking, text, ids):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("out_dir")
-    ap.add_argument("--model", default="/home/aiadmin/kronos-scratch/logos/engines/praxis/hf")
-    ap.add_argument("--tests", default="/home/aiadmin/kronos-scratch/logos/engines/vllm-metis/tests")
+    ap.add_argument("--model", default=os.path.join(os.environ.get("LX_WORK", os.path.expanduser("~/lx-work")), "logos/engines/praxis/hf"))
+    ap.add_argument("--tests", default=os.path.join(os.environ.get("LX_WORK", os.path.expanduser("~/lx-work")), "logos/engines/vllm-metis/tests"))
     ap.add_argument("--fuzz", type=int, default=4000)
     ap.add_argument("--seed", type=int, default=20261024)
     args = ap.parse_args()

@@ -1,4 +1,4 @@
-/home/aiadmin/kronos-scratch/logos/engines/praxis/hf  (/home/aiadmin/kronos-scratch/logos/engines/praxis/hf)
+$LX_WORK/logos/engines/praxis/hf  ($LX_WORK/logos/engines/praxis/hf)
   512 prompt tokens, 256 generated tokens per stream, greedy
   each stream count loads its own engine, so it runs on the plan a standalone run at that count gets
  streams decode tok/s   per stream   TTFT p50   TTFT p90 prefill tok/s  roofline tok/s % of spec % of peak per-token tok/s

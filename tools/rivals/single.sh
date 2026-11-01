@@ -25,7 +25,7 @@ out=$here/out/rivals
 mkdir -p "$out"
 
 LLAMA=${LLAMA:-$HOME/lernex-engine-dev/rivals-llama/build-rivals/bin}
-ENG=$HOME/kronos-scratch/logos/engines
+ENG=${LX_WORK:-$HOME/lx-work}/logos/engines
 PRAXIS_GGUF=$ENG/praxis/release
 LOGOS_GGUF=$ENG/gguf/release
 PRAXIS_BF16=$HOME/.cache/dromos/models/Lernex/Metis-1.6-Praxis

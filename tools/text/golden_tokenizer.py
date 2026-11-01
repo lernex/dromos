@@ -16,6 +16,7 @@ from the same tokenizer.json with its added tokens removed, which is what parse_
 """
 import argparse
 import json
+import os
 import random
 import sys
 from pathlib import Path
@@ -253,7 +254,7 @@ def main():
     ap.add_argument("--seed", type=int, default=20261024)
     ap.add_argument("--random", type=int, default=30000)
     ap.add_argument("--supplementary", type=int, default=20000)
-    ap.add_argument("--corpus", default="/home/aiadmin/kronos-scratch/logos/engines/tok_texts.txt")
+    ap.add_argument("--corpus", default=os.path.join(os.environ.get("LX_WORK", os.path.expanduser("~/lx-work")), "logos/engines/tok_texts.txt"))
     args = ap.parse_args()
 
     model_dir = Path(args.model_dir)

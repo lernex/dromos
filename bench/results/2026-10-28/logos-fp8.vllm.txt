@@ -13,4 +13,4 @@ logos-fp8 vllm streams= 64 rep=2 decode=   807.0 tok/s per-stream=   12.6 TTFT p
 logos-fp8 vllm prefill T=512: TTFT median 83.4 ms, 6141 tok/s
 logos-fp8 vllm prefill T=2048: TTFT median 269.9 ms, 7587 tok/s
 logos-fp8 vllm prefill T=8192: TTFT median 1018.0 ms, 8047 tok/s
-wrote /home/aiadmin/lernex-engine-dev/bench-results/2026-10-28/logos-fp8.vllm.json
+wrote ~/lernex-engine-dev/bench-results/2026-10-28/logos-fp8.vllm.json

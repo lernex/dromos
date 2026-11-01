@@ -4,7 +4,7 @@ Status: partial. The vLLM cells, the prefix-cache check and the Logos FP8 runs a
 memory are measured (the Logos section). The Dromos format sweep (every format, the serve view, prefill, spec-check and
 the profile) waits for final main.
 
-Measured 2026-10-28 on `ssh lernex`. Every GPU run went through the lock (`scripts/remote.sh bench x`).
+Measured 2026-10-28 on the benchmark machine. Every GPU run went through the lock (`scripts/remote.sh bench x`).
 
 ## Setup
 
@@ -27,11 +27,13 @@ It runs in a transient systemd user scope with `MemoryMax=20G` and `MAX_JOBS=2`.
 so the Logos runs at other settings pass `--max-model-len`, `--gpu-memory-utilization` and, where noted,
 `--max-num-batched-tokens` again. vLLM warns about the repeated keys, and its logged settings are the appended values.
 
+The model folders below sit under `$LX_WORK`, the folder on the benchmark machine that holds the checkpoints.
+
 | Format | Folder | Notes |
 |---|---|---|
-| Praxis BF16 | `~/kronos-scratch/logos/engines/praxis/hf` (model.safetensors, 6,162,552,620 bytes) | the folder Dromos loads too |
-| Praxis FP8 | `~/kronos-scratch/logos/engines/praxis/fp8` | compressed-tensors. Its conversion receipt names source sha256 `9654d9c8...`, and the BF16 folder's config names `861af5db...`. The FP8 weights may not be the BF16 weights rounded. Speed is not affected; a quality comparison would be |
-| Logos FP8 | `~/kronos-scratch/logos/hfport/fp8` | compressed-tensors, 11 GB |
+| Praxis BF16 | `$LX_WORK/logos/engines/praxis/hf` (model.safetensors, 6,162,552,620 bytes) | the folder Dromos loads too |
+| Praxis FP8 | `$LX_WORK/logos/engines/praxis/fp8` | compressed-tensors. Its conversion receipt names source sha256 `9654d9c8...`, and the BF16 folder's config names `861af5db...`. The FP8 weights may not be the BF16 weights rounded. Speed is not affected; a quality comparison would be |
+| Logos FP8 | `$LX_WORK/logos/hfport/fp8` | compressed-tensors, 11 GB |
 
 Workload, the same for both engines:
 
@@ -245,13 +247,13 @@ streams are resident.
 
 ## Reproduce
 
-    scripts/remote.sh bench x 'bash bench/run_bench.sh serve-vllm /home/aiadmin/kronos-scratch/logos/engines/praxis/hf praxis-bf16 65536'
-    scripts/remote.sh bench x 'bash bench/run_bench.sh serve-vllm /home/aiadmin/kronos-scratch/logos/engines/praxis/fp8 praxis-fp8 65536'
-    scripts/remote.sh bench x 'bash bench/run_bench.sh serve-vllm /home/aiadmin/kronos-scratch/logos/hfport/fp8 logos-fp8 65536'
-    scripts/remote.sh bench x 'LX_VLLM_STREAMS=32,64 LX_VLLM_PREFILL=512 bash bench/run_bench.sh serve-vllm /home/aiadmin/kronos-scratch/logos/hfport/fp8 logos-fp8-ctx1024-u96 65536 --max-model-len 1024 --gpu-memory-utilization 0.96'
-    scripts/remote.sh bench x 'LX_VLLM_STREAMS=32,64 LX_VLLM_PREFILL=512 bash bench/run_bench.sh serve-vllm /home/aiadmin/kronos-scratch/logos/hfport/fp8 logos-fp8-ctx1024-mbt2048-u96 65536 --max-model-len 1024 --gpu-memory-utilization 0.96 --max-num-batched-tokens 2048'
-    scripts/remote.sh bench x 'bash bench/run_bench.sh cachecheck /home/aiadmin/kronos-scratch/logos/engines/praxis/hf praxis-bf16'
-    scripts/remote.sh bench x 'bash bench/run_bench.sh cacheoff /home/aiadmin/kronos-scratch/logos/engines/praxis/hf praxis-bf16'
+    scripts/remote.sh bench x 'bash bench/run_bench.sh serve-vllm $LX_WORK/logos/engines/praxis/hf praxis-bf16 65536'
+    scripts/remote.sh bench x 'bash bench/run_bench.sh serve-vllm $LX_WORK/logos/engines/praxis/fp8 praxis-fp8 65536'
+    scripts/remote.sh bench x 'bash bench/run_bench.sh serve-vllm $LX_WORK/logos/hfport/fp8 logos-fp8 65536'
+    scripts/remote.sh bench x 'LX_VLLM_STREAMS=32,64 LX_VLLM_PREFILL=512 bash bench/run_bench.sh serve-vllm $LX_WORK/logos/hfport/fp8 logos-fp8-ctx1024-u96 65536 --max-model-len 1024 --gpu-memory-utilization 0.96'
+    scripts/remote.sh bench x 'LX_VLLM_STREAMS=32,64 LX_VLLM_PREFILL=512 bash bench/run_bench.sh serve-vllm $LX_WORK/logos/hfport/fp8 logos-fp8-ctx1024-mbt2048-u96 65536 --max-model-len 1024 --gpu-memory-utilization 0.96 --max-num-batched-tokens 2048'
+    scripts/remote.sh bench x 'bash bench/run_bench.sh cachecheck $LX_WORK/logos/engines/praxis/hf praxis-bf16'
+    scripts/remote.sh bench x 'bash bench/run_bench.sh cacheoff $LX_WORK/logos/engines/praxis/hf praxis-bf16'
 
 Raw outputs are in `bench/results/2026-10-28/`. `bench/make_tables.py` turns a results directory into the tables and
 `summary.csv`. `bench/vllm_cells.py` prints each repeat's server-log and client counts for a vLLM run.

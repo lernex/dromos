@@ -7,9 +7,9 @@ math       tensor cores: BF16, INT8, FP8, FP4
 clusters   yes (sm_90 and up: the cluster paths run)
 CUDA       driver 13.2, runtime 13.4
 build      kernels for sm_120
-backend    CUDA, liblernex_kernels.so (/home/aiadmin/lernex-engine-dev/bench/build/liblernex_kernels.so)
+backend    CUDA, liblernex_kernels.so (~/lernex-engine-dev/bench/build/liblernex_kernels.so)
 missing    none
-tuning     /home/aiadmin/lernex-engine-dev/bench/tuning/NVIDIA_GeForce_RTX_5070_Ti_sm120_0.2.json
+tuning     ~/lernex-engine-dev/bench/tuning/NVIDIA_GeForce_RTX_5070_Ti_sm120_0.2.json
 
 model      praxis: 12 layers (2 attention), hidden 2048, 128 routed experts, 2 passes
 checkpoint BF16 checkpoint, 6.16 GB on disk
@@ -19,7 +19,7 @@ formats           fits    weights  decode est. maths          with --fast-math  
            BF16X  yes     4.79 GB    259 tok/s BF16           -                  lossless encoding of the BF16 file
            INT8   yes     3.32 GB   315 tok/s* BF16           INT8               round-to-nearest from the BF16 file
            FP8    yes     3.26 GB   308 tok/s* BF16           FP8                round-to-nearest from the BF16 file
-           NVFP4  yes     2.28 GB   332 tok/s* BF16           dense FP8, experts FP4 no: NVFP4 from a BF16 checkpoint is refused: round-to-nearest conversion fails its KL. Use the GPTQ NVFP4 checkpoint at /home/aiadmin/kronos-scratch/logos/engines/praxis/nvfp4 instead.
+           NVFP4  yes     2.28 GB   332 tok/s* BF16           dense FP8, experts FP4 no: NVFP4 from a BF16 checkpoint is refused: round-to-nearest conversion fails its KL. Use the GPTQ NVFP4 checkpoint at $LX_WORK/logos/engines/praxis/nvfp4 instead.
            * decoding from the BF16X copies of the BF16 tensors (4.47 GB more)
            * decoding from the BF16X copies of the BF16 tensors (0.13 GB more)
            * decoding from the BF16X copies of the BF16 tensors (0.44 GB more)
