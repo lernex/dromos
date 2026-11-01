@@ -1,7 +1,8 @@
 # Dromos
 
 The inference engine for Lernex's Metis models, written from scratch for them.
-Private until launch. Architecture: `docs/ARCHITECTURE.md`. Kernel ABI: `engine/cuda/kernels.h`.
+Models: [Metis-1.6 on Hugging Face](https://huggingface.co/collections/Lernex/metis-16-6adc52e150d985721d894f6b).
+Architecture: `docs/ARCHITECTURE.md`. Kernel ABI: `engine/cuda/kernels.h`.
 
 ## Install
 
