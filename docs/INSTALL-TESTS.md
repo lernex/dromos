@@ -776,7 +776,7 @@ gets the same run once it is built from the RC tarball.
   `cuda-toolkit.ps1` pins the same manifest.
 - Fixed after round 4 (`d290c4d`): `doctor praxis` on a BF16 checkpoint listed NVFP4 under the formats that fit,
   with a refusal as its load, and the refusal named a GPTQ checkpoint by its folder on the GPU server
-  (`$LX_WORK/...`); `run`'s refusal listed it the same way. NVFP4's load is now the command that
+  (`~/lx-work/...`); `run`'s refusal listed it the same way. NVFP4's load is now the command that
   runs it, `dromos run Lernex/Metis-1.6-Praxis-NVFP4` (or Logos), on a line of its own; "fits" lists only what this
   checkpoint loads; and `release.yml` fails a release whose engine, CLI or installers hold a `/home/` path or
   a path into the server's work folder. The GPTQ folder behind that name loads in rc2 as stored NVFP4 (`doctor` on it).

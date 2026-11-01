@@ -27,13 +27,13 @@ It runs in a transient systemd user scope with `MemoryMax=20G` and `MAX_JOBS=2`.
 so the Logos runs at other settings pass `--max-model-len`, `--gpu-memory-utilization` and, where noted,
 `--max-num-batched-tokens` again. vLLM warns about the repeated keys, and its logged settings are the appended values.
 
-The model folders below sit under `$LX_WORK`, the folder on the benchmark machine that holds the checkpoints.
+The model folders below sit under `~/lx-work`, the folder on the benchmark machine that holds the checkpoints. The scripts read `LX_WORK` when it points somewhere else.
 
 | Format | Folder | Notes |
 |---|---|---|
-| Praxis BF16 | `$LX_WORK/logos/engines/praxis/hf` (model.safetensors, 6,162,552,620 bytes) | the folder Dromos loads too |
-| Praxis FP8 | `$LX_WORK/logos/engines/praxis/fp8` | compressed-tensors. Its conversion receipt names source sha256 `9654d9c8...`, and the BF16 folder's config names `861af5db...`. The FP8 weights may not be the BF16 weights rounded. Speed is not affected; a quality comparison would be |
-| Logos FP8 | `$LX_WORK/logos/hfport/fp8` | compressed-tensors, 11 GB |
+| Praxis BF16 | `~/lx-work/logos/engines/praxis/hf` (model.safetensors, 6,162,552,620 bytes) | the folder Dromos loads too |
+| Praxis FP8 | `~/lx-work/logos/engines/praxis/fp8` | compressed-tensors. Its conversion receipt names source sha256 `9654d9c8...`, and the BF16 folder's config names `861af5db...`. The FP8 weights may not be the BF16 weights rounded. Speed is not affected; a quality comparison would be |
+| Logos FP8 | `~/lx-work/logos/hfport/fp8` | compressed-tensors, 11 GB |
 
 Workload, the same for both engines:
 
@@ -247,13 +247,13 @@ streams are resident.
 
 ## Reproduce
 
-    scripts/remote.sh bench x 'bash bench/run_bench.sh serve-vllm $LX_WORK/logos/engines/praxis/hf praxis-bf16 65536'
-    scripts/remote.sh bench x 'bash bench/run_bench.sh serve-vllm $LX_WORK/logos/engines/praxis/fp8 praxis-fp8 65536'
-    scripts/remote.sh bench x 'bash bench/run_bench.sh serve-vllm $LX_WORK/logos/hfport/fp8 logos-fp8 65536'
-    scripts/remote.sh bench x 'LX_VLLM_STREAMS=32,64 LX_VLLM_PREFILL=512 bash bench/run_bench.sh serve-vllm $LX_WORK/logos/hfport/fp8 logos-fp8-ctx1024-u96 65536 --max-model-len 1024 --gpu-memory-utilization 0.96'
-    scripts/remote.sh bench x 'LX_VLLM_STREAMS=32,64 LX_VLLM_PREFILL=512 bash bench/run_bench.sh serve-vllm $LX_WORK/logos/hfport/fp8 logos-fp8-ctx1024-mbt2048-u96 65536 --max-model-len 1024 --gpu-memory-utilization 0.96 --max-num-batched-tokens 2048'
-    scripts/remote.sh bench x 'bash bench/run_bench.sh cachecheck $LX_WORK/logos/engines/praxis/hf praxis-bf16'
-    scripts/remote.sh bench x 'bash bench/run_bench.sh cacheoff $LX_WORK/logos/engines/praxis/hf praxis-bf16'
+    scripts/remote.sh bench x 'bash bench/run_bench.sh serve-vllm ~/lx-work/logos/engines/praxis/hf praxis-bf16 65536'
+    scripts/remote.sh bench x 'bash bench/run_bench.sh serve-vllm ~/lx-work/logos/engines/praxis/fp8 praxis-fp8 65536'
+    scripts/remote.sh bench x 'bash bench/run_bench.sh serve-vllm ~/lx-work/logos/hfport/fp8 logos-fp8 65536'
+    scripts/remote.sh bench x 'LX_VLLM_STREAMS=32,64 LX_VLLM_PREFILL=512 bash bench/run_bench.sh serve-vllm ~/lx-work/logos/hfport/fp8 logos-fp8-ctx1024-u96 65536 --max-model-len 1024 --gpu-memory-utilization 0.96'
+    scripts/remote.sh bench x 'LX_VLLM_STREAMS=32,64 LX_VLLM_PREFILL=512 bash bench/run_bench.sh serve-vllm ~/lx-work/logos/hfport/fp8 logos-fp8-ctx1024-mbt2048-u96 65536 --max-model-len 1024 --gpu-memory-utilization 0.96 --max-num-batched-tokens 2048'
+    scripts/remote.sh bench x 'bash bench/run_bench.sh cachecheck ~/lx-work/logos/engines/praxis/hf praxis-bf16'
+    scripts/remote.sh bench x 'bash bench/run_bench.sh cacheoff ~/lx-work/logos/engines/praxis/hf praxis-bf16'
 
 Raw outputs are in `bench/results/2026-10-28/`. `bench/make_tables.py` turns a results directory into the tables and
 `summary.csv`. `bench/vllm_cells.py` prints each repeat's server-log and client counts for a vLLM run.

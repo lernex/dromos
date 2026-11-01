@@ -259,7 +259,7 @@ scripts/remote.sh rivals x 'PORT=30000 timeout 1500 tools/rivals/serve.sh sglang
   ~/.cache/dromos/models/Lernex/Metis-1.6-Praxis \
   --max-mamba-cache-size 160 --max-total-tokens 131072 --cuda-graph-max-bs-decode 64 --mem-fraction-static 0.8'
 scripts/remote.sh rivals x 'PORT=30000 timeout 1500 tools/rivals/serve.sh sglang sglang-praxis-fp8 \
-  $LX_WORK/logos/engines/praxis/fp8 --max-mamba-cache-size 160 --max-total-tokens 131072 \
+  ~/lx-work/logos/engines/praxis/fp8 --max-mamba-cache-size 160 --max-total-tokens 131072 \
   --cuda-graph-max-bs-decode 64 --mem-fraction-static 0.8'
 scripts/remote.sh rivals x 'PORT=30000 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True timeout 1500 \
   tools/rivals/serve.sh sglang sglang-logos-fp8 ~/.cache/dromos/models/Lernex/Metis-1.6-Logos-FP8 \
@@ -285,7 +285,7 @@ scripts/remote.sh rivals x 'PORT=8080 timeout 1500 tools/rivals/serve.sh dromos 
   ~/.cache/dromos/models/Lernex/Metis-1.6-Praxis --sequences 128 --context 2560 --no-bf16x'
 # FP8 and Logos FP8 (same client, tuned context)
 scripts/remote.sh rivals x 'PORT=8080 timeout 1500 tools/rivals/serve.sh dromos dromos-praxis-fp8 \
-  $LX_WORK/logos/engines/praxis/fp8 --sequences 128 --context 2560'
+  ~/lx-work/logos/engines/praxis/fp8 --sequences 128 --context 2560'
 scripts/remote.sh rivals x 'PORT=8080 timeout 1500 tools/rivals/serve.sh dromos dromos-logos-fp8 \
   ~/.cache/dromos/models/Lernex/Metis-1.6-Logos-FP8 --sequences 128 --context 2560'
 # structured output: json_schema on dromos serve, 64 of 64 valid expected

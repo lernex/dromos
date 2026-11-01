@@ -28,7 +28,7 @@ Bytes are counted at context 640 (512 prompt tokens plus half of the 256 generat
 
 Resident weights include the BF16X lossless copies that decode reads for the wide tensors.
 
-Where each row's weights come from: Praxis BF16 is the BF16 file as stored. Praxis INT8 is round-to-nearest from the BF16 file, at load. Praxis FP8 and NVFP4 load the checkpoints stored under `$LX_WORK/logos/engines/praxis/` (`fp8`, `nvfp4`); NVFP4 is refused from a plain BF16 checkpoint. Logos FP8 is `Metis-1.6-Logos-FP8` as stored.
+Where each row's weights come from: Praxis BF16 is the BF16 file as stored. Praxis INT8 is round-to-nearest from the BF16 file, at load. Praxis FP8 and NVFP4 load the checkpoints stored under `~/lx-work/logos/engines/praxis/` (`fp8`, `nvfp4`); NVFP4 is refused from a plain BF16 checkpoint. Logos FP8 is `Metis-1.6-Logos-FP8` as stored.
 
 ## Bench prompts and the routing census
 
