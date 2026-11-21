@@ -92,6 +92,7 @@ struct Job {
   bool chat = false;
   bool stream = false;
   bool include_usage = false;
+  bool progress = false;  // return_progress: prompt_progress chunks while the prompt is read (streams only)
   bool logprobs = false;
   int top_logprobs = 0;
   std::string model;
@@ -303,6 +304,8 @@ struct Pending {
   std::mutex mu;
   std::condition_variable cv;
   std::deque<TokenDelta> deltas;
+  // The latest word on the prompt's reading, not yet written. Only the latest: a reader that falls behind skips ahead.
+  std::optional<runtime::PrefillProgress> progress;
   bool finished = false;
   RequestResult result;
 };
@@ -350,6 +353,16 @@ class Wire {
       }
     }
     return out;
+  }
+
+  // How far the prompt has been read, as llama.cpp's server says it (return_progress): a chunk with no choices and a
+  // prompt_progress object, where processed counts the cached tokens too.
+  std::string progress(const runtime::PrefillProgress& p) const {
+    json c = base_chunk();
+    c["choices"] = json::array();
+    c["prompt_progress"] = {{"total", p.total}, {"cache", p.cached}, {"processed", p.processed},
+                            {"time_ms", static_cast<int64_t>(p.seconds * 1000.0 + 0.5)}};
+    return sse(c);
   }
 
   // The last chunk, with the reason, the usage when asked for, and [DONE].
@@ -523,6 +536,13 @@ bool Server::run() {
       state->deltas.push_back(d);
       state->cv.notify_one();
     };
+    if (job.stream && job.progress) {
+      cb.on_prefill = [state](const runtime::PrefillProgress& p) {
+        std::lock_guard<std::mutex> lock(state->mu);
+        state->progress = p;
+        state->cv.notify_one();
+      };
+    }
     cb.on_finish = [state](const RequestResult& r) {
       std::lock_guard<std::mutex> lock(state->mu);
       state->result = r;
@@ -538,23 +558,28 @@ bool Server::run() {
           "text/event-stream",
           [this, state, wire, id](size_t, httplib::DataSink& sink) {
             std::vector<TokenDelta> batch;
+            std::optional<runtime::PrefillProgress> progress;
             RequestResult result;
             bool finished = false;
             {
               std::unique_lock<std::mutex> lock(state->mu);
-              state->cv.wait(lock, [&] { return !state->deltas.empty() || state->finished; });
+              state->cv.wait(lock, [&] { return !state->deltas.empty() || state->progress || state->finished; });
               batch.assign(state->deltas.begin(), state->deltas.end());
               state->deltas.clear();
+              progress = state->progress;
+              state->progress.reset();
               finished = state->finished;
               result = state->result;
             }
+            // The reading comes before the tokens it led to.
+            const std::string read = progress ? wire->progress(*progress) : std::string();
             if (finished) {
-              const std::string tail = wire->events(batch) + wire->finish(result);
+              const std::string tail = read + wire->events(batch) + wire->finish(result);
               sink.write(tail.data(), tail.size());
               sink.done();
               return true;
             }
-            const std::string text = wire->events(batch);
+            const std::string text = read + wire->events(batch);
             if (!text.empty() && !sink.write(text.data(), text.size())) {
               engine_.cancel(id);
               return false;
@@ -637,6 +662,7 @@ bool Server::run() {
       read_limit(body, job, body.contains("max_completion_tokens") ? "max_completion_tokens" : "max_tokens");
       job.stream = body.value("stream", false);
       job.include_usage = body.value("stream_options", json::object()).value("include_usage", false);
+      job.progress = body.value("return_progress", false);
       job.logprobs = body.value("logprobs", false);
       job.top_logprobs = integer_in(body, "top_logprobs", 0, runtime::kMaxTopLogprobs, 0);
       if (job.top_logprobs > 0 && !job.logprobs) invalid("top_logprobs needs logprobs: true", "top_logprobs");
@@ -685,6 +711,7 @@ bool Server::run() {
       read_limit(body, job, "max_tokens");
       job.stream = body.value("stream", false);
       job.include_usage = body.value("stream_options", json::object()).value("include_usage", false);
+      job.progress = body.value("return_progress", false);
       job.logprobs = body.contains("logprobs") && !body["logprobs"].is_null() && integer_in(body, "logprobs", 0, runtime::kMaxTopLogprobs, 0) > 0;
       job.top_logprobs = job.logprobs ? integer_in(body, "logprobs", 0, runtime::kMaxTopLogprobs, 0) : 0;
       job.request.sampling.logprobs = job.logprobs;

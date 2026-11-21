@@ -67,5 +67,11 @@ else is decoding beside it, as in other engines. `--batch-invariant` (run, serve
 product on one algorithm instead: a request gets the same bits whatever shares its steps, about 15% slower at
 32 streams. `dromos eval` always runs this way. Speculation never changes the output in either mode.
 
+A streamed request with `"return_progress": true` hears how far its prompt has been read before the first token, as
+llama.cpp's server says it: chunks with empty `choices` and `"prompt_progress": {"total", "cache", "processed",
+"time_ms"}`, where `processed` counts the tokens the prefix cache restored, so the new reading is `processed - cache`
+of `total - cache`. One comes as the request starts, one after each step that read part of the prompt (once the device
+has finished it), and the last says `processed == total`. Only such a request pays a device sync per prefill step.
+
 `LX_ARCH_OVERRIDE=80|86|89|90` (or `--lx-arch=N` on the kernel tests) makes a newer card run the code paths
 of an older architecture, so the fallbacks are tested on one GPU.

@@ -227,6 +227,7 @@ struct Engine::Impl {
   bool spec_step(const std::shared_ptr<Sequence>& s);
   void end(const std::shared_ptr<Sequence>& s, FinishReason reason, const std::string& error, bool show_held);
   void deliver(const std::shared_ptr<Sequence>& s, const TokenDelta& delta);
+  void report_prefill(const std::shared_ptr<Sequence>& s);
   void retire(const std::shared_ptr<Sequence>& s);
   void fail_all(const std::string& reason);
   void publish_stats();
@@ -485,6 +486,7 @@ void Engine::Impl::admit() {
     model->reset_slot(s->slot);
     s->history = s->request.prompt;
     restore_prefix(s);
+    report_prefill(s);  // where the reading starts: after what the cache already holds
     check(lx_sampler_reset(static_cast<int32_t*>(seen.data()), static_cast<int32_t*>(out_counts.data()), s->slot,
                            V, stream),
           "lx_sampler_reset");
@@ -548,6 +550,14 @@ void Engine::Impl::step() {
     for (const auto& s : prompt_moved)
       if (snapshot_wanted(s->prompt_fed, static_cast<int>(s->request.prompt.size()), grid))
         snapshot(s, s->prompt_fed, s->request.prompt);  // queued before the next step
+  // How far each prompt has read, said only once the step's work is done, so a reader never runs ahead of the device.
+  // The sync is paid only when a request asked to hear (RequestCallbacks::on_prefill).
+  bool told = false;
+  for (const auto& s : prompt_moved) told = told || static_cast<bool>(s->callbacks.on_prefill);
+  if (told) {
+    check(lx_rt_stream_sync(stream), "waiting for the prompt's step");
+    for (const auto& s : prompt_moved) report_prefill(s);
+  }
   {
     std::lock_guard<std::mutex> lock(mu);
     stats.steps += 1;
@@ -893,6 +903,21 @@ bool Engine::Impl::spec_step(const std::shared_ptr<Sequence>& s) {
   const float value = row_logprob(static_cast<size_t>(accepted), &ids, &lp);
   if (accept(s, next, value, ids, lp, report.top_n, /*feed=*/true)) retire(s);
   return true;
+}
+
+void Engine::Impl::report_prefill(const std::shared_ptr<Sequence>& s) {
+  if (!s->callbacks.on_prefill) return;
+  PrefillProgress p;
+  p.total = static_cast<int>(s->request.prompt.size());
+  p.cached = s->cached;
+  p.processed = s->prompt_fed;
+  p.seconds = now() - s->submitted_at;
+  try {
+    s->callbacks.on_prefill(p);
+  } catch (...) {
+    // As with a token: a callback that throws has lost its client.
+    s->cancelled = true;
+  }
 }
 
 void Engine::Impl::deliver(const std::shared_ptr<Sequence>& s, const TokenDelta& delta) {

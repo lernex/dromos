@@ -92,8 +92,21 @@ struct RequestResult {
   int spec_accepted = 0;
 };
 
+// How far the prompt has been read, before the reply's first token. `processed` counts the tokens the prefix cache
+// restored too, so it runs from `cached` to `total`; the new reading is (processed - cached) of (total - cached).
+struct PrefillProgress {
+  int total = 0;          // the prompt's tokens
+  int cached = 0;         // restored from the prefix cache, not fed
+  int processed = 0;      // read so far, the cached ones included
+  double seconds = 0.0;   // since the request was submitted
+};
+
 struct RequestCallbacks {
   std::function<void(const TokenDelta&)> on_token;
+  // When set: once as the request starts (processed == cached), then after each step that read part of its prompt,
+  // once that step's work is done on the device, the last time with processed == total. A request set this way costs
+  // its prefill steps a device sync each, so the host stops queueing ahead of them; a request without it costs nothing.
+  std::function<void(const PrefillProgress&)> on_prefill;
   std::function<void(const RequestResult&)> on_finish;  // always called exactly once
 };
 
