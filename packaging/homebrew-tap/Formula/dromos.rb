@@ -6,9 +6,9 @@
 class Dromos < Formula
   desc "Metis inference engine on the Metal GPU of an Apple silicon Mac"
   homepage "https://github.com/lernex/dromos"
-  url "https://github.com/lernex/dromos/releases/download/v0.1.0/dromos-darwin-arm64.tar.gz"
-  version "0.1.0"
-  sha256 "cdd136284cdea38b7a8773ef5a5dbfa7f6064e0744829ad7fc081ff7138b7662"
+  url "https://github.com/lernex/dromos/releases/download/v0.1.1/dromos-darwin-arm64.tar.gz"
+  version "0.1.1"
+  sha256 "6ca2d664f611b8fd66317ead1488f699a7d5e433d311b2762780bed877385182"
   license "Apache-2.0"
 
   depends_on arch: :arm64
